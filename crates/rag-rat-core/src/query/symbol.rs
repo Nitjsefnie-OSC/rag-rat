@@ -1,4 +1,4 @@
-use duckdb::{Connection, params};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::language::Language;
@@ -38,7 +38,7 @@ pub fn lookup(
 
     let fuzzy = format!("%{name}%");
     let mut stmt = conn.prepare(&sql)?;
-    let map_row = |row: &duckdb::Row<'_>| {
+    let map_row = |row: &rusqlite::Row<'_>| {
         Ok(SymbolHit {
             symbol_id: row.get(0)?,
             path: row.get(1)?,

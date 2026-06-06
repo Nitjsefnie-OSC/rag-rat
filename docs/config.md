@@ -5,7 +5,7 @@
 ```toml
 [index]
 root = "."
-database = ".rag-rat/index.duckdb"
+database = ".rag-rat/index.sqlite"
 ```
 
 Simple bindings map a language to directories:

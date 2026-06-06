@@ -69,7 +69,7 @@ impl Config {
         let root = config_dir.join(raw.index.root.unwrap_or_else(|| ".".to_string()));
         let root = normalize_existing_dir(&root)?;
         let database =
-            root.join(raw.index.database.unwrap_or_else(|| ".rag-rat/index.duckdb".to_string()));
+            root.join(raw.index.database.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string()));
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
 
         Ok(Self { root, database, targets })

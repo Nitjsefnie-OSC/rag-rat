@@ -1,6 +1,6 @@
 # rag-rat
 
-`rag-rat` is a local, read-only-source Rust repo-intelligence tool. It builds a DuckDB FTS index over configured language roots and exposes CLI plus `rmcp` STDIO MCP access for LLM-assisted code search and propagation tracing.
+`rag-rat` is a local, read-only-source Rust repo-intelligence tool. It builds a SQLite FTS5 index over configured language roots and exposes CLI plus `rmcp` STDIO MCP access for LLM-assisted code search and propagation tracing.
 
 Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source where files are small enough for bounded parsing, markdown heading chunks for docs, and coarse chunks for generated or oversized files. Chunk anchors store content and context fingerprints so stale reads can be detected and repaired.
 
@@ -8,10 +8,16 @@ Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source 
 
 ```bash
 cargo run --bin rag-rat -- index --config rag-rat.toml
+cargo run --bin rag-rat -- index --full --config rag-rat.toml
 cargo run --bin rag-rat -- doctor --config rag-rat.toml
 cargo run --bin rag-rat -- query --config rag-rat.toml "semantic recall"
 cargo run --bin rag-rat -- mcp --config rag-rat.toml
 ```
+
+By default, rag-rat links against the system SQLite library through `rusqlite`.
+
+`index` updates files currently changed in git status. Use `index --full` to rebuild every file
+and rebuild the SQLite FTS5 table from stored chunks.
 
 ## Configuration
 
@@ -20,7 +26,7 @@ The host repo owns `rag-rat.toml`. This keeps monorepo-specific target bindings 
 ```toml
 [index]
 root = "."
-database = ".rag-rat/index.duckdb"
+database = ".rag-rat/index.sqlite"
 
 [target_bindings]
 rust = ["core/held-core/src"]
@@ -36,4 +42,4 @@ include = ["**/*.ts"]
 
 ## Security
 
-The MCP server exposes read-only source tools only. It does not execute shell commands or write configured target files. It may write the configured DuckDB index during `index` and during automatic stale-index healing before returning search or `read_chunk` results.
+The MCP server exposes read-only source tools only. It does not execute shell commands or write configured target files. It may write the configured SQLite index during `index` and during automatic stale-index healing before returning search or `read_chunk` results.

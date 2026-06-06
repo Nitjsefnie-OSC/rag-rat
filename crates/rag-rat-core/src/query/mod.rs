@@ -2,7 +2,7 @@ pub mod graph;
 pub mod impact;
 pub mod symbol;
 
-use duckdb::{Connection, OptionalExt};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]

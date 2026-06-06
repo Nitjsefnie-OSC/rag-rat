@@ -118,7 +118,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
 pub fn description(name: &str) -> &'static str {
     match name {
         "semantic_search" => {
-            "Search indexed source and docs with DuckDB BM25 lexical recall; validates stale hits."
+            "Search indexed source and docs with SQLite BM25 lexical recall; validates stale hits."
         },
         "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin symbols.",
         "find_callers" => "Traverse reverse graph edges for callers when graph data exists.",
@@ -128,7 +128,7 @@ pub fn description(name: &str) -> &'static str {
         "docs_for_symbol" => "Find docs chunks related to a symbol.",
         "read_chunk" => "Read current text for one selected chunk ID with anchor validation.",
         "index_status" => {
-            "Report DuckDB index freshness, git metadata, parser failures, and file counts."
+            "Report SQLite index freshness, git metadata, parser failures, and file counts."
         },
         _ => "Unknown tool.",
     }

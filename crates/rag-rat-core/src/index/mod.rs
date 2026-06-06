@@ -19,7 +19,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use duckdb::{OptionalExt, params};
+use gix::{
+    bstr::{BString, ByteSlice},
+    status::{UntrackedFiles, tree_index},
+};
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -44,6 +48,7 @@ pub struct IndexDatabase {
 pub enum IndexProgress {
     Started {
         database: PathBuf,
+        full_rebuild: bool,
     },
     Discovering,
     Discovered {
@@ -56,7 +61,7 @@ pub enum IndexProgress {
         language: Language,
         kind: TargetKind,
     },
-    RefreshingFts,
+    RebuildingFts,
     Finished {
         files: usize,
     },
@@ -69,8 +74,9 @@ pub struct IndexStatus {
     pub git_commit: Option<String>,
     pub git_dirty: Option<bool>,
     pub indexed_at_ms: Option<i64>,
-    pub fts_refreshed_at_ms: Option<i64>,
+    pub fts_synced_at_ms: Option<i64>,
     pub fts_source_revision: Option<String>,
+    pub fts_fresh: bool,
     pub file_count_by_language: BTreeMap<String, u64>,
     pub parser_failures: u64,
 }
@@ -93,7 +99,7 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        progress(IndexProgress::Started { database: config.database.clone() });
+        progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: true });
         remove_database_files(&config.database)?;
         let db = Self::open(&config.database)?;
         let result = (|| -> anyhow::Result<()> {
@@ -101,8 +107,42 @@ impl IndexDatabase {
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
-            progress(IndexProgress::RefreshingFts);
-            db.refresh_fts()?;
+            progress(IndexProgress::RebuildingFts);
+            db.rebuild_fts()?;
+            db.set_meta("indexed_at_ms", &now_ms().to_string())?;
+            db.storage.execute_batch("COMMIT")?;
+            progress(IndexProgress::Finished { files: indexed });
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = db.storage.execute_batch("ROLLBACK");
+        }
+        result?;
+        Ok(db)
+    }
+
+    pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
+        Self::index_changed_with_progress(config, |_| {})
+    }
+
+    pub fn index_changed_with_progress<F>(config: &Config, mut progress: F) -> anyhow::Result<Self>
+    where
+        F: FnMut(IndexProgress),
+    {
+        if !config.database.exists() {
+            return Self::rebuild_with_progress(config, progress);
+        }
+
+        progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: false });
+        let db = Self::open(&config.database)?;
+        let result = (|| -> anyhow::Result<()> {
+            db.storage.execute_batch("BEGIN TRANSACTION")?;
+            db.set_meta("source_root", &config.root.display().to_string())?;
+            db.write_git_meta(&config.root)?;
+            let indexed = db.index_changed_files_with_progress(config, &mut progress)?;
+            if indexed > 0 {
+                db.record_fts_current()?;
+            }
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
             db.storage.execute_batch("COMMIT")?;
             progress(IndexProgress::Finished { files: indexed });
@@ -163,6 +203,55 @@ impl IndexDatabase {
         Ok(files.len())
     }
 
+    fn index_changed_files_with_progress<F>(
+        &self,
+        config: &Config,
+        progress: &mut F,
+    ) -> anyhow::Result<usize>
+    where
+        F: FnMut(IndexProgress),
+    {
+        progress(IndexProgress::Discovering);
+        let changes = git_changed_paths(&config.root)?;
+        let files = collect_changed_index_files(config, &changes)?;
+        progress(IndexProgress::Discovered { files: files.len() });
+
+        for path in changes.deleted {
+            self.remove_file(&path)?;
+        }
+
+        for (index, file) in files.iter().enumerate() {
+            progress(IndexProgress::IndexingFile {
+                current: index + 1,
+                total: files.len(),
+                path: file.relative_path.clone(),
+                language: file.language,
+                kind: file.kind,
+            });
+            let text = match fs::read_to_string(&file.full_path) {
+                Ok(text) => text,
+                Err(err) => {
+                    self.insert_parser_failure(
+                        &file.relative_path,
+                        file.language,
+                        &err.to_string(),
+                    )?;
+                    continue;
+                },
+            };
+            self.remove_file(&file.relative_path)?;
+            self.index_file(
+                &file.relative_path,
+                file.language,
+                file.kind,
+                file_metadata_ms(&file.full_path)?,
+                &text,
+            )?;
+        }
+
+        Ok(files.len())
+    }
+
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
         let mut counts = BTreeMap::new();
         let mut stmt = self
@@ -176,16 +265,20 @@ impl IndexDatabase {
             counts.insert(language, u64::try_from(count).unwrap_or(0));
         }
 
+        let content_revision = self.content_revision()?;
+        let fts_source_revision = self.meta("fts_source_revision")?;
+
         Ok(IndexStatus {
             database: database.display().to_string(),
             exists: database.exists(),
             git_commit: self.meta("git_commit")?,
             git_dirty: self.meta("git_dirty")?.map(|value| value == "true"),
             indexed_at_ms: self.meta("indexed_at_ms")?.and_then(|value| value.parse::<i64>().ok()),
-            fts_refreshed_at_ms: self
-                .meta("fts_refreshed_at_ms")?
+            fts_synced_at_ms: self
+                .meta("fts_synced_at_ms")?
                 .and_then(|value| value.parse::<i64>().ok()),
-            fts_source_revision: self.meta("fts_source_revision")?,
+            fts_fresh: fts_source_revision.as_deref() == Some(content_revision.as_str()),
+            fts_source_revision,
             file_count_by_language: counts,
             parser_failures: self.parser_failure_count()?,
         })
@@ -239,7 +332,7 @@ impl IndexDatabase {
             },
             AnchorStatus::Stale => {
                 self.heal_file(Path::new(&chunk.path))?;
-                self.refresh_fts()?;
+                self.record_fts_current()?;
                 crate::query::read_chunk(self.storage.connection(), chunk_id)
             },
         }
@@ -277,9 +370,13 @@ impl IndexDatabase {
         crate::query::impact::impact_surface(self.storage.connection(), query, limit)
     }
 
-    pub fn refresh_fts(&self) -> anyhow::Result<()> {
-        schema::refresh_fts(self.storage.connection())?;
-        self.set_meta("fts_refreshed_at_ms", &now_ms().to_string())?;
+    pub fn rebuild_fts(&self) -> anyhow::Result<()> {
+        schema::rebuild_fts(self.storage.connection())?;
+        self.record_fts_current()
+    }
+
+    pub fn record_fts_current(&self) -> anyhow::Result<()> {
+        self.set_meta("fts_synced_at_ms", &now_ms().to_string())?;
         let revision = self.content_revision()?;
         self.set_meta("fts_source_revision", &revision)?;
         Ok(())
@@ -368,6 +465,11 @@ impl IndexDatabase {
                     anchor.end_context_hash,
                     anchor.context_radius,
                 ],
+            )?;
+            let chunk_id = self.storage.connection().last_insert_rowid();
+            self.storage.connection().execute(
+                "INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)",
+                params![chunk_id, chunk.text],
             )?;
         }
         Ok(())
@@ -464,7 +566,7 @@ impl IndexDatabase {
         for path in stale.into_iter().take(4) {
             self.heal_file(Path::new(&path))?;
         }
-        self.refresh_fts()?;
+        self.record_fts_current()?;
         self.search_with_heal(query, limit, include_generated, false)
     }
 
@@ -517,6 +619,18 @@ impl IndexDatabase {
 
     fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
         let path = path_string(path);
+        self.storage
+            .connection()
+            .execute("DELETE FROM parser_failures WHERE path = ?1", [&path])?;
+        self.storage.connection().execute(
+            "DELETE FROM chunk_fts
+             WHERE rowid IN (
+                 SELECT chunks.id FROM chunks
+                 JOIN files ON files.id = chunks.file_id
+                 WHERE files.path = ?1
+             )",
+            [&path],
+        )?;
         self.storage.connection().execute(
             "DELETE FROM chunks WHERE file_id IN (SELECT id FROM files WHERE path = ?1)",
             [&path],
@@ -571,6 +685,12 @@ struct IndexFile {
     kind: TargetKind,
 }
 
+#[derive(Debug, Default)]
+struct GitChangedPaths {
+    changed: BTreeSet<PathBuf>,
+    deleted: BTreeSet<PathBuf>,
+}
+
 fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
     let mut targets = config.targets.iter().collect::<Vec<_>>();
     targets.sort_by_key(|target| match target.kind {
@@ -600,7 +720,118 @@ fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
     Ok(files)
 }
 
-fn meta_for(conn: &duckdb::Connection, key: &str) -> anyhow::Result<Option<String>> {
+fn collect_changed_index_files(
+    config: &Config,
+    changes: &GitChangedPaths,
+) -> anyhow::Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    for relative_path in &changes.changed {
+        let full_path = config.root.join(relative_path);
+        if !full_path.is_file() {
+            continue;
+        }
+        let Some((language, kind)) = target_for_path(config, relative_path) else {
+            continue;
+        };
+        files.push(IndexFile { full_path, relative_path: relative_path.clone(), language, kind });
+    }
+    Ok(files)
+}
+
+fn target_for_path(config: &Config, relative_path: &Path) -> Option<(Language, TargetKind)> {
+    let relative = path_string(relative_path);
+    let language = Language::from_path(relative_path)?;
+    let mut targets = config.targets.iter().collect::<Vec<_>>();
+    targets.sort_by_key(|target| match target.kind {
+        TargetKind::Generated => 0,
+        TargetKind::Tests => 1,
+        TargetKind::Docs => 2,
+        TargetKind::Source => 3,
+    });
+    targets.into_iter().find_map(|target| {
+        if target.language != language {
+            return None;
+        }
+        if !target.directories.iter().any(|directory| {
+            directory.as_os_str().is_empty()
+                || directory == Path::new(".")
+                || relative_path.starts_with(directory)
+        }) {
+            return None;
+        }
+        if target.exclude.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
+            return None;
+        }
+        if !target.include.iter().any(|pattern| matches_simple_pattern(&relative, pattern)) {
+            return None;
+        }
+        Some((target.language, target.kind))
+    })
+}
+
+fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
+    let repo = gix::discover(root)?;
+    let worktree_root = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("git repository has no worktree"))?
+        .to_path_buf();
+    let pathspec = config_root_pathspec(&worktree_root, root);
+    let mut paths = GitChangedPaths::default();
+
+    for item in repo
+        .status(gix::progress::Discard)?
+        .untracked_files(UntrackedFiles::Files)
+        .tree_index_track_renames(tree_index::TrackRenames::Disabled)
+        .into_iter([pathspec])?
+    {
+        let item = item?;
+        let Some(path) = repo_relative_path_to_config_path(&worktree_root, root, item.location())
+        else {
+            continue;
+        };
+        if root.join(&path).exists() {
+            if !paths.deleted.contains(&path) {
+                paths.changed.insert(path);
+            }
+        } else {
+            paths.changed.remove(&path);
+            paths.deleted.insert(path);
+        }
+    }
+
+    Ok(paths)
+}
+
+fn repo_relative_path_to_config_path(
+    worktree_root: &Path,
+    config_root: &Path,
+    repo_relative_path: &gix::bstr::BStr,
+) -> Option<PathBuf> {
+    let path = PathBuf::from(repo_relative_path.to_str_lossy().as_ref());
+    worktree_root.join(path).strip_prefix(config_root).ok().map(Path::to_path_buf)
+}
+
+fn config_root_pathspec(worktree_root: &Path, config_root: &Path) -> BString {
+    let relative = config_root.strip_prefix(worktree_root).unwrap_or_else(|_| Path::new(""));
+    let relative = path_string(relative);
+    if relative.is_empty() || relative == "." {
+        BString::from("*")
+    } else {
+        BString::from(format!("{relative}/**"))
+    }
+}
+
+fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
+    if let Some(extension) = pattern.strip_prefix("**/*.") {
+        return path.ends_with(&format!(".{extension}"));
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path.starts_with(prefix);
+    }
+    path == pattern || path.contains(pattern.trim_matches('*'))
+}
+
+fn meta_for(conn: &rusqlite::Connection, key: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
         .optional()?)
@@ -644,7 +875,8 @@ fn path_string(path: &Path) -> String {
 fn remove_database_files(path: &Path) -> anyhow::Result<()> {
     for candidate in [
         path.to_path_buf(),
-        PathBuf::from(format!("{}.wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+        PathBuf::from(format!("{}-wal", path.display())),
         PathBuf::from(format!("{}.tmp", path.display())),
     ] {
         if candidate.exists() {

@@ -36,7 +36,7 @@ impl RagRatService {
 impl RagRatService {
     #[tool(
         name = "semantic_search",
-        description = "Search indexed source and docs with DuckDB BM25 lexical recall; validates stale hits."
+        description = "Search indexed source and docs with SQLite BM25 lexical recall; validates stale hits."
     )]
     fn semantic_search(
         &self,
@@ -121,7 +121,7 @@ impl RagRatService {
 
     #[tool(
         name = "index_status",
-        description = "Report DuckDB index freshness, git metadata, parser failures, and file counts."
+        description = "Report SQLite index freshness, git metadata, parser failures, and file counts."
     )]
     fn index_status(
         &self,
@@ -136,7 +136,7 @@ impl ServerHandler for RagRatService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rag-rat", "0.1.0"))
-            .with_instructions("Read-only-source repo intelligence. Index and auto-heal writes are confined to the configured DuckDB database.")
+            .with_instructions("Read-only-source repo intelligence. Index and auto-heal writes are confined to the configured SQLite database.")
     }
 }
 

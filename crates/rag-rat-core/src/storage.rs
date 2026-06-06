@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use duckdb::Connection;
+use rusqlite::Connection;
 
 #[derive(Debug)]
 pub struct IndexConnection {
@@ -18,7 +18,7 @@ impl IndexConnection {
         }
         let conn = Connection::open(path)?;
         let storage = Self { conn, source_root: None };
-        storage.setup_extensions()?;
+        storage.setup()?;
         Ok(storage)
     }
 
@@ -39,11 +39,14 @@ impl IndexConnection {
         Ok(())
     }
 
-    fn setup_extensions(&self) -> anyhow::Result<()> {
-        // DuckDB FTS is an extension and can be absent on constrained installs.
-        // Schema setup retries without failing indexing when INSTALL is unavailable.
-        let _ = self.conn.execute_batch("INSTALL fts;");
-        let _ = self.conn.execute_batch("LOAD fts;");
+    fn setup(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            ",
+        )?;
         Ok(())
     }
 }

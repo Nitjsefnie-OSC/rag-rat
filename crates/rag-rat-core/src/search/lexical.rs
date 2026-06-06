@@ -1,4 +1,4 @@
-use duckdb::{Connection, params};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -21,22 +21,23 @@ pub fn search(
     include_generated: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
     let fts_query = fts_query(query);
-    let generated_filter = if include_generated { "1 = 1" } else { "files.generated = false" };
+    let generated_filter = if include_generated { "1 = 1" } else { "files.generated = 0" };
     let sql = format!(
         "
         SELECT chunks.id, files.path, files.language, files.kind,
                chunks.start_line, chunks.end_line, chunks.symbol_path,
-               fts_main_chunks.match_bm25(chunks.id, ?1) AS score, chunks.text
-        FROM chunks
+               bm25(chunk_fts) AS score, chunks.text
+        FROM chunk_fts
+        JOIN chunks ON chunks.id = chunk_fts.rowid
         JOIN files ON files.id = chunks.file_id
-        WHERE fts_main_chunks.match_bm25(chunks.id, ?1) IS NOT NULL
+        WHERE chunk_fts MATCH ?1
           AND {generated_filter}
-        ORDER BY score DESC
+        ORDER BY score
         LIMIT ?2
         "
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![fts_query, limit], |row| {
+    let rows = stmt.query_map(params![fts_query, i64::from(limit)], |row| {
         let text: String = row.get(8)?;
         Ok(SearchHit {
             chunk_id: row.get(0)?,

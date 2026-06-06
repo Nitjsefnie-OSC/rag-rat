@@ -1,4 +1,4 @@
-use duckdb::Connection;
+use rusqlite::Connection;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]

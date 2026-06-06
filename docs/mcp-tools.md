@@ -1,6 +1,6 @@
 # MCP Tools
 
-`rag-rat mcp --config rag-rat.toml` starts a local `rmcp` STDIO server. The server is read-only for configured source roots; it may update the configured DuckDB index when automatic stale-index healing is needed.
+`rag-rat mcp --config rag-rat.toml` starts a local `rmcp` STDIO server. The server is read-only for configured source roots; it may update the configured SQLite index when automatic stale-index healing is needed.
 
 ## Tools
 
@@ -14,4 +14,4 @@
 - `read_chunk`: `{ "chunk_id": number }`
 - `index_status`: `{}`
 
-Search tools return chunk IDs, paths, line spans, short summaries, and scores. Search and `read_chunk` validate stored chunk anchors against current source before returning context; stale files are reindexed once per tool call and DuckDB FTS is refreshed before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.
+Search tools return chunk IDs, paths, line spans, short summaries, and scores. Search and `read_chunk` validate stored chunk anchors against current source before returning context; stale files are reindexed once per tool call and their SQLite FTS5 rows are updated before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.

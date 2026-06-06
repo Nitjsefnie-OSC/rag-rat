@@ -14,7 +14,11 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         "index" => {
-            let db = IndexDatabase::rebuild_with_progress(&config, render_index_progress)?;
+            let db = if has_flag(&args, "--full") {
+                IndexDatabase::rebuild_with_progress(&config, render_index_progress)?
+            } else {
+                IndexDatabase::index_changed_with_progress(&config, render_index_progress)?
+            };
             print_json(&db.status(&config.database)?)?;
         },
         "doctor" => {
@@ -78,7 +82,7 @@ fn doctor(config: &Config) -> anyhow::Result<()> {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,
             "source_read_only": true,
-            "index_writes": "duckdb_auto_heal"
+            "index_writes": "sqlite_auto_heal"
         }
     }))
 }
@@ -90,8 +94,9 @@ fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
 
 fn render_index_progress(progress: IndexProgress) {
     match progress {
-        IndexProgress::Started { database } => {
-            eprintln!("index: rebuilding {}", database.display());
+        IndexProgress::Started { database, full_rebuild } => {
+            let mode = if full_rebuild { "full rebuild" } else { "changed files" };
+            eprintln!("index: {mode} using {}", database.display());
         },
         IndexProgress::Discovering => {
             eprintln!("index: discovering files");
@@ -108,8 +113,8 @@ fn render_index_progress(progress: IndexProgress) {
                 path.display()
             );
         },
-        IndexProgress::RefreshingFts => {
-            eprintln!("index: refreshing DuckDB FTS");
+        IndexProgress::RebuildingFts => {
+            eprintln!("index: rebuilding SQLite FTS");
         },
         IndexProgress::Finished { files } => {
             eprintln!("index: complete ({files} files)");
@@ -122,12 +127,17 @@ fn usage() {
         "usage: rag-rat <index|doctor|query|mcp|dump-config> --config <path> [query]\n\
          examples:\n\
          rag-rat index --config rag-rat.toml\n\
+         rag-rat index --full --config rag-rat.toml\n\
          rag-rat query --config rag-rat.toml \"semantic recall\""
     );
 }
 
 fn option_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|window| window[0] == name).map(|window| window[1].clone())
+}
+
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|arg| arg == name)
 }
 
 fn positional_after_options(args: &[String]) -> Option<String> {

@@ -1,6 +1,6 @@
 [index]
 root = "."
-database = ".rag-rat/index.duckdb"
+database = ".rag-rat/index.sqlite"
 
 [target_bindings]
 rust = ["src"]

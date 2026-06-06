@@ -1,4 +1,4 @@
-use duckdb::{Connection, params};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -64,7 +64,7 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
 }
 
 fn rows_to_items(
-    rows: duckdb::MappedRows<'_, impl FnMut(&duckdb::Row<'_>) -> duckdb::Result<ImpactItem>>,
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ImpactItem>>,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let mut items = Vec::new();
     for row in rows {
