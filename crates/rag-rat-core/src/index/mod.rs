@@ -2,6 +2,7 @@ pub mod anchors;
 pub mod chunker;
 pub mod edges;
 pub mod git_history;
+pub mod github;
 pub mod parser;
 pub mod schema;
 pub mod symbols;
@@ -38,6 +39,7 @@ use crate::{
             ChunkBlameSummary, CommitSearchHit, GitHistoryIndexStatus, PathHistoryItem,
             QueryCommitHit, SymbolHistoryItem,
         },
+        github::{GitHubEvidence, GitHubStatus, GitHubSyncReport, Papertrail},
         symbols::Symbol,
     },
     language::Language,
@@ -90,6 +92,7 @@ pub struct IndexStatus {
     pub parser_failures: u64,
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
+    pub github: GitHubStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +325,7 @@ impl IndexDatabase {
             parser_failures: self.parser_failure_count()?,
             parser_failure_paths: self.parser_failure_paths()?,
             git_history: self.git_history_status()?,
+            github: self.github_status()?,
         })
     }
 
@@ -521,6 +525,92 @@ impl IndexDatabase {
         };
         git_history::store_blame(self.storage.connection(), &summary)?;
         Ok(Some(summary))
+    }
+
+    pub fn github_sync_from_refs(&self, offline: bool) -> anyhow::Result<GitHubSyncReport> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!("index has no source_root metadata; rebuild required");
+        };
+        if offline {
+            github::sync_from_refs::<github::GhCliGitHubClient>(
+                self.storage.connection(),
+                root,
+                None,
+                true,
+            )
+        } else {
+            let client = github::GhCliGitHubClient;
+            github::sync_from_refs(self.storage.connection(), root, Some(&client), false)
+        }
+    }
+
+    pub fn github_sync_issue(
+        &self,
+        issue_ref: &str,
+        offline: bool,
+    ) -> anyhow::Result<GitHubSyncReport> {
+        if offline {
+            github::sync_issue::<github::GhCliGitHubClient>(
+                self.storage.connection(),
+                issue_ref,
+                None,
+                true,
+            )
+        } else {
+            let client = github::GhCliGitHubClient;
+            github::sync_issue(self.storage.connection(), issue_ref, Some(&client), false)
+        }
+    }
+
+    pub fn github_issue_search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<GitHubEvidence>> {
+        github::issue_search(self.storage.connection(), query, limit)
+    }
+
+    pub fn rationale_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<GitHubEvidence>> {
+        github::rationale_search(self.storage.connection(), query, limit)
+    }
+
+    pub fn github_refs_for_path(
+        &self,
+        path: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<github::GitHubRef>> {
+        github::refs_for_path(self.storage.connection(), path, limit)
+    }
+
+    pub fn papertrail_for_chunk(
+        &self,
+        chunk_id: i64,
+        limit: u32,
+    ) -> anyhow::Result<Option<Papertrail>> {
+        let Some(chunk) = self.read_chunk(chunk_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(github::papertrail_for_chunk(self.storage.connection(), &chunk, limit)?))
+    }
+
+    pub fn papertrail_for_symbol(
+        &self,
+        symbol: &str,
+        language: Option<Language>,
+        limit: u32,
+    ) -> anyhow::Result<Option<Papertrail>> {
+        let Some(symbol) = self.symbols(symbol, language, 1)?.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(Some(github::papertrail_for_symbol(self.storage.connection(), &symbol, limit)?))
+    }
+
+    pub fn papertrail_for_commit(
+        &self,
+        commit_hash: &str,
+        limit: u32,
+    ) -> anyhow::Result<Papertrail> {
+        github::papertrail_for_commit(self.storage.connection(), commit_hash, limit)
     }
 
     pub fn ffi_surface(&self, limit: u32) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
@@ -726,6 +816,10 @@ impl IndexDatabase {
             return git_history::status(self.storage.connection(), Path::new("."));
         };
         git_history::status(self.storage.connection(), root)
+    }
+
+    fn github_status(&self) -> anyhow::Result<GitHubStatus> {
+        github::status(self.storage.connection())
     }
 
     fn mark_fts_dirty(&self) -> anyhow::Result<()> {
@@ -1322,6 +1416,54 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
+        let (root, config) =
+            markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let mock = MockGitHubClient;
+
+        let offline =
+            github::sync_from_refs::<MockGitHubClient>(db.storage.connection(), &root, None, true)
+                .unwrap();
+        assert!(offline.offline);
+        assert_eq!(offline.discovered_refs, 1);
+        assert_eq!(offline.synced_items, 0);
+
+        let report =
+            github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        assert!(!report.offline);
+        assert_eq!(report.discovered_refs, 1);
+        assert_eq!(report.synced_items, 5);
+        assert_eq!(report.status.issues, 1);
+        assert_eq!(report.status.comments, 1);
+        assert_eq!(report.status.pulls, 1);
+        assert_eq!(report.status.reviews, 1);
+        assert_eq!(report.status.review_comments, 1);
+
+        let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+        assert_eq!(issue_hits.len(), 1);
+        assert_eq!(issue_hits[0].classification, "decision");
+        assert_eq!(issue_hits[0].evidence_kind, "historical_github");
+
+        let refs = db.github_refs_for_path("docs/search.md", 10).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].source_kind, "file");
+
+        let rationale = db.rationale_search("risk", 10).unwrap();
+        assert!(rationale.iter().any(|item| item.classification == "risk"));
+
+        let chunk_id = first_chunk_id(&db);
+        let papertrail = db.papertrail_for_chunk(chunk_id, 10).unwrap().unwrap();
+        assert!(papertrail.current_source.is_some());
+        assert!(!papertrail.github_evidence.is_empty());
+        assert!(
+            papertrail.github_evidence.iter().all(|item| item.evidence_kind == "historical_github")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn search_recovers_when_fts_is_marked_dirty() {
         let (root, config) = markdown_config("alpha token");
         let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1569,5 +1711,109 @@ mod schema_bootstrap_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    struct MockGitHubClient;
+
+    impl github::GitHubClient for MockGitHubClient {
+        fn issue(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<github::GitHubIssue> {
+            Ok(github::GitHubIssue {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number,
+                html_url: format!("https://github.com/{owner}/{repo}/issues/{number}"),
+                state: "open".to_string(),
+                title: "Decision: keep sqlite".to_string(),
+                body: "We decided sqlite is required for binary size.".to_string(),
+                author: Some("octo".to_string()),
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                updated_at: Some("2026-01-02T00:00:00Z".to_string()),
+                is_pull_request: true,
+            })
+        }
+
+        fn issue_comments(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Vec<github::GitHubComment>> {
+            Ok(vec![github::GitHubComment {
+                id: 4201,
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number,
+                html_url: format!("https://github.com/{owner}/{repo}/issues/{number}#comment-1"),
+                body: "Rejected alternative: duckdb was too large.".to_string(),
+                author: Some("octo".to_string()),
+                created_at: Some("2026-01-01T01:00:00Z".to_string()),
+                updated_at: Some("2026-01-01T01:00:00Z".to_string()),
+            }])
+        }
+
+        fn pull(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Option<github::GitHubPullRequest>> {
+            Ok(Some(github::GitHubPullRequest {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number,
+                html_url: format!("https://github.com/{owner}/{repo}/pull/{number}"),
+                state: "open".to_string(),
+                title: "Use sqlite".to_string(),
+                body: "Constraint: normal queries must use cache only.".to_string(),
+                author: Some("octo".to_string()),
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                updated_at: Some("2026-01-02T00:00:00Z".to_string()),
+                merged_at: None,
+            }))
+        }
+
+        fn pull_reviews(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Vec<github::GitHubReview>> {
+            Ok(vec![github::GitHubReview {
+                id: 4202,
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number,
+                html_url: Some(format!("https://github.com/{owner}/{repo}/pull/{number}#review")),
+                state: "COMMENTED".to_string(),
+                body: "Risk: live crawling during search would be surprising.".to_string(),
+                author: Some("reviewer".to_string()),
+                submitted_at: Some("2026-01-01T02:00:00Z".to_string()),
+            }])
+        }
+
+        fn pull_review_comments(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Vec<github::GitHubReviewComment>> {
+            Ok(vec![github::GitHubReviewComment {
+                id: 4203,
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number,
+                path: Some("docs/search.md".to_string()),
+                html_url: format!("https://github.com/{owner}/{repo}/pull/{number}#discussion"),
+                body: "No longer use obsolete duckdb rationale.".to_string(),
+                author: Some("reviewer".to_string()),
+                created_at: Some("2026-01-01T03:00:00Z".to_string()),
+                updated_at: Some("2026-01-01T03:00:00Z".to_string()),
+            }])
+        }
     }
 }

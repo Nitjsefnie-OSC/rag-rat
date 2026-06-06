@@ -10,8 +10,8 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::tools::{
-    BlameChunkArgs, EmptyArgs, ImpactArgs, LimitArgs, PathHistoryArgs, ReadChunkArgs, SearchArgs,
-    SymbolArgs, SymbolGraphArgs,
+    BlameChunkArgs, EmptyArgs, ImpactArgs, LimitArgs, PapertrailChunkArgs, PapertrailCommitArgs,
+    PathHistoryArgs, ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -173,6 +173,66 @@ impl RagRatService {
         Parameters(args): Parameters<BlameChunkArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("git_blame_chunk", json!(args))
+    }
+
+    #[tool(
+        name = "papertrail_for_chunk",
+        description = "Return current chunk context plus cached GitHub rationale."
+    )]
+    fn papertrail_for_chunk(
+        &self,
+        Parameters(args): Parameters<PapertrailChunkArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("papertrail_for_chunk", json!(args))
+    }
+
+    #[tool(
+        name = "papertrail_for_symbol",
+        description = "Return current symbol context plus cached GitHub rationale."
+    )]
+    fn papertrail_for_symbol(
+        &self,
+        Parameters(args): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("papertrail_for_symbol", json!(args))
+    }
+
+    #[tool(
+        name = "papertrail_for_commit",
+        description = "Return cached GitHub rationale related to a historical commit."
+    )]
+    fn papertrail_for_commit(
+        &self,
+        Parameters(args): Parameters<PapertrailCommitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("papertrail_for_commit", json!(args))
+    }
+
+    #[tool(name = "github_issue_search", description = "Search cached GitHub issue and PR text.")]
+    fn github_issue_search(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("github_issue_search", json!(args))
+    }
+
+    #[tool(
+        name = "github_refs_for_path",
+        description = "List discovered GitHub references for one current path."
+    )]
+    fn github_refs_for_path(
+        &self,
+        Parameters(args): Parameters<PathHistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("github_refs_for_path", json!(args))
+    }
+
+    #[tool(name = "rationale_search", description = "Search cached GitHub rationale snippets.")]
+    fn rationale_search(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("rationale_search", json!(args))
     }
 
     #[tool(

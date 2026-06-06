@@ -17,6 +17,12 @@
 - `git_history_for_symbol`: `{ "symbol": string, "language"?: string, "limit"?: number }`
 - `commits_touching_query`: `{ "query": string, "limit"?: number }`
 - `git_blame_chunk`: `{ "chunk_id": number }`
+- `papertrail_for_chunk`: `{ "chunk_id": number, "limit"?: number }`
+- `papertrail_for_symbol`: `{ "symbol": string, "language"?: string, "limit"?: number }`
+- `papertrail_for_commit`: `{ "commit_hash": string, "limit"?: number }`
+- `github_issue_search`: `{ "query": string, "limit"?: number }`
+- `github_refs_for_path`: `{ "path": string, "limit"?: number }`
+- `rationale_search`: `{ "query": string, "limit"?: number }`
 - `index_status`: `{}`
 
 Search tools return chunk IDs, paths, line spans, short summaries, and scores. Search and `read_chunk` validate stored chunk anchors against current source before returning context; stale files are reindexed once per tool call and their SQLite FTS5 rows are updated before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.
@@ -38,6 +44,17 @@ and caches it by `source_text_hash`.
 `index_status.git_history` reports whether git history is available, current git HEAD, indexed HEAD,
 commit count, and file-change count. Non-git roots report unavailable history without failing source
 or docs indexing.
+
+GitHub papertrail tools read the local cache only. `rag-rat github sync --from-refs` discovers refs
+and fetches through `gh api --paginate`; `rag-rat github sync --issue owner/repo#123` fetches one
+issue/PR thread; `--offline` updates discovered refs and reports cache status without network use.
+
+Papertrail outputs keep `current_source` separate from `github_evidence`. GitHub snippets are labeled
+as historical GitHub evidence and classified as `decision`, `rejected_alternative`, `constraint`,
+`risk`, `obsolete`, or `context`.
+
+`index_status.github` reports cached refs, issues, comments, pulls, reviews, review comments,
+last sync time, and whether the `gh` CLI capability is available.
 
 Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
 message for each failed source parse. Markdown files are chunked by headings instead of parsed with

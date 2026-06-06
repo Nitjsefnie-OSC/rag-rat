@@ -18,6 +18,12 @@ pub const TOOL_NAMES: &[&str] = &[
     "git_history_for_symbol",
     "commits_touching_query",
     "git_blame_chunk",
+    "papertrail_for_chunk",
+    "papertrail_for_symbol",
+    "papertrail_for_commit",
+    "github_issue_search",
+    "github_refs_for_path",
+    "rationale_search",
     "index_status",
 ];
 
@@ -73,6 +79,20 @@ pub struct PathHistoryArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct BlameChunkArgs {
     pub chunk_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PapertrailChunkArgs {
+    pub chunk_id: i64,
+    #[serde(default = "default_graph_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PapertrailCommitArgs {
+    pub commit_hash: String,
+    #[serde(default = "default_graph_limit")]
+    pub limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
@@ -150,6 +170,34 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
             let args: BlameChunkArgs = serde_json::from_value(arguments)?;
             json!(db.git_blame_chunk(args.chunk_id)?)
         },
+        "papertrail_for_chunk" => {
+            let args: PapertrailChunkArgs = serde_json::from_value(arguments)?;
+            json!(db.papertrail_for_chunk(args.chunk_id, args.limit)?)
+        },
+        "papertrail_for_symbol" => {
+            let args: SymbolArgs = serde_json::from_value(arguments)?;
+            json!(db.papertrail_for_symbol(
+                &args.symbol,
+                optional_language(args.language)?,
+                args.limit
+            )?)
+        },
+        "papertrail_for_commit" => {
+            let args: PapertrailCommitArgs = serde_json::from_value(arguments)?;
+            json!(db.papertrail_for_commit(&args.commit_hash, args.limit)?)
+        },
+        "github_issue_search" => {
+            let args: SearchArgs = serde_json::from_value(arguments)?;
+            json!(db.github_issue_search(&args.query, args.limit)?)
+        },
+        "github_refs_for_path" => {
+            let args: PathHistoryArgs = serde_json::from_value(arguments)?;
+            json!(db.github_refs_for_path(&args.path, args.limit)?)
+        },
+        "rationale_search" => {
+            let args: SearchArgs = serde_json::from_value(arguments)?;
+            json!(db.rationale_search(&args.query, args.limit)?)
+        },
         "index_status" => json!(db.status(database)?),
         other => anyhow::bail!("unknown tool `{other}`"),
     };
@@ -177,6 +225,12 @@ pub fn description(name: &str) -> &'static str {
             "Combine commit-message and current file-change evidence for a query."
         },
         "git_blame_chunk" => "Compute lazy hash-bound git blame summary for one current chunk.",
+        "papertrail_for_chunk" => "Return current chunk context plus cached GitHub rationale.",
+        "papertrail_for_symbol" => "Return current symbol context plus cached GitHub rationale.",
+        "papertrail_for_commit" => "Return cached GitHub rationale related to a historical commit.",
+        "github_issue_search" => "Search cached GitHub issue and PR text.",
+        "github_refs_for_path" => "List discovered GitHub references for one current path.",
+        "rationale_search" => "Search cached GitHub rationale snippets.",
         "index_status" => {
             "Report SQLite index freshness, git metadata, parser failures, and file counts."
         },
@@ -258,6 +312,47 @@ pub fn schema(name: &str) -> Value {
             "type": "object",
             "properties": {"chunk_id": {"type": "integer"}},
             "required": ["chunk_id"]
+        }),
+        "papertrail_for_chunk" => json!({
+            "type": "object",
+            "properties": {
+                "chunk_id": {"type": "integer"},
+                "limit": {"type": "integer", "default": 50}
+            },
+            "required": ["chunk_id"]
+        }),
+        "papertrail_for_symbol" => json!({
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "language": {"type": "string"},
+                "limit": {"type": "integer", "default": 20}
+            },
+            "required": ["symbol"]
+        }),
+        "papertrail_for_commit" => json!({
+            "type": "object",
+            "properties": {
+                "commit_hash": {"type": "string"},
+                "limit": {"type": "integer", "default": 50}
+            },
+            "required": ["commit_hash"]
+        }),
+        "github_issue_search" | "rationale_search" => json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 10}
+            },
+            "required": ["query"]
+        }),
+        "github_refs_for_path" => json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": "integer", "default": 50}
+            },
+            "required": ["path"]
         }),
         "index_status" => json!({"type": "object", "properties": {}}),
         _ => json!({"type": "object"}),

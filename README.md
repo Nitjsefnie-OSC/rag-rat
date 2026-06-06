@@ -14,12 +14,19 @@ Git history is indexed into SQLite when the target root is a git worktree. Commi
 and path-level changes are historical evidence, separate from current source search. Chunk blame is
 computed lazily for current chunk text and cached against the current source text hash.
 
+GitHub papertrail data is fetched only by explicit `github sync` commands through `gh api`; normal
+search, papertrail, and rationale tools read the local SQLite cache only. Cached issues, PRs,
+comments, reviews, and review comments are indexed as historical GitHub evidence.
+
 ## Commands
 
 ```bash
 cargo run --bin rag-rat -- index --config rag-rat.toml
 cargo run --bin rag-rat -- index --full --config rag-rat.toml
 cargo run --bin rag-rat -- doctor --config rag-rat.toml
+cargo run --bin rag-rat -- github sync --from-refs --config rag-rat.toml
+cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42 --config rag-rat.toml
+cargo run --bin rag-rat -- github sync --from-refs --offline --config rag-rat.toml
 cargo run --bin rag-rat -- query --config rag-rat.toml "semantic recall"
 cargo run --bin rag-rat -- mcp --config rag-rat.toml
 ```
@@ -35,6 +42,10 @@ search when `fts_source_revision` no longer matches `content_revision`.
 
 Non-git target roots still index source and docs; git history status reports unavailable with zero
 commit/path rows.
+
+GitHub sync discovers references from commits, branch names, indexed files, and docs. It supports
+`Fixes`/`Closes`/`Refs`/`See`, `GH-123`, `owner/repo#123`, and full GitHub issue/PR URLs. `--offline`
+updates discovered references and reports cache status without network access.
 
 ## Configuration
 

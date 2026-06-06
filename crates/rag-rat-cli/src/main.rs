@@ -35,6 +35,9 @@ async fn main() -> anyhow::Result<()> {
         "mcp" => {
             rag_rat_mcp::server::run_stdio(config.database).await?;
         },
+        "github" => {
+            github(&config, &args)?;
+        },
         "dump-config" => {
             let targets = config
                 .targets
@@ -88,6 +91,27 @@ fn doctor(config: &Config) -> anyhow::Result<()> {
     }))
 }
 
+fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {
+    let Some(subcommand) = args.get(1).map(String::as_str) else {
+        anyhow::bail!("github command needs a subcommand");
+    };
+    match subcommand {
+        "sync" => {
+            let db = IndexDatabase::open(&config.database)?;
+            let offline = has_flag(args, "--offline");
+            let report = if let Some(issue) = option_value(args, "--issue") {
+                db.github_sync_issue(&issue, offline)?
+            } else if has_flag(args, "--from-refs") {
+                db.github_sync_from_refs(offline)?
+            } else {
+                anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
+            };
+            print_json(&report)
+        },
+        other => anyhow::bail!("unknown github subcommand `{other}`"),
+    }
+}
+
 fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -125,10 +149,11 @@ fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <index|doctor|query|mcp|dump-config> --config <path> [query]\n\
+        "usage: rag-rat <index|doctor|query|mcp|github|dump-config> --config <path> [query]\n\
          examples:\n\
          rag-rat index --config rag-rat.toml\n\
          rag-rat index --full --config rag-rat.toml\n\
+         rag-rat github sync --from-refs --config rag-rat.toml\n\
          rag-rat query --config rag-rat.toml \"semantic recall\""
     );
 }
@@ -149,7 +174,7 @@ fn positional_after_options(args: &[String]) -> Option<String> {
             skip_next = false;
             continue;
         }
-        if arg == "--config" {
+        if arg == "--config" || arg == "--issue" {
             skip_next = true;
             continue;
         }
