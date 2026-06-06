@@ -19,6 +19,10 @@ By default, rag-rat links against the system SQLite library through `rusqlite`.
 `index` updates files currently changed in git status. Use `index --full` to rebuild every file
 and rebuild the SQLite FTS5 table from stored chunks.
 
+Search never runs silently against stale FTS state. The index records a content revision for the
+current `files`/`chunks` rows, tracks whether FTS is dirty after writes, and synchronizes FTS before
+search when `fts_source_revision` no longer matches `content_revision`.
+
 ## Configuration
 
 The host repo owns `rag-rat.toml`. This keeps monorepo-specific target bindings out of the reusable tool.

@@ -75,8 +75,10 @@ pub struct IndexStatus {
     pub git_commit: Option<String>,
     pub git_dirty: Option<bool>,
     pub indexed_at_ms: Option<i64>,
+    pub content_revision: String,
     pub fts_synced_at_ms: Option<i64>,
     pub fts_source_revision: Option<String>,
+    pub fts_dirty: bool,
     pub fts_fresh: bool,
     pub file_count_by_language: BTreeMap<String, u64>,
     pub parser_failures: u64,
@@ -142,7 +144,7 @@ impl IndexDatabase {
             db.write_git_meta(&config.root)?;
             let indexed = db.index_changed_files_with_progress(config, &mut progress)?;
             if indexed > 0 {
-                db.record_fts_current()?;
+                db.sync_fts()?;
             }
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
             db.storage.execute_batch("COMMIT")?;
@@ -217,6 +219,7 @@ impl IndexDatabase {
         let files = collect_changed_index_files(config, &changes)?;
         progress(IndexProgress::Discovered { files: files.len() });
 
+        let deleted_count = changes.deleted.len();
         for path in changes.deleted {
             self.remove_file(&path)?;
         }
@@ -250,7 +253,7 @@ impl IndexDatabase {
             )?;
         }
 
-        Ok(files.len())
+        Ok(files.len() + deleted_count)
     }
 
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
@@ -268,6 +271,7 @@ impl IndexDatabase {
 
         let content_revision = self.content_revision()?;
         let fts_source_revision = self.meta("fts_source_revision")?;
+        let fts_dirty = self.fts_dirty()?;
 
         Ok(IndexStatus {
             database: database.display().to_string(),
@@ -275,10 +279,13 @@ impl IndexDatabase {
             git_commit: self.meta("git_commit")?,
             git_dirty: self.meta("git_dirty")?.map(|value| value == "true"),
             indexed_at_ms: self.meta("indexed_at_ms")?.and_then(|value| value.parse::<i64>().ok()),
+            content_revision: content_revision.clone(),
             fts_synced_at_ms: self
                 .meta("fts_synced_at_ms")?
                 .and_then(|value| value.parse::<i64>().ok()),
-            fts_fresh: fts_source_revision.as_deref() == Some(content_revision.as_str()),
+            fts_dirty,
+            fts_fresh: !fts_dirty
+                && fts_source_revision.as_deref() == Some(content_revision.as_str()),
             fts_source_revision,
             file_count_by_language: counts,
             parser_failures: self.parser_failure_count()?,
@@ -295,6 +302,7 @@ impl IndexDatabase {
         limit: u32,
         include_generated: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
+        self.ensure_fts_fresh()?;
         self.search_with_heal(query, limit, include_generated, true)
     }
 
@@ -337,7 +345,7 @@ impl IndexDatabase {
             },
             AnchorStatus::Stale => {
                 self.heal_file(Path::new(&chunk.path))?;
-                self.record_fts_current()?;
+                self.sync_fts()?;
                 crate::query::read_chunk(self.storage.connection(), chunk_id)
             },
         }
@@ -377,14 +385,30 @@ impl IndexDatabase {
 
     pub fn rebuild_fts(&self) -> anyhow::Result<()> {
         schema::rebuild_fts(self.storage.connection())?;
-        self.record_fts_current()
+        self.record_content_revision()?;
+        self.record_fts_current()?;
+        self.set_meta("fts_dirty", "false")?;
+        Ok(())
     }
 
-    pub fn record_fts_current(&self) -> anyhow::Result<()> {
+    pub fn sync_fts(&self) -> anyhow::Result<()> {
+        self.record_content_revision()?;
+        self.record_fts_current()?;
+        self.set_meta("fts_dirty", "false")?;
+        Ok(())
+    }
+
+    fn record_fts_current(&self) -> anyhow::Result<()> {
         self.set_meta("fts_synced_at_ms", &now_ms().to_string())?;
         let revision = self.content_revision()?;
         self.set_meta("fts_source_revision", &revision)?;
         Ok(())
+    }
+
+    fn record_content_revision(&self) -> anyhow::Result<String> {
+        let revision = self.content_revision()?;
+        self.set_meta("content_revision", &revision)?;
+        Ok(revision)
     }
 
     pub fn heal_file(&self, path: &Path) -> anyhow::Result<()> {
@@ -416,8 +440,8 @@ impl IndexDatabase {
         }
         let sha256 = hex_sha256(text.as_bytes());
         let file_id = self.storage.connection().query_row(
-            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              RETURNING id",
             params![
                 path_string(path),
@@ -427,6 +451,7 @@ impl IndexDatabase {
                 modified_at_ms,
                 matches!(kind, TargetKind::Generated),
                 now_ms(),
+                sha256,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -441,19 +466,26 @@ impl IndexDatabase {
             } else {
                 symbols::symbols_for_file(path, language, text)
             };
-        self.insert_chunks(file_id, &chunks, text)?;
+        self.insert_chunks(file_id, &sha256, &chunks, text)?;
         self.insert_symbols(file_id, language, &symbols)?;
+        self.mark_fts_dirty()?;
         Ok(())
     }
 
-    fn insert_chunks(&self, file_id: i64, chunks: &[Chunk], full_text: &str) -> anyhow::Result<()> {
+    fn insert_chunks(
+        &self,
+        file_id: i64,
+        source_revision: &str,
+        chunks: &[Chunk],
+        full_text: &str,
+    ) -> anyhow::Result<()> {
         for chunk in chunks {
             let anchor =
                 anchors::anchor_for_text(&chunk.text, chunk.start_line, chunk.end_line, full_text);
             self.storage.connection().execute(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line, text, text_hash,
-                                    anchor_version, normalized_hash, start_context_hash, end_context_hash, context_radius)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                    source_revision, anchor_version, normalized_hash, start_context_hash, end_context_hash, context_radius)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     file_id,
                     chunk.kind,
@@ -464,6 +496,7 @@ impl IndexDatabase {
                     i64::try_from(chunk.end_line)?,
                     chunk.text,
                     hex_sha256(chunk.text.as_bytes()),
+                    source_revision,
                     anchor.version,
                     anchor.normalized_hash,
                     anchor.start_context_hash,
@@ -511,6 +544,10 @@ impl IndexDatabase {
         let dirty = !git_output(root, &["status", "--porcelain"]).unwrap_or_default().is_empty();
         self.set_meta("git_dirty", if dirty { "true" } else { "false" })?;
         Ok(())
+    }
+
+    fn mark_fts_dirty(&self) -> anyhow::Result<()> {
+        self.set_meta("fts_dirty", "true")
     }
 
     fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -571,7 +608,7 @@ impl IndexDatabase {
         for path in stale.into_iter().take(4) {
             self.heal_file(Path::new(&path))?;
         }
-        self.record_fts_current()?;
+        self.sync_fts()?;
         self.search_with_heal(query, limit, include_generated, false)
     }
 
@@ -645,7 +682,29 @@ impl IndexDatabase {
             [&path],
         )?;
         self.storage.connection().execute("DELETE FROM files WHERE path = ?1", [&path])?;
+        self.mark_fts_dirty()?;
         Ok(())
+    }
+
+    fn ensure_fts_fresh(&self) -> anyhow::Result<()> {
+        let content_revision = self.content_revision()?;
+        let fts_source_revision = self.meta("fts_source_revision")?;
+        if !self.fts_dirty()? && fts_source_revision.as_deref() == Some(content_revision.as_str()) {
+            return Ok(());
+        }
+        self.rebuild_fts()?;
+        let refreshed_revision = self.meta("fts_source_revision")?;
+        if refreshed_revision.as_deref() != Some(content_revision.as_str()) {
+            anyhow::bail!(
+                "FTS freshness invariant failed: content_revision={content_revision}, fts_source_revision={}",
+                refreshed_revision.unwrap_or_else(|| "<missing>".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    fn fts_dirty(&self) -> anyhow::Result<bool> {
+        Ok(self.meta("fts_dirty")?.as_deref() == Some("true"))
     }
 
     fn file_row(&self, path: &Path) -> anyhow::Result<FileRow> {
@@ -893,8 +952,12 @@ fn remove_database_files(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod schema_bootstrap_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::config::ResolvedTarget;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
@@ -924,16 +987,101 @@ mod schema_bootstrap_tests {
         assert_eq!(table_count(&db, "parser_failures"), 1);
         assert_eq!(table_count(&db, "index_meta"), 1);
         assert_eq!(table_count(&db, "chunk_fts"), 1);
+        assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
+        assert_eq!(indexed_revision_count(&db), 0);
         assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
         assert!(chunk_columns(&db).contains(&"normalized_hash".to_string()));
+        assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
+        let (root, config) = markdown_config("alpha token");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let status = db.status(&config.database).unwrap();
+
+        assert!(!status.content_revision.is_empty());
+        assert_eq!(status.fts_source_revision.as_deref(), Some(status.content_revision.as_str()));
+        assert_eq!(
+            db.meta("content_revision").unwrap().as_deref(),
+            Some(status.content_revision.as_str())
+        );
+        assert!(!status.fts_dirty);
+        assert!(status.fts_fresh);
+        assert_eq!(indexed_revision_count(&db), 1);
+        assert_eq!(chunk_source_revision_count(&db), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_recovers_when_fts_is_marked_dirty() {
+        let (root, config) = markdown_config("alpha token");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage.connection().execute("UPDATE chunks SET text = 'beta token'", []).unwrap();
+        db.mark_fts_dirty().unwrap();
+
+        let dirty = db.status(&config.database).unwrap();
+        assert!(dirty.fts_dirty);
+        assert!(!dirty.fts_fresh);
+
+        let hits = db.search("beta", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].summary, "beta token");
+        let fresh = db.status(&config.database).unwrap();
+        assert!(!fresh.fts_dirty);
+        assert!(fresh.fts_fresh);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_recovers_when_fts_revision_is_stale() {
+        let (root, config) = markdown_config("alpha token");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.set_meta("fts_source_revision", "stale").unwrap();
+
+        let stale = db.status(&config.database).unwrap();
+        assert!(!stale.fts_dirty);
+        assert!(!stale.fts_fresh);
+
+        let hits = db.search("alpha", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        let fresh = db.status(&config.database).unwrap();
+        assert_eq!(fresh.fts_source_revision.as_deref(), Some(fresh.content_revision.as_str()));
+        assert!(fresh.fts_fresh);
 
         fs::remove_dir_all(root).unwrap();
     }
 
     fn unique_temp_root() -> PathBuf {
         let mut root = std::env::temp_dir();
-        root.push(format!("rag-rat-schema-test-{}-{}", std::process::id(), now_ms()));
+        let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        root.push(format!("rag-rat-schema-test-{}-{}-{suffix}", std::process::id(), now_ms()));
         root
+    }
+
+    fn markdown_config(text: &str) -> (PathBuf, Config) {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("search.md"), text).unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "markdown".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            }],
+        };
+        (root, config)
     }
 
     fn table_count(db: &IndexDatabase, table: &str) -> i64 {
@@ -948,5 +1096,28 @@ mod schema_bootstrap_tests {
     fn chunk_columns(db: &IndexDatabase) -> Vec<String> {
         let mut stmt = db.storage.connection().prepare("PRAGMA table_info(chunks)").unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+    }
+
+    fn file_columns(db: &IndexDatabase) -> Vec<String> {
+        let mut stmt = db.storage.connection().prepare("PRAGMA table_info(files)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+    }
+
+    fn indexed_revision_count(db: &IndexDatabase) -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE indexed_revision != ''", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn chunk_source_revision_count(db: &IndexDatabase) -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM chunks WHERE source_revision != ''", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 }

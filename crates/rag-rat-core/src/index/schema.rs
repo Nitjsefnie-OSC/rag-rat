@@ -16,7 +16,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             sha256 TEXT NOT NULL,
             modified_at_ms INTEGER NOT NULL,
             generated INTEGER NOT NULL DEFAULT 0,
-            indexed_at_ms INTEGER NOT NULL
+            indexed_at_ms INTEGER NOT NULL,
+            indexed_revision TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS chunks(
@@ -30,6 +31,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             end_line INTEGER NOT NULL,
             text TEXT NOT NULL,
             text_hash TEXT NOT NULL,
+            source_revision TEXT NOT NULL DEFAULT '',
             anchor_version INTEGER NOT NULL DEFAULT 1,
             normalized_hash TEXT NOT NULL DEFAULT '',
             start_context_hash TEXT NOT NULL DEFAULT '',
@@ -95,6 +97,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
         ",
     )?;
+    migrate_files(conn)?;
     migrate_chunks(conn)?;
     Ok(())
 }
@@ -110,12 +113,31 @@ pub fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_files(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "files", "indexed_revision", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute("UPDATE files SET indexed_revision = sha256 WHERE indexed_revision = ''", [])?;
+    Ok(())
+}
+
 fn migrate_chunks(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "chunks", "source_revision", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "anchor_version", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(conn, "chunks", "normalized_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "start_context_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "end_context_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "context_radius", "INTEGER NOT NULL DEFAULT 2")?;
+    conn.execute(
+        "
+        UPDATE chunks
+        SET source_revision = (
+            SELECT files.indexed_revision
+            FROM files
+            WHERE files.id = chunks.file_id
+        )
+        WHERE source_revision = ''
+        ",
+        [],
+    )?;
     Ok(())
 }
 
