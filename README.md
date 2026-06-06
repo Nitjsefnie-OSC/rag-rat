@@ -6,6 +6,10 @@ Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source 
 
 Tree-sitter grammars are exact-pinned in `Cargo.toml` so parser node coverage changes deliberately.
 
+Chunk anchors include normalized text hashes, boundary hashes, nearby context hashes, and an anchor
+version. `read_chunk` and search validate anchors against current source, relocate small line drift,
+and cap automatic stale-file reindexing per call.
+
 ## Commands
 
 ```bash

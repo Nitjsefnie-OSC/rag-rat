@@ -4,6 +4,13 @@ use crate::index::anchors::{self, AnchorStatus};
 fn exact_anchor_matches() {
     let text = "one\nfn target() {}\nthree\n";
     let anchor = anchors::anchor_for_text("fn target() {}\n", 2, 2, text);
+    assert_eq!(anchor.version, 1);
+    assert!(!anchor.normalized_hash.is_empty());
+    assert!(!anchor.start_boundary_hash.is_empty());
+    assert!(!anchor.end_boundary_hash.is_empty());
+    assert!(!anchor.start_context_hash.is_empty());
+    assert!(!anchor.end_context_hash.is_empty());
+    assert_eq!(anchor.context_radius, 2);
     assert_eq!(anchors::validate("fn target() {}\n", 2, 2, &anchor, text), AnchorStatus::Exact);
 }
 

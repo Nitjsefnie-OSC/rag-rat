@@ -34,6 +34,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             source_revision TEXT NOT NULL DEFAULT '',
             anchor_version INTEGER NOT NULL DEFAULT 1,
             normalized_hash TEXT NOT NULL DEFAULT '',
+            start_boundary_hash TEXT NOT NULL DEFAULT '',
+            end_boundary_hash TEXT NOT NULL DEFAULT '',
             start_context_hash TEXT NOT NULL DEFAULT '',
             end_context_hash TEXT NOT NULL DEFAULT '',
             context_radius INTEGER NOT NULL DEFAULT 2,
@@ -123,6 +125,8 @@ fn migrate_chunks(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "chunks", "source_revision", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "anchor_version", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(conn, "chunks", "normalized_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "start_boundary_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "end_boundary_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "start_context_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "end_context_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "context_radius", "INTEGER NOT NULL DEFAULT 2")?;

@@ -26,6 +26,7 @@ use gix::{
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 use crate::{
     config::{Config, TargetKind},
@@ -92,6 +93,18 @@ pub struct ParserFailure {
     pub message: String,
 }
 
+const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
+
+#[derive(Debug, Error)]
+pub enum IndexError {
+    #[error("Gone: indexed chunk {chunk_id} no longer exists")]
+    Gone { chunk_id: i64 },
+    #[error("StaleChunk: chunk {chunk_id} in {path} could not be relocated after reindex")]
+    StaleChunk { chunk_id: i64, path: String },
+    #[error("needs_reindex: {stale_files} stale files exceeds automatic heal cap {cap}")]
+    NeedsReindex { stale_files: usize, cap: usize },
+}
+
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let mut storage = IndexConnection::open(path)?;
@@ -112,10 +125,11 @@ impl IndexDatabase {
     {
         progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: true });
         remove_database_files(&config.database)?;
-        let db = Self::open(&config.database)?;
+        let mut db = Self::open(&config.database)?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
+            db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
             progress(IndexProgress::RebuildingFts);
@@ -145,10 +159,11 @@ impl IndexDatabase {
         }
 
         progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: false });
-        let db = Self::open(&config.database)?;
+        let mut db = Self::open(&config.database)?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
+            db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             let indexed = db.index_changed_files_with_progress(config, &mut progress)?;
             if indexed > 0 {
@@ -334,7 +349,12 @@ impl IndexDatabase {
         let source_path = root.join(&chunk.path);
         let current_text = match fs::read_to_string(&source_path) {
             Ok(text) => text,
-            Err(_) => return Ok(Some(chunk)),
+            Err(_) => {
+                let path = chunk.path.clone();
+                self.remove_file(Path::new(&path))?;
+                self.sync_fts()?;
+                anyhow::bail!(IndexError::Gone { chunk_id });
+            },
         };
         let anchor = self.chunk_anchor(chunk_id)?;
         let status = anchors::validate(
@@ -345,7 +365,16 @@ impl IndexDatabase {
             &current_text,
         );
         match status {
-            AnchorStatus::Exact => Ok(Some(chunk)),
+            AnchorStatus::Exact => {
+                if let Some(text) = anchors::slice_lines(
+                    &current_text,
+                    usize::try_from(chunk.start_line).unwrap_or(1),
+                    usize::try_from(chunk.end_line).unwrap_or(1),
+                ) {
+                    chunk.text = text;
+                }
+                Ok(Some(chunk))
+            },
             AnchorStatus::Relocated { start_line, end_line, text } => {
                 chunk.start_line = i64::try_from(start_line)?;
                 chunk.end_line = i64::try_from(end_line)?;
@@ -355,7 +384,11 @@ impl IndexDatabase {
             AnchorStatus::Stale => {
                 self.heal_file(Path::new(&chunk.path))?;
                 self.sync_fts()?;
-                crate::query::read_chunk(self.storage.connection(), chunk_id)
+                let healed = crate::query::read_chunk(self.storage.connection(), chunk_id)?;
+                match healed {
+                    Some(chunk) => Ok(Some(chunk)),
+                    None => anyhow::bail!(IndexError::StaleChunk { chunk_id, path: chunk.path }),
+                }
             },
         }
     }
@@ -493,8 +526,9 @@ impl IndexDatabase {
                 anchors::anchor_for_text(&chunk.text, chunk.start_line, chunk.end_line, full_text);
             self.storage.connection().execute(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line, text, text_hash,
-                                    source_revision, anchor_version, normalized_hash, start_context_hash, end_context_hash, context_radius)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                    source_revision, anchor_version, normalized_hash, start_boundary_hash, end_boundary_hash,
+                                    start_context_hash, end_context_hash, context_radius)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     file_id,
                     chunk.kind,
@@ -508,6 +542,8 @@ impl IndexDatabase {
                     source_revision,
                     anchor.version,
                     anchor.normalized_hash,
+                    anchor.start_boundary_hash,
+                    anchor.end_boundary_hash,
                     anchor.start_context_hash,
                     anchor.end_context_hash,
                     anchor.context_radius,
@@ -628,7 +664,13 @@ impl IndexDatabase {
         if stale.is_empty() {
             return Ok(hits);
         }
-        for path in stale.into_iter().take(4) {
+        if stale.len() > MAX_AUTO_HEAL_FILES_PER_CALL {
+            anyhow::bail!(IndexError::NeedsReindex {
+                stale_files: stale.len(),
+                cap: MAX_AUTO_HEAL_FILES_PER_CALL,
+            });
+        }
+        for path in stale {
             self.heal_file(Path::new(&path))?;
         }
         self.sync_fts()?;
@@ -650,13 +692,20 @@ impl IndexDatabase {
                 stale.push(hit.path.clone());
                 continue;
             };
-            let current = hex_sha256(text.as_bytes());
-            let stored = self.storage.connection().query_row(
-                "SELECT sha256 FROM files WHERE path = ?1",
-                [&hit.path],
-                |row| row.get::<_, String>(0),
-            )?;
-            if current != stored {
+            let chunk = crate::query::read_chunk(self.storage.connection(), hit.chunk_id)?;
+            let Some(chunk) = chunk else {
+                stale.push(hit.path.clone());
+                continue;
+            };
+            let anchor = self.chunk_anchor(hit.chunk_id)?;
+            let status = anchors::validate(
+                &chunk.text,
+                usize::try_from(chunk.start_line).unwrap_or(1),
+                usize::try_from(chunk.end_line).unwrap_or(1),
+                &anchor,
+                &text,
+            );
+            if !matches!(status, AnchorStatus::Exact) {
                 stale.push(hit.path.clone());
             }
         }
@@ -666,7 +715,8 @@ impl IndexDatabase {
     fn chunk_anchor(&self, chunk_id: i64) -> anyhow::Result<ChunkAnchor> {
         Ok(self.storage.connection().query_row(
             "
-            SELECT anchor_version, normalized_hash, start_context_hash, end_context_hash, context_radius
+            SELECT anchor_version, normalized_hash, start_boundary_hash, end_boundary_hash,
+                   start_context_hash, end_context_hash, context_radius
             FROM chunks WHERE id = ?1
             ",
             [chunk_id],
@@ -674,9 +724,11 @@ impl IndexDatabase {
                 Ok(ChunkAnchor {
                     version: row.get(0)?,
                     normalized_hash: row.get(1)?,
-                    start_context_hash: row.get(2)?,
-                    end_context_hash: row.get(3)?,
-                    context_radius: row.get(4)?,
+                    start_boundary_hash: row.get(2)?,
+                    end_boundary_hash: row.get(3)?,
+                    start_context_hash: row.get(4)?,
+                    end_context_hash: row.get(5)?,
+                    context_radius: row.get(6)?,
                 })
             },
         )?)
@@ -1014,6 +1066,8 @@ mod schema_bootstrap_tests {
         assert_eq!(indexed_revision_count(&db), 0);
         assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
         assert!(chunk_columns(&db).contains(&"normalized_hash".to_string()));
+        assert!(chunk_columns(&db).contains(&"start_boundary_hash".to_string()));
+        assert!(chunk_columns(&db).contains(&"end_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
 
         fs::remove_dir_all(root).unwrap();
@@ -1043,19 +1097,114 @@ mod schema_bootstrap_tests {
     fn search_recovers_when_fts_is_marked_dirty() {
         let (root, config) = markdown_config("alpha token");
         let db = IndexDatabase::rebuild(&config).unwrap();
-        db.storage.connection().execute("UPDATE chunks SET text = 'beta token'", []).unwrap();
         db.mark_fts_dirty().unwrap();
 
         let dirty = db.status(&config.database).unwrap();
         assert!(dirty.fts_dirty);
         assert!(!dirty.fts_fresh);
 
-        let hits = db.search("beta", 10, false).unwrap();
+        let hits = db.search("alpha", 10, false).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].summary, "beta token");
+        assert_eq!(hits[0].summary, "alpha token");
         let fresh = db.status(&config.database).unwrap();
         assert!(!fresh.fts_dirty);
         assert!(fresh.fts_fresh);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_chunk_relocates_small_line_drift_to_current_text() {
+        let (root, config) = markdown_config("# Title\nalpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let chunk_id = first_chunk_id(&db);
+        fs::write(root.join("docs/search.md"), "inserted\n# Title\nalpha token\n").unwrap();
+
+        let chunk = db.read_chunk(chunk_id).unwrap().unwrap();
+        assert_eq!(chunk.start_line, 2);
+        assert_eq!(chunk.end_line, 3);
+        assert_eq!(chunk.text, "# Title\nalpha token\n");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_chunk_large_drift_reindexes_and_reports_stale_chunk() {
+        let (root, config) = markdown_config("# Title\nalpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let chunk_id = first_chunk_id(&db);
+        fs::write(root.join("docs/search.md"), "# Replacement\nbeta token\n").unwrap();
+
+        let err = db.read_chunk(chunk_id).unwrap_err().to_string();
+        assert!(err.contains("StaleChunk"), "{err}");
+        let hits = db.search("beta", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(db.search("alpha", 10, false).unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_retries_after_healing_stale_hit() {
+        let (root, config) = markdown_config("# Title\nalpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        fs::write(root.join("docs/search.md"), "# Title\nbeta token\n").unwrap();
+
+        let hits = db.search("alpha", 10, false).unwrap();
+        assert!(hits.is_empty());
+        let beta_hits = db.search("beta", 10, false).unwrap();
+        assert_eq!(beta_hits.len(), 1);
+        assert!(beta_hits[0].summary.contains("beta"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_heals_relocated_hits_before_returning_line_spans() {
+        let (root, config) = markdown_config("# Title\nalpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        fs::write(root.join("docs/search.md"), "inserted\n# Title\nalpha token\n").unwrap();
+
+        let hits = db.search("alpha", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start_line, 2);
+        assert_eq!(hits[0].end_line, 3);
+        assert!(hits[0].summary.contains("alpha"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_chunk_deleted_source_reports_gone() {
+        let (root, config) = markdown_config("# Title\nalpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let chunk_id = first_chunk_id(&db);
+        fs::remove_file(root.join("docs/search.md")).unwrap();
+
+        let err = db.read_chunk(chunk_id).unwrap_err().to_string();
+        assert!(err.contains("Gone"), "{err}");
+        assert!(db.search("alpha", 10, false).unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_returns_needs_reindex_when_heal_cap_is_exceeded() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        for index in 0..=MAX_AUTO_HEAL_FILES_PER_CALL {
+            fs::write(docs.join(format!("doc-{index}.md")), "common stale token\n").unwrap();
+        }
+        let config = markdown_config_for_root(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        for index in 0..=MAX_AUTO_HEAL_FILES_PER_CALL {
+            fs::write(docs.join(format!("doc-{index}.md")), "fresh replacement token\n").unwrap();
+        }
+
+        let err = db.search("common", 20, false).unwrap_err().to_string();
+        assert!(err.contains("needs_reindex"), "{err}");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1120,7 +1269,12 @@ mod schema_bootstrap_tests {
         let docs = root.join("docs");
         fs::create_dir_all(&docs).unwrap();
         fs::write(docs.join("search.md"), text).unwrap();
-        let config = Config {
+        let config = markdown_config_for_root(root.clone());
+        (root, config)
+    }
+
+    fn markdown_config_for_root(root: PathBuf) -> Config {
+        Config {
             root: root.clone(),
             database: root.join(".rag-rat/index.sqlite"),
             targets: vec![ResolvedTarget {
@@ -1131,8 +1285,7 @@ mod schema_bootstrap_tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Docs,
             }],
-        };
-        (root, config)
+        }
     }
 
     fn table_count(db: &IndexDatabase, table: &str) -> i64 {
@@ -1169,6 +1322,13 @@ mod schema_bootstrap_tests {
             .query_row("SELECT COUNT(*) FROM chunks WHERE source_revision != ''", [], |row| {
                 row.get(0)
             })
+            .unwrap()
+    }
+
+    fn first_chunk_id(db: &IndexDatabase) -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT id FROM chunks ORDER BY id LIMIT 1", [], |row| row.get(0))
             .unwrap()
     }
 }

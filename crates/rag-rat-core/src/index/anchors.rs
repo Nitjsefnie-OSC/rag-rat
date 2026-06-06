@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 pub struct ChunkAnchor {
     pub version: i64,
     pub normalized_hash: String,
+    pub start_boundary_hash: String,
+    pub end_boundary_hash: String,
     pub start_context_hash: String,
     pub end_context_hash: String,
     pub context_radius: i64,
@@ -27,6 +29,8 @@ pub fn anchor_for_text(
     ChunkAnchor {
         version: 1,
         normalized_hash: hash_normalized(text),
+        start_boundary_hash: boundary_hash(&lines, start_line),
+        end_boundary_hash: boundary_hash(&lines, end_line),
         start_context_hash: context_hash(&lines, start_line, radius),
         end_context_hash: context_hash(&lines, end_line, radius),
         context_radius: i64::try_from(radius).unwrap_or(2),
@@ -72,11 +76,16 @@ fn relocate(stored_text: &str, anchor: &ChunkAnchor, current_text: &str) -> Opti
             continue;
         };
         if hash_normalized(&candidate) == wanted_hash {
+            let start_boundary = boundary_hash(&lines, start);
+            let end_boundary = boundary_hash(&lines, end);
             let start_context =
                 context_hash(&lines, start, usize::try_from(anchor.context_radius).unwrap_or(2));
             let end_context =
                 context_hash(&lines, end, usize::try_from(anchor.context_radius).unwrap_or(2));
-            if start_context == anchor.start_context_hash || end_context == anchor.end_context_hash
+            if start_boundary == anchor.start_boundary_hash
+                || end_boundary == anchor.end_boundary_hash
+                || start_context == anchor.start_context_hash
+                || end_context == anchor.end_context_hash
             {
                 return Some(AnchorStatus::Relocated {
                     start_line: start,
@@ -89,7 +98,7 @@ fn relocate(stored_text: &str, anchor: &ChunkAnchor, current_text: &str) -> Opti
     None
 }
 
-fn slice_lines(text: &str, start_line: usize, end_line: usize) -> Option<String> {
+pub(crate) fn slice_lines(text: &str, start_line: usize, end_line: usize) -> Option<String> {
     if start_line == 0 || end_line < start_line {
         return None;
     }
@@ -106,6 +115,16 @@ fn slice_lines(text: &str, start_line: usize, end_line: usize) -> Option<String>
         text.push('\n');
         text
     })
+}
+
+fn boundary_hash(lines: &[&str], line: usize) -> String {
+    if line == 0 {
+        return hex_sha256(b"");
+    }
+    lines
+        .get(line - 1)
+        .map(|line| hex_sha256(line.trim().as_bytes()))
+        .unwrap_or_else(|| hex_sha256(b""))
 }
 
 fn context_hash(lines: &[&str], line: usize, radius: usize) -> String {
