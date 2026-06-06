@@ -71,6 +71,7 @@ fn doctor(config: &Config) -> anyhow::Result<()> {
     print_json(&serde_json::json!({
         "config_root": config.root,
         "database": config.database,
+        "storage": db.storage_status()?,
         "targets": config.targets.iter().map(|target| serde_json::json!({
             "name": target.name,
             "language": target.language.as_str(),

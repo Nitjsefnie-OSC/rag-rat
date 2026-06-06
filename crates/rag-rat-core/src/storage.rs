@@ -4,6 +4,14 @@ use std::{
 };
 
 use rusqlite::Connection;
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageStatus {
+    pub backend: &'static str,
+    pub sqlite_version: String,
+    pub fts5_available: bool,
+}
 
 #[derive(Debug)]
 pub struct IndexConnection {
@@ -39,6 +47,16 @@ impl IndexConnection {
         Ok(())
     }
 
+    pub fn status(&self) -> anyhow::Result<StorageStatus> {
+        let sqlite_version =
+            self.conn.query_row("SELECT sqlite_version()", [], |row| row.get::<_, String>(0))?;
+        Ok(StorageStatus {
+            backend: "sqlite",
+            sqlite_version,
+            fts5_available: self.fts5_available(),
+        })
+    }
+
     fn setup(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(
             "
@@ -48,5 +66,16 @@ impl IndexConnection {
             ",
         )?;
         Ok(())
+    }
+
+    fn fts5_available(&self) -> bool {
+        self.conn
+            .execute_batch(
+                "
+                CREATE VIRTUAL TABLE temp.rag_rat_fts_probe USING fts5(text);
+                DROP TABLE temp.rag_rat_fts_probe;
+                ",
+            )
+            .is_ok()
     }
 }

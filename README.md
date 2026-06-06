@@ -43,3 +43,8 @@ include = ["**/*.ts"]
 ## Security
 
 The MCP server exposes read-only source tools only. It does not execute shell commands or write configured target files. It may write the configured SQLite index during `index` and during automatic stale-index healing before returning search or `read_chunk` results.
+
+## Size Budget
+
+Storage dependency changes must keep the binary slim. See `docs/binary-size.md` for the
+manual size check and heavyweight dependency policy.

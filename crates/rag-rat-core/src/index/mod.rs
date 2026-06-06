@@ -37,6 +37,7 @@ use crate::{
     language::Language,
     search::lexical::SearchHit,
     storage::IndexConnection,
+    storage::StorageStatus,
 };
 
 #[derive(Debug)]
@@ -282,6 +283,10 @@ impl IndexDatabase {
             file_count_by_language: counts,
             parser_failures: self.parser_failure_count()?,
         })
+    }
+
+    pub fn storage_status(&self) -> anyhow::Result<StorageStatus> {
+        self.storage.status()
     }
 
     pub fn search(
@@ -884,4 +889,64 @@ fn remove_database_files(path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod schema_bootstrap_tests {
+    use super::*;
+    use crate::config::ResolvedTarget;
+
+    #[test]
+    fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "markdown".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            }],
+        };
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        assert!(config.database.exists());
+        assert_eq!(table_count(&db, "files"), 1);
+        assert_eq!(table_count(&db, "chunks"), 1);
+        assert_eq!(table_count(&db, "symbols"), 1);
+        assert_eq!(table_count(&db, "parser_failures"), 1);
+        assert_eq!(table_count(&db, "index_meta"), 1);
+        assert_eq!(table_count(&db, "chunk_fts"), 1);
+        assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
+        assert!(chunk_columns(&db).contains(&"normalized_hash".to_string()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn unique_temp_root() -> PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!("rag-rat-schema-test-{}-{}", std::process::id(), now_ms()));
+        root
+    }
+
+    fn table_count(db: &IndexDatabase, table: &str) -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [table], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn chunk_columns(db: &IndexDatabase) -> Vec<String> {
+        let mut stmt = db.storage.connection().prepare("PRAGMA table_info(chunks)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+    }
 }
