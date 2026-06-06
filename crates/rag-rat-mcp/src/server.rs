@@ -10,8 +10,8 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::tools::{
-    BlameChunkArgs, EmptyArgs, ImpactArgs, LimitArgs, PapertrailChunkArgs, PapertrailCommitArgs,
-    PathHistoryArgs, ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    BlameChunkArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs, PapertrailChunkArgs,
+    PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -244,6 +244,28 @@ impl RagRatService {
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("local_ai_status", json!({}))
+    }
+
+    #[tool(
+        name = "heal_index",
+        description = "Repair stale already-indexed files and refresh SQLite FTS."
+    )]
+    fn heal_index(
+        &self,
+        Parameters(args): Parameters<HealIndexArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("heal_index", json!(args))
+    }
+
+    #[tool(
+        name = "github_sync_status",
+        description = "Report local GitHub papertrail cache status."
+    )]
+    fn github_sync_status(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("github_sync_status", json!({}))
     }
 
     #[tool(

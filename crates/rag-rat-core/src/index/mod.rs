@@ -99,6 +99,16 @@ pub struct IndexStatus {
 }
 
 #[derive(Debug, Serialize)]
+pub struct HealIndexReport {
+    pub checked_files: u64,
+    pub healed_files: u64,
+    pub removed_files: u64,
+    pub skipped_files: u64,
+    pub fts_fresh: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ParserFailure {
     pub path: String,
     pub language: String,
@@ -587,6 +597,10 @@ impl IndexDatabase {
         github::refs_for_path(self.storage.connection(), path, limit)
     }
 
+    pub fn github_sync_status(&self) -> anyhow::Result<GitHubStatus> {
+        self.github_status()
+    }
+
     pub fn papertrail_for_chunk(
         &self,
         chunk_id: i64,
@@ -632,6 +646,53 @@ impl IndexDatabase {
 
     pub fn reconcile(&self, limit: Option<u32>) -> anyhow::Result<ReconcileReport> {
         ai::reconcile(self.storage.connection(), limit)
+    }
+
+    pub fn heal_index(&self, limit: Option<u32>) -> anyhow::Result<HealIndexReport> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
+        };
+        let indexed_files = self.indexed_files()?;
+        let max_files = limit.map(usize::try_from).transpose()?.unwrap_or(usize::MAX);
+        let mut report = HealIndexReport {
+            checked_files: 0,
+            healed_files: 0,
+            removed_files: 0,
+            skipped_files: 0,
+            fts_fresh: false,
+            message: None,
+        };
+
+        for file in indexed_files.into_iter().take(max_files) {
+            report.checked_files += 1;
+            let path = Path::new(&file.path);
+            let full_path = root.join(path);
+            let Ok(text) = fs::read_to_string(&full_path) else {
+                self.remove_file(path)?;
+                report.removed_files += 1;
+                continue;
+            };
+            let sha256 = hex_sha256(text.as_bytes());
+            if sha256 == file.sha256 {
+                report.skipped_files += 1;
+                continue;
+            }
+            self.heal_file(path)?;
+            report.healed_files += 1;
+        }
+
+        if report.healed_files > 0 || report.removed_files > 0 {
+            self.sync_fts()?;
+        } else {
+            self.ensure_fts_fresh()?;
+        }
+        report.fts_fresh = !self.fts_dirty()?;
+        if usize::try_from(report.checked_files).unwrap_or(usize::MAX)
+            < self.indexed_file_count()?
+        {
+            report.message = Some("limit reached; rerun heal_index to continue".to_string());
+        }
+        Ok(report)
     }
 
     pub fn ffi_surface(&self, limit: u32) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
@@ -1052,6 +1113,26 @@ impl IndexDatabase {
             })
     }
 
+    fn indexed_files(&self) -> anyhow::Result<Vec<IndexedFile>> {
+        let mut stmt =
+            self.storage.connection().prepare("SELECT path, sha256 FROM files ORDER BY path")?;
+        let rows =
+            stmt.query_map([], |row| Ok(IndexedFile { path: row.get(0)?, sha256: row.get(1)? }))?;
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+        Ok(files)
+    }
+
+    fn indexed_file_count(&self) -> anyhow::Result<usize> {
+        let count =
+            self.storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
     fn content_revision(&self) -> anyhow::Result<String> {
         let value = self.storage.connection().query_row(
             "SELECT COALESCE(string_agg(path || ':' || sha256, ',' ORDER BY path), '') FROM files",
@@ -1066,6 +1147,12 @@ impl IndexDatabase {
 struct FileRow {
     language: Language,
     kind: TargetKind,
+}
+
+#[derive(Debug)]
+struct IndexedFile {
+    path: String,
+    sha256: String,
 }
 
 #[derive(Debug)]

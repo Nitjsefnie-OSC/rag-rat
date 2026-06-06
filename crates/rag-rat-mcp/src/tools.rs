@@ -25,6 +25,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "github_refs_for_path",
     "rationale_search",
     "local_ai_status",
+    "heal_index",
+    "github_sync_status",
     "index_status",
 ];
 
@@ -94,6 +96,11 @@ pub struct PapertrailCommitArgs {
     pub commit_hash: String,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct HealIndexArgs {
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
@@ -200,6 +207,11 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
             json!(db.rationale_search(&args.query, args.limit)?)
         },
         "local_ai_status" => json!(db.local_ai_status()?),
+        "heal_index" => {
+            let args: HealIndexArgs = serde_json::from_value(arguments)?;
+            json!(db.heal_index(args.limit)?)
+        },
+        "github_sync_status" => json!(db.github_sync_status()?),
         "index_status" => json!(db.status(database)?),
         other => anyhow::bail!("unknown tool `{other}`"),
     };
@@ -234,6 +246,8 @@ pub fn description(name: &str) -> &'static str {
         "github_refs_for_path" => "List discovered GitHub references for one current path.",
         "rationale_search" => "Search cached GitHub rationale snippets.",
         "local_ai_status" => "Report explicit local AI capability and artifact status.",
+        "heal_index" => "Repair stale already-indexed files and refresh SQLite FTS.",
+        "github_sync_status" => "Report local GitHub papertrail cache status.",
         "index_status" => {
             "Report SQLite index freshness, git metadata, parser failures, and file counts."
         },
@@ -243,124 +257,30 @@ pub fn description(name: &str) -> &'static str {
 
 pub fn schema(name: &str) -> Value {
     match name {
-        "semantic_search" => json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 10},
-                "include_generated": {"type": "boolean", "default": false}
-            },
-            "required": ["query"]
-        }),
-        "symbol_lookup" => json!({
-            "type": "object",
-            "properties": {
-                "symbol": {"type": "string"},
-                "language": {"type": "string"},
-                "limit": {"type": "integer", "default": 20}
-            },
-            "required": ["symbol"]
-        }),
-        "find_callers" | "trace_callees" | "docs_for_symbol" => json!({
-            "type": "object",
-            "properties": {
-                "symbol": {"type": "string"},
-                "limit": {"type": "integer", "default": 50}
-            },
-            "required": ["symbol"]
-        }),
-        "impact_surface" => json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 50}
-            },
-            "required": ["query"]
-        }),
-        "ffi_surface" => json!({
-            "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 50}}
-        }),
-        "read_chunk" => json!({
-            "type": "object",
-            "properties": {"chunk_id": {"type": "integer"}},
-            "required": ["chunk_id"]
-        }),
-        "commit_search" | "commits_touching_query" => json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 10}
-            },
-            "required": ["query"]
-        }),
-        "git_history_for_path" => json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "limit": {"type": "integer", "default": 50}
-            },
-            "required": ["path"]
-        }),
-        "git_history_for_symbol" => json!({
-            "type": "object",
-            "properties": {
-                "symbol": {"type": "string"},
-                "language": {"type": "string"},
-                "limit": {"type": "integer", "default": 20}
-            },
-            "required": ["symbol"]
-        }),
-        "git_blame_chunk" => json!({
-            "type": "object",
-            "properties": {"chunk_id": {"type": "integer"}},
-            "required": ["chunk_id"]
-        }),
-        "papertrail_for_chunk" => json!({
-            "type": "object",
-            "properties": {
-                "chunk_id": {"type": "integer"},
-                "limit": {"type": "integer", "default": 50}
-            },
-            "required": ["chunk_id"]
-        }),
-        "papertrail_for_symbol" => json!({
-            "type": "object",
-            "properties": {
-                "symbol": {"type": "string"},
-                "language": {"type": "string"},
-                "limit": {"type": "integer", "default": 20}
-            },
-            "required": ["symbol"]
-        }),
-        "papertrail_for_commit" => json!({
-            "type": "object",
-            "properties": {
-                "commit_hash": {"type": "string"},
-                "limit": {"type": "integer", "default": 50}
-            },
-            "required": ["commit_hash"]
-        }),
-        "github_issue_search" | "rationale_search" => json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 10}
-            },
-            "required": ["query"]
-        }),
-        "github_refs_for_path" => json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "limit": {"type": "integer", "default": 50}
-            },
-            "required": ["path"]
-        }),
-        "local_ai_status" => json!({"type": "object", "properties": {}}),
-        "index_status" => json!({"type": "object", "properties": {}}),
+        "semantic_search"
+        | "commit_search"
+        | "commits_touching_query"
+        | "github_issue_search"
+        | "rationale_search" => schema_for::<SearchArgs>(),
+        "symbol_lookup" | "git_history_for_symbol" | "papertrail_for_symbol" => {
+            schema_for::<SymbolArgs>()
+        },
+        "find_callers" | "trace_callees" | "docs_for_symbol" => schema_for::<SymbolGraphArgs>(),
+        "impact_surface" => schema_for::<ImpactArgs>(),
+        "ffi_surface" => schema_for::<LimitArgs>(),
+        "read_chunk" => schema_for::<ReadChunkArgs>(),
+        "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),
+        "git_blame_chunk" => schema_for::<BlameChunkArgs>(),
+        "papertrail_for_chunk" => schema_for::<PapertrailChunkArgs>(),
+        "papertrail_for_commit" => schema_for::<PapertrailCommitArgs>(),
+        "heal_index" => schema_for::<HealIndexArgs>(),
+        "local_ai_status" | "github_sync_status" | "index_status" => schema_for::<EmptyArgs>(),
         _ => json!({"type": "object"}),
     }
+}
+
+fn schema_for<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| json!({"type": "object"}))
 }
 
 fn optional_language(language: Option<String>) -> anyhow::Result<Option<Language>> {
@@ -377,4 +297,214 @@ fn default_symbol_limit() -> u32 {
 
 fn default_graph_limit() -> u32 {
     50
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use rag_rat_core::{Config, IndexDatabase, ResolvedTarget, TargetKind, language::Language};
+    use serde_json::json;
+
+    use super::*;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn list_tools_exposes_complete_typed_schemas() {
+        let tools = list_tools();
+        let tools = tools.as_array().expect("tools/list shape");
+        let names =
+            tools.iter().map(|tool| tool["name"].as_str().expect("tool name")).collect::<Vec<_>>();
+
+        for expected in [
+            "semantic_search",
+            "symbol_lookup",
+            "find_callers",
+            "trace_callees",
+            "impact_surface",
+            "ffi_surface",
+            "docs_for_symbol",
+            "read_chunk",
+            "index_status",
+            "commit_search",
+            "git_history_for_path",
+            "git_history_for_symbol",
+            "commits_touching_query",
+            "git_blame_chunk",
+            "papertrail_for_chunk",
+            "papertrail_for_symbol",
+            "papertrail_for_commit",
+            "github_issue_search",
+            "github_refs_for_path",
+            "rationale_search",
+            "local_ai_status",
+            "heal_index",
+            "github_sync_status",
+        ] {
+            assert!(names.contains(&expected), "missing MCP tool {expected}");
+        }
+
+        assert_schema_requires(tools, "semantic_search", "query");
+        assert_schema_requires(tools, "read_chunk", "chunk_id");
+        assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
+        assert_schema_has_property(tools, "heal_index", "limit");
+        assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
+    }
+
+    #[test]
+    fn mcp_tool_calls_preserve_compatibility_shapes() {
+        let (root, config) = mixed_config();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        drop(db);
+
+        let search =
+            call_tool(&config.database, "semantic_search", json!({"query": "alpha"})).unwrap();
+        let hit = search.as_array().unwrap().first().expect("semantic hit");
+        for field in ["chunk_id", "path", "start_line", "end_line", "summary", "score"] {
+            assert!(hit.get(field).is_some(), "semantic_search missing {field}");
+        }
+        let chunk_id = hit["chunk_id"].as_i64().unwrap();
+
+        let chunk =
+            call_tool(&config.database, "read_chunk", json!({"chunk_id": chunk_id})).unwrap();
+        for field in ["chunk_id", "path", "start_line", "end_line", "text"] {
+            assert!(chunk.get(field).is_some(), "read_chunk missing {field}");
+        }
+
+        let status = call_tool(&config.database, "index_status", json!({})).unwrap();
+        assert!(status["database"].as_str().unwrap().ends_with("index.sqlite"));
+        assert_eq!(status["fts_fresh"], true);
+        assert!(status["local_ai"].is_object());
+
+        let papertrail = call_tool(
+            &config.database,
+            "papertrail_for_symbol",
+            json!({"symbol": "alpha_symbol", "language": "rust"}),
+        )
+        .unwrap();
+        assert!(papertrail["current_source"].is_object());
+        assert!(papertrail["github_evidence"].is_array());
+
+        let github_status = call_tool(&config.database, "github_sync_status", json!({})).unwrap();
+        assert!(github_status["capability"].is_string());
+
+        let local_ai = call_tool(&config.database, "local_ai_status", json!({})).unwrap();
+        assert_eq!(local_ai["embedding"]["state"], "MissingModel");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
+        let (root, config) = markdown_config("# Title\nalpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        drop(db);
+
+        let search =
+            call_tool(&config.database, "semantic_search", json!({"query": "alpha"})).unwrap();
+        let chunk_id = search.as_array().unwrap()[0]["chunk_id"].as_i64().unwrap();
+        fs::write(root.join("docs/search.md"), "inserted\n# Title\nalpha token\n").unwrap();
+
+        let chunk =
+            call_tool(&config.database, "read_chunk", json!({"chunk_id": chunk_id})).unwrap();
+        assert_eq!(chunk["start_line"], 2);
+        assert_eq!(chunk["text"], "# Title\nalpha token\n");
+
+        fs::write(root.join("docs/search.md"), "# Changed\nbeta token\n").unwrap();
+        let report = call_tool(&config.database, "heal_index", json!({"limit": 10})).unwrap();
+        assert_eq!(report["healed_files"], 1);
+        assert_eq!(report["fts_fresh"], true);
+
+        let stale =
+            call_tool(&config.database, "semantic_search", json!({"query": "alpha"})).unwrap();
+        assert!(stale.as_array().unwrap().is_empty());
+        let fresh =
+            call_tool(&config.database, "semantic_search", json!({"query": "beta"})).unwrap();
+        assert_eq!(fresh.as_array().unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
+        let schema = tool_schema(tools, name);
+        let required = schema["required"].as_array().expect("required array");
+        assert!(required.iter().any(|value| value == field), "{name} should require {field}");
+    }
+
+    fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
+        let schema = tool_schema(tools, name);
+        assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
+    }
+
+    fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| &tool["inputSchema"])
+            .expect("tool schema")
+    }
+
+    fn mixed_config() -> (PathBuf, Config) {
+        let root = unique_temp_root();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn alpha_symbol() {}\n").unwrap();
+        (
+            root.clone(),
+            Config {
+                root: root.clone(),
+                database: root.join(".rag-rat/index.sqlite"),
+                targets: vec![
+                    ResolvedTarget {
+                        name: "markdown".to_string(),
+                        language: Language::Markdown,
+                        directories: vec![PathBuf::from("docs")],
+                        include: vec!["**/*.md".to_string()],
+                        exclude: Vec::new(),
+                        kind: TargetKind::Docs,
+                    },
+                    ResolvedTarget {
+                        name: "rust".to_string(),
+                        language: Language::Rust,
+                        directories: vec![PathBuf::from("src")],
+                        include: vec!["**/*.rs".to_string()],
+                        exclude: Vec::new(),
+                        kind: TargetKind::Source,
+                    },
+                ],
+            },
+        )
+    }
+
+    fn markdown_config(text: &str) -> (PathBuf, Config) {
+        let root = unique_temp_root();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/search.md"), text).unwrap();
+        (
+            root.clone(),
+            Config {
+                root: root.clone(),
+                database: root.join(".rag-rat/index.sqlite"),
+                targets: vec![ResolvedTarget {
+                    name: "markdown".to_string(),
+                    language: Language::Markdown,
+                    directories: vec![PathBuf::from("docs")],
+                    include: vec!["**/*.md".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Docs,
+                }],
+            },
+        )
+    }
+
+    fn unique_temp_root() -> PathBuf {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rag-rat-mcp-test-{}-{id}", std::process::id()))
+    }
 }

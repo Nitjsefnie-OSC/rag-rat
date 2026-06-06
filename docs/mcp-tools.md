@@ -24,7 +24,12 @@
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
 - `rationale_search`: `{ "query": string, "limit"?: number }`
 - `local_ai_status`: `{}`
+- `heal_index`: `{ "limit"?: number }`
+- `github_sync_status`: `{}`
 - `index_status`: `{}`
+
+`tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
+used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.
 
 Search tools return chunk IDs, paths, line spans, short summaries, and scores. Search and `read_chunk` validate stored chunk anchors against current source before returning context; stale files are reindexed once per tool call and their SQLite FTS5 rows are updated before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.
 
@@ -56,6 +61,9 @@ as historical GitHub evidence and classified as `decision`, `rejected_alternativ
 
 `index_status.github` reports cached refs, issues, comments, pulls, reviews, review comments,
 last sync time, and whether the `gh` CLI capability is available.
+`github_sync_status` returns that GitHub cache section directly. `heal_index` repairs or removes
+already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
+SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
 Local AI artifacts are explicit and current-only. MCP query paths never install or download models.
 `local_ai_status` reports model capability state, artifact counts, and whether embeddings or summaries
