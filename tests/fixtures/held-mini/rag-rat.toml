@@ -1,0 +1,9 @@
+[index]
+root = "."
+database = ".rag-rat/index.duckdb"
+
+[target_bindings]
+rust = ["src"]
+typescript = ["src"]
+kotlin = ["src"]
+markdown = ["docs"]

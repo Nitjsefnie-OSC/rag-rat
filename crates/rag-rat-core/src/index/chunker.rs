@@ -1,0 +1,235 @@
+use std::path::Path;
+
+use crate::{index::parser, language::Language};
+
+pub const MAX_STRUCTURAL_PARSE_BYTES: usize = 10_000;
+
+#[derive(Debug, Clone)]
+pub struct Chunk {
+    pub kind: &'static str,
+    pub symbol_path: Option<String>,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+}
+
+pub fn chunks_for_file(path: &Path, language: Language, text: &str) -> Vec<Chunk> {
+    if text.len() > MAX_STRUCTURAL_PARSE_BYTES && language != Language::Markdown {
+        return split_text_chunks(path, "code", text, 160);
+    }
+    match language {
+        Language::Markdown => markdown_chunks(text),
+        _ => code_chunks(path, language, text).unwrap_or_else(|_| whole_file_chunk(path, text)),
+    }
+}
+
+pub fn generated_chunks_for_file(path: &Path, text: &str) -> Vec<Chunk> {
+    split_text_chunks(path, "generated", text, 160)
+}
+
+fn markdown_chunks(text: &str) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut current_heading = Vec::<String>::new();
+    let mut start_line = 1;
+    let mut start_byte = 0;
+    let mut buffer = String::new();
+    let mut byte = 0;
+
+    for (idx, line) in text.lines().enumerate() {
+        if line.starts_with('#') && !buffer.trim().is_empty() {
+            chunks.push(make_chunk(
+                "markdown",
+                Some(current_heading.join(" > ")),
+                start_byte,
+                byte,
+                start_line,
+                idx,
+                std::mem::take(&mut buffer),
+            ));
+            start_line = idx + 1;
+            start_byte = byte;
+        }
+        if let Some(heading) = heading_text(line) {
+            current_heading.push(heading);
+        }
+        buffer.push_str(line);
+        buffer.push('\n');
+        byte += line.len() + 1;
+    }
+
+    if !buffer.trim().is_empty() {
+        chunks.push(make_chunk(
+            "markdown",
+            Some(current_heading.join(" > ")),
+            start_byte,
+            text.len(),
+            start_line,
+            text.lines().count().max(start_line),
+            buffer,
+        ));
+    }
+    chunks
+}
+
+fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Vec<Chunk>> {
+    let symbols = parser::parse_symbols(path, language, text)?;
+    let mut chunks = Vec::new();
+    for symbol in symbols {
+        let Some(symbol_text) = text.get(symbol.start_byte..symbol.end_byte) else {
+            continue;
+        };
+        if symbol_text.trim().is_empty() {
+            continue;
+        }
+        for (part_idx, part) in split_symbol(symbol_text, symbol.start_byte, symbol.start_line, 120)
+            .into_iter()
+            .enumerate()
+        {
+            chunks.push(make_chunk(
+                "code",
+                Some(if part_idx == 0 {
+                    symbol.qualified_name.clone()
+                } else {
+                    format!("{}#{part_idx}", symbol.qualified_name)
+                }),
+                part.start_byte,
+                part.end_byte,
+                part.start_line,
+                part.end_line,
+                part.text,
+            ));
+        }
+    }
+    if chunks.is_empty() { Ok(whole_file_chunk(path, text)) } else { Ok(chunks) }
+}
+
+fn whole_file_chunk(path: &Path, text: &str) -> Vec<Chunk> {
+    vec![make_chunk(
+        "code",
+        path.file_name().map(|name| name.to_string_lossy().to_string()),
+        0,
+        text.len(),
+        1,
+        text.lines().count().max(1),
+        text.to_string(),
+    )]
+}
+
+fn split_text_chunks(path: &Path, kind: &'static str, text: &str, max_lines: usize) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut start_line = 1;
+    let mut start_byte = 0;
+    let mut byte = 0;
+    let mut buffer = String::new();
+    for (idx, line) in text.lines().enumerate() {
+        buffer.push_str(line);
+        buffer.push('\n');
+        byte += line.len() + 1;
+        let line_no = idx + 1;
+        if line_no - start_line + 1 >= max_lines {
+            chunks.push(make_chunk(
+                kind,
+                path.file_name().map(|name| name.to_string_lossy().to_string()),
+                start_byte,
+                byte,
+                start_line,
+                line_no,
+                std::mem::take(&mut buffer),
+            ));
+            start_byte = byte;
+            start_line = line_no + 1;
+        }
+    }
+    if !buffer.trim().is_empty() {
+        chunks.push(make_chunk(
+            kind,
+            path.file_name().map(|name| name.to_string_lossy().to_string()),
+            start_byte,
+            text.len(),
+            start_line,
+            text.lines().count().max(start_line),
+            buffer,
+        ));
+    }
+    chunks
+}
+
+fn make_chunk(
+    kind: &'static str,
+    symbol_path: Option<String>,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    text: String,
+) -> Chunk {
+    Chunk {
+        kind,
+        symbol_path: symbol_path.filter(|s| !s.is_empty()),
+        start_byte,
+        end_byte,
+        start_line,
+        end_line,
+        text,
+    }
+}
+
+fn heading_text(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let level_end = trimmed.chars().take_while(|c| *c == '#').count();
+    if level_end == 0 {
+        return None;
+    }
+    Some(trimmed[level_end..].trim().to_string())
+}
+
+#[derive(Debug)]
+struct ChunkPart {
+    start_byte: usize,
+    end_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    text: String,
+}
+
+fn split_symbol(
+    text: &str,
+    base_byte: usize,
+    base_line: usize,
+    max_lines: usize,
+) -> Vec<ChunkPart> {
+    let mut parts = Vec::new();
+    let mut start_byte = base_byte;
+    let mut start_line = base_line;
+    let mut byte = base_byte;
+    let mut buffer = String::new();
+    for (idx, line) in text.lines().enumerate() {
+        buffer.push_str(line);
+        buffer.push('\n');
+        byte += line.len() + 1;
+        let line_no = base_line + idx;
+        if line_no - start_line + 1 >= max_lines {
+            parts.push(ChunkPart {
+                start_byte,
+                end_byte: byte,
+                start_line,
+                end_line: line_no,
+                text: std::mem::take(&mut buffer),
+            });
+            start_byte = byte;
+            start_line = line_no + 1;
+        }
+    }
+    if !buffer.trim().is_empty() {
+        parts.push(ChunkPart {
+            start_byte,
+            end_byte: base_byte + text.len(),
+            start_line,
+            end_line: base_line + text.lines().count().saturating_sub(1),
+            text: buffer,
+        });
+    }
+    parts
+}
