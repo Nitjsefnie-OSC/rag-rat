@@ -1,6 +1,6 @@
 use std::env;
 
-use rag_rat_core::{Config, IndexDatabase};
+use rag_rat_core::{Config, IndexDatabase, index::IndexProgress};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         "index" => {
-            let db = IndexDatabase::rebuild(&config)?;
+            let db = IndexDatabase::rebuild_with_progress(&config, render_index_progress)?;
             print_json(&db.status(&config.database)?)?;
         },
         "doctor" => {
@@ -86,6 +86,35 @@ fn doctor(config: &Config) -> anyhow::Result<()> {
 fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn render_index_progress(progress: IndexProgress) {
+    match progress {
+        IndexProgress::Started { database } => {
+            eprintln!("index: rebuilding {}", database.display());
+        },
+        IndexProgress::Discovering => {
+            eprintln!("index: discovering files");
+        },
+        IndexProgress::Discovered { files } => {
+            eprintln!("index: discovered {files} files");
+        },
+        IndexProgress::IndexingFile { current, total, path, language, kind } => {
+            let percent = current.saturating_mul(100).checked_div(total).unwrap_or(100);
+            eprintln!(
+                "index: {current}/{total} ({percent:>3}%) [{}:{}] {}",
+                kind.as_str(),
+                language.as_str(),
+                path.display()
+            );
+        },
+        IndexProgress::RefreshingFts => {
+            eprintln!("index: refreshing DuckDB FTS");
+        },
+        IndexProgress::Finished { files } => {
+            eprintln!("index: complete ({files} files)");
+        },
+    }
 }
 
 fn usage() {

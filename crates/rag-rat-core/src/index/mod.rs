@@ -40,6 +40,28 @@ pub struct IndexDatabase {
     storage: IndexConnection,
 }
 
+#[derive(Debug, Clone)]
+pub enum IndexProgress {
+    Started {
+        database: PathBuf,
+    },
+    Discovering,
+    Discovered {
+        files: usize,
+    },
+    IndexingFile {
+        current: usize,
+        total: usize,
+        path: PathBuf,
+        language: Language,
+        kind: TargetKind,
+    },
+    RefreshingFts,
+    Finished {
+        files: usize,
+    },
+}
+
 #[derive(Debug, Serialize)]
 pub struct IndexStatus {
     pub database: String,
@@ -64,16 +86,26 @@ impl IndexDatabase {
     }
 
     pub fn rebuild(config: &Config) -> anyhow::Result<Self> {
+        Self::rebuild_with_progress(config, |_| {})
+    }
+
+    pub fn rebuild_with_progress<F>(config: &Config, mut progress: F) -> anyhow::Result<Self>
+    where
+        F: FnMut(IndexProgress),
+    {
+        progress(IndexProgress::Started { database: config.database.clone() });
         remove_database_files(&config.database)?;
         let db = Self::open(&config.database)?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.write_git_meta(&config.root)?;
-            db.index_targets(config)?;
+            let indexed = db.index_targets_with_progress(config, &mut progress)?;
+            progress(IndexProgress::RefreshingFts);
             db.refresh_fts()?;
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
             db.storage.execute_batch("COMMIT")?;
+            progress(IndexProgress::Finished { files: indexed });
             Ok(())
         })();
         if result.is_err() {
@@ -84,42 +116,51 @@ impl IndexDatabase {
     }
 
     pub fn index_targets(&self, config: &Config) -> anyhow::Result<()> {
-        let mut targets = config.targets.iter().collect::<Vec<_>>();
-        targets.sort_by_key(|target| match target.kind {
-            TargetKind::Generated => 0,
-            TargetKind::Tests => 1,
-            TargetKind::Docs => 2,
-            TargetKind::Source => 3,
-        });
-        let mut seen = BTreeSet::new();
-
-        for target in targets {
-            for file in walker::walk_target(&config.root, target)? {
-                let relative_path = file.strip_prefix(&config.root)?.to_path_buf();
-                if !seen.insert(relative_path.clone()) {
-                    continue;
-                }
-                let text = match fs::read_to_string(&file) {
-                    Ok(text) => text,
-                    Err(err) => {
-                        self.insert_parser_failure(
-                            &relative_path,
-                            target.language,
-                            &err.to_string(),
-                        )?;
-                        continue;
-                    },
-                };
-                self.index_file(
-                    &relative_path,
-                    target.language,
-                    target.kind,
-                    file_metadata_ms(&file)?,
-                    &text,
-                )?;
-            }
-        }
+        self.index_targets_with_progress(config, &mut |_| {})?;
         Ok(())
+    }
+
+    fn index_targets_with_progress<F>(
+        &self,
+        config: &Config,
+        progress: &mut F,
+    ) -> anyhow::Result<usize>
+    where
+        F: FnMut(IndexProgress),
+    {
+        progress(IndexProgress::Discovering);
+        let files = collect_index_files(config)?;
+        progress(IndexProgress::Discovered { files: files.len() });
+
+        for (index, file) in files.iter().enumerate() {
+            progress(IndexProgress::IndexingFile {
+                current: index + 1,
+                total: files.len(),
+                path: file.relative_path.clone(),
+                language: file.language,
+                kind: file.kind,
+            });
+            let text = match fs::read_to_string(&file.full_path) {
+                Ok(text) => text,
+                Err(err) => {
+                    self.insert_parser_failure(
+                        &file.relative_path,
+                        file.language,
+                        &err.to_string(),
+                    )?;
+                    continue;
+                },
+            };
+            self.index_file(
+                &file.relative_path,
+                file.language,
+                file.kind,
+                file_metadata_ms(&file.full_path)?,
+                &text,
+            )?;
+        }
+
+        Ok(files.len())
     }
 
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
@@ -265,11 +306,8 @@ impl IndexDatabase {
     ) -> anyhow::Result<()> {
         if language != Language::Markdown && kind != TargetKind::Generated {
             if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
-                self.insert_parser_failure(
-                    path,
-                    language,
-                    "file exceeds structural parse byte limit; indexed with coarse chunks",
-                )?;
+                // Large source files are intentionally coarse-indexed to keep full-repo indexing
+                // responsive. This is not a parser failure.
             } else if let Err(err) = parser::parse_symbols(path, language, text) {
                 self.insert_parser_failure(path, language, &err.to_string())?;
             }
@@ -523,6 +561,43 @@ impl IndexDatabase {
 struct FileRow {
     language: Language,
     kind: TargetKind,
+}
+
+#[derive(Debug)]
+struct IndexFile {
+    full_path: PathBuf,
+    relative_path: PathBuf,
+    language: Language,
+    kind: TargetKind,
+}
+
+fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
+    let mut targets = config.targets.iter().collect::<Vec<_>>();
+    targets.sort_by_key(|target| match target.kind {
+        TargetKind::Generated => 0,
+        TargetKind::Tests => 1,
+        TargetKind::Docs => 2,
+        TargetKind::Source => 3,
+    });
+    let mut seen = BTreeSet::new();
+    let mut files = Vec::new();
+
+    for target in targets {
+        for file in walker::walk_target(&config.root, target)? {
+            let relative_path = file.strip_prefix(&config.root)?.to_path_buf();
+            if !seen.insert(relative_path.clone()) {
+                continue;
+            }
+            files.push(IndexFile {
+                full_path: file,
+                relative_path,
+                language: target.language,
+                kind: target.kind,
+            });
+        }
+    }
+
+    Ok(files)
 }
 
 fn meta_for(conn: &duckdb::Connection, key: &str) -> anyhow::Result<Option<String>> {
