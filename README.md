@@ -10,6 +10,10 @@ Chunk anchors include normalized text hashes, boundary hashes, nearby context ha
 version. `read_chunk` and search validate anchors against current source, relocate small line drift,
 and cap automatic stale-file reindexing per call.
 
+Git history is indexed into SQLite when the target root is a git worktree. Commit subjects/bodies
+and path-level changes are historical evidence, separate from current source search. Chunk blame is
+computed lazily for current chunk text and cached against the current source text hash.
+
 ## Commands
 
 ```bash
@@ -28,6 +32,9 @@ and rebuild the SQLite FTS5 table from stored chunks.
 Search never runs silently against stale FTS state. The index records a content revision for the
 current `files`/`chunks` rows, tracks whether FTS is dirty after writes, and synchronizes FTS before
 search when `fts_source_revision` no longer matches `content_revision`.
+
+Non-git target roots still index source and docs; git history status reports unavailable with zero
+commit/path rows.
 
 ## Configuration
 

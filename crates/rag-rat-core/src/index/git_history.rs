@@ -1,0 +1,616 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use crate::search::lexical::SearchHit;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitHistoryIndexStatus {
+    pub available: bool,
+    pub head: Option<String>,
+    pub indexed_head: Option<String>,
+    pub commit_count: u64,
+    pub file_change_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitSearchHit {
+    pub hash: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at_s: i64,
+    pub committed_at_s: i64,
+    pub subject: String,
+    pub body: String,
+    pub changed_file_count: i64,
+    pub score: f64,
+    pub evidence_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathHistoryItem {
+    pub hash: String,
+    pub path: String,
+    pub additions: Option<i64>,
+    pub deletions: Option<i64>,
+    pub change_kind: String,
+    pub author_name: String,
+    pub authored_at_s: i64,
+    pub subject: String,
+    pub evidence_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolHistoryItem {
+    pub symbol: String,
+    pub qualified_name: String,
+    pub path: String,
+    pub start_byte: i64,
+    pub end_byte: i64,
+    pub commit: PathHistoryItem,
+    pub evidence_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryCommitHit {
+    pub hash: String,
+    pub author_name: String,
+    pub authored_at_s: i64,
+    pub subject: String,
+    pub changed_file_count: i64,
+    pub evidence: Vec<String>,
+    pub score: f64,
+    pub evidence_kind: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkBlameSummary {
+    pub chunk_id: i64,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub source_text_hash: String,
+    pub line_count: i64,
+    pub dominant_commit: Option<String>,
+    pub dominant_commit_lines: i64,
+    pub newest_commit: Option<String>,
+    pub newest_commit_time_s: Option<i64>,
+    pub oldest_commit: Option<String>,
+    pub oldest_commit_time_s: Option<i64>,
+    pub commit_counts: BTreeMap<String, i64>,
+    pub evidence_kind: &'static str,
+}
+
+#[derive(Debug)]
+struct GitRepo {
+    worktree_root: PathBuf,
+    head: String,
+}
+
+#[derive(Debug)]
+struct CommitRecord {
+    hash: String,
+    author_name: String,
+    author_email: String,
+    authored_at_s: i64,
+    committed_at_s: i64,
+    subject: String,
+    body: String,
+}
+
+#[derive(Debug)]
+struct FileChange {
+    commit_hash: String,
+    path: String,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    change_kind: String,
+}
+
+pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
+    let Some(repo) = git_repo(root) else {
+        clear(conn)?;
+        return status(conn, root);
+    };
+
+    conn.execute_batch(
+        "
+        DELETE FROM commit_fts;
+        DELETE FROM git_chunk_blame;
+        DELETE FROM git_file_changes;
+        DELETE FROM git_commits;
+        ",
+    )?;
+
+    let commits = read_commits(root)?;
+    for commit in &commits {
+        conn.execute(
+            "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, committed_at_s, subject, body, changed_file_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            params![
+                commit.hash,
+                commit.author_name,
+                commit.author_email,
+                commit.authored_at_s,
+                commit.committed_at_s,
+                commit.subject,
+                commit.body,
+            ],
+        )?;
+    }
+
+    let changes = read_file_changes(root, &repo.worktree_root)?;
+    let mut changed_counts = BTreeMap::<String, i64>::new();
+    for change in changes {
+        *changed_counts.entry(change.commit_hash.clone()).or_default() += 1;
+        conn.execute(
+            "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                change.commit_hash,
+                change.path,
+                change.additions,
+                change.deletions,
+                change.change_kind,
+            ],
+        )?;
+    }
+    for (hash, count) in changed_counts {
+        conn.execute(
+            "UPDATE git_commits SET changed_file_count = ?2 WHERE hash = ?1",
+            params![hash, count],
+        )?;
+    }
+
+    conn.execute_batch(
+        "
+        INSERT INTO commit_fts(rowid, subject, body)
+        SELECT rowid, subject, body FROM git_commits;
+        ",
+    )?;
+    set_meta(conn, "git_history_indexed_head", &repo.head)?;
+    status(conn, root)
+}
+
+pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
+    let repo = git_repo(root);
+    let commit_count = count_table(conn, "git_commits")?;
+    let file_change_count = count_table(conn, "git_file_changes")?;
+    Ok(GitHistoryIndexStatus {
+        available: repo.is_some(),
+        head: repo.map(|repo| repo.head),
+        indexed_head: meta(conn, "git_history_indexed_head")?,
+        commit_count,
+        file_change_count,
+    })
+}
+
+pub fn commit_search(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<CommitSearchHit>> {
+    let fts_query = fts_query(query);
+    let mut stmt = conn.prepare(
+        "
+        SELECT git_commits.hash, git_commits.author_name, git_commits.author_email,
+               git_commits.authored_at_s, git_commits.committed_at_s,
+               git_commits.subject, git_commits.body, git_commits.changed_file_count,
+               bm25(commit_fts) AS score
+        FROM commit_fts
+        JOIN git_commits ON git_commits.rowid = commit_fts.rowid
+        WHERE commit_fts MATCH ?1
+        ORDER BY score, git_commits.authored_at_s DESC
+        LIMIT ?2
+        ",
+    )?;
+    let rows = stmt.query_map(params![fts_query, i64::from(limit)], |row| {
+        Ok(CommitSearchHit {
+            hash: row.get(0)?,
+            author_name: row.get(1)?,
+            author_email: row.get(2)?,
+            authored_at_s: row.get(3)?,
+            committed_at_s: row.get(4)?,
+            subject: row.get(5)?,
+            body: row.get(6)?,
+            changed_file_count: row.get(7)?,
+            score: row.get(8)?,
+            evidence_kind: "historical",
+        })
+    })?;
+    collect_rows(rows)
+}
+
+pub fn history_for_path(
+    conn: &Connection,
+    path: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<PathHistoryItem>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT git_commits.hash, git_file_changes.path, git_file_changes.additions,
+               git_file_changes.deletions, git_file_changes.change_kind,
+               git_commits.author_name, git_commits.authored_at_s, git_commits.subject
+        FROM git_file_changes
+        JOIN git_commits ON git_commits.hash = git_file_changes.commit_hash
+        WHERE git_file_changes.path = ?1
+        ORDER BY git_commits.authored_at_s DESC, git_commits.hash
+        LIMIT ?2
+        ",
+    )?;
+    let rows = stmt.query_map(params![path, i64::from(limit)], path_history_row)?;
+    collect_rows(rows)
+}
+
+pub fn commits_touching_query(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    current_hits: &[SearchHit],
+) -> anyhow::Result<Vec<QueryCommitHit>> {
+    let mut combined = BTreeMap::<String, QueryCommitHit>::new();
+    for (rank, hit) in commit_search(conn, query, limit)?.into_iter().enumerate() {
+        combined.insert(
+            hit.hash.clone(),
+            QueryCommitHit {
+                hash: hit.hash,
+                author_name: hit.author_name,
+                authored_at_s: hit.authored_at_s,
+                subject: hit.subject,
+                changed_file_count: hit.changed_file_count,
+                evidence: vec!["commit_message".to_string()],
+                score: rank as f64,
+                evidence_kind: "historical",
+            },
+        );
+    }
+
+    let mut paths = BTreeSet::new();
+    for hit in current_hits {
+        paths.insert(hit.path.as_str());
+    }
+    for path in paths {
+        for item in history_for_path(conn, path, limit)? {
+            let entry = combined.entry(item.hash.clone()).or_insert_with(|| QueryCommitHit {
+                hash: item.hash.clone(),
+                author_name: item.author_name.clone(),
+                authored_at_s: item.authored_at_s,
+                subject: item.subject.clone(),
+                changed_file_count: 0,
+                evidence: Vec::new(),
+                score: f64::from(limit),
+                evidence_kind: "historical",
+            });
+            if !entry.evidence.iter().any(|value| value == "file_change") {
+                entry.evidence.push("file_change".to_string());
+            }
+            entry.score -= 0.25;
+        }
+    }
+
+    let mut hits = combined.into_values().collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        left.score
+            .partial_cmp(&right.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.authored_at_s.cmp(&left.authored_at_s))
+    });
+    hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(hits)
+}
+
+pub fn cached_blame(
+    conn: &Connection,
+    chunk_id: i64,
+    source_text_hash: &str,
+) -> anyhow::Result<Option<ChunkBlameSummary>> {
+    conn.query_row(
+        "
+        SELECT chunk_id, path, start_line, end_line, source_text_hash, line_count,
+               dominant_commit, dominant_commit_lines, newest_commit, newest_commit_time_s,
+               oldest_commit, oldest_commit_time_s, commit_counts_json
+        FROM git_chunk_blame
+        WHERE chunk_id = ?1 AND source_text_hash = ?2
+        ",
+        params![chunk_id, source_text_hash],
+        blame_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn store_blame(conn: &Connection, summary: &ChunkBlameSummary) -> anyhow::Result<()> {
+    let counts = serde_json::to_string(&summary.commit_counts)?;
+    conn.execute(
+        "
+        INSERT INTO git_chunk_blame(
+            chunk_id, source_text_hash, path, start_line, end_line, line_count,
+            dominant_commit, dominant_commit_lines, newest_commit, newest_commit_time_s,
+            oldest_commit, oldest_commit_time_s, commit_counts_json, computed_at_ms
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ON CONFLICT(chunk_id) DO UPDATE SET
+            source_text_hash = excluded.source_text_hash,
+            path = excluded.path,
+            start_line = excluded.start_line,
+            end_line = excluded.end_line,
+            line_count = excluded.line_count,
+            dominant_commit = excluded.dominant_commit,
+            dominant_commit_lines = excluded.dominant_commit_lines,
+            newest_commit = excluded.newest_commit,
+            newest_commit_time_s = excluded.newest_commit_time_s,
+            oldest_commit = excluded.oldest_commit,
+            oldest_commit_time_s = excluded.oldest_commit_time_s,
+            commit_counts_json = excluded.commit_counts_json,
+            computed_at_ms = excluded.computed_at_ms
+        ",
+        params![
+            summary.chunk_id,
+            summary.source_text_hash,
+            summary.path,
+            summary.start_line,
+            summary.end_line,
+            summary.line_count,
+            summary.dominant_commit,
+            summary.dominant_commit_lines,
+            summary.newest_commit,
+            summary.newest_commit_time_s,
+            summary.oldest_commit,
+            summary.oldest_commit_time_s,
+            counts,
+            crate::index::now_ms(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn blame_lines(root: &Path, path: &str, start_line: i64, end_line: i64) -> Vec<BlameLine> {
+    let range = format!("{start_line},{end_line}");
+    let Some(output) = git_output(root, &["blame", "--line-porcelain", "-L", &range, "--", path])
+    else {
+        return Vec::new();
+    };
+    parse_blame(&output)
+}
+
+#[derive(Debug, Clone)]
+pub struct BlameLine {
+    pub commit: String,
+    pub author_time_s: Option<i64>,
+}
+
+pub fn source_text_hash(text: &str) -> String {
+    hex_sha256(text.as_bytes())
+}
+
+fn clear(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "
+        DELETE FROM commit_fts;
+        DELETE FROM git_chunk_blame;
+        DELETE FROM git_file_changes;
+        DELETE FROM git_commits;
+        DELETE FROM index_meta WHERE key = 'git_history_indexed_head';
+        ",
+    )?;
+    Ok(())
+}
+
+fn read_commits(root: &Path) -> anyhow::Result<Vec<CommitRecord>> {
+    let Some(output) = git_output(
+        root,
+        &["log", "--format=format:%H%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1f%B%x1e", "--", "."],
+    ) else {
+        return Ok(Vec::new());
+    };
+    let mut commits = Vec::new();
+    for record in output.split('\x1e') {
+        let record = record.trim();
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.splitn(7, '\x1f');
+        let Some(hash) = parts.next() else { continue };
+        let Some(author_name) = parts.next() else { continue };
+        let Some(author_email) = parts.next() else { continue };
+        let Some(authored_at_s) = parts.next() else { continue };
+        let Some(committed_at_s) = parts.next() else { continue };
+        let Some(subject) = parts.next() else { continue };
+        let body = parts.next().unwrap_or_default().trim().to_string();
+        commits.push(CommitRecord {
+            hash: hash.to_string(),
+            author_name: author_name.to_string(),
+            author_email: author_email.to_string(),
+            authored_at_s: authored_at_s.parse().unwrap_or(0),
+            committed_at_s: committed_at_s.parse().unwrap_or(0),
+            subject: subject.to_string(),
+            body,
+        });
+    }
+    Ok(commits)
+}
+
+fn read_file_changes(root: &Path, worktree_root: &Path) -> anyhow::Result<Vec<FileChange>> {
+    let Some(output) = git_output(root, &["log", "--numstat", "--format=format:%x1e%H", "--", "."])
+    else {
+        return Ok(Vec::new());
+    };
+    let mut changes = Vec::new();
+    for record in output.split('\x1e') {
+        let mut lines = record.lines().filter(|line| !line.trim().is_empty());
+        let Some(hash) = lines.next().map(str::trim).filter(|line| !line.is_empty()) else {
+            continue;
+        };
+        for line in lines {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() < 3 {
+                continue;
+            }
+            let Some(path) = normalize_git_path(root, worktree_root, fields[2]) else {
+                continue;
+            };
+            changes.push(FileChange {
+                commit_hash: hash.to_string(),
+                path,
+                additions: parse_numstat_count(fields[0]),
+                deletions: parse_numstat_count(fields[1]),
+                change_kind: "modified".to_string(),
+            });
+        }
+    }
+    Ok(changes)
+}
+
+fn normalize_git_path(root: &Path, worktree_root: &Path, path: &str) -> Option<String> {
+    let path = normalize_rename_path(path);
+    let path = Path::new(path);
+    if let Ok(relative) = worktree_root.join(path).strip_prefix(root) {
+        return Some(path_string(relative));
+    }
+    if root.join(path).exists() || !path.is_absolute() {
+        return Some(path_string(path));
+    }
+    None
+}
+
+fn normalize_rename_path(path: &str) -> &str {
+    path.rsplit(" => ").next().unwrap_or(path).trim_matches('{').trim_matches('}')
+}
+
+fn parse_numstat_count(value: &str) -> Option<i64> {
+    (value != "-").then(|| value.parse::<i64>().ok()).flatten()
+}
+
+fn parse_blame(output: &str) -> Vec<BlameLine> {
+    let mut lines = Vec::new();
+    let mut current_commit = None::<String>;
+    let mut current_time = None::<i64>;
+    for line in output.lines() {
+        if let Some((hash, _rest)) = line.split_once(' ') {
+            if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                current_commit = Some(hash.to_string());
+                current_time = None;
+                continue;
+            }
+        }
+        if let Some(value) = line.strip_prefix("author-time ") {
+            current_time = value.parse().ok();
+            continue;
+        }
+        if line.starts_with('\t') {
+            if let Some(commit) = current_commit.clone() {
+                lines.push(BlameLine { commit, author_time_s: current_time });
+            }
+        }
+    }
+    lines
+}
+
+fn path_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PathHistoryItem> {
+    Ok(PathHistoryItem {
+        hash: row.get(0)?,
+        path: row.get(1)?,
+        additions: row.get(2)?,
+        deletions: row.get(3)?,
+        change_kind: row.get(4)?,
+        author_name: row.get(5)?,
+        authored_at_s: row.get(6)?,
+        subject: row.get(7)?,
+        evidence_kind: "historical",
+    })
+}
+
+fn blame_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkBlameSummary> {
+    let counts_json: String = row.get(12)?;
+    let commit_counts = serde_json::from_str(&counts_json).unwrap_or_default();
+    Ok(ChunkBlameSummary {
+        chunk_id: row.get(0)?,
+        path: row.get(1)?,
+        start_line: row.get(2)?,
+        end_line: row.get(3)?,
+        source_text_hash: row.get(4)?,
+        line_count: row.get(5)?,
+        dominant_commit: row.get(6)?,
+        dominant_commit_lines: row.get(7)?,
+        newest_commit: row.get(8)?,
+        newest_commit_time_s: row.get(9)?,
+        oldest_commit: row.get(10)?,
+        oldest_commit_time_s: row.get(11)?,
+        commit_counts,
+        evidence_kind: "historical",
+    })
+}
+
+fn collect_rows<T>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
+) -> anyhow::Result<Vec<T>> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
+    let count =
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get::<_, i64>(0))?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+fn git_repo(root: &Path) -> Option<GitRepo> {
+    let worktree_root = git_output(root, &["rev-parse", "--show-toplevel"])?;
+    let head = git_output(root, &["rev-parse", "HEAD"])?;
+    Some(GitRepo { worktree_root: PathBuf::from(worktree_root), head })
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn fts_query(query: &str) -> String {
+    let terms = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if terms.is_empty() { "\"\"".to_string() } else { terms.join(" OR ") }
+}
+
+fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()?)
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let hash = Sha256::digest(bytes);
+    let mut out = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}

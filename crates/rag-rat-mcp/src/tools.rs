@@ -13,6 +13,11 @@ pub const TOOL_NAMES: &[&str] = &[
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
+    "commit_search",
+    "git_history_for_path",
+    "git_history_for_symbol",
+    "commits_touching_query",
+    "git_blame_chunk",
     "index_status",
 ];
 
@@ -55,6 +60,18 @@ pub struct LimitArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadChunkArgs {
+    pub chunk_id: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PathHistoryArgs {
+    pub path: String,
+    #[serde(default = "default_graph_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct BlameChunkArgs {
     pub chunk_id: i64,
 }
 
@@ -109,6 +126,30 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
             json!(db.read_chunk(args.chunk_id)?)
         },
+        "commit_search" => {
+            let args: SearchArgs = serde_json::from_value(arguments)?;
+            json!(db.commit_search(&args.query, args.limit)?)
+        },
+        "git_history_for_path" => {
+            let args: PathHistoryArgs = serde_json::from_value(arguments)?;
+            json!(db.git_history_for_path(&args.path, args.limit)?)
+        },
+        "git_history_for_symbol" => {
+            let args: SymbolArgs = serde_json::from_value(arguments)?;
+            json!(db.git_history_for_symbol(
+                &args.symbol,
+                optional_language(args.language)?,
+                args.limit
+            )?)
+        },
+        "commits_touching_query" => {
+            let args: SearchArgs = serde_json::from_value(arguments)?;
+            json!(db.commits_touching_query(&args.query, args.limit)?)
+        },
+        "git_blame_chunk" => {
+            let args: BlameChunkArgs = serde_json::from_value(arguments)?;
+            json!(db.git_blame_chunk(args.chunk_id)?)
+        },
         "index_status" => json!(db.status(database)?),
         other => anyhow::bail!("unknown tool `{other}`"),
     };
@@ -127,6 +168,15 @@ pub fn description(name: &str) -> &'static str {
         "ffi_surface" => "Find UniFFI/export/generated-binding/call-site candidates.",
         "docs_for_symbol" => "Find docs chunks related to a symbol.",
         "read_chunk" => "Read current text for one selected chunk ID with anchor validation.",
+        "commit_search" => "Search historical git commit subjects and bodies.",
+        "git_history_for_path" => "Return historical commits that touched one current path.",
+        "git_history_for_symbol" => {
+            "Resolve a current symbol, then return historical commits touching its path."
+        },
+        "commits_touching_query" => {
+            "Combine commit-message and current file-change evidence for a query."
+        },
+        "git_blame_chunk" => "Compute lazy hash-bound git blame summary for one current chunk.",
         "index_status" => {
             "Report SQLite index freshness, git metadata, parser failures, and file counts."
         },
@@ -175,6 +225,36 @@ pub fn schema(name: &str) -> Value {
             "properties": {"limit": {"type": "integer", "default": 50}}
         }),
         "read_chunk" => json!({
+            "type": "object",
+            "properties": {"chunk_id": {"type": "integer"}},
+            "required": ["chunk_id"]
+        }),
+        "commit_search" | "commits_touching_query" => json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 10}
+            },
+            "required": ["query"]
+        }),
+        "git_history_for_path" => json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": "integer", "default": 50}
+            },
+            "required": ["path"]
+        }),
+        "git_history_for_symbol" => json!({
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "language": {"type": "string"},
+                "limit": {"type": "integer", "default": 20}
+            },
+            "required": ["symbol"]
+        }),
+        "git_blame_chunk" => json!({
             "type": "object",
             "properties": {"chunk_id": {"type": "integer"}},
             "required": ["chunk_id"]

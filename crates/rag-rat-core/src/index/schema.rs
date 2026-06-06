@@ -86,6 +86,45 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             message TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS git_commits(
+            hash TEXT PRIMARY KEY,
+            author_name TEXT NOT NULL,
+            author_email TEXT NOT NULL,
+            authored_at_s INTEGER NOT NULL,
+            committed_at_s INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT NOT NULL,
+            changed_file_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS git_file_changes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_hash TEXT NOT NULL,
+            path TEXT NOT NULL,
+            additions INTEGER,
+            deletions INTEGER,
+            change_kind TEXT NOT NULL DEFAULT 'modified',
+            FOREIGN KEY(commit_hash) REFERENCES git_commits(hash) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS git_chunk_blame(
+            chunk_id INTEGER PRIMARY KEY,
+            source_text_hash TEXT NOT NULL,
+            path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            line_count INTEGER NOT NULL,
+            dominant_commit TEXT,
+            dominant_commit_lines INTEGER NOT NULL DEFAULT 0,
+            newest_commit TEXT,
+            newest_commit_time_s INTEGER,
+            oldest_commit TEXT,
+            oldest_commit_time_s INTEGER,
+            commit_counts_json TEXT NOT NULL,
+            computed_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
             text,
             content='chunks',
@@ -93,10 +132,20 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             tokenize='porter'
         );
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS commit_fts USING fts5(
+            subject,
+            body,
+            content='git_commits',
+            content_rowid='rowid',
+            tokenize='porter'
+        );
+
         CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
+        CREATE INDEX IF NOT EXISTS idx_git_file_changes_commit ON git_file_changes(commit_hash);
         ",
     )?;
     migrate_files(conn)?;
@@ -110,6 +159,9 @@ pub fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
         DELETE FROM chunk_fts;
         INSERT INTO chunk_fts(rowid, text)
         SELECT id, text FROM chunks;
+        DELETE FROM commit_fts;
+        INSERT INTO commit_fts(rowid, subject, body)
+        SELECT rowid, subject, body FROM git_commits;
         ",
     )?;
     Ok(())

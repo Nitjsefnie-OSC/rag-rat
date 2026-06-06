@@ -1,6 +1,7 @@
 pub mod anchors;
 pub mod chunker;
 pub mod edges;
+pub mod git_history;
 pub mod parser;
 pub mod schema;
 pub mod symbols;
@@ -33,6 +34,10 @@ use crate::{
     index::{
         anchors::{AnchorStatus, ChunkAnchor},
         chunker::Chunk,
+        git_history::{
+            ChunkBlameSummary, CommitSearchHit, GitHistoryIndexStatus, PathHistoryItem,
+            QueryCommitHit, SymbolHistoryItem,
+        },
         symbols::Symbol,
     },
     language::Language,
@@ -84,6 +89,7 @@ pub struct IndexStatus {
     pub file_count_by_language: BTreeMap<String, u64>,
     pub parser_failures: u64,
     pub parser_failure_paths: Vec<ParserFailure>,
+    pub git_history: GitHistoryIndexStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +138,7 @@ impl IndexDatabase {
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
+            db.index_git_history(&config.root)?;
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
@@ -165,6 +172,7 @@ impl IndexDatabase {
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
+            db.index_git_history(&config.root)?;
             let indexed = db.index_changed_files_with_progress(config, &mut progress)?;
             if indexed > 0 {
                 db.sync_fts()?;
@@ -313,6 +321,7 @@ impl IndexDatabase {
             file_count_by_language: counts,
             parser_failures: self.parser_failure_count()?,
             parser_failure_paths: self.parser_failure_paths()?,
+            git_history: self.git_history_status()?,
         })
     }
 
@@ -395,6 +404,123 @@ impl IndexDatabase {
 
     pub fn docs_for_symbol(&self, symbol: &str, limit: u32) -> anyhow::Result<Vec<SearchHit>> {
         self.search(symbol, limit, true)
+    }
+
+    pub fn commit_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<CommitSearchHit>> {
+        git_history::commit_search(self.storage.connection(), query, limit)
+    }
+
+    pub fn git_history_for_path(
+        &self,
+        path: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<PathHistoryItem>> {
+        git_history::history_for_path(self.storage.connection(), path, limit)
+    }
+
+    pub fn git_history_for_symbol(
+        &self,
+        symbol: &str,
+        language: Option<Language>,
+        limit: u32,
+    ) -> anyhow::Result<Vec<SymbolHistoryItem>> {
+        let symbols = self.symbols(symbol, language, limit)?;
+        let per_symbol_limit = limit.max(1);
+        let mut out = Vec::new();
+        for symbol_hit in symbols {
+            for commit in self.git_history_for_path(&symbol_hit.path, per_symbol_limit)? {
+                out.push(SymbolHistoryItem {
+                    symbol: symbol_hit.name.clone(),
+                    qualified_name: symbol_hit.qualified_name.clone(),
+                    path: symbol_hit.path.clone(),
+                    start_byte: symbol_hit.start_byte,
+                    end_byte: symbol_hit.end_byte,
+                    commit,
+                    evidence_kind: "historical",
+                });
+                if out.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn commits_touching_query(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<QueryCommitHit>> {
+        let current_hits = self.search(query, limit, true)?;
+        git_history::commits_touching_query(self.storage.connection(), query, limit, &current_hits)
+    }
+
+    pub fn git_blame_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<ChunkBlameSummary>> {
+        let Some(chunk) = self.read_chunk(chunk_id)? else {
+            return Ok(None);
+        };
+        let source_text_hash = git_history::source_text_hash(&chunk.text);
+        if let Some(cached) =
+            git_history::cached_blame(self.storage.connection(), chunk_id, &source_text_hash)?
+        {
+            return Ok(Some(cached));
+        }
+        let Some(root) = self.storage.source_root() else {
+            return Ok(Some(ChunkBlameSummary {
+                chunk_id,
+                path: chunk.path,
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                source_text_hash,
+                line_count: 0,
+                dominant_commit: None,
+                dominant_commit_lines: 0,
+                newest_commit: None,
+                newest_commit_time_s: None,
+                oldest_commit: None,
+                oldest_commit_time_s: None,
+                commit_counts: BTreeMap::new(),
+                evidence_kind: "historical",
+            }));
+        };
+        let blame_lines =
+            git_history::blame_lines(root, &chunk.path, chunk.start_line, chunk.end_line);
+        let mut counts = BTreeMap::<String, i64>::new();
+        let mut newest = None::<(String, i64)>;
+        let mut oldest = None::<(String, i64)>;
+        for line in &blame_lines {
+            *counts.entry(line.commit.clone()).or_default() += 1;
+            if let Some(time) = line.author_time_s {
+                if newest.as_ref().is_none_or(|(_, newest_time)| time > *newest_time) {
+                    newest = Some((line.commit.clone(), time));
+                }
+                if oldest.as_ref().is_none_or(|(_, oldest_time)| time < *oldest_time) {
+                    oldest = Some((line.commit.clone(), time));
+                }
+            }
+        }
+        let dominant = counts
+            .iter()
+            .max_by_key(|(commit, count)| (*count, *commit))
+            .map(|(commit, count)| (commit.clone(), *count));
+        let summary = ChunkBlameSummary {
+            chunk_id,
+            path: chunk.path,
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+            source_text_hash,
+            line_count: i64::try_from(blame_lines.len()).unwrap_or(i64::MAX),
+            dominant_commit: dominant.as_ref().map(|(commit, _)| commit.clone()),
+            dominant_commit_lines: dominant.map(|(_, count)| count).unwrap_or(0),
+            newest_commit: newest.as_ref().map(|(commit, _)| commit.clone()),
+            newest_commit_time_s: newest.as_ref().map(|(_, time)| *time),
+            oldest_commit: oldest.as_ref().map(|(commit, _)| commit.clone()),
+            oldest_commit_time_s: oldest.as_ref().map(|(_, time)| *time),
+            commit_counts: counts,
+            evidence_kind: "historical",
+        };
+        git_history::store_blame(self.storage.connection(), &summary)?;
+        Ok(Some(summary))
     }
 
     pub fn ffi_surface(&self, limit: u32) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
@@ -589,6 +715,17 @@ impl IndexDatabase {
         let dirty = !git_output(root, &["status", "--porcelain"]).unwrap_or_default().is_empty();
         self.set_meta("git_dirty", if dirty { "true" } else { "false" })?;
         Ok(())
+    }
+
+    fn index_git_history(&self, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
+        git_history::index(self.storage.connection(), root)
+    }
+
+    fn git_history_status(&self) -> anyhow::Result<GitHistoryIndexStatus> {
+        let Some(root) = self.storage.source_root() else {
+            return git_history::status(self.storage.connection(), Path::new("."));
+        };
+        git_history::status(self.storage.connection(), root)
     }
 
     fn mark_fts_dirty(&self) -> anyhow::Result<()> {
@@ -1062,6 +1199,10 @@ mod schema_bootstrap_tests {
         assert_eq!(table_count(&db, "parser_failures"), 1);
         assert_eq!(table_count(&db, "index_meta"), 1);
         assert_eq!(table_count(&db, "chunk_fts"), 1);
+        assert_eq!(table_count(&db, "git_commits"), 1);
+        assert_eq!(table_count(&db, "git_file_changes"), 1);
+        assert_eq!(table_count(&db, "git_chunk_blame"), 1);
+        assert_eq!(table_count(&db, "commit_fts"), 1);
         assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
         assert_eq!(indexed_revision_count(&db), 0);
         assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
@@ -1087,8 +1228,95 @@ mod schema_bootstrap_tests {
         );
         assert!(!status.fts_dirty);
         assert!(status.fts_fresh);
+        assert!(!status.git_history.available);
+        assert_eq!(status.git_history.commit_count, 0);
         assert_eq!(indexed_revision_count(&db), 1);
         assert_eq!(chunk_source_revision_count(&db), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_history_indexes_commits_paths_queries_and_blame() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.name", "Rag Rat"]);
+        run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+        fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn tracked_symbol() {}\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "Add alpha docs"]);
+
+        fs::write(root.join("docs/search.md"), "# Title\nbeta token\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "Refresh beta docs"]);
+
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![
+                ResolvedTarget {
+                    name: "markdown".to_string(),
+                    language: Language::Markdown,
+                    directories: vec![PathBuf::from("docs")],
+                    include: vec!["**/*.md".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Docs,
+                },
+                ResolvedTarget {
+                    name: "rust".to_string(),
+                    language: Language::Rust,
+                    directories: vec![PathBuf::from("src")],
+                    include: vec!["**/*.rs".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Source,
+                },
+            ],
+        };
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let status = db.status(&config.database).unwrap();
+        assert!(status.git_history.available);
+        assert!(status.git_history.head.is_some());
+        assert_eq!(status.git_history.indexed_head, status.git_history.head);
+        assert_eq!(status.git_history.commit_count, 2);
+        assert_eq!(status.git_history.file_change_count, 3);
+
+        let commit_hits = db.commit_search("beta", 10).unwrap();
+        assert_eq!(commit_hits.len(), 1);
+        assert_eq!(commit_hits[0].subject, "Refresh beta docs");
+        assert_eq!(commit_hits[0].evidence_kind, "historical");
+
+        let path_history = db.git_history_for_path("docs/search.md", 10).unwrap();
+        assert_eq!(path_history.len(), 2);
+        assert!(path_history.iter().all(|item| item.evidence_kind == "historical"));
+
+        let symbol_history =
+            db.git_history_for_symbol("tracked_symbol", Some(Language::Rust), 10).unwrap();
+        assert_eq!(symbol_history.len(), 1);
+        assert_eq!(symbol_history[0].path, "src/lib.rs");
+        assert_eq!(symbol_history[0].evidence_kind, "historical");
+
+        let query_commits = db.commits_touching_query("beta", 10).unwrap();
+        let beta_commit =
+            query_commits.iter().find(|hit| hit.subject == "Refresh beta docs").unwrap();
+        assert!(beta_commit.evidence.iter().any(|value| value == "commit_message"));
+        assert!(beta_commit.evidence.iter().any(|value| value == "file_change"));
+        assert_eq!(beta_commit.evidence_kind, "historical");
+
+        let chunk_id = first_chunk_id(&db);
+        let blame = db.git_blame_chunk(chunk_id).unwrap().unwrap();
+        assert_eq!(blame.source_text_hash, hex_sha256("# Title\nbeta token\n".as_bytes()));
+        assert_eq!(blame.line_count, 2);
+        assert_eq!(blame.commit_counts.values().sum::<i64>(), 2);
+        assert!(blame.dominant_commit_lines >= 1);
+        assert!(blame.dominant_commit.is_some());
+        assert_eq!(blame.evidence_kind, "historical");
+        let cached = db.git_blame_chunk(chunk_id).unwrap().unwrap();
+        assert_eq!(cached.source_text_hash, blame.source_text_hash);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1330,5 +1558,16 @@ mod schema_bootstrap_tests {
             .connection()
             .query_row("SELECT id FROM chunks ORDER BY id LIMIT 1", [], |row| row.get(0))
             .unwrap()
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git").args(args).current_dir(root).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

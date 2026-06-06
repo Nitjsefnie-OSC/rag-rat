@@ -10,7 +10,8 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::tools::{
-    EmptyArgs, ImpactArgs, LimitArgs, ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    BlameChunkArgs, EmptyArgs, ImpactArgs, LimitArgs, PathHistoryArgs, ReadChunkArgs, SearchArgs,
+    SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -117,6 +118,61 @@ impl RagRatService {
         Parameters(args): Parameters<ReadChunkArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("read_chunk", json!(args))
+    }
+
+    #[tool(
+        name = "commit_search",
+        description = "Search historical git commit subjects and bodies."
+    )]
+    fn commit_search(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("commit_search", json!(args))
+    }
+
+    #[tool(
+        name = "git_history_for_path",
+        description = "Return historical commits that touched one current path."
+    )]
+    fn git_history_for_path(
+        &self,
+        Parameters(args): Parameters<PathHistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("git_history_for_path", json!(args))
+    }
+
+    #[tool(
+        name = "git_history_for_symbol",
+        description = "Resolve a current symbol, then return historical commits touching its path."
+    )]
+    fn git_history_for_symbol(
+        &self,
+        Parameters(args): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("git_history_for_symbol", json!(args))
+    }
+
+    #[tool(
+        name = "commits_touching_query",
+        description = "Combine commit-message and current file-change evidence for a query."
+    )]
+    fn commits_touching_query(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("commits_touching_query", json!(args))
+    }
+
+    #[tool(
+        name = "git_blame_chunk",
+        description = "Compute lazy hash-bound git blame summary for one current chunk."
+    )]
+    fn git_blame_chunk(
+        &self,
+        Parameters(args): Parameters<BlameChunkArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("git_blame_chunk", json!(args))
     }
 
     #[tool(
