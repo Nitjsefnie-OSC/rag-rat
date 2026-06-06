@@ -23,6 +23,7 @@
 - `github_issue_search`: `{ "query": string, "limit"?: number }`
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
 - `rationale_search`: `{ "query": string, "limit"?: number }`
+- `local_ai_status`: `{}`
 - `index_status`: `{}`
 
 Search tools return chunk IDs, paths, line spans, short summaries, and scores. Search and `read_chunk` validate stored chunk anchors against current source before returning context; stale files are reindexed once per tool call and their SQLite FTS5 rows are updated before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.
@@ -55,6 +56,14 @@ as historical GitHub evidence and classified as `decision`, `rejected_alternativ
 
 `index_status.github` reports cached refs, issues, comments, pulls, reviews, review comments,
 last sync time, and whether the `gh` CLI capability is available.
+
+Local AI artifacts are explicit and current-only. MCP query paths never install or download models.
+`local_ai_status` reports model capability state, artifact counts, and whether embeddings or summaries
+are ready, missing, stale, blocked, disabled, or failed. The CLI-only `models install <model-id>`
+command records explicit local model availability, and `reconcile` writes embeddings and summaries for
+current chunk hashes only. Hybrid search degrades to lexical/structural evidence when a model is
+missing or an artifact hash does not match the current chunk text; stale summaries and embeddings are
+treated as absent.
 
 Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
 message for each failed source parse. Markdown files are chunked by headings instead of parsed with

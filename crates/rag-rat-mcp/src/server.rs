@@ -236,6 +236,17 @@ impl RagRatService {
     }
 
     #[tool(
+        name = "local_ai_status",
+        description = "Report explicit local AI capability and artifact status."
+    )]
+    fn local_ai_status(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("local_ai_status", json!({}))
+    }
+
+    #[tool(
         name = "index_status",
         description = "Report SQLite index freshness, git metadata, parser failures, and file counts."
     )]

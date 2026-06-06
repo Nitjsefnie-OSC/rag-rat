@@ -18,6 +18,10 @@ GitHub papertrail data is fetched only by explicit `github sync` commands throug
 search, papertrail, and rationale tools read the local SQLite cache only. Cached issues, PRs,
 comments, reviews, and review comments are indexed as historical GitHub evidence.
 
+Local AI artifacts are also explicit. Query paths never download models. `models install` records
+model availability, and `reconcile` writes hash-bound embeddings and summaries only for current
+chunks. Stale AI artifacts are treated as absent.
+
 ## Commands
 
 ```bash
@@ -27,6 +31,9 @@ cargo run --bin rag-rat -- doctor --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --from-refs --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42 --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --from-refs --offline --config rag-rat.toml
+cargo run --bin rag-rat -- models list --config rag-rat.toml
+cargo run --bin rag-rat -- models install embedding-small --config rag-rat.toml
+cargo run --bin rag-rat -- reconcile --limit 100 --config rag-rat.toml
 cargo run --bin rag-rat -- query --config rag-rat.toml "semantic recall"
 cargo run --bin rag-rat -- mcp --config rag-rat.toml
 ```

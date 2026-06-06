@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod anchors;
 pub mod chunker;
 pub mod edges;
@@ -33,6 +34,7 @@ use thiserror::Error;
 use crate::{
     config::{Config, TargetKind},
     index::{
+        ai::{LocalAiStatus, ModelInfo, ReconcileReport},
         anchors::{AnchorStatus, ChunkAnchor},
         chunker::Chunk,
         git_history::{
@@ -93,6 +95,7 @@ pub struct IndexStatus {
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
     pub github: GitHubStatus,
+    pub local_ai: LocalAiStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +121,7 @@ impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let mut storage = IndexConnection::open(path)?;
         schema::apply(storage.connection())?;
+        ai::ensure_model_manifest(storage.connection())?;
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
@@ -326,6 +330,7 @@ impl IndexDatabase {
             parser_failure_paths: self.parser_failure_paths()?,
             git_history: self.git_history_status()?,
             github: self.github_status()?,
+            local_ai: self.local_ai_status()?,
         })
     }
 
@@ -611,6 +616,22 @@ impl IndexDatabase {
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
         github::papertrail_for_commit(self.storage.connection(), commit_hash, limit)
+    }
+
+    pub fn local_ai_status(&self) -> anyhow::Result<LocalAiStatus> {
+        ai::status(self.storage.connection())
+    }
+
+    pub fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        ai::models(self.storage.connection())
+    }
+
+    pub fn install_model(&self, model_id: &str) -> anyhow::Result<ModelInfo> {
+        ai::install_model(self.storage.connection(), model_id)
+    }
+
+    pub fn reconcile(&self, limit: Option<u32>) -> anyhow::Result<ReconcileReport> {
+        ai::reconcile(self.storage.connection(), limit)
     }
 
     pub fn ffi_surface(&self, limit: u32) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
@@ -1297,6 +1318,10 @@ mod schema_bootstrap_tests {
         assert_eq!(table_count(&db, "git_file_changes"), 1);
         assert_eq!(table_count(&db, "git_chunk_blame"), 1);
         assert_eq!(table_count(&db, "commit_fts"), 1);
+        assert_eq!(table_count(&db, "ai_models"), 1);
+        assert_eq!(table_count(&db, "chunk_embeddings"), 1);
+        assert_eq!(table_count(&db, "chunk_summaries"), 1);
+        assert_eq!(table_count(&db, "reconcile_attempts"), 1);
         assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
         assert_eq!(indexed_revision_count(&db), 0);
         assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
@@ -1324,8 +1349,72 @@ mod schema_bootstrap_tests {
         assert!(status.fts_fresh);
         assert!(!status.git_history.available);
         assert_eq!(status.git_history.commit_count, 0);
+        assert_eq!(status.local_ai.embedding.state, "MissingModel");
+        assert_eq!(status.local_ai.summary.state, "Ready");
         assert_eq!(indexed_revision_count(&db), 1);
         assert_eq!(chunk_source_revision_count(&db), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
+        let (root, config) = markdown_config("alpha token\nsecond line\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let chunk_id = first_chunk_id(&db);
+
+        let models = db.list_models().unwrap();
+        let embedding = models.iter().find(|model| model.model_id == "embedding-small").unwrap();
+        assert!(!embedding.installed);
+        assert_eq!(embedding.status, "MissingModel");
+
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO chunk_summaries(chunk_id, model_id, source_text_hash, summary, status, created_at_ms)
+                 VALUES (?1, 'summary-basic', 'stale-hash', 'WRONG STALE SUMMARY', 'Current', ?2)",
+                params![chunk_id, now_ms()],
+            )
+            .unwrap();
+        let hits = db.search("alpha", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!hits[0].summary.contains("WRONG STALE SUMMARY"));
+
+        let blocked = db.reconcile(Some(1)).unwrap();
+        assert_eq!(blocked.processed_chunks, 1);
+        assert_eq!(blocked.embeddings_written, 0);
+        assert_eq!(blocked.summaries_written, 1);
+        assert_eq!(blocked.blocked_chunks, 1);
+        assert_eq!(blocked.status, "Blocked");
+
+        let status = db.local_ai_status().unwrap();
+        assert_eq!(status.embedding.state, "MissingModel");
+        assert_eq!(status.embedding.blocked_artifacts, 1);
+        assert_eq!(status.summary.current_artifacts, 1);
+
+        db.install_model("embedding-small").unwrap();
+        let current = db.reconcile(Some(1)).unwrap();
+        assert_eq!(current.embeddings_written, 1);
+        assert_eq!(current.summaries_written, 1);
+        assert_eq!(current.status, "Current");
+        let status = db.local_ai_status().unwrap();
+        assert_eq!(status.embedding.state, "Ready");
+        assert_eq!(status.embedding.current_artifacts, 1);
+
+        let hits = db.search("alpha", 10, false).unwrap();
+        assert_eq!(hits[0].summary, "alpha token\nsecond line");
+
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE chunk_summaries SET source_text_hash = 'old-hash', summary = 'STALE AFTER HASH CHANGE' WHERE chunk_id = ?1",
+                [chunk_id],
+            )
+            .unwrap();
+        let stale_status = db.local_ai_status().unwrap();
+        assert_eq!(stale_status.summary.stale_artifacts, 1);
+        let hits = db.search("alpha", 10, false).unwrap();
+        assert!(!hits[0].summary.contains("STALE AFTER HASH CHANGE"));
 
         fs::remove_dir_all(root).unwrap();
     }

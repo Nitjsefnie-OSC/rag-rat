@@ -71,19 +71,60 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             heading_path TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS embeddings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chunk_id INTEGER NOT NULL,
-            model_id TEXT NOT NULL,
-            vector_blob BLOB NOT NULL,
-            text_hash TEXT NOT NULL
-        );
-
         CREATE TABLE IF NOT EXISTS parser_failures(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL,
             language TEXT NOT NULL,
             message TEXT NOT NULL
+        );
+
+        DROP TABLE IF EXISTS embeddings;
+
+        CREATE TABLE IF NOT EXISTS ai_models(
+            model_id TEXT PRIMARY KEY,
+            capability TEXT NOT NULL,
+            installed INTEGER NOT NULL DEFAULT 0,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'MissingModel',
+            installed_at_ms INTEGER,
+            last_error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS chunk_embeddings(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            source_text_hash TEXT NOT NULL,
+            vector_blob BLOB NOT NULL,
+            status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            last_error TEXT,
+            UNIQUE(chunk_id, model_id),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS chunk_summaries(
+            chunk_id INTEGER PRIMARY KEY,
+            model_id TEXT NOT NULL,
+            source_text_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            last_error TEXT,
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS reconcile_attempts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at_ms INTEGER NOT NULL,
+            finished_at_ms INTEGER,
+            limit_count INTEGER,
+            processed_chunks INTEGER NOT NULL DEFAULT 0,
+            embeddings_written INTEGER NOT NULL DEFAULT 0,
+            summaries_written INTEGER NOT NULL DEFAULT 0,
+            blocked_chunks INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            message TEXT
         );
 
         CREATE TABLE IF NOT EXISTS git_commits(

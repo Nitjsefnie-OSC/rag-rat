@@ -26,10 +26,16 @@ pub fn search(
         "
         SELECT chunks.id, files.path, files.language, files.kind,
                chunks.start_line, chunks.end_line, chunks.symbol_path,
-               bm25(chunk_fts) AS score, chunks.text
+               bm25(chunk_fts) AS score,
+               COALESCE(current_summaries.summary, chunks.text) AS summary_text,
+               chunks.text
         FROM chunk_fts
         JOIN chunks ON chunks.id = chunk_fts.rowid
         JOIN files ON files.id = chunks.file_id
+        LEFT JOIN chunk_summaries AS current_summaries
+          ON current_summaries.chunk_id = chunks.id
+         AND current_summaries.source_text_hash = chunks.text_hash
+         AND current_summaries.status = 'Current'
         WHERE chunk_fts MATCH ?1
           AND {generated_filter}
         ORDER BY score
@@ -38,7 +44,8 @@ pub fn search(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![fts_query, i64::from(limit)], |row| {
-        let text: String = row.get(8)?;
+        let summary_text: String = row.get(8)?;
+        let text: String = row.get(9)?;
         Ok(SearchHit {
             chunk_id: row.get(0)?,
             path: row.get(1)?,
@@ -48,7 +55,7 @@ pub fn search(
             end_line: row.get(5)?,
             symbol_path: row.get(6)?,
             score: row.get(7)?,
-            summary: snippet(&text, query),
+            summary: snippet(&summary_text, query).if_empty_then(|| snippet(&text, query)),
         })
     })?;
 
@@ -57,6 +64,16 @@ pub fn search(
         hits.push(row?);
     }
     Ok(hits)
+}
+
+trait IfEmpty {
+    fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String;
+}
+
+impl IfEmpty for String {
+    fn if_empty_then(self, fallback: impl FnOnce() -> String) -> String {
+        if self.is_empty() { fallback() } else { self }
+    }
 }
 
 fn fts_query(query: &str) -> String {

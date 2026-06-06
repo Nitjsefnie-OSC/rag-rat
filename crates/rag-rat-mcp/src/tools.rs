@@ -24,6 +24,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "github_issue_search",
     "github_refs_for_path",
     "rationale_search",
+    "local_ai_status",
     "index_status",
 ];
 
@@ -198,6 +199,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
             let args: SearchArgs = serde_json::from_value(arguments)?;
             json!(db.rationale_search(&args.query, args.limit)?)
         },
+        "local_ai_status" => json!(db.local_ai_status()?),
         "index_status" => json!(db.status(database)?),
         other => anyhow::bail!("unknown tool `{other}`"),
     };
@@ -231,6 +233,7 @@ pub fn description(name: &str) -> &'static str {
         "github_issue_search" => "Search cached GitHub issue and PR text.",
         "github_refs_for_path" => "List discovered GitHub references for one current path.",
         "rationale_search" => "Search cached GitHub rationale snippets.",
+        "local_ai_status" => "Report explicit local AI capability and artifact status.",
         "index_status" => {
             "Report SQLite index freshness, git metadata, parser failures, and file counts."
         },
@@ -354,6 +357,7 @@ pub fn schema(name: &str) -> Value {
             },
             "required": ["path"]
         }),
+        "local_ai_status" => json!({"type": "object", "properties": {}}),
         "index_status" => json!({"type": "object", "properties": {}}),
         _ => json!({"type": "object"}),
     }

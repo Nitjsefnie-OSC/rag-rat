@@ -38,6 +38,12 @@ async fn main() -> anyhow::Result<()> {
         "github" => {
             github(&config, &args)?;
         },
+        "models" => {
+            models(&config, &args)?;
+        },
+        "reconcile" => {
+            reconcile(&config, &args)?;
+        },
         "dump-config" => {
             let targets = config
                 .targets
@@ -66,6 +72,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
+    let db = IndexDatabase::open(&config.database)?;
+    match args.get(1).map(String::as_str) {
+        Some("list") | None => print_json(&db.list_models()?),
+        Some("install") => {
+            let Some(model_id) = args.get(2) else {
+                anyhow::bail!("models install needs a model id");
+            };
+            print_json(&db.install_model(model_id)?)
+        },
+        Some(other) => anyhow::bail!("unknown models subcommand `{other}`"),
+    }
+}
+
+fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
+    let db = IndexDatabase::open(&config.database)?;
+    let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
+    print_json(&db.reconcile(limit)?)
 }
 
 fn doctor(config: &Config) -> anyhow::Result<()> {
@@ -149,11 +175,14 @@ fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <index|doctor|query|mcp|github|dump-config> --config <path> [query]\n\
+        "usage: rag-rat <index|doctor|query|mcp|github|models|reconcile|dump-config> --config <path> [query]\n\
          examples:\n\
          rag-rat index --config rag-rat.toml\n\
          rag-rat index --full --config rag-rat.toml\n\
          rag-rat github sync --from-refs --config rag-rat.toml\n\
+         rag-rat models list --config rag-rat.toml\n\
+         rag-rat models install embedding-small --config rag-rat.toml\n\
+         rag-rat reconcile --limit 100 --config rag-rat.toml\n\
          rag-rat query --config rag-rat.toml \"semantic recall\""
     );
 }
@@ -174,7 +203,7 @@ fn positional_after_options(args: &[String]) -> Option<String> {
             skip_next = false;
             continue;
         }
-        if arg == "--config" || arg == "--issue" {
+        if arg == "--config" || arg == "--issue" || arg == "--limit" {
             skip_next = true;
             continue;
         }
