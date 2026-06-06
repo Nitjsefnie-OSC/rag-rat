@@ -19,3 +19,7 @@ Search tools return chunk IDs, paths, line spans, short summaries, and scores. S
 `index_status` reports `content_revision`, `fts_source_revision`, `fts_dirty`, and `fts_fresh`.
 Search tools synchronize dirty or stale SQLite FTS state before querying so results are not served
 from an outdated FTS table.
+
+Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
+message for each failed source parse. Markdown files are chunked by headings instead of parsed with
+tree-sitter.

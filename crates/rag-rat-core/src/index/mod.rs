@@ -82,6 +82,14 @@ pub struct IndexStatus {
     pub fts_fresh: bool,
     pub file_count_by_language: BTreeMap<String, u64>,
     pub parser_failures: u64,
+    pub parser_failure_paths: Vec<ParserFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ParserFailure {
+    pub path: String,
+    pub language: String,
+    pub message: String,
 }
 
 impl IndexDatabase {
@@ -289,6 +297,7 @@ impl IndexDatabase {
             fts_source_revision,
             file_count_by_language: counts,
             parser_failures: self.parser_failure_count()?,
+            parser_failure_paths: self.parser_failure_paths()?,
         })
     }
 
@@ -583,6 +592,20 @@ impl IndexDatabase {
             |row| row.get::<_, i64>(0),
         )?;
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    fn parser_failure_paths(&self) -> anyhow::Result<Vec<ParserFailure>> {
+        let mut stmt = self.storage.connection().prepare(
+            "SELECT path, language, message FROM parser_failures ORDER BY path, language, message",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ParserFailure { path: row.get(0)?, language: row.get(1)?, message: row.get(2)? })
+        })?;
+        let mut failures = Vec::new();
+        for row in rows {
+            failures.push(row?);
+        }
+        Ok(failures)
     }
 
     fn search_with_heal(
@@ -1052,6 +1075,34 @@ mod schema_bootstrap_tests {
         let fresh = db.status(&config.database).unwrap();
         assert_eq!(fresh.fts_source_revision.as_deref(), Some(fresh.content_revision.as_str()));
         assert!(fresh.fts_fresh);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parser_failures_report_paths() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let src = root.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("broken.rs"), "pub fn broken(").unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+        };
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let status = db.status(&config.database).unwrap();
+        assert_eq!(status.parser_failures, 1);
+        assert_eq!(status.parser_failure_paths[0].path, "src/broken.rs");
 
         fs::remove_dir_all(root).unwrap();
     }

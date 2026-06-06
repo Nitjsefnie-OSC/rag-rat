@@ -17,23 +17,45 @@ pub struct ParsedSymbol {
     pub docs: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParserKind {
+    Rust,
+    TypeScript,
+    Tsx,
+    Kotlin,
+    Markdown,
+}
+
+pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
+    match language {
+        Language::Rust => ParserKind::Rust,
+        Language::TypeScript => {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("tsx") {
+                ParserKind::Tsx
+            } else {
+                ParserKind::TypeScript
+            }
+        },
+        Language::Kotlin => ParserKind::Kotlin,
+        Language::Markdown => ParserKind::Markdown,
+    }
+}
+
 pub fn parse_symbols(
     path: &Path,
     language: Language,
     text: &str,
 ) -> anyhow::Result<Vec<ParsedSymbol>> {
-    match language {
-        Language::Rust => parse_tree_sitter(path, language, text, tree_sitter_rust::language()),
-        Language::TypeScript => {
-            let grammar = if path.extension().and_then(|ext| ext.to_str()) == Some("tsx") {
-                tree_sitter_typescript::language_tsx()
-            } else {
-                tree_sitter_typescript::language_typescript()
-            };
-            parse_tree_sitter(path, language, text, grammar)
+    match parser_kind(path, language) {
+        ParserKind::Rust => parse_tree_sitter(path, language, text, tree_sitter_rust::language()),
+        ParserKind::TypeScript => {
+            parse_tree_sitter(path, language, text, tree_sitter_typescript::language_typescript())
         },
-        Language::Kotlin => parse_kotlin(path, text),
-        Language::Markdown => Ok(Vec::new()),
+        ParserKind::Tsx => {
+            parse_tree_sitter(path, language, text, tree_sitter_typescript::language_tsx())
+        },
+        ParserKind::Kotlin => parse_kotlin(path, text),
+        ParserKind::Markdown => Ok(Vec::new()),
     }
 }
 
@@ -115,6 +137,11 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             "enum_item" => Some(("enum", child_name(node)?)),
             "trait_item" => Some(("trait", child_name(node)?)),
             "impl_item" => Some(("impl", impl_name(node).unwrap_or(node))),
+            "mod_item" => Some(("module", child_name(node)?)),
+            "const_item" => Some(("const", child_name(node)?)),
+            "static_item" => Some(("static", child_name(node)?)),
+            "type_item" => Some(("type", child_name(node)?)),
+            "macro_definition" => Some(("macro", child_name(node)?)),
             _ => None,
         },
         Language::TypeScript => match kind {
@@ -124,7 +151,9 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             "class_declaration" => Some(("class", child_name(node)?)),
             "interface_declaration" => Some(("interface", child_name(node)?)),
             "type_alias_declaration" => Some(("type", child_name(node)?)),
-            "lexical_declaration" | "variable_declarator" => Some(("const", child_name(node)?)),
+            "lexical_declaration" | "variable_declarator" | "public_field_definition" => {
+                Some(("const", child_name(node)?))
+            },
             _ => None,
         },
         Language::Kotlin | Language::Markdown => None,
@@ -137,12 +166,32 @@ fn kotlin_symbol_node(node: tree_sitter::Node<'_>, text: &str) -> Option<(&'stat
         "class_declaration" => "class",
         "object_declaration" => "object",
         "function_declaration" => "function",
+        "property_declaration" => "property",
+        "companion_object" | "companion_object_declaration" => "object",
         _ => return None,
     };
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if matches!(child.kind(), "simple_identifier" | "type_identifier") {
             return Some((symbol_kind, child.utf8_text(text.as_bytes()).ok()?.to_string()));
+        }
+    }
+    if kind == "property_declaration" {
+        let name = first_descendant_text(node, text, &["simple_identifier"])?;
+        return Some((symbol_kind, name));
+    }
+    matches!(kind, "companion_object" | "companion_object_declaration")
+        .then(|| (symbol_kind, "companion".to_string()))
+}
+
+fn first_descendant_text(node: Node<'_>, text: &str, kinds: &[&str]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if kinds.contains(&child.kind()) {
+            return child.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned);
+        }
+        if let Some(value) = first_descendant_text(child, text, kinds) {
+            return Some(value);
         }
     }
     None
@@ -152,7 +201,10 @@ fn child_name(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("name").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).find(|child| {
-            matches!(child.kind(), "identifier" | "type_identifier" | "property_identifier")
+            matches!(
+                child.kind(),
+                "identifier" | "type_identifier" | "property_identifier" | "field_identifier"
+            )
         })
     })
 }

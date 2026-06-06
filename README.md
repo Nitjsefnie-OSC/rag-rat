@@ -4,6 +4,8 @@
 
 Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source where files are small enough for bounded parsing, markdown heading chunks for docs, and coarse chunks for generated or oversized files. Chunk anchors store content and context fingerprints so stale reads can be detected and repaired.
 
+Tree-sitter grammars are exact-pinned in `Cargo.toml` so parser node coverage changes deliberately.
+
 ## Commands
 
 ```bash
