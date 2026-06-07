@@ -162,6 +162,8 @@ pub struct SearchArgs {
     pub include_graph: McpGraphMode,
     #[serde(default = "default_search_graph_limit")]
     pub graph_limit: u32,
+    #[serde(default)]
+    pub include_fallback: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -196,6 +198,8 @@ pub struct SymbolGraphArgs {
     pub include_macros: bool,
     #[serde(default)]
     pub include_common_methods: bool,
+    #[serde(default)]
+    pub include_coverage: bool,
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -287,6 +291,8 @@ pub struct PapertrailCommitArgs {
     pub commit_hash: String,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
+    #[serde(default)]
+    pub include_fallback: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -423,7 +429,11 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
         },
         "papertrail_for_commit" => {
             let args: PapertrailCommitArgs = serde_json::from_value(arguments)?;
-            json!(db.papertrail_for_commit(&args.commit_hash, args.limit)?)
+            let mut value = json!(db.papertrail_for_commit(&args.commit_hash, args.limit)?);
+            if !args.include_fallback {
+                strip_fallback_github_evidence(&mut value);
+            }
+            value
         },
         "github_issue_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -435,7 +445,11 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
         },
         "rationale_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
-            json!(db.rationale_search(&args.query, args.limit)?)
+            let mut value = json!(db.rationale_search(&args.query, args.limit)?);
+            if !args.include_fallback {
+                keep_literal_github_refs_if_present(&mut value);
+            }
+            value
         },
         "local_ai_status" => json!(db.local_ai_status()?),
         "heal_index" => {
@@ -476,13 +490,15 @@ fn graph_tool(
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: args.logical_symbol_id,
             };
-            Ok(json!(db.graph_traversal_report(
+            let mut value = json!(db.graph_traversal_report(
                 if reverse { "find_callers" } else { "trace_callees" },
                 &symbol,
                 reverse,
                 limit,
                 &options
-            )?))
+            )?);
+            compact_graph_coverage(&mut value, args.include_coverage);
+            Ok(value)
         },
         Ok(None) if allow_ambiguous => {
             let Some(symbol) = args.symbol.as_deref() else {
@@ -561,6 +577,44 @@ fn compare_graph_to_text_tool(
         },
         Ok(None) => Ok(Value::Null),
         Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
+fn strip_fallback_github_evidence(value: &mut Value) {
+    if let Value::Object(map) = value {
+        map.remove("fallback_github_evidence");
+    }
+}
+
+fn keep_literal_github_refs_if_present(value: &mut Value) {
+    let Value::Array(items) = value else {
+        return;
+    };
+    let literal_items = items
+        .iter()
+        .filter(|item| {
+            item.get("evidence_kind").and_then(Value::as_str) == Some("literal_github_ref")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !literal_items.is_empty() {
+        *items = literal_items;
+    }
+}
+
+fn compact_graph_coverage(value: &mut Value, include_coverage: bool) {
+    if include_coverage {
+        return;
+    }
+    let Some(coverage) = value.get_mut("coverage").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let parser_failures =
+        coverage.get("parser_failures").and_then(Value::as_u64).unwrap_or_default();
+    let stale_files = coverage.get("stale_files").and_then(Value::as_u64).unwrap_or_default();
+    let known_gaps = coverage.get("known_index_gaps").and_then(Value::as_array).map_or(0, Vec::len);
+    if parser_failures == 0 && stale_files == 0 && known_gaps == 0 {
+        coverage.remove("parser_coverage_for_paths");
     }
 }
 
@@ -873,12 +927,14 @@ mod tests {
         assert_schema_has_property(tools, "semantic_search", "graph_limit");
         assert_schema_has_property(tools, "semantic_search", "include_git");
         assert_schema_has_property(tools, "semantic_search", "include_papertrail");
+        assert_schema_has_property(tools, "semantic_search", "include_fallback");
         assert_schema_has_property(tools, "semantic_search", "explain");
         assert_symbol_selector_schema(tools, "symbol_lookup");
         assert_schema_has_property(tools, "find_callers", "include_references");
         assert_schema_has_property(tools, "find_callers", "include_unresolved");
         assert_schema_has_property(tools, "find_callers", "include_macros");
         assert_schema_has_property(tools, "find_callers", "include_common_methods");
+        assert_schema_has_property(tools, "find_callers", "include_coverage");
         assert_schema_has_property(tools, "find_callers", "edge_kinds");
         assert_schema_has_property(tools, "find_callers", "resolution");
         assert_schema_property_enum(
@@ -908,6 +964,7 @@ mod tests {
         assert_schema_has_property(tools, "trace_callees", "include_unresolved");
         assert_schema_has_property(tools, "trace_callees", "include_macros");
         assert_schema_has_property(tools, "trace_callees", "include_common_methods");
+        assert_schema_has_property(tools, "trace_callees", "include_coverage");
         assert_schema_has_property(tools, "trace_callees", "edge_kinds");
         assert_schema_has_property(tools, "trace_callees", "resolution");
         assert_schema_has_property(tools, "trace_callees", "logical_symbol_id");
@@ -942,6 +999,8 @@ mod tests {
         );
         assert_schema_has_property(tools, "read_chunk", "graph_limit");
         assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
+        assert_schema_has_property(tools, "papertrail_for_commit", "include_fallback");
+        assert_schema_has_property(tools, "rationale_search", "include_fallback");
         assert_schema_has_property(tools, "heal_index", "limit");
         assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
     }
@@ -1104,7 +1163,24 @@ mod tests {
         assert_eq!(exact["summary"]["false_positive_risk"], "low");
         assert_eq!(exact["summary"]["completeness_risk"], "low");
         assert_eq!(exact["coverage"]["stale_files"], 0);
-        assert!(!exact["coverage"]["parser_coverage_for_paths"].as_array().unwrap().is_empty());
+        assert!(exact["coverage"].get("parser_coverage_for_paths").is_none());
+        let exact_with_coverage = call_tool(
+            &config.database,
+            "find_callers",
+            json!({
+                "symbol_id": one["symbol_id"].as_i64().unwrap(),
+                "resolution": "exact",
+                "edge_kinds": ["calls_name"],
+                "include_coverage": true
+            }),
+        )
+        .unwrap();
+        assert!(
+            !exact_with_coverage["coverage"]["parser_coverage_for_paths"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let exact_results = exact["results"].as_array().unwrap();
         assert_eq!(exact_results.len(), 1, "exact callers: {exact:?}");
         assert_eq!(exact_results[0]["verified_target_symbol"], true);
