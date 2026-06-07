@@ -115,10 +115,15 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     for (edge_id, to_name, edge_kind, current_confidence) in rows {
         let resolution = resolve_symbol(&to_name, &edge_kind, &by_name, &by_qualified);
         let Some((to_symbol_id, confidence)) = resolution else {
-            if current_confidence != EdgeConfidence::NameOnly.as_str() {
+            let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_str() {
+                EdgeConfidence::Ambiguous
+            } else {
+                EdgeConfidence::NameOnly
+            };
+            if current_confidence != confidence.as_str() {
                 conn.execute(
                     "UPDATE edges SET to_symbol_id = NULL, confidence = ?2 WHERE id = ?1",
-                    params![edge_id, EdgeConfidence::NameOnly.as_str()],
+                    params![edge_id, confidence.as_str()],
                 )?;
             }
             continue;
@@ -247,9 +252,23 @@ fn rust_edges(
 ) {
     match node.kind() {
         "use_declaration" => {
-            for name in identifiers_under(node, text) {
+            let names = identifiers_under(node, text);
+            let is_reexport = node_text(node, text).trim_start().starts_with("pub use ");
+            for name in names {
                 if !is_rust_path_keyword(&name) {
                     out.push(file_edge(path, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                }
+            }
+            if is_reexport {
+                for name in identifiers_under(node, text) {
+                    if !is_rust_path_keyword(&name) {
+                        out.push(file_edge(
+                            path,
+                            name,
+                            EdgeKind::Exports,
+                            EdgeConfidence::NameOnly,
+                        ));
+                    }
                 }
             }
         },
@@ -266,6 +285,26 @@ fn rust_edges(
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
+                ));
+            }
+            if let Some(receiver) = scoped_receiver_name(node, text) {
+                out.push(symbol_edge(
+                    symbols,
+                    node.start_byte(),
+                    receiver,
+                    EdgeKind::ReferencesType,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+        },
+        "macro_invocation" => {
+            if let Some(name) = first_identifier_text(node, text) {
+                out.push(symbol_edge(
+                    symbols,
+                    node.start_byte(),
+                    name,
+                    EdgeKind::CallsName,
+                    EdgeConfidence::Ambiguous,
                 ));
             }
         },
@@ -339,12 +378,24 @@ fn typescript_edges(
             }
         },
         "call_expression" | "new_expression" => {
-            if let Some(name) = call_target_name(node, text) {
+            let identifiers =
+                identifiers_under(node.child_by_field_name("function").unwrap_or(node), text);
+            if let Some(name) = identifiers.last().cloned().or_else(|| call_target_name(node, text))
+            {
                 out.push(symbol_edge(
                     symbols,
                     node.start_byte(),
                     name,
                     EdgeKind::CallsName,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+            if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
+                out.push(symbol_edge(
+                    symbols,
+                    node.start_byte(),
+                    receiver,
+                    EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
                 ));
             }
@@ -389,12 +440,35 @@ fn kotlin_edges(
             }
         },
         "call_expression" => {
-            if let Some(name) = first_identifier_text(node, text) {
+            let identifiers = identifiers_under(node, text);
+            if let Some(name) =
+                identifiers.last().cloned().or_else(|| first_identifier_text(node, text))
+            {
                 out.push(symbol_edge(
                     symbols,
                     node.start_byte(),
                     name,
                     EdgeKind::CallsName,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+            if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
+                out.push(symbol_edge(
+                    symbols,
+                    node.start_byte(),
+                    receiver,
+                    EdgeKind::ReferencesType,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+            if let Some(constructor) =
+                identifiers.first().filter(|name| looks_like_type_name(name)).cloned()
+            {
+                out.push(symbol_edge(
+                    symbols,
+                    node.start_byte(),
+                    constructor,
+                    EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
                 ));
             }
@@ -458,16 +532,47 @@ fn symbol_edge(
 }
 
 fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedSymbol> {
-    symbols
+    let mut matches = symbols
         .iter()
         .filter(|symbol| symbol.start_byte <= byte && symbol.end_byte >= byte)
-        .min_by_key(|symbol| symbol.end_byte.saturating_sub(symbol.start_byte))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|symbol| symbol.end_byte.saturating_sub(symbol.start_byte));
+    let first = matches.first().copied()?;
+    if matches!(first.kind.as_str(), "const" | "property" | "static") {
+        matches
+            .iter()
+            .copied()
+            .find(|symbol| {
+                symbol.id != first.id
+                    && !matches!(symbol.kind.as_str(), "const" | "property" | "static")
+            })
+            .or(Some(first))
+    } else {
+        Some(first)
+    }
 }
 
 fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
     node.child_by_field_name("function")
         .and_then(|child| last_identifier_text(child, text))
         .or_else(|| first_identifier_text(node, text))
+}
+
+fn scoped_receiver_name(node: Node<'_>, text: &str) -> Option<String> {
+    let function = node.child_by_field_name("function").unwrap_or(node);
+    let value = node_text(function, text);
+    let separator = if value.contains("::") {
+        "::"
+    } else if value.contains('.') {
+        "."
+    } else {
+        return None;
+    };
+    value
+        .split(separator)
+        .next()
+        .map(|name| short_name(name.trim()).to_string())
+        .filter(|name| !name.is_empty())
 }
 
 fn child_name_text(node: Node<'_>, text: &str) -> Option<String> {
@@ -531,6 +636,10 @@ fn is_identifier_kind(kind: &str) -> bool {
 
 fn is_rust_path_keyword(value: &str) -> bool {
     matches!(value, "self" | "super" | "crate")
+}
+
+fn looks_like_type_name(value: &str) -> bool {
+    value.chars().next().is_some_and(char::is_uppercase)
 }
 
 fn node_text(node: Node<'_>, text: &str) -> String {

@@ -2229,6 +2229,34 @@ fn caller() {
     }
 
     #[test]
+    fn indexes_real_world_rust_graph_patterns() {
+        let root = fixture_temp_root("graph-realworld/rust");
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "src/lib.rs", "worker", "imports", "Syntactic");
+        assert_edge(&db, "src/lib.rs", "Worker", "exports", "Syntactic");
+        assert_edge(&db, "entry", "new", "calls_name", "Ambiguous");
+        assert_edge(&db, "entry", "Client", "references_type", "Syntactic");
+        assert_edge(&db, "drive", "serve", "calls_name", "Syntactic");
+        assert_edge(&db, "drive", "GenericRunner", "references_type", "Syntactic");
+        assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
+        assert_edge(&db, "generic_call", "T", "references_type", "NameOnly");
+        assert_edge(&db, "entry", "generated_call", "calls_name", "Ambiguous");
+        let callers = db.find_callers("serve", 10).unwrap();
+        assert!(
+            callers.iter().any(|edge| {
+                edge.edge_kind == "calls_name"
+                    && edge.edge_confidence == edge.confidence
+                    && edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("drive"))
+            }),
+            "serve callers: {callers:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn indexes_typescript_graph_edges_from_tree_sitter() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
@@ -2272,6 +2300,35 @@ export const callRun = () => run();
     }
 
     #[test]
+    fn indexes_real_world_typescript_graph_patterns() {
+        let root = fixture_temp_root("graph-realworld/typescript");
+        let config = source_config(root.clone(), Language::TypeScript);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "src/lib.tsx", "DefaultWidget", "imports", "Syntactic");
+        assert_edge(&db, "src/lib.tsx", "WidgetNS", "imports", "NameOnly");
+        assert_edge(&db, "src/lib.tsx", "WidgetProps", "imports", "Syntactic");
+        assert_edge(&db, "src/lib.tsx", "ReExportedWidget", "exports", "NameOnly");
+        assert_edge(&db, "useWidget", "useMemo", "calls_name", "NameOnly");
+        assert_edge(&db, "useWidget", "DefaultWidget", "calls_name", "Syntactic");
+        assert_edge(&db, "Shell", "renderWidget", "calls_name", "Syntactic");
+        assert_edge(&db, "Shell", "WidgetNS", "references_type", "NameOnly");
+        assert_edge(&db, "Shell", "DefaultWidget", "references_type", "Syntactic");
+        assert_edge(&db, "DefaultWidget", "WidgetProps", "references_type", "Syntactic");
+        let callees = db.trace_callees("Shell", 10).unwrap();
+        assert!(
+            callees.iter().any(|edge| {
+                edge.edge_kind == "references_type"
+                    && edge.edge_confidence == edge.confidence
+                    && edge.to_symbol.as_deref().is_some_and(|name| name.ends_with("DefaultWidget"))
+            }),
+            "Shell callees: {callees:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn indexes_kotlin_graph_edges_from_tree_sitter() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
@@ -2308,6 +2365,35 @@ fun helper() {}
                 item.category == "Direct structural impact" && item.reason == "direct_caller"
             }),
             "impact: {impact:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_real_world_kotlin_graph_patterns() {
+        let root = fixture_temp_root("graph-realworld/kotlin");
+        let config = source_config(root.clone(), Language::Kotlin);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "src/Main.kt", "ExternalFactory", "imports", "NameOnly");
+        assert_edge(&db, "Worker", "companion", "contains", "Exact");
+        assert_edge(&db, "companion", "create", "contains", "Exact");
+        assert_edge(&db, "syncOnce", "create", "calls_name", "Syntactic");
+        assert_edge(&db, "syncOnce", "Worker", "references_type", "Syntactic");
+        assert_edge(&db, "syncOnce", "run", "calls_name", "Syntactic");
+        assert_edge(&db, "syncOnce", "SingletonRunner", "references_type", "Syntactic");
+        assert_edge(&db, "syncOnce", "ExternalFactory", "calls_name", "NameOnly");
+        assert_edge(&db, "syncOnce", "ExternalFactory", "references_type", "NameOnly");
+        assert_edge(&db, "syncOnce", "cleaned", "calls_name", "Syntactic");
+        let callers = db.find_callers("cleaned", 10).unwrap();
+        assert!(
+            callers.iter().any(|edge| {
+                edge.edge_kind == "calls_name"
+                    && edge.edge_confidence == edge.confidence
+                    && edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("syncOnce"))
+            }),
+            "cleaned callers: {callers:?}"
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -2529,6 +2615,29 @@ fun helper() {}
         let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         root.push(format!("rag-rat-schema-test-{}-{}-{suffix}", std::process::id(), now_ms()));
         root
+    }
+
+    fn fixture_temp_root(fixture: &str) -> PathBuf {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").join(fixture);
+        copy_fixture_dir(&fixture_root, &root);
+        root
+    }
+
+    fn copy_fixture_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let from_path = entry.path();
+            let to_path = to.join(entry.file_name());
+            if from_path.is_dir() {
+                copy_fixture_dir(&from_path, &to_path);
+            } else {
+                fs::copy(&from_path, &to_path).unwrap();
+            }
+        }
     }
 
     fn markdown_config(text: &str) -> (PathBuf, Config) {

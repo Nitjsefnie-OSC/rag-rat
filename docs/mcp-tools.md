@@ -45,7 +45,8 @@ Search tools synchronize dirty or stale SQLite FTS state before querying so resu
 from an outdated FTS table.
 
 Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `imports`, `exports`,
-`calls_name`, `references_type`, `implements`, and `contains`; confidence is reported as `Exact`,
+`calls_name`, `references_type`, `implements`, and `contains`; confidence is reported as
+`edge_confidence` (`confidence` is retained as the compatibility alias) with values `Exact`,
 `Syntactic`, `NameOnly`, or `Ambiguous`. These are intentionally not compiler-grade resolved call
 graphs.
 

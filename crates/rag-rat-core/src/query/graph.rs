@@ -7,6 +7,7 @@ pub struct GraphHop {
     pub to_symbol: Option<String>,
     pub edge_kind: String,
     pub confidence: String,
+    pub edge_confidence: String,
 }
 
 pub fn traverse(
@@ -56,6 +57,7 @@ pub fn traverse(
             to_symbol: row.get(1)?,
             edge_kind: row.get(2)?,
             confidence: row.get(3)?,
+            edge_confidence: row.get(3)?,
         })
     })?;
     let mut hops = Vec::new();
