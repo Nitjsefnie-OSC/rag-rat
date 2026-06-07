@@ -4,6 +4,7 @@ use std::{
     process::Command,
 };
 
+use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -409,31 +410,12 @@ fn read_commits(root: &Path) -> anyhow::Result<Vec<CommitRecord>> {
     ) else {
         return Ok(Vec::new());
     };
-    let mut commits = Vec::new();
-    for record in output.split('\x1e') {
-        let record = record.trim();
-        if record.is_empty() {
-            continue;
-        }
-        let mut parts = record.splitn(7, '\x1f');
-        let Some(hash) = parts.next() else { continue };
-        let Some(author_name) = parts.next() else { continue };
-        let Some(author_email) = parts.next() else { continue };
-        let Some(authored_at_s) = parts.next() else { continue };
-        let Some(committed_at_s) = parts.next() else { continue };
-        let Some(subject) = parts.next() else { continue };
-        let body = parts.next().unwrap_or_default().trim().to_string();
-        commits.push(CommitRecord {
-            hash: hash.to_string(),
-            author_name: author_name.to_string(),
-            author_email: author_email.to_string(),
-            authored_at_s: authored_at_s.parse().unwrap_or(0),
-            committed_at_s: committed_at_s.parse().unwrap_or(0),
-            subject: subject.to_string(),
-            body,
-        });
-    }
-    Ok(commits)
+    Ok(output
+        .split('\x1e')
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .filter_map(parse_commit_record)
+        .collect())
 }
 
 fn read_file_changes(root: &Path, worktree_root: &Path) -> anyhow::Result<Vec<FileChange>> {
@@ -441,30 +423,61 @@ fn read_file_changes(root: &Path, worktree_root: &Path) -> anyhow::Result<Vec<Fi
     else {
         return Ok(Vec::new());
     };
+    Ok(output
+        .split('\x1e')
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .flat_map(|record| parse_file_change_record(root, worktree_root, record))
+        .collect())
+}
+
+fn parse_commit_record(record: &str) -> Option<CommitRecord> {
+    let record = record.trim();
+    if record.is_empty() {
+        return None;
+    }
+    let mut parts = record.splitn(7, '\x1f');
+    let hash = parts.next()?;
+    let author_name = parts.next()?;
+    let author_email = parts.next()?;
+    let authored_at_s = parts.next()?;
+    let committed_at_s = parts.next()?;
+    let subject = parts.next()?;
+    let body = parts.next().unwrap_or_default().trim().to_string();
+    Some(CommitRecord {
+        hash: hash.to_string(),
+        author_name: author_name.to_string(),
+        author_email: author_email.to_string(),
+        authored_at_s: authored_at_s.parse().unwrap_or(0),
+        committed_at_s: committed_at_s.parse().unwrap_or(0),
+        subject: subject.to_string(),
+        body,
+    })
+}
+
+fn parse_file_change_record(root: &Path, worktree_root: &Path, record: &str) -> Vec<FileChange> {
+    let mut lines = record.lines().filter(|line| !line.trim().is_empty());
+    let Some(hash) = lines.next().map(str::trim).filter(|line| !line.is_empty()) else {
+        return Vec::new();
+    };
     let mut changes = Vec::new();
-    for record in output.split('\x1e') {
-        let mut lines = record.lines().filter(|line| !line.trim().is_empty());
-        let Some(hash) = lines.next().map(str::trim).filter(|line| !line.is_empty()) else {
+    for line in lines {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() < 3 {
+            continue;
+        }
+        let Some(path) = normalize_git_path(root, worktree_root, fields[2]) else {
             continue;
         };
-        for line in lines {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() < 3 {
-                continue;
-            }
-            let Some(path) = normalize_git_path(root, worktree_root, fields[2]) else {
-                continue;
-            };
-            changes.push(FileChange {
-                commit_hash: hash.to_string(),
-                path,
-                additions: parse_numstat_count(fields[0]),
-                deletions: parse_numstat_count(fields[1]),
-                change_kind: "modified".to_string(),
-            });
-        }
+        changes.push(FileChange {
+            commit_hash: hash.to_string(),
+            path,
+            additions: parse_numstat_count(fields[0]),
+            deletions: parse_numstat_count(fields[1]),
+            change_kind: "modified".to_string(),
+        });
     }
-    Ok(changes)
+    changes
 }
 
 fn normalize_git_path(root: &Path, worktree_root: &Path, path: &str) -> Option<String> {

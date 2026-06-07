@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -150,16 +151,27 @@ pub fn reconcile(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Reconc
         message: None,
     };
 
-    for chunk in chunks {
-        report.processed_chunks += 1;
-        if embedding_ready {
-            store_embedding(conn, &chunk)?;
-            report.embeddings_written += 1;
-        } else {
-            store_blocked_embedding(conn, &chunk, "MissingModel")?;
-            report.blocked_chunks += 1;
+    report.processed_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let write_result = if embedding_ready {
+        let embeddings = chunks.par_iter().map(PreparedEmbedding::from_chunk).collect::<Vec<_>>();
+        for embedding in &embeddings {
+            store_prepared_embedding(conn, embedding)?;
         }
+        report.embeddings_written = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
+        Ok(())
+    } else {
+        for chunk in &chunks {
+            store_blocked_embedding(conn, chunk, "MissingModel")?;
+        }
+        report.blocked_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
+        Ok(())
+    };
+    if let Err(err) = write_result {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(err);
     }
+    conn.execute_batch("COMMIT")?;
 
     if !embedding_ready {
         report.status = "Blocked".to_string();
@@ -291,6 +303,22 @@ struct CurrentChunk {
     text_hash: String,
 }
 
+struct PreparedEmbedding {
+    chunk_id: i64,
+    text_hash: String,
+    vector_blob: Vec<u8>,
+}
+
+impl PreparedEmbedding {
+    fn from_chunk(chunk: &CurrentChunk) -> Self {
+        Self {
+            chunk_id: chunk.id,
+            text_hash: chunk.text_hash.clone(),
+            vector_blob: encode_vector(&embed_text(&chunk.text)),
+        }
+    }
+}
+
 fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<CurrentChunk>> {
     let sql = if limit.is_some() {
         "SELECT id, text, text_hash FROM chunks ORDER BY id LIMIT ?1"
@@ -304,8 +332,10 @@ fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<C
     collect_rows(rows)
 }
 
-fn store_embedding(conn: &Connection, chunk: &CurrentChunk) -> anyhow::Result<()> {
-    let vector = encode_vector(&embed_text(&chunk.text));
+fn store_prepared_embedding(
+    conn: &Connection,
+    embedding: &PreparedEmbedding,
+) -> anyhow::Result<()> {
     conn.execute(
         "
         INSERT INTO chunk_embeddings(chunk_id, model_id, source_text_hash, embedding_dim, vector_blob, status, created_at_ms, last_error)
@@ -319,11 +349,11 @@ fn store_embedding(conn: &Connection, chunk: &CurrentChunk) -> anyhow::Result<()
             last_error = NULL
         ",
         params![
-            chunk.id,
+            embedding.chunk_id,
             EMBEDDING_MODEL_ID,
-            chunk.text_hash,
+            embedding.text_hash,
             i64::try_from(EMBEDDING_DIM).unwrap_or(i64::MAX),
-            vector,
+            embedding.vector_blob,
             now_ms()
         ],
     )?;

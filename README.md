@@ -30,6 +30,10 @@ current chunks. `semantic_search` uses embeddings only when the model is install
 dimension matches the model metadata, the artifact is `Current`, and the artifact text hash matches
 the current chunk text hash. Stale AI artifacts are treated as absent.
 
+CPU-heavy index work uses the Rayon worker pool. File reads, source hashing, tree-sitter preparation,
+git-log parsing, and embedding computation run in parallel across available cores; SQLite writes stay
+on one deterministic writer path and are transaction-batched where the command owns the write scope.
+
 ## Commands
 
 ```bash

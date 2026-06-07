@@ -89,6 +89,11 @@ the model is installed, the embedding dimension matches model metadata, the arti
 `Current`, and the artifact text hash matches the current chunk text hash; stale embeddings are
 treated as absent. There is no summarizer or LLM runtime in this milestone.
 
+Indexing and reconcile use a Rayon worker pool for CPU-heavy preparation: file reads, hashing,
+tree-sitter chunk/symbol preparation, git-log parsing, and embedding computation run across available
+cores. SQLite writes are still serialized through the local index connection and transaction-batched
+where the command owns the write scope.
+
 Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
 message for each failed source parse. Markdown files are chunked by headings instead of parsed with
 tree-sitter.

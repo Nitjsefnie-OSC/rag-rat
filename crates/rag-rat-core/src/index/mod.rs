@@ -26,6 +26,7 @@ use gix::{
     bstr::{BString, ByteSlice},
     status::{UntrackedFiles, tree_index},
 };
+use rayon::prelude::*;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -321,32 +322,16 @@ impl IndexDatabase {
         let files = collect_index_files(config)?;
         progress(IndexProgress::Discovered { files: files.len() });
 
-        for (index, file) in files.iter().enumerate() {
+        let prepared = files.par_iter().map(prepare_index_file).collect::<Vec<_>>();
+        for (index, prepared_file) in prepared.iter().enumerate() {
             progress(IndexProgress::IndexingFile {
                 current: index + 1,
                 total: files.len(),
-                path: file.relative_path.clone(),
-                language: file.language,
-                kind: file.kind,
+                path: prepared_file.file.relative_path.clone(),
+                language: prepared_file.file.language,
+                kind: prepared_file.file.kind,
             });
-            let text = match fs::read_to_string(&file.full_path) {
-                Ok(text) => text,
-                Err(err) => {
-                    self.insert_parser_failure(
-                        &file.relative_path,
-                        file.language,
-                        &err.to_string(),
-                    )?;
-                    continue;
-                },
-            };
-            self.index_file(
-                &file.relative_path,
-                file.language,
-                file.kind,
-                file_metadata_ms(&file.full_path)?,
-                &text,
-            )?;
+            self.insert_prepared_file(prepared_file)?;
         }
 
         Ok(files.len())
@@ -395,33 +380,17 @@ impl IndexDatabase {
             self.remove_file(&path)?;
         }
 
-        for (index, file) in files.iter().enumerate() {
+        let prepared = files.par_iter().map(prepare_index_file).collect::<Vec<_>>();
+        for (index, prepared_file) in prepared.iter().enumerate() {
             progress(IndexProgress::IndexingFile {
                 current: index + 1,
                 total: files.len(),
-                path: file.relative_path.clone(),
-                language: file.language,
-                kind: file.kind,
+                path: prepared_file.file.relative_path.clone(),
+                language: prepared_file.file.language,
+                kind: prepared_file.file.kind,
             });
-            let text = match fs::read_to_string(&file.full_path) {
-                Ok(text) => text,
-                Err(err) => {
-                    self.insert_parser_failure(
-                        &file.relative_path,
-                        file.language,
-                        &err.to_string(),
-                    )?;
-                    continue;
-                },
-            };
-            self.remove_file(&file.relative_path)?;
-            self.index_file(
-                &file.relative_path,
-                file.language,
-                file.kind,
-                file_metadata_ms(&file.full_path)?,
-                &text,
-            )?;
+            self.remove_file(&prepared_file.file.relative_path)?;
+            self.insert_prepared_file(prepared_file)?;
         }
 
         Ok(files.len() + deleted_count)
@@ -963,6 +932,51 @@ impl IndexDatabase {
         Ok(())
     }
 
+    fn insert_prepared_file(&self, prepared_file: &PreparedIndexFile) -> anyhow::Result<()> {
+        let file = &prepared_file.file;
+        let prepared = match &prepared_file.prepared {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self.insert_parser_failure(&file.relative_path, file.language, &err.to_string())?;
+                return Ok(());
+            },
+        };
+        if let Some(message) = &prepared.parser_failure {
+            self.insert_parser_failure(&file.relative_path, file.language, message)?;
+        }
+        let file_id = self.storage.connection().query_row(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             RETURNING id",
+            params![
+                path_string(&file.relative_path),
+                file.language.as_str(),
+                file.kind.as_str(),
+                prepared.sha256,
+                prepared.modified_at_ms,
+                matches!(file.kind, TargetKind::Generated),
+                now_ms(),
+                prepared.sha256,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.insert_chunks(file_id, &prepared.sha256, &prepared.chunks, &prepared.text)?;
+        self.insert_symbols(file_id, file.language, &prepared.symbols)?;
+        if file.kind != TargetKind::Generated
+            && prepared.text.len() <= chunker::MAX_STRUCTURAL_PARSE_BYTES
+        {
+            edges::index_file_edges(
+                self.storage.connection(),
+                file_id,
+                &file.relative_path,
+                file.language,
+                &prepared.text,
+            )?;
+        }
+        self.mark_fts_dirty()?;
+        Ok(())
+    }
+
     fn insert_chunks(
         &self,
         file_id: i64,
@@ -1340,6 +1354,22 @@ struct IndexFile {
 }
 
 #[derive(Debug)]
+struct PreparedIndexFile {
+    file: IndexFile,
+    prepared: anyhow::Result<PreparedIndexContent>,
+}
+
+#[derive(Debug)]
+struct PreparedIndexContent {
+    modified_at_ms: i64,
+    text: String,
+    sha256: String,
+    chunks: Vec<Chunk>,
+    symbols: Vec<Symbol>,
+    parser_failure: Option<String>,
+}
+
+#[derive(Debug)]
 struct DiscoveryPlan {
     files: Vec<IndexFile>,
     deleted: BTreeSet<PathBuf>,
@@ -1402,6 +1432,40 @@ fn collect_changed_index_files(
     Ok(files)
 }
 
+fn prepare_index_file(file: &IndexFile) -> PreparedIndexFile {
+    PreparedIndexFile { file: file.clone(), prepared: prepare_index_content(file) }
+}
+
+fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexContent> {
+    let text = fs::read_to_string(&file.full_path)?;
+    let modified_at_ms = file_metadata_ms(&file.full_path)?;
+    let sha256 = hex_sha256(text.as_bytes());
+    let parser_failure =
+        if file.language != Language::Markdown && file.kind != TargetKind::Generated {
+            if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
+                None
+            } else {
+                parser::parse_symbols(&file.relative_path, file.language, &text)
+                    .err()
+                    .map(|err| err.to_string())
+            }
+        } else {
+            None
+        };
+    let chunks = if file.kind == TargetKind::Generated {
+        chunker::generated_chunks_for_file(&file.relative_path, &text)
+    } else {
+        chunker::chunks_for_file(&file.relative_path, file.language, &text)
+    };
+    let symbols =
+        if file.kind == TargetKind::Generated || text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
+            Vec::new()
+        } else {
+            symbols::symbols_for_file(&file.relative_path, file.language, &text)
+        };
+    Ok(PreparedIndexContent { modified_at_ms, text, sha256, chunks, symbols, parser_failure })
+}
+
 fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Result<DiscoveryPlan> {
     let discovered = collect_index_files(config)?;
     let mut indexed = indexed_file_map(conn)?;
@@ -1409,8 +1473,17 @@ fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Resul
     let mut files = Vec::new();
     let mut unindexed = Vec::new();
     let mut changed = Vec::new();
+    let discovered_files = discovered.len();
+    let hashed = discovered
+        .par_iter()
+        .map(|file| -> anyhow::Result<(IndexFile, String)> {
+            let text = fs::read(&file.full_path)?;
+            Ok((file.clone(), hex_sha256(&text)))
+        })
+        .collect::<Vec<_>>();
 
-    for file in discovered {
+    for hashed_file in hashed {
+        let (file, current_hash) = hashed_file?;
         let relative = path_string(&file.relative_path);
         current_paths.insert(file.relative_path.clone());
         let Some(indexed_hash) = indexed.remove(&relative) else {
@@ -1418,8 +1491,6 @@ fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Resul
             files.push(file);
             continue;
         };
-        let text = fs::read(&file.full_path)?;
-        let current_hash = hex_sha256(&text);
         if current_hash != indexed_hash {
             changed.push(file.relative_path.clone());
             files.push(file);
@@ -1433,7 +1504,7 @@ fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Resul
         .collect::<BTreeSet<_>>();
 
     Ok(DiscoveryPlan {
-        discovered_files: current_paths.len(),
+        discovered_files,
         indexed_files: current_paths
             .len()
             .saturating_add(deleted.len())
