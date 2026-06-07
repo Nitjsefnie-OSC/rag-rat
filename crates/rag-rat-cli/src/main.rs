@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, path::PathBuf};
 
 use rag_rat_core::{Config, IndexDatabase, index::IndexProgress};
 
@@ -90,10 +90,10 @@ fn eval(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let options = rag_rat_core::eval::EvalOptions {
         queries_path: option_value(args, "--queries")
             .map(Into::into)
-            .unwrap_or_else(|| "evals/queries.toml".into()),
+            .unwrap_or_else(|| default_eval_path(config, "queries.toml")),
         expected_path: option_value(args, "--expected")
             .map(Into::into)
-            .unwrap_or_else(|| "evals/expected_hits.toml".into()),
+            .unwrap_or_else(|| default_eval_path(config, "expected_hits.toml")),
         update_baseline: has_flag(args, "--update-baseline"),
     };
     let report = rag_rat_core::eval::run(config, &options)?;
@@ -110,6 +110,10 @@ fn eval(config: &Config, args: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
+    config.root.join("evals").join(file_name)
 }
 
 fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
