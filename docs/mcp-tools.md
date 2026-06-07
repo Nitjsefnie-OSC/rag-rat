@@ -4,14 +4,14 @@
 
 ## Tools
 
-- `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "counts" | "compact" | "full", "graph_limit"?: number, "explain"?: boolean }`
+- `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`
 - `symbol_lookup`: `{ "symbol": string, "language"?: string, "limit"?: number }`
 - `find_callers`: `{ "symbol": string, "limit"?: number }`
 - `trace_callees`: `{ "symbol": string, "limit"?: number }`
 - `impact_surface`: `{ "query": string, "limit"?: number }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol": string, "limit"?: number }`
-- `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "counts" | "compact" | "full", "graph_limit"?: number }`
+- `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number }`
 - `commit_search`: `{ "query": string, "limit"?: number }`
 - `git_history_for_path`: `{ "path": string, "limit"?: number }`
 - `git_history_for_symbol`: `{ "symbol": string, "language"?: string, "limit"?: number }`
@@ -44,13 +44,25 @@ Auto-heal is capped at four files per call. If more stale files are detected, to
 Search tools synchronize dirty or stale SQLite FTS state before querying so results are not served
 from an outdated FTS table.
 
+`semantic_search` graph and evidence controls:
+
+- `include_graph`: `none`, `compact`, or `full`. Default is `compact`.
+- `graph_limit`: maximum caller/callee/import/type evidence entries to attach. Default is `3` for
+  search and `20` for `read_chunk`.
+- `include_git`: include git-history ranking boosts when available. Default is `true`.
+- `include_papertrail`: include cached GitHub papertrail ranking boosts when available. Default is
+  `true`.
+- `explain`: include score components (`bm25`, `vector`, `symbol`, `graph`, `git`, `github`).
+  Default is `false`.
+
 Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `imports`, `exports`,
 `calls_name`, `references_type`, `implements`, and `contains`; confidence is reported as
 `edge_confidence` (`confidence` is retained as the compatibility alias) with values `Exact`,
-`Syntactic`, `NameOnly`, or `Ambiguous`. These are intentionally not compiler-grade resolved call
-graphs. Search results default to compact graph evidence with bounded caller/callee lists; `read_chunk`
-defaults to full graph evidence. Caller and callee entries include exact tree-sitter callsite spans:
-`callsite.path`, `callsite.line`, and `callsite.span` (`[start_line, end_line]`).
+`Syntactic`, `NameOnly`, or `Ambiguous`. Graph evidence is syntactic, confidence-labeled evidence,
+not compiler-grade name resolution or hard truth. Search results default to compact graph evidence
+with bounded caller/callee lists; `read_chunk` defaults to full graph evidence. Caller and callee
+entries include exact tree-sitter callsite spans: `callsite.path`, `callsite.line`, and
+`callsite.span` (`[start_line, end_line]`).
 
 `impact_surface` is graph-backed first. It layers exact symbol definitions, direct callers, direct
 callees, import/export dependents, same-file siblings, git commits touching those files, and cached

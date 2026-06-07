@@ -47,7 +47,7 @@ use crate::{
     },
     language::Language,
     query::graph_meta::{self, GraphMetaMode},
-    search::lexical::SearchHit,
+    search::lexical::{SearchHit, SearchOptions},
     storage::IndexConnection,
     storage::StorageStatus,
 };
@@ -497,8 +497,28 @@ impl IndexDatabase {
         graph_mode: GraphMetaMode,
         graph_limit: u32,
     ) -> anyhow::Result<Vec<SearchHit>> {
+        self.search_with_graph_meta_options(
+            query,
+            limit,
+            include_generated,
+            graph_mode,
+            graph_limit,
+            SearchOptions::default(),
+        )
+    }
+
+    pub fn search_with_graph_meta_options(
+        &self,
+        query: &str,
+        limit: u32,
+        include_generated: bool,
+        graph_mode: GraphMetaMode,
+        graph_limit: u32,
+        options: SearchOptions,
+    ) -> anyhow::Result<Vec<SearchHit>> {
         self.ensure_fts_fresh()?;
-        let mut hits = self.search_with_heal(query, limit, include_generated, true, false)?;
+        let mut hits =
+            self.search_with_heal(query, limit, include_generated, true, false, options)?;
         graph_meta::attach_to_search_hits(
             self.storage.connection(),
             &mut hits,
@@ -516,8 +536,28 @@ impl IndexDatabase {
         graph_mode: GraphMetaMode,
         graph_limit: u32,
     ) -> anyhow::Result<Vec<SearchHit>> {
+        self.search_explain_with_graph_meta_options(
+            query,
+            limit,
+            include_generated,
+            graph_mode,
+            graph_limit,
+            SearchOptions::default(),
+        )
+    }
+
+    pub fn search_explain_with_graph_meta_options(
+        &self,
+        query: &str,
+        limit: u32,
+        include_generated: bool,
+        graph_mode: GraphMetaMode,
+        graph_limit: u32,
+        options: SearchOptions,
+    ) -> anyhow::Result<Vec<SearchHit>> {
         self.ensure_fts_fresh()?;
-        let mut hits = self.search_with_heal(query, limit, include_generated, true, true)?;
+        let mut hits =
+            self.search_with_heal(query, limit, include_generated, true, true, options)?;
         graph_meta::attach_to_search_hits(
             self.storage.connection(),
             &mut hits,
@@ -1245,22 +1285,16 @@ impl IndexDatabase {
         include_generated: bool,
         allow_heal: bool,
         explain: bool,
+        options: SearchOptions,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        let hits = if explain {
-            crate::search::lexical::search_explain(
-                self.storage.connection(),
-                query,
-                limit,
-                include_generated,
-            )?
-        } else {
-            crate::search::lexical::search(
-                self.storage.connection(),
-                query,
-                limit,
-                include_generated,
-            )?
-        };
+        let hits = crate::search::lexical::search_with_options(
+            self.storage.connection(),
+            query,
+            limit,
+            include_generated,
+            explain,
+            options,
+        )?;
         if !allow_heal {
             return Ok(hits);
         }
@@ -1278,7 +1312,7 @@ impl IndexDatabase {
             self.heal_file(Path::new(&path))?;
         }
         self.sync_fts()?;
-        self.search_with_heal(query, limit, include_generated, false, explain)
+        self.search_with_heal(query, limit, include_generated, false, explain, options)
     }
 
     fn stale_hit_paths(&self, hits: &[SearchHit]) -> anyhow::Result<Vec<String>> {

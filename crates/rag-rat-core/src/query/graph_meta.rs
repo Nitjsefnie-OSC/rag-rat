@@ -11,7 +11,6 @@ const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphMetaMode {
     None,
-    Counts,
     Compact,
     Full,
 }
@@ -20,11 +19,10 @@ impl GraphMetaMode {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
             "none" | "false" => Ok(Self::None),
-            "counts" => Ok(Self::Counts),
             "compact" | "true" => Ok(Self::Compact),
             "full" => Ok(Self::Full),
             other => anyhow::bail!(
-                "unknown graph metadata mode `{other}`; expected none, counts, compact, or full"
+                "unknown graph metadata mode `{other}`; expected none, compact, or full"
             ),
         }
     }
@@ -168,10 +166,6 @@ fn evidence_for_chunk(
         truncated: GraphTruncation::default(),
         notes: Vec::new(),
     };
-    if mode == GraphMetaMode::Counts {
-        return Ok(Some(evidence));
-    }
-
     let callers = callers(conn, &symbol, limit)?;
     let callees = callees(conn, symbol.id, limit)?;
     evidence.truncated.callers = caller_count > u64::try_from(callers.len()).unwrap_or(u64::MAX);

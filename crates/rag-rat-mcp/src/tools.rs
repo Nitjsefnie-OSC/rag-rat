@@ -1,6 +1,9 @@
 use std::{path::Path, str::FromStr};
 
-use rag_rat_core::{IndexDatabase, language::Language, query::graph_meta::GraphMetaMode};
+use rag_rat_core::{
+    IndexDatabase, language::Language, query::graph_meta::GraphMetaMode,
+    search::lexical::SearchOptions,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -39,6 +42,10 @@ pub struct SearchArgs {
     pub include_generated: bool,
     #[serde(default)]
     pub explain: bool,
+    #[serde(default = "default_true")]
+    pub include_git: bool,
+    #[serde(default = "default_true")]
+    pub include_papertrail: bool,
     #[serde(default = "default_search_graph_mode")]
     pub include_graph: String,
     #[serde(default = "default_search_graph_limit")]
@@ -135,21 +142,27 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
             let graph_mode = GraphMetaMode::parse(&args.include_graph)?;
+            let options = SearchOptions {
+                include_git: args.include_git,
+                include_papertrail: args.include_papertrail,
+            };
             if args.explain {
-                json!(db.search_explain_with_graph_meta(
+                json!(db.search_explain_with_graph_meta_options(
                     &args.query,
                     args.limit,
                     args.include_generated,
                     graph_mode,
-                    args.graph_limit
+                    args.graph_limit,
+                    options
                 )?)
             } else {
-                json!(db.search_with_graph_meta(
+                json!(db.search_with_graph_meta_options(
                     &args.query,
                     args.limit,
                     args.include_generated,
                     graph_mode,
-                    args.graph_limit
+                    args.graph_limit,
+                    options
                 )?)
             }
         },
@@ -324,6 +337,10 @@ fn default_search_limit() -> u32 {
     10
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_search_graph_mode() -> String {
     "compact".to_string()
 }
@@ -401,6 +418,9 @@ mod tests {
         assert_schema_requires(tools, "semantic_search", "query");
         assert_schema_has_property(tools, "semantic_search", "include_graph");
         assert_schema_has_property(tools, "semantic_search", "graph_limit");
+        assert_schema_has_property(tools, "semantic_search", "include_git");
+        assert_schema_has_property(tools, "semantic_search", "include_papertrail");
+        assert_schema_has_property(tools, "semantic_search", "explain");
         assert_schema_requires(tools, "read_chunk", "chunk_id");
         assert_schema_has_property(tools, "read_chunk", "include_graph");
         assert_schema_has_property(tools, "read_chunk", "graph_limit");

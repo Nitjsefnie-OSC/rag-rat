@@ -39,6 +39,18 @@ pub struct ScoreComponents {
     pub github: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub include_git: bool,
+    pub include_papertrail: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self { include_git: true, include_papertrail: true }
+    }
+}
+
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -52,6 +64,7 @@ pub fn search(
         include_generated,
         ai::embed_query(conn, query)?,
         false,
+        SearchOptions::default(),
     )
 }
 
@@ -68,6 +81,7 @@ pub fn search_hash_baseline(
         include_generated,
         Some(ai::hash_query_embedding(query)?),
         false,
+        SearchOptions::default(),
     )
 }
 
@@ -84,6 +98,26 @@ pub fn search_explain(
         include_generated,
         ai::embed_query(conn, query)?,
         true,
+        SearchOptions::default(),
+    )
+}
+
+pub fn search_with_options(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    include_generated: bool,
+    explain: bool,
+    options: SearchOptions,
+) -> anyhow::Result<Vec<SearchHit>> {
+    search_with_query_embedding(
+        conn,
+        query,
+        limit,
+        include_generated,
+        ai::embed_query(conn, query)?,
+        explain,
+        options,
     )
 }
 
@@ -94,6 +128,7 @@ fn search_with_query_embedding(
     include_generated: bool,
     query_embedding: Option<ai::QueryEmbedding>,
     explain: bool,
+    options: SearchOptions,
 ) -> anyhow::Result<Vec<SearchHit>> {
     let terms = query_terms(query);
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
@@ -116,7 +151,7 @@ fn search_with_query_embedding(
     let mut hits = ranked
         .into_values()
         .map(|mut hit| {
-            let boosts = boosts(conn, &hit.hit, &terms)?;
+            let boosts = boosts(conn, &hit.hit, &terms, options)?;
             hit.components.symbol = SYMBOL_WEIGHT * boosts.symbol;
             hit.components.graph = GRAPH_WEIGHT * boosts.graph;
             hit.components.git = GIT_WEIGHT * boosts.git;
@@ -285,8 +320,13 @@ struct BoostComponents {
     github: f64,
 }
 
-fn boosts(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::Result<BoostComponents> {
-    let historical = historical_boost(conn, &hit.path)?;
+fn boosts(
+    conn: &Connection,
+    hit: &SearchHit,
+    terms: &[String],
+    options: SearchOptions,
+) -> anyhow::Result<BoostComponents> {
+    let historical = historical_boost(conn, &hit.path, options)?;
     Ok(BoostComponents {
         symbol: symbol_path_boost(hit, terms),
         graph: graph_boost(conn, hit, terms)?,
@@ -419,17 +459,29 @@ struct HistoricalBoost {
     github: f64,
 }
 
-fn historical_boost(conn: &Connection, path: &str) -> anyhow::Result<HistoricalBoost> {
-    let git = conn.query_row(
-        "SELECT COUNT(*) FROM git_file_changes WHERE path = ?1 LIMIT 1",
-        [path],
-        |row| row.get::<_, i64>(0),
-    )?;
-    let github = conn.query_row(
-        "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1 LIMIT 1",
-        [path],
-        |row| row.get::<_, i64>(0),
-    )?;
+fn historical_boost(
+    conn: &Connection,
+    path: &str,
+    options: SearchOptions,
+) -> anyhow::Result<HistoricalBoost> {
+    let git = if options.include_git {
+        conn.query_row(
+            "SELECT COUNT(*) FROM git_file_changes WHERE path = ?1 LIMIT 1",
+            [path],
+            |row| row.get::<_, i64>(0),
+        )?
+    } else {
+        0
+    };
+    let github = if options.include_papertrail {
+        conn.query_row(
+            "SELECT COUNT(*) FROM github_refs WHERE source_path = ?1 LIMIT 1",
+            [path],
+            |row| row.get::<_, i64>(0),
+        )?
+    } else {
+        0
+    };
     Ok(HistoricalBoost {
         git: if git > 0 { 1.0 } else { 0.0 },
         github: if github > 0 { 1.0 } else { 0.0 },
