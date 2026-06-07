@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 
@@ -394,7 +396,25 @@ pub fn traverse_with_options(
     for row in rows {
         hops.push(row?);
     }
+    dedupe_hops(&mut hops);
     Ok(hops)
+}
+
+fn dedupe_hops(hops: &mut Vec<GraphHop>) {
+    let mut seen = BTreeSet::new();
+    hops.retain(|hop| {
+        let callsite = hop.callsite.as_ref();
+        seen.insert((
+            hop.from_symbol.clone(),
+            hop.to_symbol.clone(),
+            hop.edge_kind.clone(),
+            hop.target.clone(),
+            hop.target_qualified_name.clone(),
+            hop.receiver_hint.clone(),
+            callsite.map(|value| value.path.clone()),
+            callsite.map(|value| value.span),
+        ))
+    });
 }
 
 pub fn traversal_summary(

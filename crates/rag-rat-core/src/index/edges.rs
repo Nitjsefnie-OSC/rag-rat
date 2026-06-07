@@ -715,12 +715,20 @@ fn kotlin_edges(
             if let Some(name) =
                 identifiers.last().cloned().or_else(|| first_identifier_text(node, text))
             {
-                out.push(symbol_edge(
+                out.push(symbol_edge_with_context(
                     symbols,
                     node,
+                    text,
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
+                    EdgeContext {
+                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        receiver_hint: identifiers
+                            .first()
+                            .filter(|_| identifiers.len() > 1)
+                            .cloned(),
+                    },
                 ));
             }
             if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {

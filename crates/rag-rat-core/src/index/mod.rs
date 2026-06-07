@@ -4612,6 +4612,76 @@ fun helper() {}
     }
 
     #[test]
+    fn kotlin_caller_lookup_respects_qualified_receivers_for_common_method_names() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/Main.kt"),
+            r#"
+package dev.cq27.test
+
+object WatchProposalBuilder {
+  fun build(): String = "proposal"
+}
+
+class AndroidDialogBuilder {
+  fun build(): String = "dialog"
+}
+
+fun actualCaller() {
+  WatchProposalBuilder.build()
+}
+
+fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
+  dialog.build()
+  AndroidDialogBuilder().build()
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Kotlin);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let target = db
+            .symbols("build", Some(Language::Kotlin), 10)
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.qualified_name.contains("WatchProposalBuilder"))
+            .expect("WatchProposalBuilder.build symbol");
+        let callers = db
+            .find_callers_with_options(
+                "build",
+                20,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    symbol_id: Some(target.symbol_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            callers
+                .iter()
+                .filter(|edge| edge
+                    .from_symbol
+                    .as_deref()
+                    .is_some_and(|name| name.ends_with("actualCaller")))
+                .count(),
+            1,
+            "actual caller should be present once: {callers:?}"
+        );
+        assert!(
+            callers.iter().all(|edge| edge
+                .from_symbol
+                .as_deref()
+                .is_none_or(|name| !name.ends_with("unrelatedBuilderCalls"))),
+            "unrelated builder calls should not resolve to WatchProposalBuilder.build: {callers:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
         let (root, config) =
             markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
