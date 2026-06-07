@@ -1,12 +1,16 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 1;
+pub const LATEST_SCHEMA_VERSION: u32 = 2;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
 const MIGRATION_001_DESCRIPTION: &str =
     "SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata";
+const MIGRATION_002_ID: &str = "002_embedding_vector_metadata";
+const MIGRATION_002_CHECKSUM: &str = "sha256:rag-rat-embedding-vector-metadata-v2";
+const MIGRATION_002_DESCRIPTION: &str =
+    "Add embedding model dimension metadata and per-vector dimensions for hybrid vector search";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -60,11 +64,9 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         return Err(err);
     }
     conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![MIGRATION_001_ID, now_ms(), MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION],
-    )?;
+    record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)?;
+    apply_embedding_vector_metadata(conn)?;
+    record_migration(conn, MIGRATION_002_ID, MIGRATION_002_CHECKSUM, MIGRATION_002_DESCRIPTION)?;
     Ok(())
 }
 
@@ -100,9 +102,7 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
             message: "dirty or partial schema migration detected; rebuild the derived index with `rag-rat index --full`".to_string(),
         });
     }
-    if migrations.iter().any(|migration| {
-        migration.id == MIGRATION_001_ID && migration.checksum != MIGRATION_001_CHECKSUM
-    }) {
+    if migrations.iter().any(migration_checksum_mismatch) {
         return Ok(SchemaStatus {
             state: SchemaState::Dirty,
             current_version: known_version(&migrations),
@@ -240,10 +240,13 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         DROP TABLE IF EXISTS embeddings;
+        DROP TABLE IF EXISTS chunk_summaries;
 
         CREATE TABLE IF NOT EXISTS ai_models(
             model_id TEXT PRIMARY KEY,
             capability TEXT NOT NULL,
+            embedding_dim INTEGER,
+            runtime TEXT NOT NULL DEFAULT 'local',
             installed INTEGER NOT NULL DEFAULT 0,
             disabled INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'MissingModel',
@@ -256,22 +259,12 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             chunk_id INTEGER NOT NULL,
             model_id TEXT NOT NULL,
             source_text_hash TEXT NOT NULL,
+            embedding_dim INTEGER NOT NULL DEFAULT 0,
             vector_blob BLOB NOT NULL,
             status TEXT NOT NULL,
             created_at_ms INTEGER NOT NULL,
             last_error TEXT,
             UNIQUE(chunk_id, model_id),
-            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS chunk_summaries(
-            chunk_id INTEGER PRIMARY KEY,
-            model_id TEXT NOT NULL,
-            source_text_hash TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL,
-            last_error TEXT,
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
         );
 
@@ -282,7 +275,6 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             limit_count INTEGER,
             processed_chunks INTEGER NOT NULL DEFAULT 0,
             embeddings_written INTEGER NOT NULL DEFAULT 0,
-            summaries_written INTEGER NOT NULL DEFAULT 0,
             blocked_chunks INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             message TEXT
@@ -448,8 +440,6 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_edges_from_symbol ON edges(from_symbol_id);
         CREATE INDEX IF NOT EXISTS idx_edges_to_symbol ON edges(to_symbol_id);
-        CREATE INDEX IF NOT EXISTS idx_edges_from_name ON edges(from_name);
-        CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_commit ON git_file_changes(commit_hash);
         CREATE INDEX IF NOT EXISTS idx_github_refs_path ON github_refs(source_path);
@@ -462,6 +452,13 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     migrate_files(conn)?;
     migrate_chunks(conn)?;
     migrate_edges(conn)?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_edges_from_name ON edges(from_name);
+        CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
+        ",
+    )?;
+    apply_embedding_vector_metadata(conn)?;
     Ok(())
 }
 
@@ -538,6 +535,32 @@ fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_embedding_vector_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "ai_models", "embedding_dim", "INTEGER")?;
+    add_column_if_missing(conn, "ai_models", "runtime", "TEXT NOT NULL DEFAULT 'local'")?;
+    add_column_if_missing(conn, "chunk_embeddings", "embedding_dim", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute(
+        "
+        UPDATE ai_models
+        SET embedding_dim = CASE
+                WHEN capability = 'embedding' THEN COALESCE(embedding_dim, 384)
+                ELSE embedding_dim
+            END,
+            runtime = COALESCE(runtime, 'local')
+        ",
+        [],
+    )?;
+    conn.execute(
+        "
+        UPDATE chunk_embeddings
+        SET embedding_dim = 384
+        WHERE embedding_dim = 0 AND model_id = 'embedding-small'
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
 fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -566,6 +589,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
         .iter()
         .filter_map(|migration| match migration.id.as_str() {
             MIGRATION_001_ID => Some(1),
+            MIGRATION_002_ID => Some(2),
             _ => None,
         })
         .max()
@@ -573,7 +597,29 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
 }
 
 fn known_migration(id: &str) -> bool {
-    matches!(id, MIGRATION_001_ID | DIRTY_MIGRATION_ID)
+    matches!(id, MIGRATION_001_ID | MIGRATION_002_ID | DIRTY_MIGRATION_ID)
+}
+
+fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
+    match migration.id.as_str() {
+        MIGRATION_001_ID => migration.checksum != MIGRATION_001_CHECKSUM,
+        MIGRATION_002_ID => migration.checksum != MIGRATION_002_CHECKSUM,
+        _ => false,
+    }
+}
+
+fn record_migration(
+    conn: &Connection,
+    id: &str,
+    checksum: &str,
+    description: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id, now_ms(), checksum, description],
+    )?;
+    Ok(())
 }
 
 fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {

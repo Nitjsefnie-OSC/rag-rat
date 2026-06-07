@@ -31,7 +31,10 @@
 `tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
 used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.
 
-Search tools return chunk IDs, paths, line spans, short summaries, and scores. Search and `read_chunk` validate stored chunk anchors against current source before returning context; stale files are reindexed once per tool call and their SQLite FTS5 rows are updated before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.
+Search tools return chunk IDs, paths, line spans, current-text snippets in the `summary` field, and
+scores. Search and `read_chunk` validate stored chunk anchors against current source before
+returning context; stale files are reindexed once per tool call and their SQLite FTS5 rows are
+updated before retrying. Use `read_chunk` only after a search or lookup has narrowed the context.
 
 Auto-heal is capped at four files per call. If more stale files are detected, tools return a
 `needs_reindex` error instead of doing unbounded work. Deleted source for a requested chunk returns
@@ -77,12 +80,14 @@ already-indexed files whose current source no longer matches the stored SQLite i
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
 Local AI artifacts are explicit and current-only. MCP query paths never install or download models.
-`local_ai_status` reports model capability state, artifact counts, and whether embeddings or summaries
-are ready, missing, stale, blocked, disabled, or failed. The CLI-only `models install <model-id>`
-command records explicit local model availability, and `reconcile` writes embeddings and summaries for
-current chunk hashes only. Hybrid search degrades to lexical/structural evidence when a model is
-missing or an artifact hash does not match the current chunk text; stale summaries and embeddings are
-treated as absent.
+`local_ai_status` reports embedding model state and artifact counts. The CLI-only
+`models install embedding-small` command records explicit local embedding availability, and
+`reconcile` writes local 384-dimensional chunk embeddings for current chunk hashes only.
+`semantic_search` combines BM25 candidates, vector similarity, symbol/name/path boosts,
+graph-neighborhood boosts, and optional git/GitHub papertrail boosts. Embeddings are used only when
+the model is installed, the embedding dimension matches model metadata, the artifact status is
+`Current`, and the artifact text hash matches the current chunk text hash; stale embeddings are
+treated as absent. There is no summarizer or LLM runtime in this milestone.
 
 Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
 message for each failed source parse. Markdown files are chunked by headings instead of parsed with

@@ -1648,7 +1648,6 @@ mod schema_bootstrap_tests {
         assert_eq!(table_count(&db, "commit_fts"), 1);
         assert_eq!(table_count(&db, "ai_models"), 1);
         assert_eq!(table_count(&db, "chunk_embeddings"), 1);
-        assert_eq!(table_count(&db, "chunk_summaries"), 1);
         assert_eq!(table_count(&db, "reconcile_attempts"), 1);
         assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
         assert_eq!(indexed_revision_count(&db), 0);
@@ -1657,7 +1656,7 @@ mod schema_bootstrap_tests {
         assert!(chunk_columns(&db).contains(&"start_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"end_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 1);
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 2);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1681,6 +1680,73 @@ mod schema_bootstrap_tests {
         let migrated = IndexDatabase::migrate(&database).unwrap();
         assert_eq!(migrated.state, schema::SchemaState::Compatible);
         IndexDatabase::open(&database).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrate_adds_edge_name_columns_before_indexing_them() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".rag-rat")).unwrap();
+        let database = root.join(".rag-rat/index.sqlite");
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE files(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                language TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                modified_at_ms INTEGER NOT NULL,
+                generated INTEGER NOT NULL DEFAULT 0,
+                indexed_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE chunks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                chunk_kind TEXT NOT NULL,
+                symbol_path TEXT,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                text_hash TEXT NOT NULL
+            );
+            CREATE TABLE symbols(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                language TEXT NOT NULL,
+                name TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                signature TEXT,
+                docs TEXT
+            );
+            CREATE TABLE edges(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_symbol_id INTEGER,
+                to_symbol_id INTEGER,
+                edge_kind TEXT NOT NULL,
+                confidence TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = IndexDatabase::migrate(&database).unwrap();
+        assert_eq!(migrated.state, schema::SchemaState::Compatible);
+        let db = IndexDatabase::open(&database).unwrap();
+        let columns = table_columns(&db, "edges");
+        assert!(columns.contains(&"from_name".to_string()));
+        assert!(columns.contains(&"to_name".to_string()));
+        assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
+        assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1775,7 +1841,6 @@ mod schema_bootstrap_tests {
         assert!(!status.git_history.available);
         assert_eq!(status.git_history.commit_count, 0);
         assert_eq!(status.local_ai.embedding.state, "MissingModel");
-        assert_eq!(status.local_ai.summary.state, "Ready");
         assert_eq!(indexed_revision_count(&db), 1);
         assert_eq!(chunk_source_revision_count(&db), 1);
 
@@ -1793,53 +1858,55 @@ mod schema_bootstrap_tests {
         assert!(!embedding.installed);
         assert_eq!(embedding.status, "MissingModel");
 
-        db.storage
-            .connection()
-            .execute(
-                "INSERT INTO chunk_summaries(chunk_id, model_id, source_text_hash, summary, status, created_at_ms)
-                 VALUES (?1, 'summary-basic', 'stale-hash', 'WRONG STALE SUMMARY', 'Current', ?2)",
-                params![chunk_id, now_ms()],
-            )
-            .unwrap();
         let hits = db.search("alpha", 10, false).unwrap();
         assert_eq!(hits.len(), 1);
-        assert!(!hits[0].summary.contains("WRONG STALE SUMMARY"));
+        assert_eq!(hits[0].summary, "alpha token\nsecond line");
 
         let blocked = db.reconcile(Some(1)).unwrap();
         assert_eq!(blocked.processed_chunks, 1);
         assert_eq!(blocked.embeddings_written, 0);
-        assert_eq!(blocked.summaries_written, 1);
         assert_eq!(blocked.blocked_chunks, 1);
         assert_eq!(blocked.status, "Blocked");
 
         let status = db.local_ai_status().unwrap();
         assert_eq!(status.embedding.state, "MissingModel");
         assert_eq!(status.embedding.blocked_artifacts, 1);
-        assert_eq!(status.summary.current_artifacts, 1);
 
         db.install_model("embedding-small").unwrap();
         let current = db.reconcile(Some(1)).unwrap();
         assert_eq!(current.embeddings_written, 1);
-        assert_eq!(current.summaries_written, 1);
         assert_eq!(current.status, "Current");
         let status = db.local_ai_status().unwrap();
         assert_eq!(status.embedding.state, "Ready");
         assert_eq!(status.embedding.current_artifacts, 1);
+        let embedding_bytes: i64 = db
+            .storage
+            .connection()
+            .query_row(
+                "SELECT length(vector_blob) FROM chunk_embeddings WHERE chunk_id = ?1 AND status = 'Current'",
+                [chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedding_bytes, (ai::EMBEDDING_DIM * 4) as i64);
 
         let hits = db.search("alpha", 10, false).unwrap();
         assert_eq!(hits[0].summary, "alpha token\nsecond line");
 
+        db.storage.connection().execute("DELETE FROM chunk_fts", []).unwrap();
+        let vector_hits = db.search("alpha", 10, false).unwrap();
+        assert_eq!(vector_hits.len(), 1);
+        assert_eq!(vector_hits[0].chunk_id, chunk_id);
+
         db.storage
             .connection()
             .execute(
-                "UPDATE chunk_summaries SET source_text_hash = 'old-hash', summary = 'STALE AFTER HASH CHANGE' WHERE chunk_id = ?1",
+                "UPDATE chunk_embeddings SET source_text_hash = 'old-hash' WHERE chunk_id = ?1",
                 [chunk_id],
             )
             .unwrap();
-        let stale_status = db.local_ai_status().unwrap();
-        assert_eq!(stale_status.summary.stale_artifacts, 1);
-        let hits = db.search("alpha", 10, false).unwrap();
-        assert!(!hits[0].summary.contains("STALE AFTER HASH CHANGE"));
+        let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
+        assert!(stale_embedding_hits.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2360,12 +2427,16 @@ fun helper() {}
     }
 
     fn chunk_columns(db: &IndexDatabase) -> Vec<String> {
-        let mut stmt = db.storage.connection().prepare("PRAGMA table_info(chunks)").unwrap();
-        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+        table_columns(db, "chunks")
     }
 
     fn file_columns(db: &IndexDatabase) -> Vec<String> {
-        let mut stmt = db.storage.connection().prepare("PRAGMA table_info(files)").unwrap();
+        table_columns(db, "files")
+    }
+
+    fn table_columns(db: &IndexDatabase, table: &str) -> Vec<String> {
+        let mut stmt =
+            db.storage.connection().prepare(&format!("PRAGMA table_info({table})")).unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
     }
 

@@ -24,9 +24,11 @@ GitHub papertrail data is fetched only by explicit `github sync` commands throug
 search, papertrail, and rationale tools read the local SQLite cache only. Cached issues, PRs,
 comments, reviews, and review comments are indexed as historical GitHub evidence.
 
-Local AI artifacts are also explicit. Query paths never download models. `models install` records
-model availability, and `reconcile` writes hash-bound embeddings and summaries only for current
-chunks. Stale AI artifacts are treated as absent.
+Local AI artifacts are explicit. Query paths never download models. `models install` records local
+embedding availability, and `reconcile` writes hash-bound 384-dimensional chunk embeddings only for
+current chunks. `semantic_search` uses embeddings only when the model is installed, the stored
+dimension matches the model metadata, the artifact is `Current`, and the artifact text hash matches
+the current chunk text hash. Stale AI artifacts are treated as absent.
 
 ## Commands
 
