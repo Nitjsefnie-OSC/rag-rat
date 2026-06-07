@@ -314,33 +314,103 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
     let Some(symbol) = hit.symbol_path.as_deref() else {
         return Ok(0.0);
     };
-    let direct = conn.query_row(
+    let qualified = qualified_symbol_name(symbol);
+    let mut stmt = conn.prepare(
         "
-        SELECT COUNT(*)
+        SELECT edge_kind, confidence, from_name, to_name
         FROM edges
-        WHERE from_name = ?1 OR to_name = ?1
+        WHERE from_name IN (?1, ?2) OR to_name IN (?1, ?2)
+        ORDER BY
+            CASE confidence
+                WHEN 'Exact' THEN 0
+                WHEN 'Syntactic' THEN 1
+                WHEN 'NameOnly' THEN 2
+                ELSE 3
+            END,
+            edge_kind
+        LIMIT 64
         ",
-        [symbol],
-        |row| row.get::<_, i64>(0),
     )?;
-    let mut boost: f64 = if direct > 0 { 0.70 } else { 0.0 };
-    for term in terms {
-        let like = format!("%{term}%");
-        let related = conn.query_row(
-            "
-            SELECT COUNT(*)
-            FROM edges
-            WHERE (from_name = ?1 OR to_name = ?1)
-              AND (from_name LIKE ?2 OR to_name LIKE ?2)
-            ",
-            params![symbol, like],
-            |row| row.get::<_, i64>(0),
-        )?;
-        if related > 0 {
-            boost += 0.20;
+    let rows = stmt.query_map(params![symbol, qualified], |row| {
+        Ok(GraphEdgeEvidence {
+            edge_kind: row.get(0)?,
+            confidence: row.get(1)?,
+            from_name: row.get(2)?,
+            to_name: row.get(3)?,
+        })
+    })?;
+    let mut strongest: f64 = 0.0;
+    let mut secondary: f64 = 0.0;
+    for row in rows {
+        let edge = row?;
+        let Some(other) = edge.other_endpoint(symbol, qualified) else {
+            continue;
+        };
+        let term_weight = if terms.iter().any(|term| !term.is_empty() && other.contains(term)) {
+            1.0
+        } else {
+            0.35
+        };
+        let evidence =
+            confidence_weight(&edge.confidence) * relation_weight(&edge.edge_kind) * term_weight;
+        if evidence > strongest {
+            secondary += strongest * 0.15;
+            strongest = evidence;
+        } else {
+            secondary += evidence * 0.15;
         }
     }
-    Ok(boost.min(1.0))
+    Ok((strongest + secondary).min(1.0))
+}
+
+#[derive(Debug)]
+struct GraphEdgeEvidence {
+    edge_kind: String,
+    confidence: String,
+    from_name: Option<String>,
+    to_name: String,
+}
+
+impl GraphEdgeEvidence {
+    fn other_endpoint(&self, symbol: &str, qualified: &str) -> Option<String> {
+        let from_name = self.from_name.as_deref().unwrap_or_default();
+        if from_name == symbol || from_name == qualified {
+            return Some(self.to_name.to_ascii_lowercase());
+        }
+        if self.to_name == symbol || self.to_name == qualified {
+            return Some(from_name.to_ascii_lowercase());
+        }
+        None
+    }
+}
+
+fn qualified_symbol_name(symbol_path: &str) -> &str {
+    for marker in [".rs::", ".ts::", ".tsx::", ".kt::", ".kts::"] {
+        if let Some(index) = symbol_path.find(marker) {
+            return &symbol_path[(index + marker.len())..];
+        }
+    }
+    symbol_path
+}
+
+fn confidence_weight(confidence: &str) -> f64 {
+    match confidence {
+        "Exact" => 1.0,
+        "Syntactic" => 0.70,
+        "NameOnly" => 0.25,
+        "Ambiguous" => 0.0,
+        _ => 0.0,
+    }
+}
+
+fn relation_weight(edge_kind: &str) -> f64 {
+    match edge_kind {
+        "calls_name" | "constructs" | "uses_macro" => 1.0,
+        "imports" | "exports" => 0.60,
+        "references_type" | "implements" | "extends" => 0.40,
+        "contains" => 0.20,
+        _ => 0.0,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
