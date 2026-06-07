@@ -1152,7 +1152,15 @@ fn search_fts(
     } else {
         stmt.query_map(params![fts_query, i64::from(limit)], evidence_row)?
     };
-    collect_rows(rows)
+    let mut hits = collect_rows(rows)?;
+    for (rank, hit) in hits.iter_mut().enumerate() {
+        hit.score = positive_rank_score(rank);
+    }
+    Ok(hits)
+}
+
+fn positive_rank_score(rank: usize) -> f64 {
+    1.0 / ((rank + 1) as f64).sqrt()
 }
 
 fn evidence_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubEvidence> {

@@ -3528,6 +3528,7 @@ mod schema_bootstrap_tests {
         assert!((hits[0].score - component_sum).abs() < 0.000_001);
         assert!(components.bm25 > 0.0);
         assert!(components.vector > 0.0);
+        assert!(components.vector_note.is_none());
         assert!(components.bm25 <= 0.45);
         assert!(components.vector <= 0.35);
         assert!(components.symbol <= 0.10);
@@ -3535,6 +3536,27 @@ mod schema_bootstrap_tests {
         assert!(components.git <= 0.03);
         assert!(components.github <= 0.02);
         assert!(db.search("runtime shutdown", 10, false).unwrap()[0].score_components.is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_explain_labels_missing_vector_runtime() {
+        let (root, config) = markdown_config(
+            "alpha runtime shutdown\nsecond line with enough detail for lexical search without embeddings\nthird line\n",
+        );
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let hits = db.search_explain("runtime shutdown", 10, false).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        let components = hits[0].score_components.as_ref().unwrap();
+        assert!(components.bm25 > 0.0);
+        assert_eq!(components.vector, 0.0);
+        assert_eq!(
+            components.vector_note.as_deref(),
+            Some("vector search unavailable: no current embedding model")
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3593,6 +3615,7 @@ mod schema_bootstrap_tests {
         assert_eq!(commit_hits.len(), 1);
         assert_eq!(commit_hits[0].subject, "Refresh beta docs");
         assert_eq!(commit_hits[0].evidence_kind, "historical");
+        assert!(commit_hits[0].score > 0.0);
 
         let path_history = db.git_history_for_path("docs/search.md", 10).unwrap();
         assert_eq!(path_history.len(), 2);

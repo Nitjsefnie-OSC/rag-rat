@@ -37,6 +37,8 @@ pub struct ScoreComponents {
     pub graph: f64,
     pub git: f64,
     pub github: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,13 +134,14 @@ fn search_with_query_embedding(
 ) -> anyhow::Result<Vec<SearchHit>> {
     let terms = query_terms(query);
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
+    let vector_available = query_embedding.is_some();
     let mut ranked = BTreeMap::<i64, RankedHit>::new();
 
     for (rank, hit) in
         bm25_candidates(conn, query, candidate_limit, include_generated)?.into_iter().enumerate()
     {
         let entry = ranked.entry(hit.chunk_id).or_insert_with(|| RankedHit::new(hit));
-        entry.components.bm25 = BM25_WEIGHT * (1.0 / (rank as f64 + 1.0));
+        entry.components.bm25 = BM25_WEIGHT * lexical_rank_score(rank);
     }
 
     for (hit, similarity) in
@@ -156,7 +159,7 @@ fn search_with_query_embedding(
             hit.components.graph = GRAPH_WEIGHT * boosts.graph;
             hit.components.git = GIT_WEIGHT * boosts.git;
             hit.components.github = GITHUB_WEIGHT * boosts.github;
-            Ok(hit.finish(explain))
+            Ok(hit.finish(explain, vector_available))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -174,7 +177,7 @@ impl RankedHit {
         Self { hit, components: ScoreComponents::default() }
     }
 
-    fn finish(mut self, explain: bool) -> SearchHit {
+    fn finish(mut self, explain: bool, vector_available: bool) -> SearchHit {
         self.hit.score = self.components.bm25
             + self.components.vector
             + self.components.symbol
@@ -182,10 +185,21 @@ impl RankedHit {
             + self.components.git
             + self.components.github;
         if explain {
+            if !vector_available {
+                self.components.vector_note =
+                    Some("vector search unavailable: no current embedding model".to_string());
+            } else if self.components.vector == 0.0 {
+                self.components.vector_note =
+                    Some("no positive current vector match for this chunk".to_string());
+            }
             self.hit.score_components = Some(self.components);
         }
         self.hit
     }
+}
+
+fn lexical_rank_score(rank: usize) -> f64 {
+    1.0 / ((rank + 1) as f64).sqrt()
 }
 
 fn bm25_candidates(

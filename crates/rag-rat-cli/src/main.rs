@@ -228,6 +228,9 @@ fn print_query_explain(hits: &[SearchHit]) {
             println!("  graph: {:.3}", components.graph);
             println!("  git: {:.3}", components.git);
             println!("  github: {:.3}", components.github);
+            if let Some(note) = &components.vector_note {
+                println!("  vector_note: {note}");
+            }
         }
         println!("summary:");
         for line in hit.summary.lines() {

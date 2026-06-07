@@ -225,7 +225,15 @@ pub fn commit_search(
             evidence_kind: "historical",
         })
     })?;
-    collect_rows(rows)
+    let mut hits = collect_rows(rows)?;
+    for (rank, hit) in hits.iter_mut().enumerate() {
+        hit.score = positive_rank_score(rank);
+    }
+    Ok(hits)
+}
+
+fn positive_rank_score(rank: usize) -> f64 {
+    1.0 / ((rank + 1) as f64).sqrt()
 }
 
 pub fn history_for_path(
