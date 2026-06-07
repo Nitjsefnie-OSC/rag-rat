@@ -37,7 +37,7 @@ impl RagRatService {
 impl RagRatService {
     #[tool(
         name = "semantic_search",
-        description = "Search indexed source and docs with SQLite BM25 lexical recall; validates stale hits."
+        description = "Search indexed source and docs with hybrid BM25/vector/structural ranking; optionally explains score components."
     )]
     fn semantic_search(
         &self,

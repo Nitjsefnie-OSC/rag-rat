@@ -37,6 +37,8 @@ pub struct SearchArgs {
     pub limit: u32,
     #[serde(default)]
     pub include_generated: bool,
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -124,7 +126,11 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
-            json!(db.search(&args.query, args.limit, args.include_generated)?)
+            if args.explain {
+                json!(db.search_explain(&args.query, args.limit, args.include_generated)?)
+            } else {
+                json!(db.search(&args.query, args.limit, args.include_generated)?)
+            }
         },
         "symbol_lookup" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;

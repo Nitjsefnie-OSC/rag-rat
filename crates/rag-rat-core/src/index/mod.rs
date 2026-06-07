@@ -471,7 +471,17 @@ impl IndexDatabase {
         include_generated: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
         self.ensure_fts_fresh()?;
-        self.search_with_heal(query, limit, include_generated, true)
+        self.search_with_heal(query, limit, include_generated, true, false)
+    }
+
+    pub fn search_explain(
+        &self,
+        query: &str,
+        limit: u32,
+        include_generated: bool,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        self.ensure_fts_fresh()?;
+        self.search_with_heal(query, limit, include_generated, true, true)
     }
 
     pub fn symbols(
@@ -1164,13 +1174,23 @@ impl IndexDatabase {
         limit: u32,
         include_generated: bool,
         allow_heal: bool,
+        explain: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        let hits = crate::search::lexical::search(
-            self.storage.connection(),
-            query,
-            limit,
-            include_generated,
-        )?;
+        let hits = if explain {
+            crate::search::lexical::search_explain(
+                self.storage.connection(),
+                query,
+                limit,
+                include_generated,
+            )?
+        } else {
+            crate::search::lexical::search(
+                self.storage.connection(),
+                query,
+                limit,
+                include_generated,
+            )?
+        };
         if !allow_heal {
             return Ok(hits);
         }
@@ -1188,7 +1208,7 @@ impl IndexDatabase {
             self.heal_file(Path::new(&path))?;
         }
         self.sync_fts()?;
-        self.search_with_heal(query, limit, include_generated, false)
+        self.search_with_heal(query, limit, include_generated, false, explain)
     }
 
     fn stale_hit_paths(&self, hits: &[SearchHit]) -> anyhow::Result<Vec<String>> {
@@ -2030,6 +2050,37 @@ mod schema_bootstrap_tests {
         assert_eq!(report.embeddings_written, 2);
         assert_eq!(report.batch_size, 2);
         assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 2);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_explain_reports_weighted_score_components() {
+        let (root, config) = markdown_config("alpha runtime shutdown\nsecond line\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+        db.reconcile(None, Some(8)).unwrap();
+
+        let hits = db.search_explain("runtime shutdown", 10, false).unwrap();
+
+        assert_eq!(hits.len(), 1);
+        let components = hits[0].score_components.as_ref().unwrap();
+        let component_sum = components.bm25
+            + components.vector
+            + components.symbol
+            + components.graph
+            + components.git
+            + components.github;
+        assert!((hits[0].score - component_sum).abs() < 0.000_001);
+        assert!(components.bm25 > 0.0);
+        assert!(components.vector > 0.0);
+        assert!(components.bm25 <= 0.45);
+        assert!(components.vector <= 0.35);
+        assert!(components.symbol <= 0.10);
+        assert!(components.graph <= 0.05);
+        assert!(components.git <= 0.03);
+        assert!(components.github <= 0.02);
+        assert!(db.search("runtime shutdown", 10, false).unwrap()[0].score_components.is_none());
 
         fs::remove_dir_all(root).unwrap();
     }

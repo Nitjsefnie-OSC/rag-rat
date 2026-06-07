@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use rag_rat_core::{Config, IndexDatabase, index::IndexProgress};
+use rag_rat_core::{Config, IndexDatabase, index::IndexProgress, search::lexical::SearchHit};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +39,11 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("query command needs a search string");
             }
             let db = IndexDatabase::open(&config.database)?;
-            print_json(&db.search(&query, 10, false)?)?;
+            if has_flag(&args, "--explain") {
+                print_query_explain(&db.search_explain(&query, 10, false)?);
+            } else {
+                print_json(&db.search(&query, 10, false)?)?;
+            }
         },
         "mcp" => {
             rag_rat_mcp::server::run_stdio(config.database).await?;
@@ -156,6 +160,34 @@ fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
             result.missing_papertrail_kinds,
             result.stale_current_source_violations
         );
+    }
+}
+
+fn print_query_explain(hits: &[SearchHit]) {
+    for (index, hit) in hits.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        println!(
+            "{}:{}-{} {}",
+            hit.path,
+            hit.start_line,
+            hit.end_line,
+            hit.symbol_path.as_deref().unwrap_or("<chunk>")
+        );
+        println!("score: {:.3}", hit.score);
+        if let Some(components) = &hit.score_components {
+            println!("  bm25: {:.3}", components.bm25);
+            println!("  vector: {:.3}", components.vector);
+            println!("  symbol: {:.3}", components.symbol);
+            println!("  graph: {:.3}", components.graph);
+            println!("  git: {:.3}", components.git);
+            println!("  github: {:.3}", components.github);
+        }
+        println!("summary:");
+        for line in hit.summary.lines() {
+            println!("  {line}");
+        }
     }
 }
 
@@ -336,7 +368,8 @@ fn usage() {
          rag-rat eval --config rag-rat.toml\n\
          rag-rat eval --json --config rag-rat.toml\n\
          rag-rat eval --update-baseline --config rag-rat.toml\n\
-         rag-rat query --config rag-rat.toml \"semantic recall\""
+         rag-rat query --config rag-rat.toml \"semantic recall\"\n\
+         rag-rat query --explain --config rag-rat.toml \"runtime shutdown\""
     );
 }
 
