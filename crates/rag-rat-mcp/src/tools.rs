@@ -409,7 +409,7 @@ fn graph_tool(
 fn docs_for_symbol_tool(db: &IndexDatabase, args: SymbolGraphArgs) -> anyhow::Result<Value> {
     let selector = graph_symbol_selector(&args)?;
     match db.select_symbol(&selector)? {
-        Ok(Some(symbol)) => Ok(json!(db.docs_for_symbol(&symbol.qualified_name, args.limit)?)),
+        Ok(Some(symbol)) => Ok(json!(db.docs_for_selected_symbol(&symbol, args.limit)?)),
         Ok(None) if args.allow_ambiguous => {
             let Some(symbol) = args.symbol.as_deref() else {
                 return Ok(Value::Null);

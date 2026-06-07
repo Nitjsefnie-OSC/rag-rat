@@ -789,6 +789,19 @@ impl IndexDatabase {
         self.search(symbol, limit, true)
     }
 
+    pub fn docs_for_selected_symbol(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        limit: u32,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        let mut hits = self.local_symbol_context_hits(symbol, limit)?;
+        hits.extend(self.search(&symbol.name, limit.saturating_mul(4).max(limit), true)?);
+        rank_docs_for_symbol(symbol, &mut hits);
+        dedupe_search_hits(&mut hits);
+        hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(hits)
+    }
+
     pub fn commit_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<CommitSearchHit>> {
         git_history::commit_search(self.storage.connection(), query, limit)
     }
@@ -1410,6 +1423,65 @@ impl IndexDatabase {
         let mut options = options.clone();
         options.logical_symbol_id = Some(logical.logical_symbol_id);
         Ok(options)
+    }
+
+    fn local_symbol_context_hits(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        limit: u32,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        let mut stmt = self.storage.connection().prepare(
+            "
+            SELECT chunks.id, files.path, files.language, files.kind,
+                   chunks.start_line, chunks.end_line, chunks.symbol_path, chunks.text
+            FROM chunks
+            JOIN files ON files.id = chunks.file_id
+            WHERE files.path = ?1
+              AND (
+                chunks.symbol_path = ?2
+                OR chunks.symbol_path LIKE ?3
+                OR chunks.text LIKE ?4
+              )
+            ORDER BY
+              CASE
+                WHEN chunks.symbol_path = ?2 THEN 0
+                WHEN chunks.symbol_path LIKE ?3 THEN 1
+                ELSE 2
+              END,
+              chunks.start_line
+            LIMIT ?5
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                symbol.path,
+                symbol.qualified_name,
+                format!("%{}%", symbol.name),
+                format!("%{}%", symbol.name),
+                i64::from(limit.max(1)),
+            ],
+            |row| {
+                let text: String = row.get(7)?;
+                Ok(SearchHit {
+                    chunk_id: row.get(0)?,
+                    path: row.get(1)?,
+                    language: row.get(2)?,
+                    kind: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                    symbol_path: row.get(6)?,
+                    score: 1.0,
+                    summary: bounded_summary(&text),
+                    graph: None,
+                    score_components: None,
+                })
+            },
+        )?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        Ok(hits)
     }
 
     pub fn impact_surface(
@@ -2381,6 +2453,75 @@ struct GraphPathRow {
     language: String,
     sha256: String,
     indexed_revision: String,
+}
+
+fn rank_docs_for_symbol(symbol: &crate::query::symbol::SymbolHit, hits: &mut [SearchHit]) {
+    let source_module = module_stem(&symbol.path);
+    let symbol_name = symbol.name.to_ascii_lowercase();
+    let qualified_name = symbol.qualified_name.to_ascii_lowercase();
+    hits.sort_by(|a, b| {
+        let a_rank = docs_locality_rank(symbol, &source_module, &symbol_name, &qualified_name, a);
+        let b_rank = docs_locality_rank(symbol, &source_module, &symbol_name, &qualified_name, b);
+        a_rank
+            .cmp(&b_rank)
+            .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.start_line.cmp(&b.start_line))
+    });
+    for (idx, hit) in hits.iter_mut().enumerate() {
+        hit.score = (10_000usize.saturating_sub(idx)) as f64;
+    }
+}
+
+fn docs_locality_rank(
+    symbol: &crate::query::symbol::SymbolHit,
+    source_module: &str,
+    symbol_name: &str,
+    qualified_name: &str,
+    hit: &SearchHit,
+) -> u8 {
+    let path = hit.path.to_ascii_lowercase();
+    let summary = hit.summary.to_ascii_lowercase();
+    let hit_symbol = hit.symbol_path.as_deref().unwrap_or_default().to_ascii_lowercase();
+    if hit.path == symbol.path && hit_symbol == symbol.qualified_name.to_ascii_lowercase() {
+        return 0;
+    }
+    if hit.path == symbol.path {
+        return 1;
+    }
+    if !source_module.is_empty()
+        && path.contains(source_module)
+        && (summary.contains(symbol_name) || hit_symbol.contains(symbol_name))
+    {
+        return 2;
+    }
+    if summary.contains(qualified_name) || hit_symbol.contains(qualified_name) {
+        return 3;
+    }
+    if summary.contains(symbol_name) || hit_symbol.contains(symbol_name) {
+        return 4;
+    }
+    if !source_module.is_empty() && path.contains(source_module) {
+        return 5;
+    }
+    9
+}
+
+fn module_stem(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn dedupe_search_hits(hits: &mut Vec<SearchHit>) {
+    let mut seen = BTreeSet::new();
+    hits.retain(|hit| seen.insert(hit.chunk_id));
+}
+
+fn bounded_summary(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(240).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -4387,6 +4528,72 @@ pub fn caller() {
                     && item.symbol.as_deref() != Some("Send")
             }),
             "type references should not appear as direct impact: {impact:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docs_for_symbol_prefers_local_source_context_before_broad_markdown() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/runtime")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("src/runtime/task_spawn.rs"),
+            r#"
+pub fn spawn_blocking<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    f()
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/phrase-persistence.md"),
+            "# Phrase persistence\nUnrelated notes mention spawn_blocking in passing.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/task_spawn.md"),
+            "# task_spawn\nLocal task_spawn notes explain spawn_blocking.\n",
+        )
+        .unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![
+                ResolvedTarget {
+                    name: "rust".to_string(),
+                    language: Language::Rust,
+                    directories: vec![PathBuf::from("src")],
+                    include: vec!["src/".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Source,
+                },
+                ResolvedTarget {
+                    name: "markdown".to_string(),
+                    language: Language::Markdown,
+                    directories: vec![PathBuf::from("docs")],
+                    include: vec!["**/*.md".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Docs,
+                },
+            ],
+            local_ai: Default::default(),
+        };
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);
+        let hits = db.docs_for_selected_symbol(&symbol, 10).unwrap();
+        assert_eq!(hits[0].path, "src/runtime/task_spawn.rs", "docs hits: {hits:?}");
+        let phrase_index = hits.iter().position(|hit| hit.path == "docs/phrase-persistence.md");
+        let task_spawn_index = hits.iter().position(|hit| hit.path == "docs/task_spawn.md");
+        assert!(
+            phrase_index.is_none_or(|phrase| task_spawn_index.is_some_and(|local| local < phrase)),
+            "path-local task_spawn docs should outrank unrelated phrase docs: {hits:?}"
         );
 
         fs::remove_dir_all(root).unwrap();
