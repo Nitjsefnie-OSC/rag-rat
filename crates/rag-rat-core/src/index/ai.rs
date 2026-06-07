@@ -174,6 +174,13 @@ pub struct ReconcileReport {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub enum ReconcileProgress {
+    Started { model_id: String, total_chunks: u64, batch_size: usize },
+    Batch { processed_chunks: u64, total_chunks: u64, embeddings_written: u64, blocked_chunks: u64 },
+    Finished { processed_chunks: u64, embeddings_written: u64, blocked_chunks: u64 },
+}
+
 pub fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     remove_legacy_models(conn)?;
     upsert_model(conn, HASH_MODEL_ID, "embedding", Some(HASH_EMBEDDING_DIM), "hash", false)?;
@@ -256,6 +263,15 @@ pub fn reconcile(
     limit: Option<u32>,
     batch_size: Option<u32>,
 ) -> anyhow::Result<ReconcileReport> {
+    reconcile_with_progress(conn, limit, batch_size, |_| {})
+}
+
+pub fn reconcile_with_progress(
+    conn: &Connection,
+    limit: Option<u32>,
+    batch_size: Option<u32>,
+    mut progress: impl FnMut(ReconcileProgress),
+) -> anyhow::Result<ReconcileReport> {
     ensure_model_manifest(conn)?;
     let active_model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &active_model_id)?;
@@ -285,8 +301,12 @@ pub fn reconcile(
     };
 
     report.processed_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let write_result = if let Ok(embedder) = embedder {
+    progress(ReconcileProgress::Started {
+        model_id: active_model_id.clone(),
+        total_chunks: report.processed_chunks,
+        batch_size,
+    });
+    if let Ok(embedder) = embedder {
         for batch in chunks.chunks(batch_size) {
             let texts = batch.iter().map(|chunk| chunk.text.clone()).collect::<Vec<_>>();
             let vectors = embedder.embed_batch(&texts)?;
@@ -298,25 +318,34 @@ pub fn reconcile(
                     batch.len()
                 );
             }
-            for (chunk, vector) in batch.iter().zip(vectors) {
-                store_embedding(conn, embedder.as_ref(), chunk, &vector)?;
-            }
+            write_current_embedding_batch(conn, embedder.as_ref(), batch, &vectors)?;
+            report.embeddings_written += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            progress(ReconcileProgress::Batch {
+                processed_chunks: report.embeddings_written + report.blocked_chunks,
+                total_chunks: report.processed_chunks,
+                embeddings_written: report.embeddings_written,
+                blocked_chunks: report.blocked_chunks,
+            });
         }
-        report.embeddings_written = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
-        Ok(())
     } else {
         let reason = model_not_ready_reason(&model);
-        for chunk in &chunks {
-            store_blocked_embedding(conn, &active_model_id, model.embedding_dim, chunk, &reason)?;
+        for batch in chunks.chunks(batch_size) {
+            write_blocked_embedding_batch(
+                conn,
+                &active_model_id,
+                model.embedding_dim,
+                batch,
+                &reason,
+            )?;
+            report.blocked_chunks += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            progress(ReconcileProgress::Batch {
+                processed_chunks: report.embeddings_written + report.blocked_chunks,
+                total_chunks: report.processed_chunks,
+                embeddings_written: report.embeddings_written,
+                blocked_chunks: report.blocked_chunks,
+            });
         }
-        report.blocked_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
-        Ok(())
     };
-    if let Err(err) = write_result {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(err);
-    }
-    conn.execute_batch("COMMIT")?;
 
     if report.blocked_chunks > 0 {
         report.status = "Blocked".to_string();
@@ -347,6 +376,11 @@ pub fn reconcile(
             report.message,
         ],
     )?;
+    progress(ReconcileProgress::Finished {
+        processed_chunks: report.processed_chunks,
+        embeddings_written: report.embeddings_written,
+        blocked_chunks: report.blocked_chunks,
+    });
     Ok(report)
 }
 
@@ -477,16 +511,67 @@ struct CurrentChunk {
 }
 
 fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<CurrentChunk>> {
-    let sql = if limit.is_some() {
-        "SELECT id, text, text_hash FROM chunks ORDER BY id LIMIT ?1"
+    let rows = if let Some(limit) = limit {
+        let mut stmt =
+            conn.prepare("SELECT id, text, text_hash FROM chunks ORDER BY id LIMIT ?1")?;
+        let rows = stmt.query_map(params![i64::from(limit)], current_chunk_row)?;
+        collect_rows(rows)?
     } else {
-        "SELECT id, text, text_hash FROM chunks ORDER BY id LIMIT -1"
+        let mut stmt = conn.prepare("SELECT id, text, text_hash FROM chunks ORDER BY id")?;
+        let rows = stmt.query_map([], current_chunk_row)?;
+        collect_rows(rows)?
     };
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([limit.map(i64::from).unwrap_or(-1)], |row| {
-        Ok(CurrentChunk { id: row.get(0)?, text: row.get(1)?, text_hash: row.get(2)? })
-    })?;
-    collect_rows(rows)
+    Ok(rows)
+}
+
+fn current_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CurrentChunk> {
+    Ok(CurrentChunk { id: row.get(0)?, text: row.get(1)?, text_hash: row.get(2)? })
+}
+
+fn write_current_embedding_batch(
+    conn: &Connection,
+    embedder: &dyn Embedder,
+    batch: &[CurrentChunk],
+    vectors: &[Vec<f32>],
+) -> anyhow::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let write_result = (|| {
+        for (chunk, vector) in batch.iter().zip(vectors) {
+            store_embedding(conn, embedder, chunk, vector)?;
+        }
+        Ok(())
+    })();
+    finish_batch_transaction(conn, write_result)
+}
+
+fn write_blocked_embedding_batch(
+    conn: &Connection,
+    model_id: &str,
+    embedding_dim: Option<i64>,
+    batch: &[CurrentChunk],
+    reason: &str,
+) -> anyhow::Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let write_result = (|| {
+        for chunk in batch {
+            store_blocked_embedding(conn, model_id, embedding_dim, chunk, reason)?;
+        }
+        Ok(())
+    })();
+    finish_batch_transaction(conn, write_result)
+}
+
+fn finish_batch_transaction(conn: &Connection, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        },
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        },
+    }
 }
 
 fn store_embedding(

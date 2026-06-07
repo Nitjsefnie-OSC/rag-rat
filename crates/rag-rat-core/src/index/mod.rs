@@ -783,6 +783,15 @@ impl IndexDatabase {
         ai::reconcile(self.storage.connection(), limit, batch_size)
     }
 
+    pub fn reconcile_with_progress(
+        &self,
+        limit: Option<u32>,
+        batch_size: Option<u32>,
+        progress: impl FnMut(ai::ReconcileProgress),
+    ) -> anyhow::Result<ReconcileReport> {
+        ai::reconcile_with_progress(self.storage.connection(), limit, batch_size, progress)
+    }
+
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
         ai::current_embedding_count(self.storage.connection(), model_id)
     }
@@ -2005,6 +2014,22 @@ mod schema_bootstrap_tests {
             .unwrap();
         let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
         assert!(stale_embedding_hits.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconcile_without_limit_processes_all_chunks() {
+        let (root, config) = markdown_config("# One\nalpha token\n\n# Two\nbeta token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+        let report = db.reconcile(None, Some(2)).unwrap();
+
+        assert_eq!(report.processed_chunks, 2);
+        assert_eq!(report.embeddings_written, 2);
+        assert_eq!(report.batch_size, 2);
+        assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 2);
 
         fs::remove_dir_all(root).unwrap();
     }

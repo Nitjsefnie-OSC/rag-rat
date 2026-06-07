@@ -177,7 +177,40 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let db = IndexDatabase::open(&config.database)?;
     let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
     let batch_size = option_value(args, "--batch-size").map(|value| value.parse()).transpose()?;
-    print_json(&db.reconcile(limit, batch_size)?)
+    print_json(&db.reconcile_with_progress(limit, batch_size, render_reconcile_progress)?)
+}
+
+fn render_reconcile_progress(progress: rag_rat_core::index::ai::ReconcileProgress) {
+    match progress {
+        rag_rat_core::index::ai::ReconcileProgress::Started {
+            model_id,
+            total_chunks,
+            batch_size,
+        } => {
+            eprintln!("reconcile: model={model_id} chunks={total_chunks} batch_size={batch_size}");
+        },
+        rag_rat_core::index::ai::ReconcileProgress::Batch {
+            processed_chunks,
+            total_chunks,
+            embeddings_written,
+            blocked_chunks,
+        } => {
+            let percent =
+                processed_chunks.saturating_mul(100).checked_div(total_chunks).unwrap_or(100);
+            eprintln!(
+                "reconcile: {processed_chunks}/{total_chunks} ({percent:>3}%) written={embeddings_written} blocked={blocked_chunks}"
+            );
+        },
+        rag_rat_core::index::ai::ReconcileProgress::Finished {
+            processed_chunks,
+            embeddings_written,
+            blocked_chunks,
+        } => {
+            eprintln!(
+                "reconcile: complete processed={processed_chunks} written={embeddings_written} blocked={blocked_chunks}"
+            );
+        },
+    }
 }
 
 fn migrate(config: &Config, args: &[String]) -> anyhow::Result<()> {
