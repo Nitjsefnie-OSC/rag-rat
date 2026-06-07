@@ -8,6 +8,11 @@ root = "."
 database = ".rag-rat/index.sqlite"
 ```
 
+The database stores explicit schema migrations in `schema_version` with migration id,
+`applied_at_ms`, checksum, and description. `rag-rat migrate --check` verifies compatibility without
+changing source files; `rag-rat migrate` applies the current SQLite index schema. Normal runtime
+opens refuse older, newer, dirty, or partial schemas instead of silently altering tables.
+
 Simple bindings map a language to directories:
 
 ```toml

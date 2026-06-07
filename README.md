@@ -34,6 +34,8 @@ chunks. Stale AI artifacts are treated as absent.
 cargo run --bin rag-rat -- index --config rag-rat.toml
 cargo run --bin rag-rat -- index --full --config rag-rat.toml
 cargo run --bin rag-rat -- doctor --config rag-rat.toml
+cargo run --bin rag-rat -- migrate --check --config rag-rat.toml
+cargo run --bin rag-rat -- migrate --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --from-refs --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42 --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --from-refs --offline --config rag-rat.toml
@@ -45,6 +47,16 @@ cargo run --bin rag-rat -- mcp --config rag-rat.toml
 ```
 
 By default, rag-rat links against the system SQLite library through `rusqlite`.
+
+## Schema Migrations
+
+The SQLite index has an explicit `schema_version` table. Each migration records an id,
+`applied_at_ms`, checksum, and description. Runtime opens are check-only: compatible schemas open,
+older schemas report `rag-rat migrate` or `rag-rat index --full`, newer schemas are refused, and
+dirty or partial migrations are refused with a rebuild instruction.
+
+Use `migrate --check` for CI/preflight and `migrate` to apply the current index schema baseline.
+Because the index is derived, hard migration failures should be resolved with `index --full`.
 
 `index` updates files currently changed in git status. Use `index --full` to rebuild every file
 and rebuild the SQLite FTS5 table from stored chunks.

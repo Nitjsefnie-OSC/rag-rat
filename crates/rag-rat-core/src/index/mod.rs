@@ -82,6 +82,7 @@ pub enum IndexProgress {
 pub struct IndexStatus {
     pub database: String,
     pub exists: bool,
+    pub schema: schema::SchemaStatus,
     pub git_commit: Option<String>,
     pub git_dirty: Option<bool>,
     pub indexed_at_ms: Option<i64>,
@@ -130,6 +131,36 @@ pub enum IndexError {
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let mut storage = IndexConnection::open(path)?;
+        schema::check_compatible(storage.connection())?;
+        ai::ensure_model_manifest(storage.connection())?;
+        if let Some(root) = meta_for(storage.connection(), "source_root")? {
+            storage.set_source_root(PathBuf::from(root));
+        }
+        Ok(Self { storage })
+    }
+
+    pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
+        let storage = IndexConnection::open(path)?;
+        let status = schema::status(storage.connection())?;
+        match status.state {
+            schema::SchemaState::Compatible => return Ok(status),
+            schema::SchemaState::Newer | schema::SchemaState::Dirty => {
+                anyhow::bail!("{}", status.message);
+            },
+            schema::SchemaState::Missing | schema::SchemaState::Older => {},
+        }
+        schema::apply(storage.connection())?;
+        ai::ensure_model_manifest(storage.connection())?;
+        schema::status(storage.connection())
+    }
+
+    pub fn migration_check(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
+        let storage = IndexConnection::open(path)?;
+        schema::status(storage.connection())
+    }
+
+    fn create_or_migrate(path: &Path) -> anyhow::Result<Self> {
+        let mut storage = IndexConnection::open(path)?;
         schema::apply(storage.connection())?;
         ai::ensure_model_manifest(storage.connection())?;
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
@@ -148,7 +179,7 @@ impl IndexDatabase {
     {
         progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: true });
         remove_database_files(&config.database)?;
-        let mut db = Self::open(&config.database)?;
+        let mut db = Self::create_or_migrate(&config.database)?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
@@ -182,9 +213,15 @@ impl IndexDatabase {
         if !config.database.exists() {
             return Self::rebuild_with_progress(config, progress);
         }
+        if Self::migration_check(&config.database)?.state == schema::SchemaState::Missing {
+            return Self::rebuild_with_progress(config, progress);
+        }
 
-        progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: false });
         let mut db = Self::open(&config.database)?;
+        if db.indexed_file_count()? == 0 {
+            return Self::rebuild_with_progress(config, progress);
+        }
+        progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: false });
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
@@ -326,6 +363,7 @@ impl IndexDatabase {
         Ok(IndexStatus {
             database: database.display().to_string(),
             exists: database.exists(),
+            schema: schema::status(self.storage.connection())?,
             git_commit: self.meta("git_commit")?,
             git_dirty: self.meta("git_dirty")?.map(|value| value == "true"),
             indexed_at_ms: self.meta("indexed_at_ms")?.and_then(|value| value.parse::<i64>().ok()),
@@ -1447,6 +1485,75 @@ mod schema_bootstrap_tests {
         assert!(chunk_columns(&db).contains(&"start_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"end_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compatible_open_requires_recorded_schema_version() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".rag-rat")).unwrap();
+        let database = root.join(".rag-rat/index.sqlite");
+        IndexDatabase::migrate(&database).unwrap();
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch("DROP TABLE schema_version;").unwrap();
+        drop(conn);
+
+        let status = IndexDatabase::migration_check(&database).unwrap();
+        assert_eq!(status.state, schema::SchemaState::Older);
+        let err = IndexDatabase::open(&database).unwrap_err().to_string();
+        assert!(err.contains("run `rag-rat migrate`"), "{err}");
+
+        let migrated = IndexDatabase::migrate(&database).unwrap();
+        assert_eq!(migrated.state, schema::SchemaState::Compatible);
+        IndexDatabase::open(&database).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compatible_open_refuses_dirty_and_newer_schema() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".rag-rat")).unwrap();
+        let database = root.join(".rag-rat/index.sqlite");
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_version(
+                id TEXT PRIMARY KEY,
+                applied_at_ms INTEGER NOT NULL,
+                checksum TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            INSERT INTO schema_version(id, applied_at_ms, checksum, description)
+            VALUES ('__dirty__', 1, '', 'partial migration in progress');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let dirty = IndexDatabase::migration_check(&database).unwrap();
+        assert_eq!(dirty.state, schema::SchemaState::Dirty);
+        let err = IndexDatabase::open(&database).unwrap_err().to_string();
+        assert!(err.contains("dirty or partial"), "{err}");
+
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "
+            DELETE FROM schema_version;
+            INSERT INTO schema_version(id, applied_at_ms, checksum, description)
+            VALUES ('999_future_schema', 1, 'sha256:future', 'future schema');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+        let newer = IndexDatabase::migration_check(&database).unwrap();
+        assert_eq!(newer.state, schema::SchemaState::Newer);
+        let err = IndexDatabase::open(&database).unwrap_err().to_string();
+        assert!(err.contains("newer rag-rat"), "{err}");
 
         fs::remove_dir_all(root).unwrap();
     }

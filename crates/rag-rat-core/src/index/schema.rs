@@ -1,6 +1,161 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+
+pub const LATEST_SCHEMA_VERSION: u32 = 1;
+const DIRTY_MIGRATION_ID: &str = "__dirty__";
+const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
+const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
+const MIGRATION_001_DESCRIPTION: &str =
+    "SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaState {
+    Missing,
+    Compatible,
+    Older,
+    Newer,
+    Dirty,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedMigration {
+    pub id: String,
+    pub applied_at_ms: i64,
+    pub checksum: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaStatus {
+    pub state: SchemaState,
+    pub current_version: u32,
+    pub latest_version: u32,
+    pub migrations: Vec<AppliedMigration>,
+    pub message: String,
+}
 
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS schema_version(
+            id TEXT PRIMARY KEY,
+            applied_at_ms INTEGER NOT NULL,
+            checksum TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        ",
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![DIRTY_MIGRATION_ID, now_ms(), "", "partial migration in progress"],
+    )?;
+    let result = apply_baseline(conn);
+    if let Err(err) = result {
+        let _ = conn.execute(
+            "UPDATE schema_version SET description = ?2 WHERE id = ?1",
+            params![DIRTY_MIGRATION_ID, format!("partial migration failed: {err}")],
+        );
+        return Err(err);
+    }
+    conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![MIGRATION_001_ID, now_ms(), MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION],
+    )?;
+    Ok(())
+}
+
+pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
+    if !table_exists(conn, "schema_version")? {
+        let has_legacy_tables = table_exists(conn, "files")? || table_exists(conn, "chunks")?;
+        return Ok(if has_legacy_tables {
+            SchemaStatus {
+                state: SchemaState::Older,
+                current_version: 0,
+                latest_version: LATEST_SCHEMA_VERSION,
+                migrations: Vec::new(),
+                message: "legacy index schema has no schema_version table; run `rag-rat migrate` or rebuild the derived index with `rag-rat index --full`".to_string(),
+            }
+        } else {
+            SchemaStatus {
+                state: SchemaState::Missing,
+                current_version: 0,
+                latest_version: LATEST_SCHEMA_VERSION,
+                migrations: Vec::new(),
+                message: "index schema is not initialized; run `rag-rat migrate` or build the derived index with `rag-rat index --full`".to_string(),
+            }
+        });
+    }
+
+    let migrations = applied_migrations(conn)?;
+    if migrations.iter().any(|migration| migration.id == DIRTY_MIGRATION_ID) {
+        return Ok(SchemaStatus {
+            state: SchemaState::Dirty,
+            current_version: known_version(&migrations),
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "dirty or partial schema migration detected; rebuild the derived index with `rag-rat index --full`".to_string(),
+        });
+    }
+    if migrations.iter().any(|migration| {
+        migration.id == MIGRATION_001_ID && migration.checksum != MIGRATION_001_CHECKSUM
+    }) {
+        return Ok(SchemaStatus {
+            state: SchemaState::Dirty,
+            current_version: known_version(&migrations),
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "schema migration checksum mismatch; refusing to open, rebuild the derived index with `rag-rat index --full`".to_string(),
+        });
+    }
+    if migrations.iter().any(|migration| !known_migration(&migration.id)) {
+        return Ok(SchemaStatus {
+            state: SchemaState::Newer,
+            current_version: known_version(&migrations),
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "index schema was created by a newer rag-rat; refusing to open".to_string(),
+        });
+    }
+    let current_version = known_version(&migrations);
+    if current_version < LATEST_SCHEMA_VERSION {
+        return Ok(SchemaStatus {
+            state: SchemaState::Older,
+            current_version,
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "index schema is older than this rag-rat; run `rag-rat migrate` or rebuild the derived index with `rag-rat index --full`".to_string(),
+        });
+    }
+    Ok(SchemaStatus {
+        state: SchemaState::Compatible,
+        current_version,
+        latest_version: LATEST_SCHEMA_VERSION,
+        migrations,
+        message: "schema is compatible".to_string(),
+    })
+}
+
+pub fn check_compatible(conn: &Connection) -> anyhow::Result<()> {
+    let status = status(conn)?;
+    match status.state {
+        SchemaState::Compatible => Ok(()),
+        SchemaState::Missing => {
+            anyhow::bail!(
+                "{}",
+                "index schema is not initialized; run `rag-rat migrate`, `rag-rat index`, or `rag-rat index --full`"
+            )
+        },
+        SchemaState::Older => anyhow::bail!("{}", status.message),
+        SchemaState::Newer => anyhow::bail!("{}", status.message),
+        SchemaState::Dirty => anyhow::bail!("{}", status.message),
+    }
+}
+
+fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS index_meta(
@@ -381,6 +536,63 @@ fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
     Ok(())
+}
+
+fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, applied_at_ms, checksum, description
+        FROM schema_version
+        ORDER BY applied_at_ms, id
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(AppliedMigration {
+            id: row.get(0)?,
+            applied_at_ms: row.get(1)?,
+            checksum: row.get(2)?,
+            description: row.get(3)?,
+        })
+    })?;
+    let mut migrations = Vec::new();
+    for row in rows {
+        migrations.push(row?);
+    }
+    Ok(migrations)
+}
+
+fn known_version(migrations: &[AppliedMigration]) -> u32 {
+    migrations
+        .iter()
+        .filter_map(|migration| match migration.id.as_str() {
+            MIGRATION_001_ID => Some(1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn known_migration(id: &str) -> bool {
+    matches!(id, MIGRATION_001_ID | DIRTY_MIGRATION_ID)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn add_column_if_missing(

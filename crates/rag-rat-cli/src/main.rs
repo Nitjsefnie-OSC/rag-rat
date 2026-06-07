@@ -24,6 +24,9 @@ async fn main() -> anyhow::Result<()> {
         "doctor" => {
             doctor(&config)?;
         },
+        "migrate" => {
+            migrate(&config, &args)?;
+        },
         "query" => {
             let query = positional_after_options(&args).unwrap_or_default();
             if query.is_empty() {
@@ -94,20 +97,47 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
     print_json(&db.reconcile(limit)?)
 }
 
+fn migrate(config: &Config, args: &[String]) -> anyhow::Result<()> {
+    let status = if has_flag(args, "--check") {
+        IndexDatabase::migration_check(&config.database)?
+    } else {
+        IndexDatabase::migrate(&config.database)?
+    };
+    print_json(&status)?;
+    if has_flag(args, "--check")
+        && status.state != rag_rat_core::index::schema::SchemaState::Compatible
+    {
+        anyhow::bail!("{}", status.message);
+    }
+    Ok(())
+}
+
 fn doctor(config: &Config) -> anyhow::Result<()> {
-    let db = IndexDatabase::open(&config.database)?;
-    let status = db.status(&config.database)?;
+    let schema = IndexDatabase::migration_check(&config.database)?;
+    let index = if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
+        let db = IndexDatabase::open(&config.database)?;
+        Some(serde_json::to_value(db.status(&config.database)?)?)
+    } else {
+        None
+    };
+    let storage = if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
+        let db = IndexDatabase::open(&config.database)?;
+        Some(serde_json::to_value(db.storage_status()?)?)
+    } else {
+        None
+    };
     print_json(&serde_json::json!({
         "config_root": config.root,
         "database": config.database,
-        "storage": db.storage_status()?,
+        "schema": schema,
+        "storage": storage,
         "targets": config.targets.iter().map(|target| serde_json::json!({
             "name": target.name,
             "language": target.language.as_str(),
             "directories": target.directories,
             "kind": target.kind.as_str(),
         })).collect::<Vec<_>>(),
-        "index": status,
+        "index": index,
         "mcp": {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,
@@ -175,10 +205,11 @@ fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <index|doctor|query|mcp|github|models|reconcile|dump-config> --config <path> [query]\n\
+        "usage: rag-rat <index|doctor|migrate|query|mcp|github|models|reconcile|dump-config> --config <path> [query]\n\
          examples:\n\
          rag-rat index --config rag-rat.toml\n\
          rag-rat index --full --config rag-rat.toml\n\
+         rag-rat migrate --check --config rag-rat.toml\n\
          rag-rat github sync --from-refs --config rag-rat.toml\n\
          rag-rat models list --config rag-rat.toml\n\
          rag-rat models install embedding-small --config rag-rat.toml\n\
