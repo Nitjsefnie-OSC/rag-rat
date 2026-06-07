@@ -69,7 +69,7 @@ Development config without installing:
 - `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_docs"?: boolean, "include_git"?: boolean, "include_papertrail"?: boolean, "include_text_fallback"?: boolean }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
@@ -240,31 +240,38 @@ currently indexed source files, then compares `(path, line)` sets:
 {
   "query": {
     "symbol_id": 3150,
+    "logical_symbol_id": 123,
     "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
     "pattern": "crate::runtime::task_spawn::spawn_blocking\\(",
-    "resolution": "syntactic"
+    "resolution": "syntactic",
+    "include_tests": true
   },
   "summary": {
-    "graph_edges": 38,
-    "text_hits": 42,
-    "matched": 36,
+    "text_hits": 38,
+    "graph_hits": 31,
+    "matched": 29,
     "graph_only": 2,
-    "text_only": 6,
+    "text_only": 9,
+    "likely_parser_gaps": 7,
     "likely_false_positives": 1,
-    "likely_index_gaps": 5
+    "complete": false,
+    "recommended_fallback": "both"
   },
   "matched_hits": [],
   "text_only_hits": [],
   "graph_only_edges": [],
+  "likely_parser_gaps": [],
   "likely_false_positives": []
 }
 ```
 
-Use `text_only_hits` as candidate parser/call-extraction gaps, `graph_only_edges` as candidate
-regex-too-narrow or imported/unqualified callsites, and `likely_false_positives` as graph rows whose
-current source line no longer appears to support the edge. The tool includes the same `coverage`
-object as graph traversal envelopes so audit output can be checked for stale source and parser
-failures before treating the counts as authoritative.
+Matching is by `path + callsite line`. Text hits with no graph edge at that location are reported as
+`text_only_hits` and copied into `likely_parser_gaps`; graph edges with no text match are reported as
+`graph_only_edges`. Exact or logical graph-only rows may be legitimate imported, aliased, or
+unqualified calls whose source line does not match the supplied regex. Fuzzy/name-only graph-only
+rows are also listed in `likely_false_positives`. The tool includes the same `coverage` object as
+graph traversal envelopes so audit output can be checked for stale source and parser failures before
+treating the counts as authoritative.
 
 `impact_surface` is the graph-backed rg replacement path for a selected symbol. For `symbol_id`,
 `symbol_path`, or `symbol` requests it returns sections instead of a flat list:

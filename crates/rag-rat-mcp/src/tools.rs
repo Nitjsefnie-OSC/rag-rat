@@ -105,6 +105,8 @@ pub struct CompareGraphTextArgs {
     pub resolution: Option<String>,
     #[serde(default = "default_compare_limit")]
     pub limit: u32,
+    #[serde(default = "default_true")]
+    pub include_tests: bool,
     #[serde(default)]
     pub allow_ambiguous: bool,
     #[serde(default)]
@@ -432,7 +434,13 @@ fn compare_graph_to_text_tool(
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: args.logical_symbol_id,
             };
-            Ok(json!(db.compare_graph_to_text(&symbol, &args.pattern, args.limit, &options)?))
+            Ok(json!(db.compare_graph_to_text(
+                &symbol,
+                &args.pattern,
+                args.limit,
+                &options,
+                args.include_tests
+            )?))
         },
         Ok(None) => Ok(Value::Null),
         Err(disambiguation) => Ok(json!(disambiguation)),
@@ -754,6 +762,7 @@ mod tests {
         assert_schema_has_property(tools, "compare_graph_to_text", "include_unresolved");
         assert_schema_has_property(tools, "compare_graph_to_text", "include_macros");
         assert_schema_has_property(tools, "compare_graph_to_text", "include_common_methods");
+        assert_schema_has_property(tools, "compare_graph_to_text", "include_tests");
         assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
         assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
         assert_schema_has_property(tools, "compare_graph_to_text", "logical_symbol_id");
@@ -927,12 +936,17 @@ mod tests {
         .unwrap();
         assert_eq!(comparison["query"]["symbol_id"], one["symbol_id"]);
         assert_eq!(comparison["summary"]["graph_edges"], 1);
+        assert_eq!(comparison["summary"]["graph_hits"], 1);
         assert_eq!(comparison["summary"]["text_hits"], 2);
         assert_eq!(comparison["summary"]["matched"], 1);
         assert_eq!(comparison["summary"]["text_only"], 1);
+        assert_eq!(comparison["summary"]["likely_parser_gaps"], 1);
         assert_eq!(comparison["summary"]["graph_only"], 0);
+        assert_eq!(comparison["summary"]["complete"], false);
+        assert_eq!(comparison["summary"]["recommended_fallback"], "text");
         assert_eq!(comparison["matched_hits"].as_array().unwrap().len(), 1);
         assert_eq!(comparison["text_only_hits"].as_array().unwrap().len(), 1);
+        assert_eq!(comparison["likely_parser_gaps"].as_array().unwrap().len(), 1);
 
         let impact = call_tool(
             &config.database,

@@ -161,6 +161,7 @@ pub struct CompareGraphTextReport {
     pub matched_hits: Vec<MatchedGraphTextHit>,
     pub text_only_hits: Vec<TextOnlyHit>,
     pub graph_only_edges: Vec<GraphOnlyEdge>,
+    pub likely_parser_gaps: Vec<TextOnlyHit>,
     pub likely_false_positives: Vec<GraphOnlyEdge>,
 }
 
@@ -171,17 +172,22 @@ pub struct CompareGraphTextQuery {
     pub symbol_path: String,
     pub pattern: String,
     pub resolution: String,
+    pub include_tests: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct CompareGraphTextSummary {
+    pub graph_hits: u64,
     pub graph_edges: u64,
     pub text_hits: u64,
     pub matched: u64,
     pub graph_only: u64,
     pub text_only: u64,
+    pub likely_parser_gaps: u64,
     pub likely_false_positives: u64,
     pub likely_index_gaps: u64,
+    pub complete: bool,
+    pub recommended_fallback: String,
 }
 
 #[derive(Debug, Serialize)]

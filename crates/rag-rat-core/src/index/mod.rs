@@ -1113,25 +1113,23 @@ impl IndexDatabase {
         pattern: &str,
         limit: u32,
         options: &crate::query::graph::GraphTraversalOptions,
+        include_tests: bool,
     ) -> anyhow::Result<crate::query::graph::CompareGraphTextReport> {
         let regex = Regex::new(pattern)?;
-        let graph_edges = crate::query::graph::traverse_with_options(
+        let mut graph_edges = crate::query::graph::traverse_with_options(
             self.storage.connection(),
             &symbol.qualified_name,
             true,
             limit,
             options,
         )?;
-        let graph_summary = crate::query::graph::traversal_summary(
-            self.storage.connection(),
-            &symbol.qualified_name,
-            true,
-            limit,
-            options,
-            graph_edges.len(),
-        )?;
+        if !include_tests {
+            graph_edges.retain(|edge| {
+                edge.callsite.as_ref().is_none_or(|callsite| !is_test_like_path(&callsite.path))
+            });
+        }
         let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
-        let text_hits = self.regex_hits(pattern, &regex)?;
+        let text_hits = self.regex_hits(pattern, &regex, include_tests)?;
         let text_by_location = text_hits
             .iter()
             .map(|hit| ((hit.path.clone(), hit.line), hit))
@@ -1211,11 +1209,15 @@ impl IndexDatabase {
                 reason: "graph edge exists but pattern did not match text".to_string(),
                 likely_reason: graph_only_reason(edge, current_line.as_deref()),
             };
-            if graph_only.likely_reason == "stale_or_overbroad_graph_edge" {
+            if is_likely_false_positive_graph_only(edge, &graph_only) {
                 likely_false_positives.push(graph_only.clone());
             }
             graph_only_edges.push(graph_only);
         }
+        let likely_parser_gaps = text_only_hits.clone();
+        let complete = likely_parser_gaps.is_empty() && likely_false_positives.is_empty();
+        let recommended_fallback =
+            recommended_graph_text_fallback(&likely_parser_gaps, &graph_only_edges);
 
         Ok(crate::query::graph::CompareGraphTextReport {
             query: crate::query::graph::CompareGraphTextQuery {
@@ -1224,23 +1226,29 @@ impl IndexDatabase {
                 symbol_path: symbol.qualified_name.clone(),
                 pattern: pattern.to_string(),
                 resolution: options.resolution_mode.as_str().to_string(),
+                include_tests,
             },
             logical_symbol,
             variants,
             summary: crate::query::graph::CompareGraphTextSummary {
-                graph_edges: graph_summary.total_matching_edges,
+                graph_hits: u64::try_from(graph_edges.len()).unwrap_or(u64::MAX),
+                graph_edges: u64::try_from(graph_edges.len()).unwrap_or(u64::MAX),
                 text_hits: u64::try_from(text_hits.len()).unwrap_or(u64::MAX),
                 matched: u64::try_from(matched_hits.len()).unwrap_or(u64::MAX),
                 graph_only: u64::try_from(graph_only_edges.len()).unwrap_or(u64::MAX),
                 text_only: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+                likely_parser_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
                 likely_false_positives: u64::try_from(likely_false_positives.len())
                     .unwrap_or(u64::MAX),
                 likely_index_gaps: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+                complete,
+                recommended_fallback,
             },
             coverage: self.graph_coverage(paths)?,
             matched_hits,
             text_only_hits,
             graph_only_edges,
+            likely_parser_gaps,
             likely_false_positives,
         })
     }
@@ -1798,6 +1806,7 @@ impl IndexDatabase {
         &self,
         pattern: &str,
         regex: &Regex,
+        include_tests: bool,
     ) -> anyhow::Result<Vec<crate::query::graph::TextOnlyHit>> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("cannot compare graph to text: source_root is missing from index_meta");
@@ -1807,6 +1816,9 @@ impl IndexDatabase {
             stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         let mut hits = Vec::new();
         for path in paths {
+            if !include_tests && is_test_like_path(&path) {
+                continue;
+            }
             let full_path = root.join(&path);
             let Ok(text) = fs::read_to_string(&full_path) else {
                 continue;
@@ -2259,6 +2271,44 @@ fn graph_only_reason(edge: &crate::query::graph::GraphHop, current_line: Option<
         return "regex_too_narrow".to_string();
     }
     "stale_or_overbroad_graph_edge".to_string()
+}
+
+fn is_likely_false_positive_graph_only(
+    edge: &crate::query::graph::GraphHop,
+    graph_only: &crate::query::graph::GraphOnlyEdge,
+) -> bool {
+    if graph_only.likely_reason == "stale_or_overbroad_graph_edge" {
+        return true;
+    }
+    edge.resolution == "target_name_fallback"
+        || edge.confidence == "NameOnly"
+        || edge.confidence == "Ambiguous"
+        || !edge.verified_target_symbol
+}
+
+fn recommended_graph_text_fallback(
+    parser_gaps: &[crate::query::graph::TextOnlyHit],
+    graph_only_edges: &[crate::query::graph::GraphOnlyEdge],
+) -> String {
+    match (parser_gaps.is_empty(), graph_only_edges.is_empty()) {
+        (false, false) => "both",
+        (false, true) => "text",
+        (true, false) => "graph",
+        (true, true) => "none",
+    }
+    .to_string()
+}
+
+fn is_test_like_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.tsx")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.tsx")
 }
 
 #[derive(Debug)]
