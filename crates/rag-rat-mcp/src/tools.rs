@@ -887,7 +887,8 @@ mod tests {
         assert_eq!(exact["summary"]["truncated"], false);
         assert_eq!(exact["summary"]["exact_verified"], 1);
         assert_eq!(exact["summary"]["false_positive_risk"], "low");
-        assert_eq!(exact["coverage"]["source_stale_files"], 0);
+        assert_eq!(exact["summary"]["completeness_risk"], "low");
+        assert_eq!(exact["coverage"]["stale_files"], 0);
         assert!(!exact["coverage"]["parser_coverage_for_paths"].as_array().unwrap().is_empty());
         let exact_results = exact["results"].as_array().unwrap();
         assert_eq!(exact_results.len(), 1, "exact callers: {exact:?}");

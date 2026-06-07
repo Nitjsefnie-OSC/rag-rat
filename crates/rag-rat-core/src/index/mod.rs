@@ -1073,6 +1073,13 @@ impl IndexDatabase {
                 paths.insert(callsite.path.clone());
             }
         }
+        let mut coverage = self.graph_coverage(paths)?;
+        if summary.unresolved > 0 {
+            coverage.known_index_gaps.push(format!(
+                "{} unresolved qualified callsites match the requested final segment but are not verified to this symbol",
+                summary.unresolved
+            ));
+        }
         Ok(crate::query::graph::GraphTraversalReport {
             query: crate::query::graph::GraphTraversalQuery {
                 tool: tool.to_string(),
@@ -1081,7 +1088,7 @@ impl IndexDatabase {
                 resolution: options.resolution_mode.as_str().to_string(),
             },
             summary,
-            coverage: self.graph_coverage(paths)?,
+            coverage,
             results,
         })
     }
@@ -1521,13 +1528,14 @@ impl IndexDatabase {
         let parser_failures = u64::try_from(parser_failure_paths.len()).unwrap_or(0);
         let known_index_gaps = parser_failure_paths
             .iter()
-            .map(|failure| crate::query::graph::GraphIndexGap {
-                path: failure.path.clone(),
-                language: failure.language.clone(),
-                reason: failure.message.clone(),
+            .map(|failure| {
+                format!(
+                    "{} parser failed for {}: {}",
+                    failure.language, failure.path, failure.message
+                )
             })
             .collect::<Vec<_>>();
-        let mut source_stale_files = 0_u64;
+        let mut stale_files = 0_u64;
         let mut parser_coverage_for_paths = Vec::new();
         for path in paths {
             let Some(row) = self.graph_path_row(&path)? else {
@@ -1542,7 +1550,7 @@ impl IndexDatabase {
             };
             let stale = self.source_path_is_stale(&path, &row.sha256);
             if stale {
-                source_stale_files += 1;
+                stale_files += 1;
             }
             let parser_failed = parser_failure_paths.iter().any(|failure| failure.path == path);
             parser_coverage_for_paths.push(crate::query::graph::GraphPathCoverage {
@@ -1564,7 +1572,7 @@ impl IndexDatabase {
         Ok(crate::query::graph::GraphCoverage {
             indexed_files: u64::try_from(indexed_files).unwrap_or(0),
             parser_failures,
-            source_stale_files,
+            stale_files,
             known_index_gaps,
             parser_coverage_for_paths,
         })

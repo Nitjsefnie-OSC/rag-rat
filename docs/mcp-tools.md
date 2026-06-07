@@ -181,12 +181,13 @@ specific symbol. Bare names in `exact` mode intentionally return little or nothi
     "name_only": 0,
     "ambiguous": 0,
     "unresolved": 0,
-    "false_positive_risk": "low"
+    "false_positive_risk": "low",
+    "completeness_risk": "low"
   },
   "coverage": {
     "indexed_files": 1055,
     "parser_failures": 0,
-    "source_stale_files": 0,
+    "stale_files": 0,
     "known_index_gaps": [],
     "parser_coverage_for_paths": []
   },
@@ -196,8 +197,11 @@ specific symbol. Bare names in `exact` mode intentionally return little or nothi
 
 The trust signal is in `summary` and `coverage`: exact mode should have
 `exact_verified == total_matching_edges`, `truncated: false`, no parser failures for covered paths,
-and `source_stale_files: 0`. If the source changed after indexing, `source_stale_files` is non-zero
+`stale_files: 0`, and `completeness_risk: low`. If the source changed after indexing, `stale_files` is non-zero
 for the covered paths and the result should be treated as needing reindex before audit use.
+When strict graph rows are verified but same-name unresolved callsites exist, `known_index_gaps`
+contains a plain-language note such as
+`31 unresolved qualified callsites match the requested final segment but are not verified to this symbol`.
 
 `trace_callees` is repo-relevant by default. It returns verified or syntactic `calls_name` edges and
 verified/repo-local `constructs` edges. It hides unresolved calls, unresolved macros, type

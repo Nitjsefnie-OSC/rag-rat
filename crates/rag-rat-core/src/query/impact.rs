@@ -60,7 +60,7 @@ pub struct ImpactCompleteness {
     pub graph_callees: u64,
     pub text_fallback_hits: u64,
     pub parser_failures: u64,
-    pub source_stale_files: u64,
+    pub stale_files: u64,
     pub caveats: Vec<String>,
 }
 
@@ -154,7 +154,7 @@ pub fn impact_surface_report_for_symbol(
             graph_callees: u64::try_from(direct_semantic_callees.len()).unwrap_or(u64::MAX),
             text_fallback_hits: u64::try_from(text_fallback_hits.len()).unwrap_or(u64::MAX),
             parser_failures: parser_failure_count(conn)?,
-            source_stale_files: 0,
+            stale_files: 0,
             caveats,
         },
         direct_semantic_callers,

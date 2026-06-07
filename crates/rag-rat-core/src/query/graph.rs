@@ -54,22 +54,16 @@ pub struct GraphTraversalSummary {
     pub ambiguous: u64,
     pub unresolved: u64,
     pub false_positive_risk: String,
+    pub completeness_risk: String,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct GraphCoverage {
     pub indexed_files: u64,
     pub parser_failures: u64,
-    pub source_stale_files: u64,
-    pub known_index_gaps: Vec<GraphIndexGap>,
+    pub stale_files: u64,
+    pub known_index_gaps: Vec<String>,
     pub parser_coverage_for_paths: Vec<GraphPathCoverage>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct GraphIndexGap {
-    pub path: String,
-    pub language: String,
-    pub reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -427,10 +421,22 @@ pub fn traversal_summary(
             ambiguous: count_col(row, 4)?,
             unresolved: count_col(row, 5)?,
             false_positive_risk: String::new(),
+            completeness_risk: String::new(),
         })
     })?;
+    let hidden_unresolved = hidden_unresolved_candidate_count(
+        conn,
+        symbol,
+        reverse,
+        &edge_kinds,
+        options,
+        unique_short_name,
+    )?;
+    summary.total_matching_edges = summary.total_matching_edges.saturating_add(hidden_unresolved);
+    summary.unresolved = summary.unresolved.saturating_add(hidden_unresolved);
     summary.truncated = summary.total_matching_edges > u64::from(limit);
     summary.false_positive_risk = false_positive_risk(&summary, mode).to_string();
+    summary.completeness_risk = completeness_risk(&summary).to_string();
     Ok(summary)
 }
 
@@ -450,6 +456,67 @@ fn false_positive_risk(summary: &GraphTraversalSummary, mode: GraphResolutionMod
     } else {
         "low"
     }
+}
+
+fn completeness_risk(summary: &GraphTraversalSummary) -> &'static str {
+    if summary.truncated
+        || summary.unresolved > summary.exact_verified.saturating_add(summary.syntactic)
+    {
+        "high"
+    } else if summary.unresolved > 0 || summary.name_only > 0 || summary.ambiguous > 0 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn hidden_unresolved_candidate_count(
+    conn: &Connection,
+    symbol: &str,
+    reverse: bool,
+    edge_kinds: &[String],
+    options: &GraphTraversalOptions,
+    unique_short_name: bool,
+) -> anyhow::Result<u64> {
+    let mode = options.resolution_mode;
+    let quoted = quoted_placeholders(edge_kinds.len());
+    let sql = if reverse {
+        let predicate = reverse_predicate(mode);
+        format!(
+            "
+            SELECT COUNT(*)
+            FROM edges
+            LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+            WHERE edges.edge_kind IN ({quoted})
+              AND edges.to_symbol_id IS NULL
+              AND NOT ({predicate})
+              AND (
+                edges.target_qualified_name = ?1
+                OR edges.target_qualified_name LIKE ?2
+                OR edges.to_name = ?3
+              )
+            "
+        )
+    } else {
+        let source_predicate = forward_source_predicate(mode);
+        let target_filter = forward_target_filter(mode, options);
+        let visibility_filter = forward_visibility_filter(options);
+        format!(
+            "
+            SELECT COUNT(*)
+            FROM edges
+            LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+            WHERE edges.edge_kind IN ({quoted})
+              AND ({source_predicate})
+              AND edges.to_symbol_id IS NULL
+              AND NOT (({target_filter}) AND ({visibility_filter}))
+              AND ?4 IN ('true', 'false')
+            "
+        )
+    };
+    let params = traversal_params(symbol, 0, edge_kinds, options.symbol_id, unique_short_name);
+    let count = conn.query_row(&sql, params_from_iter(params), |row| count_col(row, 0))?;
+    Ok(count)
 }
 
 fn validate_edge_kinds(edge_kinds: &[String]) -> anyhow::Result<()> {
