@@ -537,6 +537,21 @@ impl IndexDatabase {
         }
     }
 
+    pub fn search_hash_baseline(
+        &self,
+        query: &str,
+        limit: u32,
+        include_generated: bool,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        self.ensure_fts_fresh()?;
+        crate::search::lexical::search_hash_baseline(
+            self.storage.connection(),
+            query,
+            limit,
+            include_generated,
+        )
+    }
+
     pub fn docs_for_symbol(&self, symbol: &str, limit: u32) -> anyhow::Result<Vec<SearchHit>> {
         self.search(symbol, limit, true)
     }
@@ -760,8 +775,16 @@ impl IndexDatabase {
         ai::install_model(self.storage.connection(), model_id)
     }
 
-    pub fn reconcile(&self, limit: Option<u32>) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile(self.storage.connection(), limit)
+    pub fn reconcile(
+        &self,
+        limit: Option<u32>,
+        batch_size: Option<u32>,
+    ) -> anyhow::Result<ReconcileReport> {
+        ai::reconcile(self.storage.connection(), limit, batch_size)
+    }
+
+    pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
+        ai::current_embedding_count(self.storage.connection(), model_id)
     }
 
     pub fn heal_index(&self, limit: Option<u32>) -> anyhow::Result<HealIndexReport> {
@@ -1925,7 +1948,7 @@ mod schema_bootstrap_tests {
         let chunk_id = first_chunk_id(&db);
 
         let models = db.list_models().unwrap();
-        let embedding = models.iter().find(|model| model.model_id == "embedding-small").unwrap();
+        let embedding = models.iter().find(|model| model.model_id == ai::HASH_MODEL_ID).unwrap();
         assert!(!embedding.installed);
         assert_eq!(embedding.status, "MissingModel");
 
@@ -1933,19 +1956,23 @@ mod schema_bootstrap_tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].summary, "alpha token\nsecond line");
 
-        let blocked = db.reconcile(Some(1)).unwrap();
+        let blocked = db.reconcile(Some(1), Some(8)).unwrap();
         assert_eq!(blocked.processed_chunks, 1);
         assert_eq!(blocked.embeddings_written, 0);
         assert_eq!(blocked.blocked_chunks, 1);
+        assert_eq!(blocked.model_id, ai::HASH_MODEL_ID);
+        assert_eq!(blocked.batch_size, 8);
         assert_eq!(blocked.status, "Blocked");
 
         let status = db.local_ai_status().unwrap();
         assert_eq!(status.embedding.state, "MissingModel");
         assert_eq!(status.embedding.blocked_artifacts, 1);
 
-        db.install_model("embedding-small").unwrap();
-        let current = db.reconcile(Some(1)).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+        let current = db.reconcile(Some(1), Some(8)).unwrap();
         assert_eq!(current.embeddings_written, 1);
+        assert_eq!(current.model_id, ai::HASH_MODEL_ID);
+        assert_eq!(current.embedding_dim, ai::HASH_EMBEDDING_DIM);
         assert_eq!(current.status, "Current");
         let status = db.local_ai_status().unwrap();
         assert_eq!(status.embedding.state, "Ready");
@@ -1959,7 +1986,7 @@ mod schema_bootstrap_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(embedding_bytes, (ai::EMBEDDING_DIM * 4) as i64);
+        assert_eq!(embedding_bytes, (ai::HASH_EMBEDDING_DIM * 4) as i64);
 
         let hits = db.search("alpha", 10, false).unwrap();
         assert_eq!(hits[0].summary, "alpha token\nsecond line");

@@ -550,14 +550,6 @@ fn apply_embedding_vector_metadata(conn: &Connection) -> rusqlite::Result<()> {
         ",
         [],
     )?;
-    conn.execute(
-        "
-        UPDATE chunk_embeddings
-        SET embedding_dim = 384
-        WHERE embedding_dim = 0 AND model_id = 'embedding-small'
-        ",
-        [],
-    )?;
     Ok(())
 }
 

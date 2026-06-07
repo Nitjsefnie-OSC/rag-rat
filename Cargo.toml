@@ -14,6 +14,7 @@ repository = "https://github.com/cq27-dev/rag-rat"
 
 [workspace.dependencies]
 anyhow = "1.0"
+fastembed = { version = "5.1.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 gix = { version = "0.78.0", default-features = false, features = ["status", "parallel"] }
 rmcp = { version = "1.7.0", features = ["transport-io"] }
 rusqlite = "0.39"

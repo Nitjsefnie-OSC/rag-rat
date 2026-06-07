@@ -24,6 +24,37 @@ pub fn search(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
+    search_with_query_embedding(
+        conn,
+        query,
+        limit,
+        include_generated,
+        ai::embed_query(conn, query)?,
+    )
+}
+
+pub fn search_hash_baseline(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    include_generated: bool,
+) -> anyhow::Result<Vec<SearchHit>> {
+    search_with_query_embedding(
+        conn,
+        query,
+        limit,
+        include_generated,
+        Some(ai::hash_query_embedding(query)?),
+    )
+}
+
+fn search_with_query_embedding(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    include_generated: bool,
+    query_embedding: Option<ai::QueryEmbedding>,
+) -> anyhow::Result<Vec<SearchHit>> {
     let terms = query_terms(query);
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
     let mut ranked = BTreeMap::<i64, RankedHit>::new();
@@ -36,7 +67,9 @@ pub fn search(
     }
 
     for (rank, (hit, similarity)) in
-        vector_candidates(conn, query, candidate_limit, include_generated)?.into_iter().enumerate()
+        vector_candidates(conn, query, candidate_limit, include_generated, query_embedding)?
+            .into_iter()
+            .enumerate()
     {
         let entry = ranked.entry(hit.chunk_id).or_insert_with(|| RankedHit::new(hit));
         entry.vector = Some((f64::from(similarity)).max(0.0) + 1.0 / (100.0 + rank as f64));
@@ -122,8 +155,9 @@ fn vector_candidates(
     query: &str,
     limit: i64,
     include_generated: bool,
+    query_embedding: Option<ai::QueryEmbedding>,
 ) -> anyhow::Result<Vec<(SearchHit, f32)>> {
-    let Some(query_vector) = ai::embed_query(conn, query)? else {
+    let Some(query_embedding) = query_embedding else {
         return Ok(Vec::new());
     };
     let generated_filter = if include_generated { "1 = 1" } else { "files.generated = 0" };
@@ -149,7 +183,7 @@ fn vector_candidates(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![ai::EMBEDDING_MODEL_ID, i64::try_from(ai::EMBEDDING_DIM).unwrap_or(i64::MAX)],
+        params![query_embedding.model_id, i64::try_from(query_embedding.dim).unwrap_or(i64::MAX)],
         |row| {
             let text: String = row.get(7)?;
             let blob: Vec<u8> = row.get(8)?;
@@ -172,10 +206,10 @@ fn vector_candidates(
     let mut hits = Vec::new();
     for row in rows {
         let (hit, blob) = row?;
-        let Some(vector) = ai::decode_vector(&blob, ai::EMBEDDING_DIM) else {
+        let Some(vector) = ai::decode_vector(&blob, query_embedding.dim) else {
             continue;
         };
-        let similarity = dot(&query_vector, &vector);
+        let similarity = dot(&query_embedding.vector, &vector);
         if similarity > 0.0 {
             hits.push((hit, similarity));
         }

@@ -1,12 +1,100 @@
-use rayon::prelude::*;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::index::now_ms;
 
-pub const EMBEDDING_MODEL_ID: &str = "embedding-small";
-pub const EMBEDDING_DIM: usize = 384;
+pub const HASH_MODEL_ID: &str = "embedding-hash";
+pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
+pub const HASH_EMBEDDING_DIM: usize = 384;
+pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
+const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
+const DEFAULT_BATCH_SIZE: usize = 32;
+const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
+
+pub trait Embedder {
+    fn model_id(&self) -> &str;
+    fn dim(&self) -> usize;
+    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
+}
+
+pub struct HashEmbedder;
+
+impl Embedder for HashEmbedder {
+    fn model_id(&self) -> &str {
+        HASH_MODEL_ID
+    }
+
+    fn dim(&self) -> usize {
+        HASH_EMBEDDING_DIM
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|text| hash_embed_text(text, HASH_EMBEDDING_DIM)).collect())
+    }
+}
+
+#[cfg(test)]
+pub struct MockEmbedder {
+    model_id: String,
+    dim: usize,
+}
+
+#[cfg(test)]
+impl MockEmbedder {
+    pub fn new(model_id: impl Into<String>, dim: usize) -> Self {
+        Self { model_id: model_id.into(), dim }
+    }
+}
+
+#[cfg(test)]
+impl Embedder for MockEmbedder {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|text| hash_embed_text(text, self.dim)).collect())
+    }
+}
+
+#[cfg(feature = "fastembed")]
+pub struct FastEmbedEmbedder {
+    model: std::sync::Mutex<fastembed::TextEmbedding>,
+}
+
+#[cfg(feature = "fastembed")]
+impl FastEmbedEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+        )?;
+        Ok(Self { model: std::sync::Mutex::new(model) })
+    }
+}
+
+#[cfg(feature = "fastembed")]
+impl Embedder for FastEmbedEmbedder {
+    fn model_id(&self) -> &str {
+        FASTEMBED_MODEL_ID
+    }
+
+    fn dim(&self) -> usize {
+        FASTEMBED_EMBEDDING_DIM
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let documents = texts.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut model =
+            self.model.lock().map_err(|_| anyhow::anyhow!("fastembed model lock poisoned"))?;
+        Ok(model.embed(documents, None)?)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ArtifactStatus {
@@ -79,25 +167,55 @@ pub struct ReconcileReport {
     pub processed_chunks: u64,
     pub embeddings_written: u64,
     pub blocked_chunks: u64,
+    pub model_id: String,
+    pub embedding_dim: usize,
+    pub batch_size: usize,
     pub status: String,
     pub message: Option<String>,
 }
 
 pub fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
-    upsert_model(conn, EMBEDDING_MODEL_ID, "embedding", Some(EMBEDDING_DIM), false)?;
+    remove_legacy_models(conn)?;
+    upsert_model(conn, HASH_MODEL_ID, "embedding", Some(HASH_EMBEDDING_DIM), "hash", false)?;
+    upsert_model(
+        conn,
+        FASTEMBED_MODEL_ID,
+        "embedding",
+        Some(FASTEMBED_EMBEDDING_DIM),
+        "fastembed",
+        false,
+    )?;
+    Ok(())
+}
+
+fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
+    for model_id in LEGACY_MODEL_IDS {
+        conn.execute("DELETE FROM chunk_embeddings WHERE model_id = ?1", params![model_id])?;
+        conn.execute("DELETE FROM ai_models WHERE model_id = ?1", params![model_id])?;
+        conn.execute(
+            "DELETE FROM index_meta WHERE key = ?1 AND value = ?2",
+            params![ACTIVE_EMBEDDING_MODEL_META, model_id],
+        )?;
+    }
     Ok(())
 }
 
 pub fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result<ModelInfo> {
     ensure_model_manifest(conn)?;
     match model_id {
-        EMBEDDING_MODEL_ID => {
+        HASH_MODEL_ID => {
             conn.execute(
                 "UPDATE ai_models
-                 SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2, last_error = NULL
+                 SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
+                     embedding_dim = ?3, runtime = 'hash', last_error = NULL
                  WHERE model_id = ?1",
-                params![model_id, now_ms()],
+                params![model_id, now_ms(), i64::try_from(HASH_EMBEDDING_DIM).unwrap_or(i64::MAX)],
             )?;
+            set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
+        },
+        FASTEMBED_MODEL_ID => {
+            install_fastembed_model(conn, model_id)?;
+            set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
         },
         other => anyhow::bail!("unknown local AI model `{other}`"),
     }
@@ -120,7 +238,8 @@ pub fn models(conn: &Connection) -> anyhow::Result<Vec<ModelInfo>> {
 pub fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     ensure_model_manifest(conn)?;
     let total_chunks = chunk_count(conn)?;
-    let embedding = capability_status(conn, "embedding", EMBEDDING_MODEL_ID, total_chunks)?;
+    let active_model_id = active_embedding_model_id(conn)?;
+    let embedding = capability_status(conn, "embedding", &active_model_id, total_chunks)?;
     let current = embedding.current_artifacts;
     let stale = embedding.stale_artifacts;
     let failed = embedding.failed_artifacts;
@@ -132,8 +251,19 @@ pub fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     })
 }
 
-pub fn reconcile(conn: &Connection, limit: Option<u32>) -> anyhow::Result<ReconcileReport> {
+pub fn reconcile(
+    conn: &Connection,
+    limit: Option<u32>,
+    batch_size: Option<u32>,
+) -> anyhow::Result<ReconcileReport> {
     ensure_model_manifest(conn)?;
+    let active_model_id = active_embedding_model_id(conn)?;
+    let model = model(conn, &active_model_id)?;
+    let batch_size = batch_size
+        .map(usize::try_from)
+        .transpose()?
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BATCH_SIZE);
     let started = now_ms();
     conn.execute(
         "INSERT INTO reconcile_attempts(started_at_ms, limit_count, status) VALUES (?1, ?2, 'Running')",
@@ -141,28 +271,43 @@ pub fn reconcile(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Reconc
     )?;
     let attempt_id = conn.last_insert_rowid();
 
-    let embedding_ready = model_ready(conn, EMBEDDING_MODEL_ID)?;
+    let embedder = active_embedder(conn);
     let chunks = current_chunks(conn, limit)?;
     let mut report = ReconcileReport {
         processed_chunks: 0,
         embeddings_written: 0,
         blocked_chunks: 0,
+        model_id: active_model_id.clone(),
+        embedding_dim: usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0),
+        batch_size,
         status: "Current".to_string(),
         message: None,
     };
 
     report.processed_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let write_result = if embedding_ready {
-        let embeddings = chunks.par_iter().map(PreparedEmbedding::from_chunk).collect::<Vec<_>>();
-        for embedding in &embeddings {
-            store_prepared_embedding(conn, embedding)?;
+    let write_result = if let Ok(embedder) = embedder {
+        for batch in chunks.chunks(batch_size) {
+            let texts = batch.iter().map(|chunk| chunk.text.clone()).collect::<Vec<_>>();
+            let vectors = embedder.embed_batch(&texts)?;
+            if vectors.len() != batch.len() {
+                anyhow::bail!(
+                    "embedder {} returned {} vectors for {} texts",
+                    embedder.model_id(),
+                    vectors.len(),
+                    batch.len()
+                );
+            }
+            for (chunk, vector) in batch.iter().zip(vectors) {
+                store_embedding(conn, embedder.as_ref(), chunk, &vector)?;
+            }
         }
-        report.embeddings_written = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
+        report.embeddings_written = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
         Ok(())
     } else {
+        let reason = model_not_ready_reason(&model);
         for chunk in &chunks {
-            store_blocked_embedding(conn, chunk, "MissingModel")?;
+            store_blocked_embedding(conn, &active_model_id, model.embedding_dim, chunk, &reason)?;
         }
         report.blocked_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
         Ok(())
@@ -173,12 +318,12 @@ pub fn reconcile(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Reconc
     }
     conn.execute_batch("COMMIT")?;
 
-    if !embedding_ready {
+    if report.blocked_chunks > 0 {
         report.status = "Blocked".to_string();
-        report.message = Some(
-            "embedding-small model is missing; run `rag-rat models install embedding-small`"
-                .to_string(),
-        );
+        report.message = Some(format!(
+            "{} model is not ready; run `rag-rat models install {}`",
+            active_model_id, active_model_id
+        ));
     }
 
     conn.execute(
@@ -210,24 +355,57 @@ fn upsert_model(
     model_id: &str,
     capability: &str,
     embedding_dim: Option<usize>,
+    runtime: &str,
     installed_by_default: bool,
 ) -> anyhow::Result<()> {
     conn.execute(
         "
         INSERT INTO ai_models(model_id, capability, embedding_dim, runtime, installed, disabled, status, installed_at_ms)
-        VALUES (?1, ?2, ?3, 'local', ?4, 0, ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
         ON CONFLICT(model_id) DO NOTHING
         ",
         params![
             model_id,
             capability,
             embedding_dim.map(|dim| i64::try_from(dim).unwrap_or(i64::MAX)),
+            runtime,
             installed_by_default,
             if installed_by_default { "Ready" } else { "MissingModel" },
             installed_by_default.then(now_ms),
         ],
     )?;
     Ok(())
+}
+
+fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
+    #[cfg(feature = "fastembed")]
+    {
+        let embedder = FastEmbedEmbedder::new()
+            .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
+                 embedding_dim = ?3, runtime = 'fastembed', last_error = NULL
+             WHERE model_id = ?1",
+            params![model_id, now_ms(), i64::try_from(embedder.dim()).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 0, disabled = 0, status = 'MissingRuntime', last_error = ?2
+             WHERE model_id = ?1",
+            params![
+                model_id,
+                "fastembed backend is not compiled; rebuild with --features fastembed"
+            ],
+        )?;
+        anyhow::bail!(
+            "fastembed backend is not compiled; rebuild rag-rat with --features fastembed"
+        )
+    }
 }
 
 fn capability_status(
@@ -291,32 +469,11 @@ fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelInfo> {
     })
 }
 
-fn model_ready(conn: &Connection, model_id: &str) -> anyhow::Result<bool> {
-    let model = model(conn, model_id)?;
-    Ok(model.installed && !model.disabled && model.status == "Ready")
-}
-
 #[derive(Debug)]
 struct CurrentChunk {
     id: i64,
     text: String,
     text_hash: String,
-}
-
-struct PreparedEmbedding {
-    chunk_id: i64,
-    text_hash: String,
-    vector_blob: Vec<u8>,
-}
-
-impl PreparedEmbedding {
-    fn from_chunk(chunk: &CurrentChunk) -> Self {
-        Self {
-            chunk_id: chunk.id,
-            text_hash: chunk.text_hash.clone(),
-            vector_blob: encode_vector(&embed_text(&chunk.text)),
-        }
-    }
 }
 
 fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<CurrentChunk>> {
@@ -332,10 +489,20 @@ fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<C
     collect_rows(rows)
 }
 
-fn store_prepared_embedding(
+fn store_embedding(
     conn: &Connection,
-    embedding: &PreparedEmbedding,
+    embedder: &dyn Embedder,
+    chunk: &CurrentChunk,
+    vector: &[f32],
 ) -> anyhow::Result<()> {
+    if vector.len() != embedder.dim() {
+        anyhow::bail!(
+            "embedding dimension mismatch for {}: got {}, expected {}",
+            embedder.model_id(),
+            vector.len(),
+            embedder.dim()
+        );
+    }
     conn.execute(
         "
         INSERT INTO chunk_embeddings(chunk_id, model_id, source_text_hash, embedding_dim, vector_blob, status, created_at_ms, last_error)
@@ -349,11 +516,11 @@ fn store_prepared_embedding(
             last_error = NULL
         ",
         params![
-            embedding.chunk_id,
-            EMBEDDING_MODEL_ID,
-            embedding.text_hash,
-            i64::try_from(EMBEDDING_DIM).unwrap_or(i64::MAX),
-            embedding.vector_blob,
+            chunk.id,
+            embedder.model_id(),
+            chunk.text_hash,
+            i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
+            encode_vector(vector),
             now_ms()
         ],
     )?;
@@ -362,6 +529,8 @@ fn store_prepared_embedding(
 
 fn store_blocked_embedding(
     conn: &Connection,
+    model_id: &str,
+    embedding_dim: Option<i64>,
     chunk: &CurrentChunk,
     reason: &str,
 ) -> anyhow::Result<()> {
@@ -379,9 +548,9 @@ fn store_blocked_embedding(
         ",
         params![
             chunk.id,
-            EMBEDDING_MODEL_ID,
+            model_id,
             chunk.text_hash,
-            i64::try_from(EMBEDDING_DIM).unwrap_or(i64::MAX),
+            embedding_dim.unwrap_or(0),
             now_ms(),
             reason
         ],
@@ -389,17 +558,131 @@ fn store_blocked_embedding(
     Ok(())
 }
 
-pub fn embed_query(conn: &Connection, query: &str) -> anyhow::Result<Option<Vec<f32>>> {
+pub struct QueryEmbedding {
+    pub model_id: String,
+    pub dim: usize,
+    pub vector: Vec<f32>,
+}
+
+pub fn embed_query(conn: &Connection, query: &str) -> anyhow::Result<Option<QueryEmbedding>> {
     ensure_model_manifest(conn)?;
-    let model = model(conn, EMBEDDING_MODEL_ID)?;
-    if !model.installed
-        || model.disabled
-        || model.status != "Ready"
-        || model.embedding_dim != Some(i64::try_from(EMBEDDING_DIM).unwrap_or(i64::MAX))
-    {
+    let Ok(embedder) = active_embedder(conn) else {
         return Ok(None);
+    };
+    embed_query_with(&*embedder, query).map(Some)
+}
+
+pub fn hash_query_embedding(query: &str) -> anyhow::Result<QueryEmbedding> {
+    embed_query_with(&HashEmbedder, query)
+}
+
+fn embed_query_with(embedder: &dyn Embedder, query: &str) -> anyhow::Result<QueryEmbedding> {
+    let texts = vec![query.to_string()];
+    let mut vectors = embedder.embed_batch(&texts)?;
+    let Some(vector) = vectors.pop() else {
+        anyhow::bail!("embedder {} returned no query vector", embedder.model_id());
+    };
+    if vector.len() != embedder.dim() {
+        anyhow::bail!(
+            "embedder {} returned query dimension {}, expected {}",
+            embedder.model_id(),
+            vector.len(),
+            embedder.dim()
+        );
     }
-    Ok(Some(embed_text(query)))
+    Ok(QueryEmbedding { model_id: embedder.model_id().to_string(), dim: embedder.dim(), vector })
+}
+
+pub fn active_embedding_model_id(conn: &Connection) -> anyhow::Result<String> {
+    ensure_model_manifest(conn)?;
+    if let Some(model_id) = meta(conn, ACTIVE_EMBEDDING_MODEL_META)? {
+        return Ok(model_id);
+    }
+    Ok(HASH_MODEL_ID.to_string())
+}
+
+pub fn current_embedding_count(conn: &Connection, model_id: &str) -> anyhow::Result<u64> {
+    ensure_model_manifest(conn)?;
+    let count: i64 = conn.query_row(
+        "
+        SELECT COUNT(*)
+        FROM chunk_embeddings
+        JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
+        JOIN ai_models ON ai_models.model_id = chunk_embeddings.model_id
+        WHERE chunk_embeddings.model_id = ?1
+          AND ai_models.installed = 1
+          AND ai_models.disabled = 0
+          AND ai_models.status = 'Ready'
+          AND chunk_embeddings.embedding_dim = ai_models.embedding_dim
+          AND chunk_embeddings.status = 'Current'
+          AND chunk_embeddings.source_text_hash = chunks.text_hash
+        ",
+        params![model_id],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+fn active_embedder(conn: &Connection) -> anyhow::Result<Box<dyn Embedder>> {
+    let model_id = active_embedding_model_id(conn)?;
+    let model = model(conn, &model_id)?;
+    validate_ready_model(&model)?;
+    match model.model_id.as_str() {
+        HASH_MODEL_ID => Ok(Box::new(HashEmbedder)),
+        FASTEMBED_MODEL_ID => fastembed_embedder(),
+        other => anyhow::bail!("unknown active embedding model `{other}`"),
+    }
+}
+
+fn validate_ready_model(model: &ModelInfo) -> anyhow::Result<()> {
+    if model.disabled {
+        anyhow::bail!("model {} is disabled", model.model_id);
+    }
+    if !model.installed || model.status != "Ready" {
+        anyhow::bail!("{}", model_not_ready_reason(model));
+    }
+    let expected_dim = expected_dim(&model.model_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown embedding model `{}`", model.model_id))?;
+    if model.embedding_dim != Some(i64::try_from(expected_dim).unwrap_or(i64::MAX)) {
+        anyhow::bail!(
+            "model {} dimension mismatch: manifest has {:?}, expected {}",
+            model.model_id,
+            model.embedding_dim,
+            expected_dim
+        );
+    }
+    Ok(())
+}
+
+fn model_not_ready_reason(model: &ModelInfo) -> String {
+    if model.disabled {
+        "Disabled".to_string()
+    } else if !model.installed {
+        "MissingModel".to_string()
+    } else {
+        model.status.clone()
+    }
+}
+
+fn expected_dim(model_id: &str) -> Option<usize> {
+    match model_id {
+        HASH_MODEL_ID => Some(HASH_EMBEDDING_DIM),
+        FASTEMBED_MODEL_ID => Some(FASTEMBED_EMBEDDING_DIM),
+        _ => None,
+    }
+}
+
+fn fastembed_embedder() -> anyhow::Result<Box<dyn Embedder>> {
+    #[cfg(feature = "fastembed")]
+    {
+        Ok(Box::new(FastEmbedEmbedder::new()?))
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        anyhow::bail!(
+            "fastembed backend is not compiled; rebuild rag-rat with --features fastembed"
+        )
+    }
 }
 
 pub fn decode_vector(blob: &[u8], dim: usize) -> Option<Vec<f32>> {
@@ -421,8 +704,8 @@ fn encode_vector(vector: &[f32]) -> Vec<u8> {
     out
 }
 
-fn embed_text(text: &str) -> Vec<f32> {
-    let mut vector = vec![0.0_f32; EMBEDDING_DIM];
+fn hash_embed_text(text: &str, dim: usize) -> Vec<f32> {
+    let mut vector = vec![0.0_f32; dim];
     let tokens = tokens(text);
     for token in &tokens {
         add_feature(&mut vector, token, 1.0);
@@ -553,6 +836,21 @@ fn count_query(conn: &Connection, sql: &str, model_id: &str) -> anyhow::Result<u
 fn artifact_table_sql(_capability: &str, template: &str) -> String {
     let table = "chunk_embeddings";
     template.replace("{table}", table)
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()?)
 }
 
 fn collect_rows<T>(

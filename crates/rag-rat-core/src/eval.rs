@@ -7,7 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Config, IndexDatabase};
+use crate::{Config, IndexDatabase, index::ai};
 
 const TOP_K: usize = 10;
 
@@ -62,7 +62,20 @@ pub struct EvalReport {
     pub pass: bool,
     pub queries: usize,
     pub metrics: EvalMetrics,
+    pub hash_vector_baseline: EvalBaselineReport,
     pub results: Vec<EvalQueryReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EvalBaselineReport {
+    pub model_id: String,
+    pub available: bool,
+    pub current_artifacts: u64,
+    pub metrics: EvalMetrics,
+    pub delta_mrr_at_10: f64,
+    pub delta_recall_at_10: f64,
+    pub delta_path_hit_rate: f64,
+    pub delta_symbol_hit_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,10 +144,10 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     let mut results = Vec::new();
     let mut observed = Vec::new();
 
-    for query in suite.query {
+    for query in &suite.query {
         let expected_query = expected.get(&query.id);
-        let merged = merge_expected(query, expected_query);
-        let report = evaluate_query(config, &db, &merged)?;
+        let merged = merge_expected(query.clone(), expected_query);
+        let report = evaluate_query(config, &db, &merged, SearchMode::Active)?;
         observed.push(observed_expected(&report));
         results.push(report);
     }
@@ -144,8 +157,15 @@ pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport>
     }
 
     let metrics = aggregate(&results);
+    let baseline = hash_vector_baseline(config, &db, &suite.query, &expected, &metrics)?;
     let pass = metrics.stale_current_source_violations == 0 && results.iter().all(|r| r.passed);
-    Ok(EvalReport { pass, queries: results.len(), metrics, results })
+    Ok(EvalReport {
+        pass,
+        queries: results.len(),
+        metrics,
+        hash_vector_baseline: baseline,
+        results,
+    })
 }
 
 fn load_queries(path: &Path) -> anyhow::Result<EvalSuite> {
@@ -202,14 +222,15 @@ fn evaluate_query(
     config: &Config,
     db: &IndexDatabase,
     query: &EvalQuery,
+    mode: SearchMode,
 ) -> anyhow::Result<EvalQueryReport> {
     let started = Instant::now();
-    let mut hits = db.search(&query.text, TOP_K as u32, false)?;
+    let mut hits = search(db, mode, &query.text)?;
     let mut latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut current_source_violations = find_current_source_violations(config, db, &hits);
     if !current_source_violations.is_empty() {
         let retry_started = Instant::now();
-        hits = db.search(&query.text, TOP_K as u32, false)?;
+        hits = search(db, mode, &query.text)?;
         latency_ms += retry_started.elapsed().as_secs_f64() * 1000.0;
         current_source_violations = find_current_source_violations(config, db, &hits);
     }
@@ -308,6 +329,49 @@ fn evaluate_query(
         current_source_violations,
         latency_ms,
         top_hits,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SearchMode {
+    Active,
+    HashBaseline,
+}
+
+fn search(
+    db: &IndexDatabase,
+    mode: SearchMode,
+    query: &str,
+) -> anyhow::Result<Vec<crate::search::lexical::SearchHit>> {
+    match mode {
+        SearchMode::Active => db.search(query, TOP_K as u32, false),
+        SearchMode::HashBaseline => db.search_hash_baseline(query, TOP_K as u32, false),
+    }
+}
+
+fn hash_vector_baseline(
+    config: &Config,
+    db: &IndexDatabase,
+    queries: &[EvalQuery],
+    expected: &BTreeMap<String, ExpectedQuery>,
+    active_metrics: &EvalMetrics,
+) -> anyhow::Result<EvalBaselineReport> {
+    let mut results = Vec::new();
+    for query in queries {
+        let merged = merge_expected(query.clone(), expected.get(&query.id));
+        results.push(evaluate_query(config, db, &merged, SearchMode::HashBaseline)?);
+    }
+    let metrics = aggregate(&results);
+    let current_artifacts = db.current_embedding_count(ai::HASH_MODEL_ID)?;
+    Ok(EvalBaselineReport {
+        model_id: ai::HASH_MODEL_ID.to_string(),
+        available: current_artifacts > 0,
+        current_artifacts,
+        delta_mrr_at_10: active_metrics.mrr_at_10 - metrics.mrr_at_10,
+        delta_recall_at_10: active_metrics.recall_at_10 - metrics.recall_at_10,
+        delta_path_hit_rate: active_metrics.path_hit_rate - metrics.path_hit_rate,
+        delta_symbol_hit_rate: active_metrics.symbol_hit_rate - metrics.symbol_hit_rate,
+        metrics,
     })
 }
 

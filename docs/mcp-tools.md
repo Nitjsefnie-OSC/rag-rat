@@ -79,15 +79,17 @@ last sync time, and whether the `gh` CLI capability is available.
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
-Local AI artifacts are explicit and current-only. MCP query paths never install or download models.
-`local_ai_status` reports embedding model state and artifact counts. The CLI-only
-`models install embedding-small` command records explicit local embedding availability, and
-`reconcile` writes local 384-dimensional chunk embeddings for current chunk hashes only.
+Local AI artifacts are explicit and current-only. `local_ai_status` reports embedding model state
+and artifact counts. The CLI-only `models install embedding-hash` command selects the deterministic
+baseline embedder. Building with `--features fastembed` enables the real local
+`fastembed-all-minilm-l6-v2` backend; `models install fastembed-all-minilm-l6-v2` is the intended
+FastEmbed cache-population step. `reconcile` writes model-id, dimension, and text-hash-bound chunk
+embeddings in configurable batches for current chunk hashes only.
 `semantic_search` combines BM25 candidates, vector similarity, symbol/name/path boosts,
 graph-neighborhood boosts, and optional git/GitHub papertrail boosts. Embeddings are used only when
-the model is installed, the embedding dimension matches model metadata, the artifact status is
-`Current`, and the artifact text hash matches the current chunk text hash; stale embeddings are
-treated as absent. There is no summarizer or LLM runtime in this milestone.
+the active model is installed, the embedding dimension matches active model metadata, the artifact
+status is `Current`, and the artifact text hash matches the current chunk text hash; stale
+embeddings are treated as absent. There is no summarizer or LLM runtime in this milestone.
 
 Indexing and reconcile use a Rayon worker pool for CPU-heavy preparation: file reads, hashing,
 tree-sitter chunk/symbol preparation, git-log parsing, and embedding computation run across available

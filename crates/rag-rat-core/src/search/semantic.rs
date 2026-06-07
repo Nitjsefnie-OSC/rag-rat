@@ -1,10 +1,6 @@
-//! Optional semantic search extension point.
+//! Semantic embedding search is implemented through `index::ai::Embedder`.
 //!
-//! The current implementation ships a BM25 lexical floor and keeps embedding
-//! storage in the schema. Embedding providers can implement this trait without
-//! changing the CLI or MCP tool contract.
+//! This module remains the search-facing semantic namespace while the runtime
+//! boundary lives next to model manifests and artifact reconciliation.
 
-pub trait EmbeddingProvider {
-    fn model_id(&self) -> &str;
-    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
-}
+pub use crate::index::ai::Embedder;

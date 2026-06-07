@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+fastembed = { workspace = true, optional = true }
 gix.workspace = true
 rayon.workspace = true
 rusqlite.workspace = true
@@ -20,3 +21,7 @@ tree-sitter.workspace = true
 tree-sitter-kotlin.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
+
+[features]
+default = []
+fastembed = ["dep:fastembed"]

@@ -24,11 +24,13 @@ GitHub papertrail data is fetched only by explicit `github sync` commands throug
 search, papertrail, and rationale tools read the local SQLite cache only. Cached issues, PRs,
 comments, reviews, and review comments are indexed as historical GitHub evidence.
 
-Local AI artifacts are explicit. Query paths never download models. `models install` records local
-embedding availability, and `reconcile` writes hash-bound 384-dimensional chunk embeddings only for
-current chunks. `semantic_search` uses embeddings only when the model is installed, the stored
-dimension matches the model metadata, the artifact is `Current`, and the artifact text hash matches
-the current chunk text hash. Stale AI artifacts are treated as absent.
+Local AI artifacts are explicit. `embedding-hash` is the deterministic baseline embedder.
+`fastembed-all-minilm-l6-v2` is the first real local embedding backend and requires building with
+`--features fastembed`. `models install` selects the active embedding model and is the intended
+FastEmbed cache-population step. `reconcile` writes model-id, dimension, and text-hash-bound chunk
+embeddings only for current chunks. `semantic_search` uses embeddings only when the model is
+installed, the stored dimension matches the active model metadata, the artifact is `Current`, and the
+artifact text hash matches the current chunk text hash. Stale AI artifacts are treated as absent.
 
 CPU-heavy index work uses the Rayon worker pool. File reads, source hashing, tree-sitter preparation,
 git-log parsing, and embedding computation run in parallel across available cores; SQLite writes stay
@@ -48,8 +50,9 @@ cargo run --bin rag-rat -- github sync --from-refs --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42 --config rag-rat.toml
 cargo run --bin rag-rat -- github sync --from-refs --offline --config rag-rat.toml
 cargo run --bin rag-rat -- models list --config rag-rat.toml
-cargo run --bin rag-rat -- models install embedding-small --config rag-rat.toml
-cargo run --bin rag-rat -- reconcile --limit 100 --config rag-rat.toml
+cargo run --bin rag-rat -- models install embedding-hash --config rag-rat.toml
+cargo run --features fastembed --bin rag-rat -- models install fastembed-all-minilm-l6-v2 --config rag-rat.toml
+cargo run --bin rag-rat -- reconcile --limit 100 --batch-size 32 --config rag-rat.toml
 cargo run --bin rag-rat -- eval --config rag-rat.toml
 cargo run --bin rag-rat -- eval --json --config rag-rat.toml
 cargo run --bin rag-rat -- eval --update-baseline --config rag-rat.toml

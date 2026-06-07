@@ -136,6 +136,16 @@ fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     if let Some(precision) = report.metrics.papertrail_precision_sample {
         println!("eval: papertrail_precision_sample={precision:.3}");
     }
+    println!(
+        "eval: hash_vector_baseline model={} available={} current_artifacts={} mrr@10={:.3} recall@10={:.3} delta_mrr@10={:+.3} delta_recall@10={:+.3}",
+        report.hash_vector_baseline.model_id,
+        report.hash_vector_baseline.available,
+        report.hash_vector_baseline.current_artifacts,
+        report.hash_vector_baseline.metrics.mrr_at_10,
+        report.hash_vector_baseline.metrics.recall_at_10,
+        report.hash_vector_baseline.delta_mrr_at_10,
+        report.hash_vector_baseline.delta_recall_at_10
+    );
     for result in report.results.iter().filter(|result| !result.passed) {
         println!(
             "eval: failed {} missing_paths={:?} missing_symbols={:?} missing_git_subjects={:?} missing_papertrail_kinds={:?} stale_current_source_violations={}",
@@ -166,7 +176,8 @@ fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
 fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let db = IndexDatabase::open(&config.database)?;
     let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
-    print_json(&db.reconcile(limit)?)
+    let batch_size = option_value(args, "--batch-size").map(|value| value.parse()).transpose()?;
+    print_json(&db.reconcile(limit, batch_size)?)
 }
 
 fn migrate(config: &Config, args: &[String]) -> anyhow::Result<()> {
@@ -286,8 +297,9 @@ fn usage() {
          rag-rat migrate --check --config rag-rat.toml\n\
          rag-rat github sync --from-refs --config rag-rat.toml\n\
          rag-rat models list --config rag-rat.toml\n\
-         rag-rat models install embedding-small --config rag-rat.toml\n\
-         rag-rat reconcile --limit 100 --config rag-rat.toml\n\
+         rag-rat models install embedding-hash --config rag-rat.toml\n\
+         rag-rat models install fastembed-all-minilm-l6-v2 --config rag-rat.toml\n\
+         rag-rat reconcile --limit 100 --batch-size 32 --config rag-rat.toml\n\
          rag-rat eval --config rag-rat.toml\n\
          rag-rat eval --json --config rag-rat.toml\n\
          rag-rat eval --update-baseline --config rag-rat.toml\n\
@@ -311,7 +323,13 @@ fn positional_after_options(args: &[String]) -> Option<String> {
             skip_next = false;
             continue;
         }
-        if arg == "--config" || arg == "--issue" || arg == "--limit" {
+        if arg == "--config"
+            || arg == "--issue"
+            || arg == "--limit"
+            || arg == "--batch-size"
+            || arg == "--queries"
+            || arg == "--expected"
+        {
             skip_next = true;
             continue;
         }
