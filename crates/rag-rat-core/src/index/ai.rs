@@ -710,51 +710,78 @@ pub fn reconcile_with_options_progress(
                 report.truncated_inputs += 1;
             }
         }
-        let texts = selected.jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
-        match embedder.embed_batch(&texts) {
-            Ok(vectors) if vectors.len() == selected.jobs.len() => {
-                write_current_embedding_batch(
-                    conn,
-                    embedder.as_ref(),
-                    &model_version,
-                    &selected.jobs,
-                    &vectors,
-                )?;
-                report.embeddings_written += u64::try_from(selected.jobs.len()).unwrap_or(u64::MAX);
-            },
-            Ok(vectors) => {
-                let error = format!(
-                    "embedder {} returned {} vectors for {} texts",
-                    embedder.model_id(),
-                    vectors.len(),
-                    selected.jobs.len()
-                );
-                write_failed_embedding_batch(
-                    conn,
-                    embedder.as_ref(),
-                    &model_version,
-                    &selected.jobs,
-                    &error,
-                )?;
-                report.failed_chunks += u64::try_from(selected.jobs.len()).unwrap_or(u64::MAX);
-            },
-            Err(err) => {
-                write_failed_embedding_batch(
-                    conn,
-                    embedder.as_ref(),
-                    &model_version,
-                    &selected.jobs,
-                    &err.to_string(),
-                )?;
-                report.failed_chunks += u64::try_from(selected.jobs.len()).unwrap_or(u64::MAX);
-            },
+        let jobs_len = selected.jobs.len();
+        let mut reused_jobs = Vec::new();
+        let mut to_embed_jobs = Vec::new();
+        for job in selected.jobs {
+            match find_existing_embedding(conn, &active_model_id, &job.input_hash, embedding_dim)? {
+                Some(vector) => reused_jobs.push((job, vector)),
+                None => to_embed_jobs.push(job),
+            }
+        }
+
+        if !reused_jobs.is_empty() {
+            let (reused_jobs_slice, reused_vectors_slice): (Vec<_>, Vec<_>) =
+                reused_jobs.into_iter().unzip();
+            write_current_embedding_batch(
+                conn,
+                embedder.as_ref(),
+                &model_version,
+                &reused_jobs_slice,
+                &reused_vectors_slice,
+            )?;
+            report.embeddings_written += u64::try_from(reused_jobs_slice.len()).unwrap_or(u64::MAX);
+        }
+
+        if !to_embed_jobs.is_empty() {
+            let texts =
+                to_embed_jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
+            match embedder.embed_batch(&texts) {
+                Ok(vectors) if vectors.len() == to_embed_jobs.len() => {
+                    write_current_embedding_batch(
+                        conn,
+                        embedder.as_ref(),
+                        &model_version,
+                        &to_embed_jobs,
+                        &vectors,
+                    )?;
+                    report.embeddings_written +=
+                        u64::try_from(to_embed_jobs.len()).unwrap_or(u64::MAX);
+                },
+                Ok(vectors) => {
+                    let error = format!(
+                        "embedder {} returned {} vectors for {} texts",
+                        embedder.model_id(),
+                        vectors.len(),
+                        to_embed_jobs.len()
+                    );
+                    write_failed_embedding_batch(
+                        conn,
+                        embedder.as_ref(),
+                        &model_version,
+                        &to_embed_jobs,
+                        &error,
+                    )?;
+                    report.failed_chunks += u64::try_from(to_embed_jobs.len()).unwrap_or(u64::MAX);
+                },
+                Err(err) => {
+                    write_failed_embedding_batch(
+                        conn,
+                        embedder.as_ref(),
+                        &model_version,
+                        &to_embed_jobs,
+                        &err.to_string(),
+                    )?;
+                    report.failed_chunks += u64::try_from(to_embed_jobs.len()).unwrap_or(u64::MAX);
+                },
+            }
         }
         report.processed_chunks = report
             .embeddings_written
             .saturating_add(report.failed_chunks)
             .saturating_add(report.blocked_chunks);
         if let Some(value) = remaining.as_mut() {
-            *value = value.saturating_sub(u64::try_from(selected.jobs.len()).unwrap_or(0));
+            *value = value.saturating_sub(u64::try_from(jobs_len).unwrap_or(0));
         }
         progress(ReconcileProgress::Batch {
             processed_chunks: report.embeddings_written
@@ -2064,4 +2091,22 @@ fn collect_rows<T>(
         out.push(row?);
     }
     Ok(out)
+}
+
+fn find_existing_embedding(
+    conn: &Connection,
+    model_id: &str,
+    input_hash: &str,
+    dim: usize,
+) -> anyhow::Result<Option<Vec<f32>>> {
+    let vector: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT vector_blob FROM chunk_embeddings
+         WHERE model_id = ?1 AND input_hash = ?2 AND status = 'Current' AND embedding_dim = ?3
+         LIMIT 1",
+            params![model_id, input_hash, i64::try_from(dim).unwrap_or(i64::MAX)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(blob) = vector { Ok(decode_vector(&blob, dim)) } else { Ok(None) }
 }

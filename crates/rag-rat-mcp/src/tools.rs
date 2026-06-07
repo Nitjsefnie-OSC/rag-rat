@@ -1,7 +1,7 @@
 use std::{path::Path, str::FromStr};
 
 use rag_rat_core::{
-    IndexDatabase,
+    Config, IndexDatabase,
     language::Language,
     query::{
         graph::{GraphResolutionMode, GraphTraversalOptions},
@@ -208,6 +208,19 @@ pub fn list_tools() -> Value {
 
 pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Result<Value> {
     let db = IndexDatabase::open(database)?;
+    call_tool_with_db(&db, name, arguments)
+}
+
+pub fn call_tool_for_config(
+    config: &Config,
+    name: &str,
+    arguments: Value,
+) -> anyhow::Result<Value> {
+    let db = IndexDatabase::open_config(config)?;
+    call_tool_with_db(&db, name, arguments)
+}
+
+fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow::Result<Value> {
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -243,22 +256,22 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            graph_tool(&db, args, resolution_mode, true)?
+            graph_tool(db, args, resolution_mode, true)?
         },
         "trace_callees" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            graph_tool(&db, args, resolution_mode, false)?
+            graph_tool(db, args, resolution_mode, false)?
         },
         "compare_graph_to_text" => {
             let args: CompareGraphTextArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            compare_graph_to_text_tool(&db, args, resolution_mode)?
+            compare_graph_to_text_tool(db, args, resolution_mode)?
         },
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            impact_tool(&db, args, resolution_mode)?
+            impact_tool(db, args, resolution_mode)?
         },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;
@@ -266,7 +279,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "docs_for_symbol" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
-            docs_for_symbol_tool(&db, args)?
+            docs_for_symbol_tool(db, args)?
         },
         "read_chunk" => {
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
@@ -286,7 +299,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "git_history_for_symbol" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            git_history_for_symbol_tool(&db, args)?
+            git_history_for_symbol_tool(db, args)?
         },
         "commits_touching_query" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -302,7 +315,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "papertrail_for_symbol" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            papertrail_for_symbol_tool(&db, args)?
+            papertrail_for_symbol_tool(db, args)?
         },
         "papertrail_for_commit" => {
             let args: PapertrailCommitArgs = serde_json::from_value(arguments)?;
@@ -326,7 +339,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
             json!(db.heal_index(args.limit)?)
         },
         "github_sync_status" => json!(db.github_sync_status()?),
-        "index_status" => json!(db.status(database)?),
+        "index_status" => json!(db.status(db.database_path())?),
         other => anyhow::bail!("unknown tool `{other}`"),
     };
     Ok(result)
@@ -793,7 +806,7 @@ mod tests {
         drop(db);
 
         let search =
-            call_tool(&config.database, "semantic_search", json!({"query": "alpha"})).unwrap();
+            call_tool_for_config(&config, "semantic_search", json!({"query": "alpha"})).unwrap();
         let hit = search.as_array().unwrap().first().expect("semantic hit");
         for field in ["chunk_id", "path", "start_line", "end_line", "summary", "score"] {
             assert!(hit.get(field).is_some(), "semantic_search missing {field}");
@@ -801,7 +814,7 @@ mod tests {
         let chunk_id = hit["chunk_id"].as_i64().unwrap();
 
         let chunk =
-            call_tool(&config.database, "read_chunk", json!({"chunk_id": chunk_id})).unwrap();
+            call_tool_for_config(&config, "read_chunk", json!({"chunk_id": chunk_id})).unwrap();
         for field in ["chunk_id", "path", "start_line", "end_line", "text"] {
             assert!(chunk.get(field).is_some(), "read_chunk missing {field}");
         }
@@ -846,15 +859,15 @@ mod tests {
         assert_eq!(chunk["text"], "# Title\nalpha token\n");
 
         fs::write(root.join("docs/search.md"), "# Changed\nbeta token\n").unwrap();
-        let report = call_tool(&config.database, "heal_index", json!({"limit": 10})).unwrap();
+        let report = call_tool_for_config(&config, "heal_index", json!({"limit": 10})).unwrap();
         assert_eq!(report["healed_files"], 1);
         assert_eq!(report["fts_fresh"], true);
 
         let stale =
-            call_tool(&config.database, "semantic_search", json!({"query": "alpha"})).unwrap();
+            call_tool_for_config(&config, "semantic_search", json!({"query": "alpha"})).unwrap();
         assert!(stale.as_array().unwrap().is_empty());
         let fresh =
-            call_tool(&config.database, "semantic_search", json!({"query": "beta"})).unwrap();
+            call_tool_for_config(&config, "semantic_search", json!({"query": "beta"})).unwrap();
         assert_eq!(fresh.as_array().unwrap().len(), 1);
 
         fs::remove_dir_all(root).unwrap();

@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             if query.is_empty() {
                 anyhow::bail!("query command needs a search string");
             }
-            let db = IndexDatabase::open(&config.database)?;
+            let db = IndexDatabase::open_config(&config)?;
             if has_flag(&args, "--explain") {
                 print_query_explain(&db.search_explain(&query, 10, false)?);
             } else {
@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         "mcp" => {
-            rag_rat_mcp::server::run_stdio(config.database).await?;
+            rag_rat_mcp::server::run_stdio(config).await?;
         },
         "github" => {
             github(&config, &args)?;
@@ -211,7 +211,7 @@ fn print_query_explain(hits: &[SearchHit]) {
 }
 
 fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let db = IndexDatabase::open(&config.database)?;
+    let db = IndexDatabase::open_config(config)?;
     match args.get(1).map(String::as_str) {
         Some("list") | None => print_json(&db.list_models()?),
         Some("install") => {
@@ -225,7 +225,7 @@ fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
 }
 
 fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let db = IndexDatabase::open(&config.database)?;
+    let db = IndexDatabase::open_config(config)?;
     if has_flag(args, "--plan") {
         let plan = db.reconcile_plan()?;
         if has_flag(args, "--json") {
@@ -347,7 +347,7 @@ fn doctor(config: &Config) -> anyhow::Result<()> {
     let schema = IndexDatabase::migration_check(&config.database)?;
     let (index, discovery, storage) =
         if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
-            let db = IndexDatabase::open(&config.database)?;
+            let db = IndexDatabase::open_config(config)?;
             (
                 Some(serde_json::to_value(db.status(&config.database)?)?),
                 Some(serde_json::to_value(db.discovery_status(config)?)?),
@@ -384,7 +384,7 @@ fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {
     };
     match subcommand {
         "sync" => {
-            let db = IndexDatabase::open(&config.database)?;
+            let db = IndexDatabase::open_config(config)?;
             let offline = has_flag(args, "--offline");
             let report = if let Some(issue) = option_value(args, "--issue") {
                 db.github_sync_issue(&issue, offline)?

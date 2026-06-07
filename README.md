@@ -154,6 +154,12 @@ files, and removed indexed files, then updates only that delta. Use `index --ful
 file and rebuild the SQLite FTS5 table from stored chunks. `index --watch` is reserved for a later
 file-watcher mode and currently exits with an explicit not-implemented error.
 
+When the target root is a git worktree, indexed rows are scoped by context. Clean files are stored
+under the current `commit_sha`; dirty or untracked files are stored under a transient `worktree_id`
+overlay. Queries read the active worktree overlay first and then fall back to rows for the active
+commit, so branch switches can reuse previously indexed commit rows while uncommitted files shadow
+their committed versions. Non-git roots are treated as worktree overlays.
+
 `doctor` reports discovery drift. If configured source files are not indexed, it returns a warning
 such as `3 unindexed source files detected. Run rag-rat index --full or rag-rat index --discover.`
 

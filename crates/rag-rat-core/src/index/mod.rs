@@ -56,6 +56,8 @@ use crate::{
 #[derive(Debug)]
 pub struct IndexDatabase {
     storage: IndexConnection,
+    pub active_commit_sha: String,
+    pub active_worktree_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -164,13 +166,33 @@ pub enum IndexError {
 
 impl IndexDatabase {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with_graph_check(path, true)
+    }
+
+    pub fn database_path(&self) -> &Path {
+        self.storage.database_path()
+    }
+
+    fn open_with_graph_check(path: &Path, check_graph: bool) -> anyhow::Result<Self> {
         let mut storage = IndexConnection::open(path)?;
         schema::check_compatible(storage.connection())?;
         ai::ensure_model_manifest(storage.connection())?;
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
-        let db = Self { storage };
+        let db =
+            Self { storage, active_commit_sha: String::new(), active_worktree_id: String::new() };
+        if check_graph {
+            db.ensure_graph_index_current()?;
+        }
+        Ok(db)
+    }
+
+    pub fn open_config(config: &Config) -> anyhow::Result<Self> {
+        let mut db = Self::open_with_graph_check(&config.database, false)?;
+        db.storage.set_source_root(config.root.clone());
+        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
+        db.set_context(&commit_sha, &worktree_id)?;
         db.ensure_graph_index_current()?;
         Ok(db)
     }
@@ -202,7 +224,45 @@ impl IndexDatabase {
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
-        Ok(Self { storage })
+        Ok(Self { storage, active_commit_sha: String::new(), active_worktree_id: String::new() })
+    }
+
+    pub fn set_context(&mut self, commit_sha: &str, worktree_id: &str) -> anyhow::Result<()> {
+        self.active_commit_sha = commit_sha.to_string();
+        self.active_worktree_id = worktree_id.to_string();
+
+        let conn = self.storage.connection();
+        conn.execute_batch(
+            "
+            CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);
+        ",
+        )?;
+
+        let mut stmt = conn.prepare(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)",
+        )?;
+        stmt.execute(params!["commit_sha", commit_sha])?;
+        stmt.execute(params!["worktree_id", worktree_id])?;
+
+        conn.execute_batch("
+            DROP VIEW IF EXISTS temp.files;
+            CREATE TEMP VIEW temp.files AS
+            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision, commit_sha, worktree_id
+            FROM main.files
+            WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = 'worktree_id') AND worktree_id != '' AND kind != 'deleted'
+            UNION ALL
+            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision, commit_sha, worktree_id
+            FROM main.files
+            WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
+              AND commit_sha != ''
+              AND path NOT IN (
+                  SELECT path FROM main.files 
+                  WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = 'worktree_id')
+                    AND worktree_id != ''
+              );
+        ")?;
+
+        Ok(())
     }
 
     pub fn rebuild(config: &Config) -> anyhow::Result<Self> {
@@ -219,6 +279,8 @@ impl IndexDatabase {
         });
         remove_database_files(&config.database)?;
         let mut db = Self::create_or_migrate(&config.database)?;
+        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
+        db.set_context(&commit_sha, &worktree_id)?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
@@ -281,6 +343,8 @@ impl IndexDatabase {
         }
 
         let mut db = Self::open(&config.database)?;
+        let (commit_sha, worktree_id) = resolve_git_context(&config.root);
+        db.set_context(&commit_sha, &worktree_id)?;
         if db.indexed_file_count()? == 0 {
             return Self::rebuild_with_progress(config, progress);
         }
@@ -329,6 +393,8 @@ impl IndexDatabase {
     {
         progress(IndexProgress::Discovering);
         let files = collect_index_files(config)?;
+        let changes = git_changed_paths(&config.root).unwrap_or_default();
+        let files = self.assign_file_scopes(files, &changes);
         progress(IndexProgress::Discovered { files: files.len() });
 
         let prepared = files.par_iter().map(prepare_index_file).collect::<Vec<_>>();
@@ -357,6 +423,7 @@ impl IndexDatabase {
         progress(IndexProgress::Discovering);
         let changes = git_changed_paths(&config.root)?;
         let files = collect_changed_index_files(config, &changes)?;
+        let files = self.assign_file_scopes(files, &changes);
         self.apply_incremental_file_plan(files, changes.deleted, progress)
     }
 
@@ -370,7 +437,30 @@ impl IndexDatabase {
     {
         progress(IndexProgress::Discovering);
         let plan = discovery_plan(self.storage.connection(), config)?;
-        self.apply_incremental_file_plan(plan.files, plan.deleted, progress)
+        let changes = git_changed_paths(&config.root).unwrap_or_default();
+        let files = self.assign_file_scopes(plan.files, &changes);
+        self.apply_incremental_file_plan(files, plan.deleted, progress)
+    }
+
+    fn assign_file_scopes(
+        &self,
+        files: Vec<IndexFile>,
+        changes: &GitChangedPaths,
+    ) -> Vec<IndexFile> {
+        let has_base_commit = !self.active_commit_sha.is_empty();
+        files
+            .into_iter()
+            .map(|mut file| {
+                if !has_base_commit || changes.changed.contains(&file.relative_path) {
+                    file.commit_sha.clear();
+                    file.worktree_id.clone_from(&self.active_worktree_id);
+                } else {
+                    file.commit_sha.clone_from(&self.active_commit_sha);
+                    file.worktree_id.clear();
+                }
+                file
+            })
+            .collect()
     }
 
     fn apply_incremental_file_plan<F>(
@@ -386,7 +476,7 @@ impl IndexDatabase {
 
         let deleted_count = deleted.len();
         for path in deleted {
-            self.remove_file(&path)?;
+            self.mark_file_deleted(&path)?;
         }
 
         let prepared = files.par_iter().map(prepare_index_file).collect::<Vec<_>>();
@@ -398,7 +488,11 @@ impl IndexDatabase {
                 language: prepared_file.file.language,
                 kind: prepared_file.file.kind,
             });
-            self.remove_file(&prepared_file.file.relative_path)?;
+            self.remove_file_in_scope(
+                &prepared_file.file.relative_path,
+                &prepared_file.file.commit_sha,
+                &prepared_file.file.worktree_id,
+            )?;
             self.insert_prepared_file(prepared_file)?;
         }
 
@@ -634,7 +728,7 @@ impl IndexDatabase {
             Ok(text) => text,
             Err(_) => {
                 let path = chunk.path.clone();
-                self.remove_file(Path::new(&path))?;
+                self.mark_file_deleted(Path::new(&path))?;
                 self.sync_fts()?;
                 anyhow::bail!(IndexError::Gone { chunk_id });
             },
@@ -976,7 +1070,7 @@ impl IndexDatabase {
             let path = Path::new(&file.path);
             let full_path = root.join(path);
             let Ok(text) = fs::read_to_string(&full_path) else {
-                self.remove_file(path)?;
+                self.mark_file_deleted(path)?;
                 report.removed_files += 1;
                 continue;
             };
@@ -1379,8 +1473,25 @@ impl IndexDatabase {
         let row = self.file_row(path)?;
         let full_path = root.join(path);
         let text = fs::read_to_string(&full_path)?;
-        self.remove_file(path)?;
-        self.index_file(path, row.language, row.kind, file_metadata_ms(&full_path)?, &text)?;
+
+        let changes = git_changed_paths(root).unwrap_or_default();
+        let is_dirty = changes.changed.contains(path);
+        let has_base_commit = !self.active_commit_sha.is_empty();
+        let scope = if !has_base_commit || is_dirty {
+            FileScope::worktree(self.active_worktree_id.clone())
+        } else {
+            FileScope::commit(self.active_commit_sha.clone())
+        };
+        self.remove_file_in_scope(path, &scope.commit_sha, &scope.worktree_id)?;
+
+        self.index_file(
+            path,
+            row.language,
+            row.kind,
+            file_metadata_ms(&full_path)?,
+            &text,
+            &scope,
+        )?;
         self.rebuild_logical_symbols()?;
         self.resolve_edges()
     }
@@ -1392,6 +1503,7 @@ impl IndexDatabase {
         kind: TargetKind,
         modified_at_ms: i64,
         text: &str,
+        scope: &FileScope,
     ) -> anyhow::Result<()> {
         if language != Language::Markdown && kind != TargetKind::Generated {
             if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
@@ -1405,8 +1517,8 @@ impl IndexDatabase {
         }
         let sha256 = hex_sha256(text.as_bytes());
         let file_id = self.storage.connection().query_row(
-            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              RETURNING id",
             params![
                 path_string(path),
@@ -1417,6 +1529,8 @@ impl IndexDatabase {
                 matches!(kind, TargetKind::Generated),
                 now_ms(),
                 sha256,
+                &scope.commit_sha,
+                &scope.worktree_id,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -1453,8 +1567,8 @@ impl IndexDatabase {
             self.insert_parser_failure(&file.relative_path, file.language, message)?;
         }
         let file_id = self.storage.connection().query_row(
-            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              RETURNING id",
             params![
                 path_string(&file.relative_path),
@@ -1465,6 +1579,8 @@ impl IndexDatabase {
                 matches!(file.kind, TargetKind::Generated),
                 now_ms(),
                 prepared.sha256,
+                file.commit_sha,
+                file.worktree_id,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -1492,7 +1608,7 @@ impl IndexDatabase {
         full_text: &str,
     ) -> anyhow::Result<()> {
         let (path, language, kind) = self.storage.connection().query_row(
-            "SELECT path, language, kind FROM files WHERE id = ?1",
+            "SELECT path, language, kind FROM main.files WHERE id = ?1",
             [file_id],
             |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
@@ -2040,7 +2156,29 @@ impl IndexDatabase {
         )?)
     }
 
-    fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+    fn mark_file_deleted(&self, path: &Path) -> anyhow::Result<()> {
+        let path = path_string(path);
+        self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+        self.storage.connection().execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3)
+             ON CONFLICT(path, commit_sha, worktree_id) DO UPDATE SET
+                kind = 'deleted',
+                sha256 = '',
+                modified_at_ms = 0,
+                indexed_at_ms = excluded.indexed_at_ms",
+            params![path, now_ms(), self.active_worktree_id],
+        )?;
+        self.mark_fts_dirty()?;
+        Ok(())
+    }
+
+    fn remove_file_in_scope(
+        &self,
+        path: &Path,
+        commit_sha: &str,
+        worktree_id: &str,
+    ) -> anyhow::Result<()> {
         let path = path_string(path);
         self.storage.connection().execute(
             "UPDATE edges
@@ -2048,20 +2186,27 @@ impl IndexDatabase {
                  confidence = 'NameOnly'
              WHERE to_symbol_id IN (
                  SELECT symbols.id FROM symbols
-                 JOIN files ON files.id = symbols.file_id
-                 WHERE files.path = ?1
+                 JOIN main.files ON main.files.id = symbols.file_id
+                 WHERE main.files.path = ?1
+                   AND main.files.commit_sha = ?2
+                   AND main.files.worktree_id = ?3
              )",
-            [&path],
+            params![path, commit_sha, worktree_id],
         )?;
         self.storage.connection().execute(
             "DELETE FROM edges
-             WHERE source_file_id IN (SELECT id FROM files WHERE path = ?1)
+             WHERE source_file_id IN (
+                    SELECT id FROM main.files
+                    WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+                )
                 OR from_symbol_id IN (
                     SELECT symbols.id FROM symbols
-                    JOIN files ON files.id = symbols.file_id
-                    WHERE files.path = ?1
+                    JOIN main.files ON main.files.id = symbols.file_id
+                    WHERE main.files.path = ?1
+                      AND main.files.commit_sha = ?2
+                      AND main.files.worktree_id = ?3
                 )",
-            [&path],
+            params![path, commit_sha, worktree_id],
         )?;
         self.storage
             .connection()
@@ -2070,20 +2215,33 @@ impl IndexDatabase {
             "DELETE FROM chunk_fts
              WHERE rowid IN (
                  SELECT chunks.id FROM chunks
-                 JOIN files ON files.id = chunks.file_id
-                 WHERE files.path = ?1
+                 JOIN main.files ON main.files.id = chunks.file_id
+                 WHERE main.files.path = ?1
+                   AND main.files.commit_sha = ?2
+                   AND main.files.worktree_id = ?3
              )",
-            [&path],
+            params![path, commit_sha, worktree_id],
         )?;
         self.storage.connection().execute(
-            "DELETE FROM chunks WHERE file_id IN (SELECT id FROM files WHERE path = ?1)",
-            [&path],
+            "DELETE FROM chunks
+             WHERE file_id IN (
+                SELECT id FROM main.files
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+             )",
+            params![path, commit_sha, worktree_id],
         )?;
         self.storage.connection().execute(
-            "DELETE FROM symbols WHERE file_id IN (SELECT id FROM files WHERE path = ?1)",
-            [&path],
+            "DELETE FROM symbols
+             WHERE file_id IN (
+                SELECT id FROM main.files
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3
+             )",
+            params![path, commit_sha, worktree_id],
         )?;
-        self.storage.connection().execute("DELETE FROM files WHERE path = ?1", [&path])?;
+        self.storage.connection().execute(
+            "DELETE FROM main.files WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
+            params![path, commit_sha, worktree_id],
+        )?;
         self.mark_fts_dirty()?;
         Ok(())
     }
@@ -2323,6 +2481,24 @@ struct IndexFile {
     relative_path: PathBuf,
     language: Language,
     kind: TargetKind,
+    commit_sha: String,
+    worktree_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct FileScope {
+    commit_sha: String,
+    worktree_id: String,
+}
+
+impl FileScope {
+    fn commit(commit_sha: String) -> Self {
+        Self { commit_sha, worktree_id: String::new() }
+    }
+
+    fn worktree(worktree_id: String) -> Self {
+        Self { commit_sha: String::new(), worktree_id }
+    }
 }
 
 #[derive(Debug)]
@@ -2379,6 +2555,8 @@ fn collect_index_files(config: &Config) -> anyhow::Result<Vec<IndexFile>> {
                 relative_path,
                 language: target.language,
                 kind: target.kind,
+                commit_sha: String::new(),
+                worktree_id: String::new(),
             });
         }
     }
@@ -2399,7 +2577,14 @@ fn collect_changed_index_files(
         let Some((language, kind)) = target_for_path(config, relative_path) else {
             continue;
         };
-        files.push(IndexFile { full_path, relative_path: relative_path.clone(), language, kind });
+        files.push(IndexFile {
+            full_path,
+            relative_path: relative_path.clone(),
+            language,
+            kind,
+            commit_sha: String::new(),
+            worktree_id: String::new(),
+        });
     }
     Ok(files)
 }
@@ -2606,6 +2791,13 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn resolve_git_context(root: &Path) -> (String, String) {
+    let commit_sha =
+        git_output(root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+    let worktree_id = root.to_string_lossy().trim_end_matches('/').to_string();
+    (commit_sha, worktree_id)
+}
+
 fn file_metadata_ms(path: &Path) -> anyhow::Result<i64> {
     let modified = fs::metadata(path)?.modified()?;
     Ok(duration_ms(modified.duration_since(UNIX_EPOCH)?))
@@ -2728,7 +2920,7 @@ mod schema_bootstrap_tests {
         let member_columns = table_columns(&db, "logical_symbol_members");
         assert!(member_columns.contains(&"symbol_id".to_string()));
         assert!(member_columns.contains(&"signature_hash".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 7);
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 8);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2898,6 +3090,60 @@ mod schema_bootstrap_tests {
         assert!(fresh.warning.is_none());
         assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
         assert!(db.symbols("old_symbol", Some(Language::Rust), 10).unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dirty_git_files_are_indexed_as_worktree_overlay() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("search.md"), "# Title\nbase token\n").unwrap();
+        run_git(&root, &["init"]);
+        run_git(&root, &["add", "."]);
+        run_git(
+            &root,
+            &[
+                "-c",
+                "user.name=Rag Rat Test",
+                "-c",
+                "user.email=rag-rat@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let config = markdown_config_for_root(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.search("base", 10, false).unwrap().len(), 1);
+
+        fs::write(docs.join("search.md"), "# Title\noverlay token\n").unwrap();
+        let db = IndexDatabase::index_changed(&config).unwrap();
+        let scopes = db
+            .storage
+            .connection()
+            .prepare(
+                "
+                SELECT commit_sha != '', worktree_id != ''
+                FROM main.files
+                WHERE path = 'docs/search.md'
+                ORDER BY commit_sha != '' DESC, worktree_id != '' DESC
+                ",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(scopes, vec![(true, false), (false, true)]);
+        assert!(db.search("base", 10, false).unwrap().is_empty());
+        let overlay_hits = db.search("overlay", 10, false).unwrap();
+        assert_eq!(overlay_hits.len(), 1);
+        assert!(overlay_hits[0].summary.contains("overlay token"));
 
         fs::remove_dir_all(root).unwrap();
     }

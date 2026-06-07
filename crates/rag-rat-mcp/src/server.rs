@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-
+use rag_rat_core::Config;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -21,16 +20,16 @@ use crate::tools::{
 
 #[derive(Clone)]
 pub struct RagRatService {
-    database: PathBuf,
+    config: Config,
 }
 
 impl RagRatService {
-    pub fn new(database: PathBuf) -> Self {
-        Self { database }
+    pub fn new(config: Config) -> Self {
+        Self { config }
     }
 
     fn call(&self, name: &str, value: Value) -> Result<CallToolResult, ErrorData> {
-        let value = crate::tools::call_tool(&self.database, name, value)
+        let value = crate::tools::call_tool_for_config(&self.config, name, value)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         let text = serde_json::to_string_pretty(&value)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
@@ -323,8 +322,8 @@ impl ServerHandler for RagRatService {
     }
 }
 
-pub async fn run_stdio(database: PathBuf) -> anyhow::Result<()> {
-    let service = RagRatService::new(database).serve(stdio()).await?;
+pub async fn run_stdio(config: Config) -> anyhow::Result<()> {
+    let service = RagRatService::new(config).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

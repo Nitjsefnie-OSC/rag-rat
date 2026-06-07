@@ -1,6 +1,8 @@
 # MCP Tools
 
 `rag-rat mcp --config rag-rat.toml` starts a local `rmcp` STDIO server. The server is read-only for configured source roots; it may update the configured SQLite index when automatic stale-index healing is needed.
+The server opens the index through the configured root, so search and graph tools resolve the active
+git commit plus dirty worktree overlay in the same way as CLI queries.
 
 ## Install
 

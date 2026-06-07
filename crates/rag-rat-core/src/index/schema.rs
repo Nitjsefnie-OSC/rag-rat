@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 7;
+pub const LATEST_SCHEMA_VERSION: u32 = 8;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -29,6 +29,10 @@ const MIGRATION_007_ID: &str = "007_logical_symbol_groups";
 const MIGRATION_007_CHECKSUM: &str = "sha256:rag-rat-logical-symbol-groups-v7";
 const MIGRATION_007_DESCRIPTION: &str =
     "Add logical symbol groups for cfg variants and duplicate definitions";
+const MIGRATION_008_ID: &str = "008_commit_addressable_worktrees";
+const MIGRATION_008_CHECKSUM: &str = "sha256:rag-rat-commit-addressable-worktrees-v8";
+const MIGRATION_008_DESCRIPTION: &str =
+    "Add commit_sha and worktree_id to files table for multi-worktree / multi-branch support";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +99,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_006_ID, MIGRATION_006_CHECKSUM, MIGRATION_006_DESCRIPTION)?;
     apply_logical_symbol_groups(conn)?;
     record_migration(conn, MIGRATION_007_ID, MIGRATION_007_CHECKSUM, MIGRATION_007_DESCRIPTION)?;
+    apply_commit_addressable_worktrees(conn)?;
+    record_migration(conn, MIGRATION_008_ID, MIGRATION_008_CHECKSUM, MIGRATION_008_DESCRIPTION)?;
     Ok(())
 }
 
@@ -193,14 +199,17 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE TABLE IF NOT EXISTS files(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            path TEXT NOT NULL UNIQUE,
+            path TEXT NOT NULL,
             language TEXT NOT NULL,
             kind TEXT NOT NULL,
             sha256 TEXT NOT NULL,
             modified_at_ms INTEGER NOT NULL,
             generated INTEGER NOT NULL DEFAULT 0,
             indexed_at_ms INTEGER NOT NULL,
-            indexed_revision TEXT NOT NULL DEFAULT ''
+            indexed_revision TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            UNIQUE(path, commit_sha, worktree_id)
         );
 
         CREATE TABLE IF NOT EXISTS chunks(
@@ -852,6 +861,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_005_ID => Some(5),
             MIGRATION_006_ID => Some(6),
             MIGRATION_007_ID => Some(7),
+            MIGRATION_008_ID => Some(8),
             _ => None,
         })
         .max()
@@ -868,6 +878,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_005_ID
             | MIGRATION_006_ID
             | MIGRATION_007_ID
+            | MIGRATION_008_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -881,6 +892,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_005_ID => migration.checksum != MIGRATION_005_CHECKSUM,
         MIGRATION_006_ID => migration.checksum != MIGRATION_006_CHECKSUM,
         MIGRATION_007_ID => migration.checksum != MIGRATION_007_CHECKSUM,
+        MIGRATION_008_ID => migration.checksum != MIGRATION_008_CHECKSUM,
         _ => false,
     }
 }
@@ -933,4 +945,54 @@ fn add_column_if_missing(
     }
 
     conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+}
+
+fn apply_commit_addressable_worktrees(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "files", "commit_sha", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "files", "worktree_id", "TEXT NOT NULL DEFAULT ''")?;
+    rebuild_files_table_for_commit_scopes(conn)?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_files_commit_path ON files(commit_sha, path);
+        CREATE INDEX IF NOT EXISTS idx_files_worktree_path ON files(worktree_id, path);
+        ",
+    )?;
+    Ok(())
+}
+
+fn rebuild_files_table_for_commit_scopes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+
+        CREATE TABLE IF NOT EXISTS files_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            modified_at_ms INTEGER NOT NULL,
+            generated INTEGER NOT NULL DEFAULT 0,
+            indexed_at_ms INTEGER NOT NULL,
+            indexed_revision TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            UNIQUE(path, commit_sha, worktree_id)
+        );
+
+        INSERT OR IGNORE INTO files_new(
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, commit_sha, worktree_id
+        )
+        SELECT
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, COALESCE(commit_sha, ''), COALESCE(worktree_id, '')
+        FROM files;
+
+        DROP TABLE files;
+        ALTER TABLE files_new RENAME TO files;
+
+        PRAGMA foreign_keys = ON;
+        ",
+    )
 }

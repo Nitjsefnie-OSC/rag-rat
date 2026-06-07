@@ -175,7 +175,7 @@ struct BaselineSuite {
 pub fn run(config: &Config, options: &EvalOptions) -> anyhow::Result<EvalReport> {
     let suite = load_queries(&options.queries_path)?;
     let expected = load_expected(&options.expected_path)?;
-    let db = IndexDatabase::open(&config.database)?;
+    let db = IndexDatabase::open_config(config)?;
     let mut results = Vec::new();
     let mut observed = Vec::new();
 

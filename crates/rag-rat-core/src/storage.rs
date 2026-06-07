@@ -16,6 +16,7 @@ pub struct StorageStatus {
 #[derive(Debug)]
 pub struct IndexConnection {
     conn: Connection,
+    database_path: PathBuf,
     source_root: Option<PathBuf>,
 }
 
@@ -25,9 +26,13 @@ impl IndexConnection {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        let storage = Self { conn, source_root: None };
+        let storage = Self { conn, database_path: path.to_path_buf(), source_root: None };
         storage.setup()?;
         Ok(storage)
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database_path
     }
 
     pub fn connection(&self) -> &Connection {
