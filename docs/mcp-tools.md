@@ -2,6 +2,67 @@
 
 `rag-rat mcp --config rag-rat.toml` starts a local `rmcp` STDIO server. The server is read-only for configured source roots; it may update the configured SQLite index when automatic stale-index healing is needed.
 
+## Install
+
+The MCP server is launched by the MCP client over STDIO. It does not listen on a TCP port.
+
+Install the binary from a local checkout:
+
+```bash
+cargo install --path tools/rag-rat --bin rag-rat --features fastembed
+rag-rat migrate --config /home/kk/src/held/rag-rat.toml
+rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
+rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
+rag-rat reconcile --limit 500 --config /home/kk/src/held/rag-rat.toml
+rag-rat doctor --config /home/kk/src/held/rag-rat.toml
+```
+
+Use `embedding-hash` instead of FastEmbed when a small dependency footprint matters more than real
+semantic embeddings:
+
+```bash
+cargo install --path tools/rag-rat --bin rag-rat
+rag-rat models install embedding-hash --config /home/kk/src/held/rag-rat.toml
+```
+
+MCP client config for the installed binary:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat": {
+      "command": "/home/kk/.cargo/bin/rag-rat",
+      "args": ["mcp", "--config", "/home/kk/src/held/rag-rat.toml"]
+    }
+  }
+}
+```
+
+Development config without installing:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat-dev": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "/home/kk/src/held/tools/rag-rat/Cargo.toml",
+        "--features",
+        "fastembed",
+        "--bin",
+        "rag-rat",
+        "--",
+        "mcp",
+        "--config",
+        "/home/kk/src/held/rag-rat.toml"
+      ]
+    }
+  }
+}
+```
+
 ## Tools
 
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`

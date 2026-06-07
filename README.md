@@ -64,6 +64,67 @@ cargo run --bin rag-rat -- mcp --config rag-rat.toml
 
 By default, rag-rat links against the system SQLite library through `rusqlite`.
 
+## MCP Server Install
+
+The MCP server is a STDIO server, not an HTTP service. MCP clients start `rag-rat` as a child
+process and talk to it over stdin/stdout.
+
+For a reusable local install from this repo:
+
+```bash
+cargo install --path tools/rag-rat --bin rag-rat --features fastembed
+rag-rat migrate --config /home/kk/src/held/rag-rat.toml
+rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
+rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
+rag-rat reconcile --limit 500 --config /home/kk/src/held/rag-rat.toml
+rag-rat doctor --config /home/kk/src/held/rag-rat.toml
+```
+
+Without real embeddings, omit `--features fastembed` and install `embedding-hash` instead:
+
+```bash
+cargo install --path tools/rag-rat --bin rag-rat
+rag-rat models install embedding-hash --config /home/kk/src/held/rag-rat.toml
+```
+
+Add the installed binary to an MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat": {
+      "command": "/home/kk/.cargo/bin/rag-rat",
+      "args": ["mcp", "--config", "/home/kk/src/held/rag-rat.toml"]
+    }
+  }
+}
+```
+
+For development without installing the binary, point the MCP client at Cargo:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat-dev": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "/home/kk/src/held/tools/rag-rat/Cargo.toml",
+        "--features",
+        "fastembed",
+        "--bin",
+        "rag-rat",
+        "--",
+        "mcp",
+        "--config",
+        "/home/kk/src/held/rag-rat.toml"
+      ]
+    }
+  }
+}
+```
+
 ## Schema Migrations
 
 The SQLite index has an explicit `schema_version` table. Each migration records an id,
