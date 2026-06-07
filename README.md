@@ -68,6 +68,9 @@ cargo run --features fastembed --bin rag-rat -- models install fastembed-all-min
 cargo run --bin rag-rat -- reconcile --limit 100 --batch-size 32 --config rag-rat.toml
 cargo run --bin rag-rat -- reconcile --changed-first --max-seconds 60 --batch-size 64 --config rag-rat.toml
 cargo run --bin rag-rat -- reconcile --until-clean --batch-size 64 --config rag-rat.toml
+cargo run --bin rag-rat -- hooks install --config rag-rat.toml
+cargo run --bin rag-rat -- hooks status --config rag-rat.toml
+cargo run --bin rag-rat -- maintenance --trigger post-checkout --max-seconds 30 --config rag-rat.toml
 cargo run --bin rag-rat -- eval --config rag-rat.toml
 cargo run --bin rag-rat -- eval --json --config rag-rat.toml
 cargo run --bin rag-rat -- eval --update-baseline --config rag-rat.toml
@@ -219,6 +222,22 @@ directories = ["packages/held-core/src/generated"]
 kind = "generated"
 include = ["**/*.ts"]
 ```
+
+## Git Hooks
+
+`rag-rat hooks install` installs generated `post-checkout`, `post-merge`, and `post-rewrite`
+hooks for the current worktree. The hooks run in the background and call one bounded command:
+`rag-rat maintenance --trigger <hook> --max-seconds 30`. `post-checkout` forwards Git's checkout
+arguments as `--old-head`, `--new-head`, and `--branch-checkout`, and file-only checkouts are
+skipped.
+
+`rag-rat maintenance` operates on the current worktree only. For branch switches, merges, and
+rewrites it runs discover indexing for new/changed/deleted files, refreshes SQLite FTS through the
+index path when needed, then reconciles embeddings with `changed_first` until the remaining time
+budget is spent. It reports the remaining embedding backlog at the end.
+
+Use `rag-rat hooks status` to inspect generated hooks and `rag-rat hooks uninstall` to remove only
+hooks managed by rag-rat. Existing unmanaged hook files are never overwritten.
 
 ## Security
 
