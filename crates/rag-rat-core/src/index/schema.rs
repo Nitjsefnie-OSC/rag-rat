@@ -58,10 +58,16 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE TABLE IF NOT EXISTS edges(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_file_id INTEGER,
             from_symbol_id INTEGER,
             to_symbol_id INTEGER,
+            from_name TEXT,
+            to_name TEXT NOT NULL,
             edge_kind TEXT NOT NULL,
-            confidence REAL NOT NULL DEFAULT 0.5
+            confidence TEXT NOT NULL,
+            FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
+            FOREIGN KEY(from_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL,
+            FOREIGN KEY(to_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS docs(
@@ -285,6 +291,10 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_edges_from_symbol ON edges(from_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_to_symbol ON edges(to_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_from_name ON edges(from_name);
+        CREATE INDEX IF NOT EXISTS idx_edges_to_name ON edges(to_name);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_commit ON git_file_changes(commit_hash);
         CREATE INDEX IF NOT EXISTS idx_github_refs_path ON github_refs(source_path);
@@ -296,6 +306,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_files(conn)?;
     migrate_chunks(conn)?;
+    migrate_edges(conn)?;
     Ok(())
 }
 
@@ -337,6 +348,35 @@ fn migrate_chunks(conn: &Connection) -> rusqlite::Result<()> {
             WHERE files.id = chunks.file_id
         )
         WHERE source_revision = ''
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "source_file_id", "INTEGER")?;
+    add_column_if_missing(conn, "edges", "from_name", "TEXT")?;
+    add_column_if_missing(conn, "edges", "to_name", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute(
+        "
+        UPDATE edges
+        SET from_name = COALESCE(from_name, (
+                SELECT qualified_name FROM symbols WHERE symbols.id = edges.from_symbol_id
+            )),
+            to_name = CASE
+                WHEN to_name != '' THEN to_name
+                ELSE COALESCE((SELECT qualified_name FROM symbols WHERE symbols.id = edges.to_symbol_id), '')
+            END
+        ",
+        [],
+    )?;
+    conn.execute("DELETE FROM edges WHERE to_name = ''", [])?;
+    conn.execute(
+        "
+        UPDATE edges
+        SET confidence = 'NameOnly'
+        WHERE confidence NOT IN ('Exact', 'Syntactic', 'NameOnly', 'Ambiguous')
         ",
         [],
     )?;

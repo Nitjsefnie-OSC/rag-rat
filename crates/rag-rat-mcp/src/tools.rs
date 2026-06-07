@@ -224,8 +224,8 @@ pub fn description(name: &str) -> &'static str {
             "Search indexed source and docs with SQLite BM25 lexical recall; validates stale hits."
         },
         "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin symbols.",
-        "find_callers" => "Traverse reverse graph edges for callers when graph data exists.",
-        "trace_callees" => "Traverse forward graph edges for callees when graph data exists.",
+        "find_callers" => "Traverse tree-sitter-derived reverse graph edges for callers.",
+        "trace_callees" => "Traverse tree-sitter-derived forward graph edges for callees.",
         "impact_surface" => "Estimate affected source, test, generated binding, and docs surfaces.",
         "ffi_surface" => "Find UniFFI/export/generated-binding/call-site candidates.",
         "docs_for_symbol" => "Find docs chunks related to a symbol.",

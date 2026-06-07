@@ -156,6 +156,7 @@ impl IndexDatabase {
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
             db.index_git_history(&config.root)?;
+            db.resolve_edges()?;
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
@@ -191,6 +192,7 @@ impl IndexDatabase {
             db.write_git_meta(&config.root)?;
             db.index_git_history(&config.root)?;
             let indexed = db.index_changed_files_with_progress(config, &mut progress)?;
+            db.resolve_edges()?;
             if indexed > 0 {
                 db.sync_fts()?;
             }
@@ -759,7 +761,8 @@ impl IndexDatabase {
         let full_path = root.join(path);
         let text = fs::read_to_string(&full_path)?;
         self.remove_file(path)?;
-        self.index_file(path, row.language, row.kind, file_metadata_ms(&full_path)?, &text)
+        self.index_file(path, row.language, row.kind, file_metadata_ms(&full_path)?, &text)?;
+        self.resolve_edges()
     }
 
     fn index_file(
@@ -808,6 +811,9 @@ impl IndexDatabase {
             };
         self.insert_chunks(file_id, &sha256, &chunks, text)?;
         self.insert_symbols(file_id, language, &symbols)?;
+        if kind != TargetKind::Generated && text.len() <= chunker::MAX_STRUCTURAL_PARSE_BYTES {
+            edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
+        }
         self.mark_fts_dirty()?;
         Ok(())
     }
@@ -906,6 +912,10 @@ impl IndexDatabase {
 
     fn mark_fts_dirty(&self) -> anyhow::Result<()> {
         self.set_meta("fts_dirty", "true")
+    }
+
+    fn resolve_edges(&self) -> anyhow::Result<()> {
+        edges::resolve_all_edges(self.storage.connection())
     }
 
     fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -1049,6 +1059,27 @@ impl IndexDatabase {
 
     fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
         let path = path_string(path);
+        self.storage.connection().execute(
+            "UPDATE edges
+             SET to_symbol_id = NULL,
+                 confidence = 'NameOnly'
+             WHERE to_symbol_id IN (
+                 SELECT symbols.id FROM symbols
+                 JOIN files ON files.id = symbols.file_id
+                 WHERE files.path = ?1
+             )",
+            [&path],
+        )?;
+        self.storage.connection().execute(
+            "DELETE FROM edges
+             WHERE source_file_id IN (SELECT id FROM files WHERE path = ?1)
+                OR from_symbol_id IN (
+                    SELECT symbols.id FROM symbols
+                    JOIN files ON files.id = symbols.file_id
+                    WHERE files.path = ?1
+                )",
+            [&path],
+        )?;
         self.storage
             .connection()
             .execute("DELETE FROM parser_failures WHERE path = ?1", [&path])?;
@@ -1592,6 +1623,136 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn indexes_rust_graph_edges_from_tree_sitter() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+use crate::worker::Worker;
+mod worker;
+
+trait Service {
+    fn serve(&self);
+}
+
+struct Worker;
+
+impl Service for Worker {
+    fn serve(&self) {
+        helper();
+    }
+}
+
+fn helper() {}
+
+fn caller() {
+    helper();
+    Worker.serve();
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "caller", "helper", "calls_name", "Syntactic");
+        assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
+        assert_edge(&db, "src/lib.rs", "worker", "imports", "Syntactic");
+        let callers = db.find_callers("helper", 10).unwrap();
+        assert!(
+            callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("caller"))
+                    && edge.edge_kind == "calls_name"
+            }),
+            "helper callers: {callers:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_typescript_graph_edges_from_tree_sitter() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/helper.ts"),
+            "export function helper() {}\nexport const Card = () => null;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/App.tsx"),
+            r#"
+import { helper, Card } from "./helper";
+
+export function run() {
+  helper();
+  return <Card />;
+}
+
+export const callRun = () => run();
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::TypeScript);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "run", "helper", "calls_name", "Syntactic");
+        assert_edge(&db, "run", "Card", "references_type", "Syntactic");
+        assert_edge(&db, "src/App.tsx", "helper", "imports", "Syntactic");
+        assert_edge(&db, "src/App.tsx", "run", "exports", "Syntactic");
+        let callees = db.trace_callees("callRun", 10).unwrap();
+        assert!(
+            callees.iter().any(|edge| {
+                edge.to_symbol.as_deref().is_some_and(|name| name.ends_with("run"))
+                    && edge.confidence == "Syntactic"
+            }),
+            "callRun callees: {callees:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_kotlin_graph_edges_from_tree_sitter() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/Main.kt"),
+            r#"
+package dev.cq27.test
+
+import dev.cq27.lib.ExternalThing
+
+interface Syncable
+
+class MainBridge : Syncable {
+  suspend fun syncOnce() {
+    helper()
+    ExternalThing()
+  }
+}
+
+fun helper() {}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Kotlin);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "syncOnce", "helper", "calls_name", "Syntactic");
+        assert_edge(&db, "MainBridge", "Syncable", "implements", "Syntactic");
+        assert_edge(&db, "src/Main.kt", "ExternalThing", "imports", "NameOnly");
+        let impact = db.impact_surface("helper", 10).unwrap();
+        assert!(impact.iter().any(|item| item.reason == "graph_edge_match"), "impact: {impact:?}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
         let (root, config) =
             markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
@@ -1832,6 +1993,41 @@ mod schema_bootstrap_tests {
                 kind: TargetKind::Docs,
             }],
         }
+    }
+
+    fn source_config(root: PathBuf, language: Language) -> Config {
+        Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: language.as_str().to_string(),
+                language,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+        }
+    }
+
+    fn assert_edge(db: &IndexDatabase, from: &str, to: &str, edge_kind: &str, confidence: &str) {
+        let count = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT COUNT(*)
+                FROM edges
+                WHERE edge_kind = ?1
+                  AND confidence = ?2
+                  AND COALESCE(from_name, '') LIKE ?3
+                  AND to_name LIKE ?4
+                ",
+                params![edge_kind, confidence, format!("%{from}%"), format!("%{to}%")],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert!(count > 0, "missing edge {from} -[{edge_kind}/{confidence}]-> {to}");
     }
 
     fn table_count(db: &IndexDatabase, table: &str) -> i64 {

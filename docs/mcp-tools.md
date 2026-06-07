@@ -41,6 +41,11 @@ Auto-heal is capped at four files per call. If more stale files are detected, to
 Search tools synchronize dirty or stale SQLite FTS state before querying so results are not served
 from an outdated FTS table.
 
+Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `imports`, `exports`,
+`calls_name`, `references_type`, `implements`, and `contains`; confidence is reported as `Exact`,
+`Syntactic`, `NameOnly`, or `Ambiguous`. These are intentionally not compiler-grade resolved call
+graphs.
+
 Git history tools return historical evidence. `commit_search` searches commit subjects and bodies;
 `git_history_for_path` returns commits touching a current path; `git_history_for_symbol` resolves
 the current symbol path/range first, then returns path history; `commits_touching_query` combines

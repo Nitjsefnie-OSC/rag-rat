@@ -6,7 +6,7 @@ pub struct GraphHop {
     pub from_symbol: Option<String>,
     pub to_symbol: Option<String>,
     pub edge_kind: String,
-    pub confidence: f64,
+    pub confidence: String,
 }
 
 pub fn traverse(
@@ -15,24 +15,38 @@ pub fn traverse(
     reverse: bool,
     limit: u32,
 ) -> anyhow::Result<Vec<GraphHop>> {
-    let direction = if reverse {
-        ("to_symbols", "from_symbols", "to_symbol_id", "from_symbol_id")
+    let (match_alias, match_name, other_name) = if reverse {
+        ("to_symbols", "to_name", "from_name")
     } else {
-        ("from_symbols", "to_symbols", "from_symbol_id", "to_symbol_id")
+        ("from_symbols", "from_name", "to_name")
     };
     let sql = format!(
         "
-        SELECT {from_alias}.qualified_name, {to_alias}.qualified_name, edges.edge_kind, edges.confidence
+        SELECT COALESCE(from_symbols.qualified_name, edges.from_name),
+               COALESCE(to_symbols.qualified_name, edges.to_name),
+               edges.edge_kind,
+               edges.confidence
         FROM edges
-        LEFT JOIN symbols {from_alias} ON {from_alias}.id = edges.{from_col}
-        LEFT JOIN symbols {to_alias} ON {to_alias}.id = edges.{to_col}
-        WHERE {from_alias}.name = ?1 OR {from_alias}.qualified_name LIKE ?2
+        LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
+        LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
+        WHERE {match_alias}.name = ?1
+           OR {match_alias}.qualified_name LIKE ?2
+           OR edges.{match_name} = ?1
+           OR edges.{match_name} LIKE ?2
+        ORDER BY
+            CASE edges.confidence
+                WHEN 'Exact' THEN 0
+                WHEN 'Syntactic' THEN 1
+                WHEN 'NameOnly' THEN 2
+                ELSE 3
+            END,
+            edges.edge_kind,
+            edges.{other_name}
         LIMIT ?3
         ",
-        from_alias = direction.0,
-        to_alias = direction.1,
-        from_col = direction.2,
-        to_col = direction.3,
+        match_alias = match_alias,
+        match_name = match_name,
+        other_name = other_name,
     );
     let fuzzy = format!("%{symbol}%");
     let mut stmt = conn.prepare(&sql)?;

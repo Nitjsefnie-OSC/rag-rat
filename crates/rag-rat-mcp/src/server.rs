@@ -59,7 +59,7 @@ impl RagRatService {
 
     #[tool(
         name = "find_callers",
-        description = "Traverse reverse graph edges for callers when graph data exists."
+        description = "Traverse tree-sitter-derived reverse graph edges for callers."
     )]
     fn find_callers(
         &self,
@@ -70,7 +70,7 @@ impl RagRatService {
 
     #[tool(
         name = "trace_callees",
-        description = "Traverse forward graph edges for callees when graph data exists."
+        description = "Traverse tree-sitter-derived forward graph edges for callees."
     )]
     fn trace_callees(
         &self,

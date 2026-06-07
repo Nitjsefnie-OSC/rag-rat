@@ -4,6 +4,12 @@
 
 Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source where files are small enough for bounded parsing, markdown heading chunks for docs, and coarse chunks for generated or oversized files. Chunk anchors store content and context fingerprints so stale reads can be detected and repaired.
 
+Graph edges are populated from tree-sitter syntax, not compiler-grade name resolution. The indexer
+records pragmatic `imports`, `exports`, `calls_name`, `references_type`, `implements`, and
+`contains` edges with confidence labels: `Exact`, `Syntactic`, `NameOnly`, or `Ambiguous`.
+This makes `find_callers`, `trace_callees`, and impact routing useful while keeping approximate
+edges explicit.
+
 Tree-sitter grammars are exact-pinned in `Cargo.toml` so parser node coverage changes deliberately.
 
 Chunk anchors include normalized text hashes, boundary hashes, nearby context hashes, and an anchor

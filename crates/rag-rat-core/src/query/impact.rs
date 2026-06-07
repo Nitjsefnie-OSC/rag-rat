@@ -18,10 +18,22 @@ pub fn impact_surface(
     let like = format!("%{query}%");
     let mut stmt = conn.prepare(
         "
-        SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name
+        SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name,
+               CASE
+                   WHEN files.path LIKE ?1 OR symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1
+                   THEN 'path_or_symbol_match'
+                   ELSE 'graph_edge_match'
+               END AS reason
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
-        WHERE files.path LIKE ?1 OR symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1
+        WHERE files.path LIKE ?1
+           OR symbols.name LIKE ?1
+           OR symbols.qualified_name LIKE ?1
+           OR EXISTS (
+               SELECT 1 FROM edges
+               WHERE edges.source_file_id = files.id
+                 AND (edges.from_name LIKE ?1 OR edges.to_name LIKE ?1)
+           )
         ORDER BY files.kind, files.path
         LIMIT ?2
         ",
@@ -32,7 +44,7 @@ pub fn impact_surface(
             language: row.get(1)?,
             kind: row.get(2)?,
             symbol: row.get(3)?,
-            reason: "path_or_symbol_match".to_string(),
+            reason: row.get(4)?,
         })
     })?)
 }
