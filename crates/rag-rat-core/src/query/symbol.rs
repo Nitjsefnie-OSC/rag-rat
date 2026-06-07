@@ -169,7 +169,31 @@ fn lookup_name(
     if language.is_some() {
         sql.push_str(" AND symbols.language = ?3");
     }
-    sql.push_str(" ORDER BY CASE WHEN symbols.name = ?1 THEN 0 ELSE 1 END, files.path LIMIT ?");
+    sql.push_str(
+        "
+        ORDER BY
+          CASE WHEN symbols.name = ?1 THEN 0 ELSE 1 END,
+          CASE symbols.kind
+            WHEN 'struct' THEN 0
+            WHEN 'class' THEN 0
+            WHEN 'object' THEN 0
+            WHEN 'enum' THEN 1
+            WHEN 'trait' THEN 1
+            WHEN 'interface' THEN 1
+            WHEN 'type' THEN 1
+            WHEN 'function' THEN 2
+            WHEN 'method' THEN 2
+            WHEN 'const' THEN 3
+            WHEN 'property' THEN 3
+            WHEN 'static' THEN 3
+            WHEN 'impl' THEN 8
+            ELSE 9
+          END,
+          files.path,
+          symbols.start_byte
+        LIMIT ?
+        ",
+    );
 
     let fuzzy = format!("%{name}%");
     let mut stmt = conn.prepare(&sql)?;

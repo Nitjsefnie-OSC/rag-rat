@@ -3649,6 +3649,37 @@ fn caller() {
     }
 
     #[test]
+    fn symbol_lookup_ranks_type_definitions_before_impl_blocks() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+impl Database {
+    pub fn open() -> Self {
+        Database
+    }
+}
+
+pub struct Database;
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let hits = db.symbols("Database", Some(Language::Rust), 10).unwrap();
+        assert!(hits.len() >= 2, "fixture should expose both impl and struct symbols: {hits:?}");
+        assert_eq!(hits[0].kind, "struct", "Database lookup should prefer type definition");
+        assert!(
+            hits.iter().any(|hit| hit.kind == "impl"),
+            "impl Database should still be available after the struct: {hits:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn logical_symbol_exact_mode_covers_duplicate_rust_variants() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
