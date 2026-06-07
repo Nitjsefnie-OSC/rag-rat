@@ -301,12 +301,13 @@ fn graph_tool(
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
             };
-            let hops = if reverse {
-                db.find_callers_with_options(&symbol.qualified_name, limit, &options)?
-            } else {
-                db.trace_callees_with_options(&symbol.qualified_name, limit, &options)?
-            };
-            Ok(json!(hops))
+            Ok(json!(db.graph_traversal_report(
+                if reverse { "find_callers" } else { "trace_callees" },
+                &symbol,
+                reverse,
+                limit,
+                &options
+            )?))
         },
         Ok(None) if allow_ambiguous => {
             let Some(symbol) = args.symbol.as_deref() else {
@@ -760,10 +761,20 @@ mod tests {
             }),
         )
         .unwrap();
-        let exact = exact.as_array().unwrap();
-        assert_eq!(exact.len(), 1, "exact callers: {exact:?}");
-        assert_eq!(exact[0]["verified_target_symbol"], true);
-        assert!(exact[0]["from_symbol"].as_str().unwrap().contains("caller"));
+        assert_eq!(exact["query"]["tool"], "find_callers");
+        assert_eq!(exact["query"]["symbol_id"], one["symbol_id"]);
+        assert_eq!(exact["query"]["resolution"], "exact");
+        assert_eq!(exact["summary"]["returned_count"], 1);
+        assert_eq!(exact["summary"]["total_matching_edges"], 1);
+        assert_eq!(exact["summary"]["truncated"], false);
+        assert_eq!(exact["summary"]["exact_verified"], 1);
+        assert_eq!(exact["summary"]["false_positive_risk"], "low");
+        assert_eq!(exact["coverage"]["source_stale_files"], 0);
+        assert!(!exact["coverage"]["parser_coverage_for_paths"].as_array().unwrap().is_empty());
+        let exact_results = exact["results"].as_array().unwrap();
+        assert_eq!(exact_results.len(), 1, "exact callers: {exact:?}");
+        assert_eq!(exact_results[0]["verified_target_symbol"], true);
+        assert!(exact_results[0]["from_symbol"].as_str().unwrap().contains("caller"));
 
         let papertrail = call_tool(
             &config.database,

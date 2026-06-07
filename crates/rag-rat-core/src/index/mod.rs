@@ -1042,6 +1042,49 @@ impl IndexDatabase {
         )
     }
 
+    pub fn graph_traversal_report(
+        &self,
+        tool: &str,
+        symbol: &crate::query::symbol::SymbolHit,
+        reverse: bool,
+        limit: u32,
+        options: &crate::query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<crate::query::graph::GraphTraversalReport> {
+        let results = crate::query::graph::traverse_with_options(
+            self.storage.connection(),
+            &symbol.qualified_name,
+            reverse,
+            limit,
+            options,
+        )?;
+        let summary = crate::query::graph::traversal_summary(
+            self.storage.connection(),
+            &symbol.qualified_name,
+            reverse,
+            limit,
+            options,
+            results.len(),
+        )?;
+        let mut paths = BTreeSet::new();
+        paths.insert(symbol.path.clone());
+        for result in &results {
+            if let Some(callsite) = &result.callsite {
+                paths.insert(callsite.path.clone());
+            }
+        }
+        Ok(crate::query::graph::GraphTraversalReport {
+            query: crate::query::graph::GraphTraversalQuery {
+                tool: tool.to_string(),
+                symbol_id: Some(symbol.symbol_id),
+                symbol_path: symbol.qualified_name.clone(),
+                resolution: options.resolution_mode.as_str().to_string(),
+            },
+            summary,
+            coverage: self.graph_coverage(paths)?,
+            results,
+        })
+    }
+
     pub fn impact_surface(
         &self,
         query: &str,
@@ -1315,6 +1358,95 @@ impl IndexDatabase {
 
     fn resolve_edges(&self) -> anyhow::Result<()> {
         edges::resolve_all_edges(self.storage.connection())
+    }
+
+    fn graph_coverage(
+        &self,
+        paths: BTreeSet<String>,
+    ) -> anyhow::Result<crate::query::graph::GraphCoverage> {
+        let indexed_files =
+            self.storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?;
+        let parser_failure_paths = self.parser_failure_paths()?;
+        let parser_failures = u64::try_from(parser_failure_paths.len()).unwrap_or(0);
+        let known_index_gaps = parser_failure_paths
+            .iter()
+            .map(|failure| crate::query::graph::GraphIndexGap {
+                path: failure.path.clone(),
+                language: failure.language.clone(),
+                reason: failure.message.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut source_stale_files = 0_u64;
+        let mut parser_coverage_for_paths = Vec::new();
+        for path in paths {
+            let Some(row) = self.graph_path_row(&path)? else {
+                parser_coverage_for_paths.push(crate::query::graph::GraphPathCoverage {
+                    path,
+                    language: "unknown".to_string(),
+                    parser_status: "missing_from_index".to_string(),
+                    graph_status: "missing_from_index".to_string(),
+                    last_indexed_revision: None,
+                });
+                continue;
+            };
+            let stale = self.source_path_is_stale(&path, &row.sha256);
+            if stale {
+                source_stale_files += 1;
+            }
+            let parser_failed = parser_failure_paths.iter().any(|failure| failure.path == path);
+            parser_coverage_for_paths.push(crate::query::graph::GraphPathCoverage {
+                path,
+                language: row.language,
+                parser_status: if parser_failed { "failed" } else { "ok" }.to_string(),
+                graph_status: if stale {
+                    "stale_source"
+                } else if parser_failed {
+                    "parser_failed"
+                } else {
+                    "ok"
+                }
+                .to_string(),
+                last_indexed_revision: (!row.indexed_revision.is_empty())
+                    .then_some(row.indexed_revision),
+            });
+        }
+        Ok(crate::query::graph::GraphCoverage {
+            indexed_files: u64::try_from(indexed_files).unwrap_or(0),
+            parser_failures,
+            source_stale_files,
+            known_index_gaps,
+            parser_coverage_for_paths,
+        })
+    }
+
+    fn graph_path_row(&self, path: &str) -> anyhow::Result<Option<GraphPathRow>> {
+        self.storage
+            .connection()
+            .query_row(
+                "SELECT language, sha256, indexed_revision FROM files WHERE path = ?1",
+                [path],
+                |row| {
+                    Ok(GraphPathRow {
+                        language: row.get(0)?,
+                        sha256: row.get(1)?,
+                        indexed_revision: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn source_path_is_stale(&self, path: &str, indexed_sha256: &str) -> bool {
+        let Some(root) = self.storage.source_root() else {
+            return false;
+        };
+        let Ok(bytes) = fs::read(root.join(path)) else {
+            return true;
+        };
+        hex_sha256(&bytes) != indexed_sha256
     }
 
     fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
@@ -1658,6 +1790,13 @@ struct GraphReindexFile {
     path: String,
     language: Language,
     kind: TargetKind,
+}
+
+#[derive(Debug)]
+struct GraphPathRow {
+    language: String,
+    sha256: String,
+    indexed_revision: String,
 }
 
 #[derive(Debug)]

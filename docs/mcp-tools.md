@@ -161,6 +161,43 @@ Use `symbol_id` with `resolution: "exact"` when a previous `symbol_lookup` resul
 specific symbol. Bare names in `exact` mode intentionally return little or nothing unless
 `symbol_id` is provided.
 
+`find_callers` and `trace_callees` return a graph envelope, not a bare row array:
+
+```json
+{
+  "query": {
+    "tool": "find_callers",
+    "symbol_id": 3150,
+    "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+    "resolution": "exact"
+  },
+  "summary": {
+    "returned_count": 38,
+    "total_matching_edges": 38,
+    "truncated": false,
+    "exact_verified": 38,
+    "syntactic": 0,
+    "name_only": 0,
+    "ambiguous": 0,
+    "unresolved": 0,
+    "false_positive_risk": "low"
+  },
+  "coverage": {
+    "indexed_files": 1055,
+    "parser_failures": 0,
+    "source_stale_files": 0,
+    "known_index_gaps": [],
+    "parser_coverage_for_paths": []
+  },
+  "results": []
+}
+```
+
+The trust signal is in `summary` and `coverage`: exact mode should have
+`exact_verified == total_matching_edges`, `truncated: false`, no parser failures for covered paths,
+and `source_stale_files: 0`. If the source changed after indexing, `source_stale_files` is non-zero
+for the covered paths and the result should be treated as needing reindex before audit use.
+
 `trace_callees` is call-only by default: it returns `calls_name` and `constructs` edges. Type
 references, imports, exports, `contains`, `implements`, and macros are excluded unless
 `include_references` is true or `edge_kinds` is provided explicitly. `find_callers` uses exact
