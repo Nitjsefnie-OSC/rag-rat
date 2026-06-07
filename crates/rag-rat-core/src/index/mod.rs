@@ -4331,6 +4331,68 @@ pub fn caller() {{
     }
 
     #[test]
+    fn impact_surface_uses_high_signal_query_symbols_and_call_edges() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub mod runtime {
+    pub fn unrelated_runtime_symbol() {}
+}
+
+pub mod task_spawn {
+    pub fn spawn_blocking<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        f()
+    }
+}
+
+pub fn caller() {
+    crate::task_spawn::spawn_blocking(|| 1);
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let impact = db
+            .impact_surface(
+                "change runtime task_spawn spawn_blocking wasm inline native blocking pool",
+                20,
+            )
+            .unwrap();
+        assert!(
+            impact.iter().any(|item| {
+                item.category == "Direct structural impact"
+                    && item.reason == "direct_caller"
+                    && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("caller"))
+            }),
+            "spawn_blocking caller should be present: {impact:?}"
+        );
+        assert!(
+            impact.iter().all(|item| {
+                !(item.reason == "exact_symbol_definition"
+                    && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("runtime")))
+            }),
+            "broad `runtime` token should not become an exact impact seed: {impact:?}"
+        );
+        assert!(
+            impact.iter().all(|item| {
+                !item.evidence.iter().any(|evidence| evidence.contains("references_type"))
+                    && item.symbol.as_deref() != Some("Send")
+            }),
+            "type references should not appear as direct impact: {impact:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn partial_tree_sitter_trees_still_contribute_valid_symbols_and_edges() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);

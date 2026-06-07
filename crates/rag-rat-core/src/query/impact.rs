@@ -423,7 +423,12 @@ fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Vec<SymbolTar
     )?;
     let mut targets = Vec::new();
     let mut seen = BTreeSet::new();
+    let multi_candidate_query = candidates.len() > 1;
     for candidate in candidates {
+        let qualified_candidate = is_qualified_symbol(candidate);
+        if multi_candidate_query && !qualified_candidate && !is_high_signal_query_token(candidate) {
+            continue;
+        }
         let rows = stmt.query_map([candidate], |row| {
             Ok(SymbolTarget {
                 id: row.get(0)?,
@@ -435,13 +440,32 @@ fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Vec<SymbolTar
                 qualified_name: row.get(6)?,
             })
         })?;
-        for row in collect_rows(rows)? {
+        let rows = collect_rows(rows)?;
+        if !qualified_candidate && !is_high_signal_symbol_candidate(&rows) {
+            continue;
+        }
+        for row in rows {
             if seen.insert(row.id) {
                 targets.push(row);
             }
         }
     }
     Ok(targets)
+}
+
+fn is_high_signal_query_token(value: &str) -> bool {
+    value.contains('_') || value.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn is_high_signal_symbol_candidate(rows: &[SymbolTarget]) -> bool {
+    match rows {
+        [] => false,
+        [_] => true,
+        [first, ..] if rows.len() <= 4 => {
+            rows.iter().all(|row| row.path == first.path && row.name == first.name)
+        },
+        _ => false,
+    }
 }
 
 fn target_names(query: &str, targets: &[SymbolTarget]) -> Vec<String> {
@@ -544,7 +568,7 @@ fn graph_neighbors(
         LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
         LEFT JOIN files to_files ON to_files.id = to_symbols.file_id
         LEFT JOIN files source_files ON source_files.id = edges.source_file_id
-        WHERE edges.edge_kind IN ('calls_name', 'references_type', 'implements')
+        WHERE edges.edge_kind IN ('calls_name', 'constructs', 'implements')
           AND ({predicate})
           AND {source_path_col} IS NOT NULL
         ORDER BY
