@@ -3515,6 +3515,62 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
+        let (root, config) = markdown_config("tiny\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE ai_models
+                 SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2
+                 WHERE model_id = ?1",
+                params![
+                    ai::FASTEMBED_MODEL_ID,
+                    i64::try_from(ai::FASTEMBED_EMBEDDING_DIM).unwrap()
+                ],
+            )
+            .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [ai::FASTEMBED_MODEL_ID],
+            )
+            .unwrap();
+
+        let plan = db.reconcile_plan().unwrap();
+
+        assert_eq!(plan.embeddings.model_id, ai::FASTEMBED_MODEL_ID);
+        assert_eq!(plan.embeddings.missing, 0);
+        assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn blocked_fastembed_reconcile_still_reports_policy_skips() {
+        let (root, config) = markdown_config("tiny\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [ai::FASTEMBED_MODEL_ID],
+            )
+            .unwrap();
+
+        let report = db.reconcile(None, Some(8)).unwrap();
+
+        assert_eq!(report.status, "Blocked");
+        assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn search_explain_reports_weighted_score_components() {
         let (root, config) = markdown_config(
             "alpha runtime shutdown\nsecond line with enough detail for embedding eligibility and semantic vector scoring\nthird line\n",

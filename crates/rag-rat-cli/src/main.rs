@@ -361,8 +361,7 @@ fn render_reconcile_progress(progress: rag_rat_core::index::ai::ReconcileProgres
             embeddings_written,
             blocked_chunks,
         } => {
-            let percent =
-                processed_chunks.saturating_mul(100).checked_div(total_chunks).unwrap_or(100);
+            let percent = progress_percent(processed_chunks, total_chunks);
             eprintln!(
                 "reconcile: {processed_chunks}/{total_chunks} ({percent:>3}%) written={embeddings_written} blocked={blocked_chunks}"
             );
@@ -377,6 +376,10 @@ fn render_reconcile_progress(progress: rag_rat_core::index::ai::ReconcileProgres
             );
         },
     }
+}
+
+fn progress_percent(current: u64, total: u64) -> u64 {
+    current.saturating_mul(100).checked_div(total).unwrap_or(100).min(100)
 }
 
 fn migrate(config: &Config, args: &[String]) -> anyhow::Result<()> {
@@ -747,7 +750,10 @@ fn render_index_progress(progress: IndexProgress) {
             eprintln!("index: discovered {files} files");
         },
         IndexProgress::IndexingFile { current, total, path, language, kind } => {
-            let percent = current.saturating_mul(100).checked_div(total).unwrap_or(100);
+            let percent = progress_percent(
+                u64::try_from(current).unwrap_or(u64::MAX),
+                u64::try_from(total).unwrap_or(u64::MAX),
+            );
             eprintln!(
                 "index: {current}/{total} ({percent:>3}%) [{}:{}] {}",
                 kind.as_str(),
@@ -833,4 +839,16 @@ fn positional_after_options(args: &[String]) -> Option<String> {
         values.push(arg.clone());
     }
     Some(values.join(" ")).filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::progress_percent;
+
+    #[test]
+    fn progress_percent_is_capped() {
+        assert_eq!(progress_percent(0, 0), 100);
+        assert_eq!(progress_percent(50, 100), 50);
+        assert_eq!(progress_percent(17_024, 11_998), 100);
+    }
 }

@@ -473,7 +473,7 @@ fn embedding_reconcile_plan(
     message: Option<String>,
 ) -> anyhow::Result<EmbeddingReconcilePlan> {
     let jobs = embedding_job_candidates(conn, &model.model_id, model_version, dim, None, false)?;
-    let mut skipped_by_policy = BTreeMap::new();
+    let skipped_by_policy = embedding_policy_skip_summary(conn, DEFAULT_MAX_EMBEDDING_CHARS)?;
     let mut missing_by_priority = BTreeMap::new();
     let mut current = 0_u64;
     let mut missing = 0_u64;
@@ -486,7 +486,6 @@ fn embedding_reconcile_plan(
     for job in jobs {
         let policy = policy_for_job(&job, DEFAULT_MAX_EMBEDDING_CHARS);
         if !policy.eligible {
-            *skipped_by_policy.entry(policy.policy).or_default() += 1;
             continue;
         }
         let current_artifact = job.embedding_status.as_deref() == Some("Current")
@@ -600,10 +599,12 @@ pub fn reconcile_with_options_progress(
     let timer = Instant::now();
 
     let embedder = active_embedder(conn);
+    let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
+    let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
         processed_chunks: 0,
         embeddings_written: 0,
-        skipped_chunks: 0,
+        skipped_chunks,
         failed_chunks: 0,
         blocked_chunks: 0,
         model_id: active_model_id.clone(),
@@ -616,7 +617,7 @@ pub fn reconcile_with_options_progress(
         until_clean: options.until_clean,
         max_seconds: options.max_seconds,
         work_reasons: BTreeMap::new(),
-        skipped_by_policy: BTreeMap::new(),
+        skipped_by_policy,
         input_chars: 0,
         truncated_inputs: 0,
         elapsed_ms: 0,
@@ -650,7 +651,7 @@ pub fn reconcile_with_options_progress(
         },
     };
 
-    let total_chunks = estimated_reconcile_jobs(
+    let mut progress_total_chunks = estimated_reconcile_jobs(
         conn,
         &active_model_id,
         &model_version,
@@ -660,7 +661,7 @@ pub fn reconcile_with_options_progress(
     )?;
     progress(ReconcileProgress::Started {
         model_id: active_model_id.clone(),
-        total_chunks,
+        total_chunks: progress_total_chunks,
         batch_size,
     });
 
@@ -691,15 +692,7 @@ pub fn reconcile_with_options_progress(
             max_embedding_chars,
         )?;
         if selected.jobs.is_empty() {
-            for (policy, count) in selected.skipped_by_policy {
-                *report.skipped_by_policy.entry(policy).or_default() += count;
-                report.skipped_chunks = report.skipped_chunks.saturating_add(count);
-            }
             break;
-        }
-        for (policy, count) in selected.skipped_by_policy {
-            *report.skipped_by_policy.entry(policy).or_default() += count;
-            report.skipped_chunks = report.skipped_chunks.saturating_add(count);
         }
         for job in &selected.jobs {
             *report.work_reasons.entry(job.reason.as_str().to_string()).or_default() += 1;
@@ -783,11 +776,12 @@ pub fn reconcile_with_options_progress(
         if let Some(value) = remaining.as_mut() {
             *value = value.saturating_sub(u64::try_from(jobs_len).unwrap_or(0));
         }
+        progress_total_chunks = progress_total_chunks.max(report.processed_chunks);
         progress(ReconcileProgress::Batch {
             processed_chunks: report.embeddings_written
                 + report.failed_chunks
                 + report.blocked_chunks,
-            total_chunks,
+            total_chunks: progress_total_chunks,
             embeddings_written: report.embeddings_written,
             blocked_chunks: report.blocked_chunks,
         });
@@ -806,6 +800,20 @@ pub fn reconcile_with_options_progress(
         blocked_chunks: report.blocked_chunks,
     });
     Ok(report)
+}
+
+fn embedding_policy_skip_summary(
+    conn: &Connection,
+    max_embedding_chars: usize,
+) -> anyhow::Result<BTreeMap<String, u64>> {
+    let mut skipped_by_policy = BTreeMap::new();
+    for chunk in current_chunks(conn, None)? {
+        let policy = policy_for_job(&chunk, max_embedding_chars);
+        if !policy.eligible {
+            *skipped_by_policy.entry(policy.policy).or_default() += 1;
+        }
+    }
+    Ok(skipped_by_policy)
 }
 
 fn finish_reconcile_attempt(
@@ -1113,7 +1121,6 @@ struct PreparedEmbeddingJob {
 
 struct SelectedBatch {
     jobs: Vec<PreparedEmbeddingJob>,
-    skipped_by_policy: BTreeMap<String, u64>,
 }
 
 fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<CurrentChunk>> {
@@ -1305,12 +1312,10 @@ fn select_reconcile_batch(
             options.changed_first,
         )?
     };
-    let mut skipped_by_policy = BTreeMap::new();
     let mut jobs = Vec::new();
     for candidate in candidates {
         let policy = policy_for_job(&candidate, max_embedding_chars);
         if !policy.eligible {
-            *skipped_by_policy.entry(policy.policy).or_default() += 1;
             continue;
         }
         if !options.force
@@ -1339,7 +1344,7 @@ fn select_reconcile_batch(
             break;
         }
     }
-    Ok(SelectedBatch { jobs, skipped_by_policy })
+    Ok(SelectedBatch { jobs })
 }
 
 fn needs_embedding(
