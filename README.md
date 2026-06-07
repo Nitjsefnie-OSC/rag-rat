@@ -202,6 +202,12 @@ The host repo owns `rag-rat.toml`. This keeps monorepo-specific target bindings 
 root = "."
 database = ".rag-rat/index.sqlite"
 
+[local_ai.embedding.runtime]
+batch_size = 64
+ort_threads = 4
+omp_threads = 1
+max_embedding_chars = 4000
+
 [target_bindings]
 rust = ["core/held-core/src"]
 typescript = ["apps/mobile/src", "apps/web/src"]

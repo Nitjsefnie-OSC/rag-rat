@@ -6,6 +6,12 @@
 [index]
 root = "."
 database = ".rag-rat/index.sqlite"
+
+[local_ai.embedding.runtime]
+batch_size = 64
+ort_threads = 4
+omp_threads = 1
+max_embedding_chars = 4000
 ```
 
 The database stores explicit schema migrations in `schema_version` with migration id,
@@ -43,3 +49,8 @@ still obey `include_generated` filtering.
 
 Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.22.6,
 `tree-sitter-rust` 0.21.2, `tree-sitter-typescript` 0.21.2, and `tree-sitter-kotlin` 0.3.8.
+
+`[local_ai.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
+still take precedence: `--batch-size` overrides `batch_size`, and `--max-embedding-chars` overrides
+`max_embedding_chars`. `ort_threads` and `omp_threads` are applied as `ORT_NUM_THREADS` and
+`OMP_NUM_THREADS` when those environment variables are not already set by the caller.

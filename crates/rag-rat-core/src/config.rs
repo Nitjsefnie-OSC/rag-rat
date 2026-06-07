@@ -15,6 +15,36 @@ pub struct Config {
     pub root: PathBuf,
     pub database: PathBuf,
     pub targets: Vec<ResolvedTarget>,
+    pub local_ai: LocalAiConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalAiConfig {
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbeddingConfig {
+    pub runtime: EmbeddingRuntimeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRuntimeConfig {
+    pub batch_size: u32,
+    pub ort_threads: Option<u32>,
+    pub omp_threads: Option<u32>,
+    pub max_embedding_chars: usize,
+}
+
+impl Default for EmbeddingRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 64,
+            ort_threads: Some(4),
+            omp_threads: Some(1),
+            max_embedding_chars: 4000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +101,9 @@ impl Config {
         let database =
             root.join(raw.index.database.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string()));
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
+        let local_ai = raw.local_ai.into();
 
-        Ok(Self { root, database, targets })
+        Ok(Self { root, database, targets, local_ai })
     }
 }
 
@@ -170,6 +201,8 @@ struct RawConfig {
     #[serde(default)]
     index: RawIndex,
     #[serde(default)]
+    local_ai: RawLocalAi,
+    #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     target: Vec<RawTarget>,
@@ -179,6 +212,50 @@ struct RawConfig {
 struct RawIndex {
     root: Option<String>,
     database: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLocalAi {
+    #[serde(default)]
+    embedding: RawEmbedding,
+}
+
+impl From<RawLocalAi> for LocalAiConfig {
+    fn from(raw: RawLocalAi) -> Self {
+        Self { embedding: raw.embedding.into() }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawEmbedding {
+    #[serde(default)]
+    runtime: RawEmbeddingRuntime,
+}
+
+impl From<RawEmbedding> for EmbeddingConfig {
+    fn from(raw: RawEmbedding) -> Self {
+        Self { runtime: raw.runtime.into() }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawEmbeddingRuntime {
+    batch_size: Option<u32>,
+    ort_threads: Option<u32>,
+    omp_threads: Option<u32>,
+    max_embedding_chars: Option<usize>,
+}
+
+impl From<RawEmbeddingRuntime> for EmbeddingRuntimeConfig {
+    fn from(raw: RawEmbeddingRuntime) -> Self {
+        let default = EmbeddingRuntimeConfig::default();
+        Self {
+            batch_size: raw.batch_size.unwrap_or(default.batch_size),
+            ort_threads: raw.ort_threads.or(default.ort_threads),
+            omp_threads: raw.omp_threads.or(default.omp_threads),
+            max_embedding_chars: raw.max_embedding_chars.unwrap_or(default.max_embedding_chars),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +306,46 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].language, Language::Rust);
         assert_eq!(targets[1].kind, TargetKind::Generated);
+    }
+
+    #[test]
+    fn embedding_runtime_defaults_match_local_profile() {
+        let runtime = EmbeddingRuntimeConfig::default();
+
+        assert_eq!(runtime.batch_size, 64);
+        assert_eq!(runtime.ort_threads, Some(4));
+        assert_eq!(runtime.omp_threads, Some(1));
+        assert_eq!(runtime.max_embedding_chars, 4000);
+    }
+
+    #[test]
+    fn parses_embedding_runtime_overrides() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+            database = ".rag-rat/index.sqlite"
+
+            [local_ai.embedding.runtime]
+            batch_size = 128
+            ort_threads = 2
+            omp_threads = 1
+            max_embedding_chars = 5000
+            "#,
+        )
+        .unwrap();
+
+        let local_ai: LocalAiConfig = raw.local_ai.into();
+
+        assert_eq!(
+            local_ai.embedding.runtime,
+            EmbeddingRuntimeConfig {
+                batch_size: 128,
+                ort_threads: Some(2),
+                omp_threads: Some(1),
+                max_embedding_chars: 5000,
+            }
+        );
     }
 
     #[test]

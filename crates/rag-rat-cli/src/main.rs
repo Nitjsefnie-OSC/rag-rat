@@ -1,9 +1,11 @@
 use std::{env, path::PathBuf};
 
-use rag_rat_core::{Config, IndexDatabase, index::IndexProgress, search::lexical::SearchHit};
+use rag_rat_core::{
+    Config, IndexDatabase, config::EmbeddingRuntimeConfig, index::IndexProgress,
+    search::lexical::SearchHit,
+};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first().map(String::as_str) else {
         usage();
@@ -11,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let config_path = option_value(&args, "--config").unwrap_or_else(|| "rag-rat.toml".to_string());
     let config = Config::load(&config_path)?;
+    apply_embedding_runtime_env(&config.local_ai.embedding.runtime);
 
     match command {
         "index" => {
@@ -46,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         "mcp" => {
-            rag_rat_mcp::server::run_stdio(config).await?;
+            tokio::runtime::Runtime::new()?.block_on(rag_rat_mcp::server::run_stdio(config))?;
         },
         "github" => {
             github(&config, &args)?;
@@ -237,13 +240,16 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
-    let batch_size = option_value(args, "--batch-size").map(|value| value.parse()).transpose()?;
+    let batch_size = option_value(args, "--batch-size")
+        .map(|value| value.parse())
+        .transpose()?
+        .or(Some(config.local_ai.embedding.runtime.batch_size));
     let force = has_flag(args, "--force");
     let max_seconds = option_value(args, "--max-seconds").map(|value| value.parse()).transpose()?;
     let max_embedding_chars = option_value(args, "--max-embedding-chars")
         .map(|value| value.parse())
         .transpose()?
-        .unwrap_or(rag_rat_core::index::ai::DEFAULT_MAX_EMBEDDING_CHARS);
+        .unwrap_or(config.local_ai.embedding.runtime.max_embedding_chars);
     let options = rag_rat_core::index::ai::ReconcileOptions {
         limit,
         batch_size,
@@ -254,6 +260,25 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
         max_embedding_chars,
     };
     print_json(&db.reconcile_with_options_progress(options, render_reconcile_progress)?)
+}
+
+fn apply_embedding_runtime_env(runtime: &EmbeddingRuntimeConfig) {
+    set_env_if_absent("ORT_NUM_THREADS", runtime.ort_threads);
+    set_env_if_absent("OMP_NUM_THREADS", runtime.omp_threads);
+}
+
+fn set_env_if_absent(key: &str, value: Option<u32>) {
+    let Some(value) = value else {
+        return;
+    };
+    if env::var_os(key).is_some() {
+        return;
+    }
+    // This is called at process startup before rag-rat creates its Tokio runtime or initializes
+    // FastEmbed/ONNX. CLI-provided environment variables intentionally take precedence.
+    unsafe {
+        env::set_var(key, value.to_string());
+    }
 }
 
 fn print_reconcile_plan(plan: &rag_rat_core::index::ai::ReconcilePlan) {

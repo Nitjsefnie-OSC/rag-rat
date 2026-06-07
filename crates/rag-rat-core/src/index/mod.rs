@@ -2866,6 +2866,7 @@ mod schema_bootstrap_tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Docs,
             }],
+            local_ai: Default::default(),
         };
 
         let db = IndexDatabase::rebuild(&config).unwrap();
@@ -3396,6 +3397,7 @@ mod schema_bootstrap_tests {
                     kind: TargetKind::Source,
                 },
             ],
+            local_ai: Default::default(),
         };
         let db = IndexDatabase::rebuild(&config).unwrap();
         let status = db.status(&config.database).unwrap();
@@ -4782,6 +4784,7 @@ fun helper() {}
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
+            local_ai: Default::default(),
         };
 
         let db = IndexDatabase::rebuild(&config).unwrap();
@@ -4844,6 +4847,7 @@ fun helper() {}
                 exclude: Vec::new(),
                 kind: TargetKind::Docs,
             }],
+            local_ai: Default::default(),
         }
     }
 
@@ -4859,6 +4863,7 @@ fun helper() {}
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
+            local_ai: Default::default(),
         }
     }
 

@@ -1050,6 +1050,7 @@ mod tests {
                         kind: TargetKind::Source,
                     },
                 ],
+                local_ai: Default::default(),
             },
         )
     }
@@ -1071,6 +1072,7 @@ mod tests {
                     exclude: Vec::new(),
                     kind: TargetKind::Docs,
                 }],
+                local_ai: Default::default(),
             },
         )
     }
@@ -1087,6 +1089,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
+            local_ai: Default::default(),
         }
     }
 
