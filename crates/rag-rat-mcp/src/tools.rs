@@ -83,6 +83,12 @@ pub struct SymbolGraphArgs {
     pub allow_ambiguous: bool,
     #[serde(default)]
     pub include_references: bool,
+    #[serde(default)]
+    pub include_unresolved: bool,
+    #[serde(default)]
+    pub include_macros: bool,
+    #[serde(default)]
+    pub include_common_methods: bool,
     pub edge_kinds: Option<Vec<String>>,
 }
 
@@ -99,6 +105,12 @@ pub struct CompareGraphTextArgs {
     pub allow_ambiguous: bool,
     #[serde(default)]
     pub include_references: bool,
+    #[serde(default)]
+    pub include_unresolved: bool,
+    #[serde(default)]
+    pub include_macros: bool,
+    #[serde(default)]
+    pub include_common_methods: bool,
     pub edge_kinds: Option<Vec<String>>,
 }
 
@@ -311,6 +323,9 @@ fn graph_tool(
 ) -> anyhow::Result<Value> {
     let limit = args.limit;
     let include_references = args.include_references;
+    let include_unresolved = args.include_unresolved;
+    let include_macros = args.include_macros;
+    let include_common_methods = args.include_common_methods;
     let edge_kinds = args.edge_kinds.clone();
     let allow_ambiguous = args.allow_ambiguous;
     let selector = graph_symbol_selector(&args)?;
@@ -319,6 +334,9 @@ fn graph_tool(
         Ok(Some(symbol)) => {
             let options = GraphTraversalOptions {
                 include_references,
+                include_unresolved,
+                include_macros,
+                include_common_methods,
                 edge_kinds,
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
@@ -337,6 +355,9 @@ fn graph_tool(
             };
             let options = GraphTraversalOptions {
                 include_references,
+                include_unresolved,
+                include_macros,
+                include_common_methods,
                 edge_kinds,
                 resolution_mode,
                 symbol_id: args.symbol_id,
@@ -385,6 +406,9 @@ fn compare_graph_to_text_tool(
         Ok(Some(symbol)) => {
             let options = GraphTraversalOptions {
                 include_references: args.include_references,
+                include_unresolved: args.include_unresolved,
+                include_macros: args.include_macros,
+                include_common_methods: args.include_common_methods,
                 edge_kinds: args.edge_kinds,
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
@@ -679,14 +703,23 @@ mod tests {
         assert_schema_has_property(tools, "semantic_search", "explain");
         assert_symbol_selector_schema(tools, "symbol_lookup");
         assert_schema_has_property(tools, "find_callers", "include_references");
+        assert_schema_has_property(tools, "find_callers", "include_unresolved");
+        assert_schema_has_property(tools, "find_callers", "include_macros");
+        assert_schema_has_property(tools, "find_callers", "include_common_methods");
         assert_schema_has_property(tools, "find_callers", "edge_kinds");
         assert_schema_has_property(tools, "find_callers", "resolution");
         assert_symbol_selector_schema(tools, "find_callers");
         assert_schema_has_property(tools, "trace_callees", "include_references");
+        assert_schema_has_property(tools, "trace_callees", "include_unresolved");
+        assert_schema_has_property(tools, "trace_callees", "include_macros");
+        assert_schema_has_property(tools, "trace_callees", "include_common_methods");
         assert_schema_has_property(tools, "trace_callees", "edge_kinds");
         assert_schema_has_property(tools, "trace_callees", "resolution");
         assert_symbol_selector_schema(tools, "trace_callees");
         assert_schema_requires(tools, "compare_graph_to_text", "pattern");
+        assert_schema_has_property(tools, "compare_graph_to_text", "include_unresolved");
+        assert_schema_has_property(tools, "compare_graph_to_text", "include_macros");
+        assert_schema_has_property(tools, "compare_graph_to_text", "include_common_methods");
         assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
         assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
         assert_symbol_selector_schema(tools, "compare_graph_to_text");

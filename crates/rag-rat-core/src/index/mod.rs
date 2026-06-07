@@ -3690,12 +3690,14 @@ pub struct JoinSet;
             r#"
 pub struct JoinError;
 pub enum Result<T, E> { Ok(T), Err(E) }
+pub fn helper() {}
 
 pub fn spawn_blocking<F, T>(f: F) -> Result<T, JoinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    helper();
     tokio::task::spawn_blocking(f)
 }
 "#,
@@ -3708,13 +3710,17 @@ where
         assert!(
             default_callees.iter().any(|edge| {
                 edge.edge_kind == "calls_name"
-                    && edge.target.as_deref() == Some("spawn_blocking")
-                    && edge
-                        .target_qualified_name
-                        .as_deref()
-                        .is_some_and(|target| target.ends_with("tokio::task::spawn_blocking"))
+                    && edge.target.as_deref() == Some("helper")
+                    && edge.verified_target_symbol
             }),
             "default callees: {default_callees:?}"
+        );
+        assert!(
+            default_callees
+                .iter()
+                .all(|edge| edge.target_qualified_name.as_deref()
+                    != Some("tokio::task::spawn_blocking")),
+            "default callees leaked unresolved external call: {default_callees:?}"
         );
         assert!(
             default_callees.iter().all(|edge| edge.edge_kind != "references_type"),
@@ -3742,6 +3748,88 @@ where
         assert!(
             with_refs.iter().any(|edge| edge.edge_kind == "references_type"),
             "reference-enabled callees: {with_refs:?}"
+        );
+
+        let with_unresolved = db
+            .trace_callees_with_options(
+                "spawn_blocking",
+                20,
+                &crate::query::graph::GraphTraversalOptions {
+                    include_unresolved: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            with_unresolved
+                .iter()
+                .any(|edge| edge.target_qualified_name.as_deref()
+                    == Some("tokio::task::spawn_blocking")),
+            "unresolved-enabled callees: {with_unresolved:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trace_callees_defaults_to_repo_relevant_calls() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn repo_helper() {}
+
+pub fn caller(input: Result<String, String>) -> String {
+    repo_helper();
+    let values: Vec<String> = Vec::new();
+    let _ = input.map_err(|error| error.to_string());
+    let _ = Some("value").unwrap_or_else(|| "fallback");
+    let _ = format!("hello");
+    values.get(0).unwrap_or_else(|| "fallback").to_string()
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let default_callees = db.trace_callees("caller", 20).unwrap();
+        assert!(
+            default_callees.iter().any(|edge| edge.target.as_deref() == Some("repo_helper")),
+            "default callees should keep repo-local calls: {default_callees:?}"
+        );
+        assert!(
+            default_callees.iter().all(|edge| {
+                edge.edge_kind != "uses_macro"
+                    && !matches!(
+                        edge.target.as_deref(),
+                        Some("new" | "map_err" | "unwrap_or_else" | "to_string" | "format")
+                    )
+            }),
+            "default callees leaked low-signal calls: {default_callees:?}"
+        );
+
+        let expanded = db
+            .trace_callees_with_options(
+                "caller",
+                20,
+                &crate::query::graph::GraphTraversalOptions {
+                    include_unresolved: true,
+                    include_macros: true,
+                    include_common_methods: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            expanded.iter().any(|edge| edge.edge_kind == "uses_macro"),
+            "macro-enabled callees: {expanded:?}"
+        );
+        assert!(
+            expanded.iter().any(|edge| edge.target.as_deref() == Some("unwrap_or_else")),
+            "common-method-enabled callees: {expanded:?}"
         );
 
         fs::remove_dir_all(root).unwrap();

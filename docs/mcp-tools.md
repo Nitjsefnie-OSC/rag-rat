@@ -67,9 +67,9 @@ Development config without installing:
 
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`
 - `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
-- `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
@@ -199,14 +199,23 @@ The trust signal is in `summary` and `coverage`: exact mode should have
 and `source_stale_files: 0`. If the source changed after indexing, `source_stale_files` is non-zero
 for the covered paths and the result should be treated as needing reindex before audit use.
 
-`trace_callees` is call-only by default: it returns `calls_name` and `constructs` edges. Type
-references, imports, exports, `contains`, `implements`, and macros are excluded unless
-`include_references` is true or `edge_kinds` is provided explicitly. `find_callers` uses exact
-target resolution first, then qualified-name and target-name fallbacks; fallback hits are labeled
-with `resolution`, `verified_target_symbol`, raw `evidence`, and optional `receiver_hint` so clients
-can treat name-only or ambiguous edges as possible evidence instead of compiler truth. Rust macro
-invocations are stored as `uses_macro` and are not resolved to same-named normal modules or
-functions.
+`trace_callees` is repo-relevant by default. It returns verified or syntactic `calls_name` edges and
+verified/repo-local `constructs` edges. It hides unresolved calls, unresolved macros, type
+references, imports/exports, common method/combinator calls, and std/common constructors unless a
+caller asks for them explicitly:
+
+- `include_unresolved`: include unresolved qualified/name-only calls.
+- `include_macros`: include `uses_macro` edges such as `format!`, `json!`, and `vec!`.
+- `include_common_methods`: include common low-signal calls such as `clone`, `map`, `map_err`,
+  `and_then`, `unwrap_or`, `unwrap_or_else`, `to_string`, `to_owned`, `as_ref`, `as_mut`, `get`,
+  `insert`, and unresolved/common `new`.
+- `include_references`: include type references, imports, exports, `contains`, and `implements`.
+
+`find_callers` uses exact target resolution first, then qualified-name and target-name fallbacks;
+fallback hits are labeled with `resolution`, `verified_target_symbol`, raw `evidence`, and optional
+`receiver_hint` so clients can treat name-only or ambiguous edges as possible evidence instead of
+compiler truth. Rust macro invocations are stored as `uses_macro` and are not resolved to same-named
+normal modules or functions.
 
 `compare_graph_to_text` is the graph-vs-rg audit bridge. It resolves a selected symbol, runs the
 same reverse caller graph traversal used by `find_callers`, runs a line-oriented regex search over

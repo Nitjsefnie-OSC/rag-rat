@@ -2,6 +2,7 @@ use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 
 const CALL_EDGE_KINDS: &[&str] = &["calls_name", "constructs"];
+const MACRO_EDGE_KINDS: &[&str] = &["uses_macro"];
 const REFERENCE_EDGE_KINDS: &[&str] =
     &["references_type", "imports", "exports", "contains", "implements"];
 const OPTIONAL_EDGE_KINDS: &[&str] = &[
@@ -18,6 +19,9 @@ const OPTIONAL_EDGE_KINDS: &[&str] = &[
 #[derive(Debug, Clone, Default)]
 pub struct GraphTraversalOptions {
     pub include_references: bool,
+    pub include_unresolved: bool,
+    pub include_macros: bool,
+    pub include_common_methods: bool,
     pub edge_kinds: Option<Vec<String>>,
     pub resolution_mode: GraphResolutionMode,
     pub symbol_id: Option<i64>,
@@ -114,6 +118,9 @@ impl GraphTraversalOptions {
         }
         let mut edge_kinds =
             CALL_EDGE_KINDS.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
+        if self.include_macros {
+            edge_kinds.extend(MACRO_EDGE_KINDS.iter().map(|value| (*value).to_string()));
+        }
         if self.include_references {
             edge_kinds.extend(REFERENCE_EDGE_KINDS.iter().map(|value| (*value).to_string()));
         }
@@ -277,7 +284,8 @@ pub fn traverse_with_options(
         )
     } else {
         let predicate = forward_source_predicate(mode);
-        let target_filter = forward_target_filter(mode);
+        let target_filter = forward_target_filter(mode, options);
+        let visibility_filter = forward_visibility_filter(options);
         format!(
             "
             SELECT COALESCE(from_symbols.qualified_name, edges.from_name),
@@ -301,6 +309,7 @@ pub fn traverse_with_options(
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
               AND ({target_filter})
+              AND ({visibility_filter})
               AND ?4 IN ('true', 'false')
             ORDER BY
                 CASE edges.confidence
@@ -385,7 +394,8 @@ pub fn traversal_summary(
         )
     } else {
         let predicate = forward_source_predicate(mode);
-        let target_filter = forward_target_filter(mode);
+        let target_filter = forward_target_filter(mode, options);
+        let visibility_filter = forward_visibility_filter(options);
         format!(
             "
             SELECT
@@ -400,6 +410,7 @@ pub fn traversal_summary(
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
               AND ({target_filter})
+              AND ({visibility_filter})
               AND ?4 IN ('true', 'false')
             "
         )
@@ -544,13 +555,156 @@ fn forward_source_predicate(mode: GraphResolutionMode) -> &'static str {
     }
 }
 
-fn forward_target_filter(mode: GraphResolutionMode) -> &'static str {
+fn forward_target_filter(
+    mode: GraphResolutionMode,
+    options: &GraphTraversalOptions,
+) -> &'static str {
     match mode {
         GraphResolutionMode::Exact => "edges.to_symbol_id IS NOT NULL",
         GraphResolutionMode::Syntactic => {
-            "edges.to_symbol_id IS NOT NULL OR edges.target_qualified_name IS NOT NULL"
+            if options.include_unresolved {
+                "1 = 1"
+            } else if options.include_macros {
+                "
+                edges.to_symbol_id IS NOT NULL
+                OR edges.target_qualified_name IS NOT NULL
+                OR edges.edge_kind = 'uses_macro'
+                "
+            } else {
+                "edges.to_symbol_id IS NOT NULL OR edges.target_qualified_name IS NOT NULL"
+            }
         },
         GraphResolutionMode::Fuzzy => "1 = 1",
+    }
+}
+
+fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'static str {
+    match (
+        options.include_unresolved,
+        options.include_macros,
+        options.include_common_methods,
+    ) {
+        (true, true, true) => "1 = 1",
+        (true, true, false) => {
+            "
+            (
+                edges.edge_kind != 'calls_name'
+                OR edges.to_name NOT IN (
+                    'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
+                    'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
+                    'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
+                    'expect', 'ok', 'err'
+                )
+                OR edges.to_symbol_id IS NOT NULL
+            )
+            "
+        },
+        (true, false, true) => "edges.edge_kind != 'uses_macro'",
+        (true, false, false) => {
+            "
+            edges.edge_kind != 'uses_macro'
+            AND (
+                edges.edge_kind != 'calls_name'
+                OR edges.to_name NOT IN (
+                    'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
+                    'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
+                    'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
+                    'expect', 'ok', 'err'
+                )
+                OR edges.to_symbol_id IS NOT NULL
+            )
+            "
+        },
+        (false, true, true) => {
+            "
+            (
+                edges.edge_kind = 'calls_name'
+                AND (
+                    edges.to_symbol_id IS NOT NULL
+                    OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+                )
+            )
+            OR (
+                edges.edge_kind = 'constructs'
+                AND edges.to_symbol_id IS NOT NULL
+            )
+            OR edges.edge_kind = 'uses_macro'
+            OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+            "
+        },
+        (false, true, false) => {
+            "
+            (
+                edges.edge_kind = 'calls_name'
+                AND (
+                    edges.to_symbol_id IS NOT NULL
+                    OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+                )
+                AND (
+                    edges.to_name NOT IN (
+                        'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
+                        'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
+                        'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
+                        'expect', 'ok', 'err'
+                    )
+                    OR edges.to_symbol_id IS NOT NULL
+                )
+            )
+            OR (
+                edges.edge_kind = 'constructs'
+                AND edges.to_symbol_id IS NOT NULL
+            )
+            OR edges.edge_kind = 'uses_macro'
+            OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+            "
+        },
+        (false, false, true) => {
+            "
+            edges.edge_kind != 'uses_macro'
+            AND (
+                (
+                    edges.edge_kind = 'calls_name'
+                    AND (
+                        edges.to_symbol_id IS NOT NULL
+                        OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+                    )
+                )
+                OR (
+                    edges.edge_kind = 'constructs'
+                    AND edges.to_symbol_id IS NOT NULL
+                )
+                OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+            )
+            "
+        },
+        (false, false, false) => {
+            "
+            edges.edge_kind != 'uses_macro'
+            AND (
+                (
+                    edges.edge_kind = 'calls_name'
+                    AND (
+                        edges.to_symbol_id IS NOT NULL
+                        OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+                    )
+                    AND (
+                        edges.to_name NOT IN (
+                            'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
+                            'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
+                            'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
+                            'expect', 'ok', 'err'
+                        )
+                        OR edges.to_symbol_id IS NOT NULL
+                    )
+                )
+                OR (
+                    edges.edge_kind = 'constructs'
+                    AND edges.to_symbol_id IS NOT NULL
+                )
+                OR edges.edge_kind NOT IN ('calls_name', 'constructs')
+            )
+            "
+        },
     }
 }
 
