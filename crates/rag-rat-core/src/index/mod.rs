@@ -35,7 +35,7 @@ use thiserror::Error;
 use crate::{
     config::{Config, TargetKind},
     index::{
-        ai::{LocalAiStatus, ModelInfo, ReconcileReport},
+        ai::{LocalAiStatus, ModelInfo, ReconcilePlan, ReconcileReport},
         anchors::{AnchorStatus, ChunkAnchor},
         chunker::Chunk,
         git_history::{
@@ -793,13 +793,18 @@ impl IndexDatabase {
         ai::reconcile(self.storage.connection(), limit, batch_size)
     }
 
+    pub fn reconcile_plan(&self) -> anyhow::Result<ReconcilePlan> {
+        ai::reconcile_plan(self.storage.connection())
+    }
+
     pub fn reconcile_with_progress(
         &self,
         limit: Option<u32>,
         batch_size: Option<u32>,
+        force: bool,
         progress: impl FnMut(ai::ReconcileProgress),
     ) -> anyhow::Result<ReconcileReport> {
-        ai::reconcile_with_progress(self.storage.connection(), limit, batch_size, progress)
+        ai::reconcile_with_progress(self.storage.connection(), limit, batch_size, force, progress)
     }
 
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
@@ -1771,6 +1776,8 @@ mod schema_bootstrap_tests {
         assert_eq!(table_count(&db, "commit_fts"), 1);
         assert_eq!(table_count(&db, "ai_models"), 1);
         assert_eq!(table_count(&db, "chunk_embeddings"), 1);
+        assert_eq!(table_count(&db, "chunk_summaries"), 1);
+        assert_eq!(table_count(&db, "reconcile_meta"), 1);
         assert_eq!(table_count(&db, "reconcile_attempts"), 1);
         assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
         assert_eq!(indexed_revision_count(&db), 0);
@@ -1779,7 +1786,12 @@ mod schema_bootstrap_tests {
         assert!(chunk_columns(&db).contains(&"start_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"end_boundary_hash".to_string()));
         assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 2);
+        let embedding_columns = table_columns(&db, "chunk_embeddings");
+        assert!(embedding_columns.contains(&"model_version".to_string()));
+        assert!(embedding_columns.contains(&"attempt_count".to_string()));
+        assert!(embedding_columns.contains(&"next_retry_after_ms".to_string()));
+        assert!(embedding_columns.contains(&"computed_at_ms".to_string()));
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 3);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1986,23 +1998,31 @@ mod schema_bootstrap_tests {
         assert_eq!(hits[0].summary, "alpha token\nsecond line");
 
         let blocked = db.reconcile(Some(1), Some(8)).unwrap();
-        assert_eq!(blocked.processed_chunks, 1);
+        assert_eq!(blocked.processed_chunks, 0);
         assert_eq!(blocked.embeddings_written, 0);
-        assert_eq!(blocked.blocked_chunks, 1);
+        assert_eq!(blocked.blocked_chunks, 0);
         assert_eq!(blocked.model_id, ai::HASH_MODEL_ID);
         assert_eq!(blocked.batch_size, 8);
         assert_eq!(blocked.status, "Blocked");
 
         let status = db.local_ai_status().unwrap();
         assert_eq!(status.embedding.state, "MissingModel");
-        assert_eq!(status.embedding.blocked_artifacts, 1);
+        assert_eq!(status.embedding.blocked_artifacts, 0);
 
         db.install_model(ai::HASH_MODEL_ID).unwrap();
+        let plan = db.reconcile_plan().unwrap();
+        assert_eq!(plan.embeddings.missing, 1);
+        assert_eq!(plan.embeddings.current, 0);
         let current = db.reconcile(Some(1), Some(8)).unwrap();
         assert_eq!(current.embeddings_written, 1);
         assert_eq!(current.model_id, ai::HASH_MODEL_ID);
+        assert_eq!(current.model_version, "hash-v1");
         assert_eq!(current.embedding_dim, ai::HASH_EMBEDDING_DIM);
         assert_eq!(current.status, "Current");
+        assert_eq!(current.work_reasons.get("Missing"), Some(&1));
+        let noop = db.reconcile(None, Some(8)).unwrap();
+        assert_eq!(noop.processed_chunks, 0);
+        assert_eq!(noop.embeddings_written, 0);
         let status = db.local_ai_status().unwrap();
         assert_eq!(status.embedding.state, "Ready");
         assert_eq!(status.embedding.current_artifacts, 1);
@@ -2032,8 +2052,15 @@ mod schema_bootstrap_tests {
                 [chunk_id],
             )
             .unwrap();
+        let plan = db.reconcile_plan().unwrap();
+        assert_eq!(plan.embeddings.current, 0);
+        assert_eq!(plan.embeddings.stale, 1);
+        let refreshed = db.reconcile(None, Some(8)).unwrap();
+        assert_eq!(refreshed.processed_chunks, 1);
+        assert_eq!(refreshed.work_reasons.get("SourceChanged"), Some(&1));
+        assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 1);
         let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
-        assert!(stale_embedding_hits.is_empty());
+        assert_eq!(stale_embedding_hits.len(), 1);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2050,6 +2077,8 @@ mod schema_bootstrap_tests {
         assert_eq!(report.embeddings_written, 2);
         assert_eq!(report.batch_size, 2);
         assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 2);
+        let second = db.reconcile(None, Some(2)).unwrap();
+        assert_eq!(second.processed_chunks, 0);
 
         fs::remove_dir_all(root).unwrap();
     }

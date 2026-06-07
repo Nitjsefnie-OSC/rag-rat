@@ -207,6 +207,7 @@ fn vector_candidates(
     let Some(query_embedding) = query_embedding else {
         return Ok(Vec::new());
     };
+    let model_version = ai::active_embedding_model_version(conn, &query_embedding.model_id)?;
     let generated_filter = if include_generated { "1 = 1" } else { "files.generated = 0" };
     let sql = format!(
         "
@@ -225,12 +226,17 @@ fn vector_candidates(
           AND chunk_embeddings.embedding_dim = ai_models.embedding_dim
           AND chunk_embeddings.status = 'Current'
           AND chunk_embeddings.source_text_hash = chunks.text_hash
+          AND chunk_embeddings.model_version = ?3
           AND {generated_filter}
         ",
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![query_embedding.model_id, i64::try_from(query_embedding.dim).unwrap_or(i64::MAX)],
+        params![
+            query_embedding.model_id,
+            i64::try_from(query_embedding.dim).unwrap_or(i64::MAX),
+            model_version
+        ],
         |row| {
             let text: String = row.get(7)?;
             let blob: Vec<u8> = row.get(8)?;

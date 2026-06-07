@@ -207,9 +207,46 @@ fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
 
 fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let db = IndexDatabase::open(&config.database)?;
+    if has_flag(args, "--plan") {
+        let plan = db.reconcile_plan()?;
+        if has_flag(args, "--json") {
+            print_json(&plan)
+        } else {
+            print_reconcile_plan(&plan);
+            Ok(())
+        }?;
+        return Ok(());
+    }
     let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
     let batch_size = option_value(args, "--batch-size").map(|value| value.parse()).transpose()?;
-    print_json(&db.reconcile_with_progress(limit, batch_size, render_reconcile_progress)?)
+    let force = has_flag(args, "--force");
+    print_json(&db.reconcile_with_progress(limit, batch_size, force, render_reconcile_progress)?)
+}
+
+fn print_reconcile_plan(plan: &rag_rat_core::index::ai::ReconcilePlan) {
+    let embeddings = &plan.embeddings;
+    println!("Embeddings");
+    println!("  model: {}", embeddings.model_id);
+    println!("  model_version: {}", embeddings.model_version);
+    println!("  dim: {}", embeddings.dim);
+    println!("  available: {}", embeddings.available);
+    if let Some(message) = &embeddings.message {
+        println!("  message: {message}");
+    }
+    println!("  current: {}", embeddings.current);
+    println!("  missing: {}", embeddings.missing);
+    println!("  stale: {}", embeddings.stale);
+    println!("  model_changed: {}", embeddings.model_changed);
+    println!("  dim_changed: {}", embeddings.dim_changed);
+    println!("  failed_retryable: {}", embeddings.failed_retryable);
+    println!("  failed_waiting: {}", embeddings.failed_waiting);
+    println!("  blocked: {}", embeddings.blocked);
+    println!();
+    println!("Summaries");
+    println!(
+        "  {}",
+        if plan.summaries.enabled { "enabled" } else { plan.summaries.message.as_str() }
+    );
 }
 
 fn render_reconcile_progress(progress: rag_rat_core::index::ai::ReconcileProgress) {
@@ -364,7 +401,9 @@ fn usage() {
          rag-rat models list --config rag-rat.toml\n\
          rag-rat models install embedding-hash --config rag-rat.toml\n\
          rag-rat models install fastembed-all-minilm-l6-v2 --config rag-rat.toml\n\
+         rag-rat reconcile --plan --config rag-rat.toml\n\
          rag-rat reconcile --limit 100 --batch-size 32 --config rag-rat.toml\n\
+         rag-rat reconcile --force --limit 100 --batch-size 32 --config rag-rat.toml\n\
          rag-rat eval --config rag-rat.toml\n\
          rag-rat eval --json --config rag-rat.toml\n\
          rag-rat eval --update-baseline --config rag-rat.toml\n\

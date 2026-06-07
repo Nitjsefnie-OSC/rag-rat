@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 2;
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -11,6 +11,9 @@ const MIGRATION_002_ID: &str = "002_embedding_vector_metadata";
 const MIGRATION_002_CHECKSUM: &str = "sha256:rag-rat-embedding-vector-metadata-v2";
 const MIGRATION_002_DESCRIPTION: &str =
     "Add embedding model dimension metadata and per-vector dimensions for hybrid vector search";
+const MIGRATION_003_ID: &str = "003_derived_artifact_reconcile_metadata";
+const MIGRATION_003_CHECKSUM: &str = "sha256:rag-rat-derived-artifact-reconcile-metadata-v3";
+const MIGRATION_003_DESCRIPTION: &str = "Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +70,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)?;
     apply_embedding_vector_metadata(conn)?;
     record_migration(conn, MIGRATION_002_ID, MIGRATION_002_CHECKSUM, MIGRATION_002_DESCRIPTION)?;
+    apply_derived_artifact_reconcile_metadata(conn)?;
+    record_migration(conn, MIGRATION_003_ID, MIGRATION_003_CHECKSUM, MIGRATION_003_DESCRIPTION)?;
     Ok(())
 }
 
@@ -258,14 +263,40 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chunk_id INTEGER NOT NULL,
             model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL DEFAULT 'v1',
             source_text_hash TEXT NOT NULL,
             embedding_dim INTEGER NOT NULL DEFAULT 0,
             vector_blob BLOB NOT NULL,
             status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error_class TEXT,
+            next_retry_after_ms INTEGER,
+            computed_at_ms INTEGER,
             created_at_ms INTEGER NOT NULL,
             last_error TEXT,
             UNIQUE(chunk_id, model_id),
             FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS chunk_summaries(
+            chunk_id INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            text_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error_class TEXT,
+            next_retry_after_ms INTEGER,
+            computed_at_ms INTEGER,
+            PRIMARY KEY(chunk_id, model_id, prompt_version),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS reconcile_meta(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS reconcile_attempts(
@@ -459,6 +490,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         ",
     )?;
     apply_embedding_vector_metadata(conn)?;
+    apply_derived_artifact_reconcile_metadata(conn)?;
     Ok(())
 }
 
@@ -553,6 +585,60 @@ fn apply_embedding_vector_metadata(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_derived_artifact_reconcile_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "chunk_embeddings", "model_version", "TEXT NOT NULL DEFAULT 'v1'")?;
+    add_column_if_missing(conn, "chunk_embeddings", "attempt_count", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "chunk_embeddings", "last_error_class", "TEXT")?;
+    add_column_if_missing(conn, "chunk_embeddings", "next_retry_after_ms", "INTEGER")?;
+    add_column_if_missing(conn, "chunk_embeddings", "computed_at_ms", "INTEGER")?;
+    conn.execute(
+        "
+        UPDATE chunk_embeddings
+        SET model_version = CASE
+                WHEN model_id = 'embedding-hash' AND model_version = 'v1' THEN 'hash-v1'
+                WHEN model_id = 'fastembed-all-minilm-l6-v2' AND model_version = 'v1'
+                    THEN 'fastembed-all-minilm-l6-v2-v1'
+                ELSE model_version
+            END,
+            computed_at_ms = COALESCE(computed_at_ms, created_at_ms),
+            attempt_count = CASE
+                WHEN attempt_count = 0 AND status IN ('Current', 'Failed', 'Blocked') THEN 1
+                ELSE attempt_count
+            END,
+            last_error_class = CASE
+                WHEN last_error IS NOT NULL AND last_error_class IS NULL THEN status
+                ELSE last_error_class
+            END
+        ",
+        [],
+    )?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS chunk_summaries(
+            chunk_id INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            text_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error_class TEXT,
+            next_retry_after_ms INTEGER,
+            computed_at_ms INTEGER,
+            PRIMARY KEY(chunk_id, model_id, prompt_version),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS reconcile_meta(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -582,6 +668,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
         .filter_map(|migration| match migration.id.as_str() {
             MIGRATION_001_ID => Some(1),
             MIGRATION_002_ID => Some(2),
+            MIGRATION_003_ID => Some(3),
             _ => None,
         })
         .max()
@@ -589,13 +676,14 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
 }
 
 fn known_migration(id: &str) -> bool {
-    matches!(id, MIGRATION_001_ID | MIGRATION_002_ID | DIRTY_MIGRATION_ID)
+    matches!(id, MIGRATION_001_ID | MIGRATION_002_ID | MIGRATION_003_ID | DIRTY_MIGRATION_ID)
 }
 
 fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
     match migration.id.as_str() {
         MIGRATION_001_ID => migration.checksum != MIGRATION_001_CHECKSUM,
         MIGRATION_002_ID => migration.checksum != MIGRATION_002_CHECKSUM,
+        MIGRATION_003_ID => migration.checksum != MIGRATION_003_CHECKSUM,
         _ => false,
     }
 }

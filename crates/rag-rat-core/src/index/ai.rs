@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -9,6 +11,9 @@ pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
 pub const HASH_EMBEDDING_DIM: usize = 384;
 pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
+const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
+const LAST_EMBEDDING_RECONCILE_STARTED_META: &str = "last_embedding_reconcile_started_at_ms";
+const LAST_EMBEDDING_RECONCILE_FINISHED_META: &str = "last_embedding_reconcile_finished_at_ms";
 const DEFAULT_BATCH_SIZE: usize = 32;
 const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
 
@@ -166,12 +171,69 @@ pub struct ModelInfo {
 pub struct ReconcileReport {
     pub processed_chunks: u64,
     pub embeddings_written: u64,
+    pub failed_chunks: u64,
     pub blocked_chunks: u64,
     pub model_id: String,
+    pub model_version: String,
     pub embedding_dim: usize,
     pub batch_size: usize,
+    pub forced: bool,
+    pub work_reasons: BTreeMap<String, u64>,
     pub status: String,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconcilePlan {
+    pub embeddings: EmbeddingReconcilePlan,
+    pub summaries: SummaryReconcilePlan,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingReconcilePlan {
+    pub model_id: String,
+    pub model_version: String,
+    pub dim: usize,
+    pub available: bool,
+    pub current: u64,
+    pub missing: u64,
+    pub stale: u64,
+    pub model_changed: u64,
+    pub dim_changed: u64,
+    pub failed_retryable: u64,
+    pub failed_waiting: u64,
+    pub blocked: u64,
+    pub disabled: u64,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryReconcilePlan {
+    pub enabled: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReconcileReason {
+    Missing,
+    SourceChanged,
+    ModelChanged,
+    DimChanged,
+    RetryAfterFailure,
+    Forced,
+}
+
+impl ReconcileReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "Missing",
+            Self::SourceChanged => "SourceChanged",
+            Self::ModelChanged => "ModelChanged",
+            Self::DimChanged => "DimChanged",
+            Self::RetryAfterFailure => "RetryAfterFailure",
+            Self::Forced => "Forced",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +254,7 @@ pub fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
         "fastembed",
         false,
     )?;
+    normalize_embedding_model_versions(conn)?;
     Ok(())
 }
 
@@ -204,6 +267,23 @@ fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
             params![ACTIVE_EMBEDDING_MODEL_META, model_id],
         )?;
     }
+    Ok(())
+}
+
+fn normalize_embedding_model_versions(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "
+        UPDATE chunk_embeddings
+        SET model_version = CASE model_id
+            WHEN 'embedding-hash' THEN 'hash-v1'
+            WHEN 'fastembed-all-minilm-l6-v2' THEN 'fastembed-all-minilm-l6-v2-v1'
+            ELSE model_version
+        END
+        WHERE model_version = 'v1'
+          AND model_id IN ('embedding-hash', 'fastembed-all-minilm-l6-v2')
+        ",
+        [],
+    )?;
     Ok(())
 }
 
@@ -258,29 +338,131 @@ pub fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     })
 }
 
+pub fn reconcile_plan(conn: &Connection) -> anyhow::Result<ReconcilePlan> {
+    ensure_model_manifest(conn)?;
+    let model_id = active_embedding_model_id(conn)?;
+    let model = model(conn, &model_id)?;
+    let model_version = active_embedding_model_version(conn, &model_id)?;
+    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    let available = validate_ready_model(&model).is_ok();
+    let message = (!available).then(|| model_not_ready_reason(&model));
+    Ok(ReconcilePlan {
+        embeddings: embedding_reconcile_plan(
+            conn,
+            &model,
+            &model_version,
+            dim,
+            available,
+            message,
+        )?,
+        summaries: SummaryReconcilePlan {
+            enabled: false,
+            message: "summaries are not implemented yet".to_string(),
+        },
+    })
+}
+
+fn embedding_reconcile_plan(
+    conn: &Connection,
+    model: &ModelInfo,
+    model_version: &str,
+    dim: usize,
+    available: bool,
+    message: Option<String>,
+) -> anyhow::Result<EmbeddingReconcilePlan> {
+    let row = conn.query_row(
+        "
+        SELECT
+          SUM(CASE
+              WHEN e.chunk_id IS NOT NULL
+               AND e.status = 'Current'
+               AND e.source_text_hash = c.text_hash
+               AND e.model_version = ?2
+               AND e.embedding_dim = ?3
+              THEN 1 ELSE 0 END) AS current_count,
+          SUM(CASE WHEN e.chunk_id IS NULL THEN 1 ELSE 0 END) AS missing_count,
+          SUM(CASE WHEN e.chunk_id IS NOT NULL AND e.source_text_hash != c.text_hash THEN 1 ELSE 0 END) AS stale_count,
+          SUM(CASE WHEN e.chunk_id IS NOT NULL AND e.model_version != ?2 THEN 1 ELSE 0 END) AS model_changed_count,
+          SUM(CASE WHEN e.chunk_id IS NOT NULL AND e.embedding_dim != ?3 THEN 1 ELSE 0 END) AS dim_changed_count,
+          SUM(CASE
+              WHEN e.status = 'Failed'
+               AND COALESCE(e.next_retry_after_ms, 0) <= ?4
+              THEN 1 ELSE 0 END) AS failed_retryable_count,
+          SUM(CASE
+              WHEN e.status = 'Failed'
+               AND e.next_retry_after_ms > ?4
+              THEN 1 ELSE 0 END) AS failed_waiting_count,
+          SUM(CASE WHEN e.status = 'Blocked' THEN 1 ELSE 0 END) AS blocked_count
+        FROM chunks c
+        LEFT JOIN chunk_embeddings e
+          ON e.chunk_id = c.id
+         AND e.model_id = ?1
+        WHERE c.text IS NOT NULL
+        ",
+        params![
+            model.model_id,
+            model_version,
+            i64::try_from(dim).unwrap_or(i64::MAX),
+            now_ms()
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+            ))
+        },
+    )?;
+    Ok(EmbeddingReconcilePlan {
+        model_id: model.model_id.clone(),
+        model_version: model_version.to_string(),
+        dim,
+        available,
+        current: u64::try_from(row.0).unwrap_or(0),
+        missing: u64::try_from(row.1).unwrap_or(0),
+        stale: u64::try_from(row.2).unwrap_or(0),
+        model_changed: u64::try_from(row.3).unwrap_or(0),
+        dim_changed: u64::try_from(row.4).unwrap_or(0),
+        failed_retryable: u64::try_from(row.5).unwrap_or(0),
+        failed_waiting: u64::try_from(row.6).unwrap_or(0),
+        blocked: u64::try_from(row.7).unwrap_or(0),
+        disabled: u64::from(model.disabled),
+        message,
+    })
+}
+
 pub fn reconcile(
     conn: &Connection,
     limit: Option<u32>,
     batch_size: Option<u32>,
 ) -> anyhow::Result<ReconcileReport> {
-    reconcile_with_progress(conn, limit, batch_size, |_| {})
+    reconcile_with_progress(conn, limit, batch_size, false, |_| {})
 }
 
 pub fn reconcile_with_progress(
     conn: &Connection,
     limit: Option<u32>,
     batch_size: Option<u32>,
+    force: bool,
     mut progress: impl FnMut(ReconcileProgress),
 ) -> anyhow::Result<ReconcileReport> {
     ensure_model_manifest(conn)?;
     let active_model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &active_model_id)?;
+    let model_version = active_embedding_model_version(conn, &active_model_id)?;
+    let embedding_dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
     let batch_size = batch_size
         .map(usize::try_from)
         .transpose()?
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BATCH_SIZE);
     let started = now_ms();
+    set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
     conn.execute(
         "INSERT INTO reconcile_attempts(started_at_ms, limit_count, status) VALUES (?1, ?2, 'Running')",
         params![started, limit.map(i64::from)],
@@ -288,73 +470,129 @@ pub fn reconcile_with_progress(
     let attempt_id = conn.last_insert_rowid();
 
     let embedder = active_embedder(conn);
-    let chunks = current_chunks(conn, limit)?;
     let mut report = ReconcileReport {
         processed_chunks: 0,
         embeddings_written: 0,
+        failed_chunks: 0,
         blocked_chunks: 0,
         model_id: active_model_id.clone(),
-        embedding_dim: usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0),
+        model_version: model_version.clone(),
+        embedding_dim,
         batch_size,
+        forced: force,
+        work_reasons: BTreeMap::new(),
         status: "Current".to_string(),
         message: None,
     };
 
+    let embedder = match embedder {
+        Ok(embedder) => embedder,
+        Err(_) => {
+            report.status = "Blocked".to_string();
+            report.message = Some(format!(
+                "{} model is not ready; run `rag-rat models install {}`",
+                active_model_id, active_model_id
+            ));
+            finish_reconcile_attempt(conn, attempt_id, &report)?;
+            progress(ReconcileProgress::Started {
+                model_id: active_model_id,
+                total_chunks: 0,
+                batch_size,
+            });
+            progress(ReconcileProgress::Finished {
+                processed_chunks: 0,
+                embeddings_written: 0,
+                blocked_chunks: 0,
+            });
+            return Ok(report);
+        },
+    };
+
+    let chunks = if force {
+        current_chunks(conn, limit)?
+    } else {
+        chunks_needing_embedding(conn, &active_model_id, &model_version, embedding_dim, limit)?
+    };
     report.processed_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
+    for chunk in &chunks {
+        *report.work_reasons.entry(chunk.reason.as_str().to_string()).or_default() += 1;
+    }
     progress(ReconcileProgress::Started {
         model_id: active_model_id.clone(),
         total_chunks: report.processed_chunks,
         batch_size,
     });
-    if let Ok(embedder) = embedder {
-        for batch in chunks.chunks(batch_size) {
-            let texts = batch.iter().map(|chunk| chunk.text.clone()).collect::<Vec<_>>();
-            let vectors = embedder.embed_batch(&texts)?;
-            if vectors.len() != batch.len() {
-                anyhow::bail!(
+
+    for batch in chunks.chunks(batch_size) {
+        let texts = batch.iter().map(|chunk| chunk.text.clone()).collect::<Vec<_>>();
+        match embedder.embed_batch(&texts) {
+            Ok(vectors) if vectors.len() == batch.len() => {
+                write_current_embedding_batch(
+                    conn,
+                    embedder.as_ref(),
+                    &model_version,
+                    batch,
+                    &vectors,
+                )?;
+                report.embeddings_written += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            },
+            Ok(vectors) => {
+                let error = format!(
                     "embedder {} returned {} vectors for {} texts",
                     embedder.model_id(),
                     vectors.len(),
                     batch.len()
                 );
-            }
-            write_current_embedding_batch(conn, embedder.as_ref(), batch, &vectors)?;
-            report.embeddings_written += u64::try_from(batch.len()).unwrap_or(u64::MAX);
-            progress(ReconcileProgress::Batch {
-                processed_chunks: report.embeddings_written + report.blocked_chunks,
-                total_chunks: report.processed_chunks,
-                embeddings_written: report.embeddings_written,
-                blocked_chunks: report.blocked_chunks,
-            });
+                write_failed_embedding_batch(
+                    conn,
+                    embedder.as_ref(),
+                    &model_version,
+                    batch,
+                    &error,
+                )?;
+                report.failed_chunks += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            },
+            Err(err) => {
+                write_failed_embedding_batch(
+                    conn,
+                    embedder.as_ref(),
+                    &model_version,
+                    batch,
+                    &err.to_string(),
+                )?;
+                report.failed_chunks += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            },
         }
-    } else {
-        let reason = model_not_ready_reason(&model);
-        for batch in chunks.chunks(batch_size) {
-            write_blocked_embedding_batch(
-                conn,
-                &active_model_id,
-                model.embedding_dim,
-                batch,
-                &reason,
-            )?;
-            report.blocked_chunks += u64::try_from(batch.len()).unwrap_or(u64::MAX);
-            progress(ReconcileProgress::Batch {
-                processed_chunks: report.embeddings_written + report.blocked_chunks,
-                total_chunks: report.processed_chunks,
-                embeddings_written: report.embeddings_written,
-                blocked_chunks: report.blocked_chunks,
-            });
-        }
-    };
-
-    if report.blocked_chunks > 0 {
-        report.status = "Blocked".to_string();
-        report.message = Some(format!(
-            "{} model is not ready; run `rag-rat models install {}`",
-            active_model_id, active_model_id
-        ));
+        progress(ReconcileProgress::Batch {
+            processed_chunks: report.embeddings_written
+                + report.failed_chunks
+                + report.blocked_chunks,
+            total_chunks: report.processed_chunks,
+            embeddings_written: report.embeddings_written,
+            blocked_chunks: report.blocked_chunks,
+        });
+    }
+    if report.failed_chunks > 0 {
+        report.status = "Failed".to_string();
+        report.message =
+            Some(format!("{} chunks failed; retry after backoff", report.failed_chunks));
     }
 
+    finish_reconcile_attempt(conn, attempt_id, &report)?;
+    progress(ReconcileProgress::Finished {
+        processed_chunks: report.processed_chunks,
+        embeddings_written: report.embeddings_written,
+        blocked_chunks: report.blocked_chunks,
+    });
+    Ok(report)
+}
+
+fn finish_reconcile_attempt(
+    conn: &Connection,
+    attempt_id: i64,
+    report: &ReconcileReport,
+) -> anyhow::Result<()> {
+    let finished = now_ms();
     conn.execute(
         "
         UPDATE reconcile_attempts
@@ -368,7 +606,7 @@ pub fn reconcile_with_progress(
         ",
         params![
             attempt_id,
-            now_ms(),
+            finished,
             i64::try_from(report.processed_chunks).unwrap_or(i64::MAX),
             i64::try_from(report.embeddings_written).unwrap_or(i64::MAX),
             i64::try_from(report.blocked_chunks).unwrap_or(i64::MAX),
@@ -376,12 +614,8 @@ pub fn reconcile_with_progress(
             report.message,
         ],
     )?;
-    progress(ReconcileProgress::Finished {
-        processed_chunks: report.processed_chunks,
-        embeddings_written: report.embeddings_written,
-        blocked_chunks: report.blocked_chunks,
-    });
-    Ok(report)
+    set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_FINISHED_META, &finished.to_string())?;
+    Ok(())
 }
 
 fn upsert_model(
@@ -508,6 +742,7 @@ struct CurrentChunk {
     id: i64,
     text: String,
     text_hash: String,
+    reason: ReconcileReason,
 }
 
 fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<CurrentChunk>> {
@@ -525,36 +760,120 @@ fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<C
 }
 
 fn current_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CurrentChunk> {
-    Ok(CurrentChunk { id: row.get(0)?, text: row.get(1)?, text_hash: row.get(2)? })
+    Ok(CurrentChunk {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        text_hash: row.get(2)?,
+        reason: ReconcileReason::Forced,
+    })
+}
+
+fn chunks_needing_embedding(
+    conn: &Connection,
+    model_id: &str,
+    model_version: &str,
+    dim: usize,
+    limit: Option<u32>,
+) -> anyhow::Result<Vec<CurrentChunk>> {
+    let sql = "
+        SELECT chunks.id,
+               chunks.text,
+               chunks.text_hash,
+               CASE
+                   WHEN chunk_embeddings.chunk_id IS NULL THEN 'Missing'
+                   WHEN chunk_embeddings.source_text_hash != chunks.text_hash THEN 'SourceChanged'
+                   WHEN chunk_embeddings.model_version != ?2 THEN 'ModelChanged'
+                   WHEN chunk_embeddings.embedding_dim != ?3 THEN 'DimChanged'
+                   WHEN chunk_embeddings.status = 'Failed' THEN 'RetryAfterFailure'
+                   ELSE 'Missing'
+               END AS reason
+        FROM chunks
+        LEFT JOIN chunk_embeddings
+          ON chunk_embeddings.chunk_id = chunks.id
+         AND chunk_embeddings.model_id = ?1
+        WHERE chunks.text IS NOT NULL
+          AND (
+            chunk_embeddings.chunk_id IS NULL
+            OR chunk_embeddings.source_text_hash != chunks.text_hash
+            OR chunk_embeddings.model_version != ?2
+            OR chunk_embeddings.embedding_dim != ?3
+            OR chunk_embeddings.status IN ('Missing', 'Stale')
+            OR (
+              chunk_embeddings.status = 'Failed'
+              AND COALESCE(chunk_embeddings.next_retry_after_ms, 0) <= ?4
+            )
+          )
+        ORDER BY
+          CASE
+            WHEN chunk_embeddings.chunk_id IS NULL THEN 0
+            WHEN chunk_embeddings.source_text_hash != chunks.text_hash THEN 1
+            WHEN chunk_embeddings.status = 'Failed' THEN 2
+            ELSE 3
+          END,
+          chunks.source_revision DESC,
+          chunks.id
+        LIMIT ?5
+    ";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        params![
+            model_id,
+            model_version,
+            i64::try_from(dim).unwrap_or(i64::MAX),
+            now_ms(),
+            limit.map(i64::from).unwrap_or(i64::MAX)
+        ],
+        |row| {
+            Ok(CurrentChunk {
+                id: row.get(0)?,
+                text: row.get(1)?,
+                text_hash: row.get(2)?,
+                reason: reconcile_reason(row.get::<_, String>(3)?.as_str()),
+            })
+        },
+    )?;
+    collect_rows(rows)
+}
+
+fn reconcile_reason(value: &str) -> ReconcileReason {
+    match value {
+        "SourceChanged" => ReconcileReason::SourceChanged,
+        "ModelChanged" => ReconcileReason::ModelChanged,
+        "DimChanged" => ReconcileReason::DimChanged,
+        "RetryAfterFailure" => ReconcileReason::RetryAfterFailure,
+        "Forced" => ReconcileReason::Forced,
+        _ => ReconcileReason::Missing,
+    }
 }
 
 fn write_current_embedding_batch(
     conn: &Connection,
     embedder: &dyn Embedder,
+    model_version: &str,
     batch: &[CurrentChunk],
     vectors: &[Vec<f32>],
 ) -> anyhow::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let write_result = (|| {
         for (chunk, vector) in batch.iter().zip(vectors) {
-            store_embedding(conn, embedder, chunk, vector)?;
+            store_embedding(conn, embedder, model_version, chunk, vector)?;
         }
         Ok(())
     })();
     finish_batch_transaction(conn, write_result)
 }
 
-fn write_blocked_embedding_batch(
+fn write_failed_embedding_batch(
     conn: &Connection,
-    model_id: &str,
-    embedding_dim: Option<i64>,
+    embedder: &dyn Embedder,
+    model_version: &str,
     batch: &[CurrentChunk],
-    reason: &str,
+    error: &str,
 ) -> anyhow::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let write_result = (|| {
         for chunk in batch {
-            store_blocked_embedding(conn, model_id, embedding_dim, chunk, reason)?;
+            store_failed_embedding(conn, embedder, model_version, chunk, error)?;
         }
         Ok(())
     })();
@@ -577,6 +896,7 @@ fn finish_batch_transaction(conn: &Connection, result: anyhow::Result<()>) -> an
 fn store_embedding(
     conn: &Connection,
     embedder: &dyn Embedder,
+    model_version: &str,
     chunk: &CurrentChunk,
     vector: &[f32],
 ) -> anyhow::Result<()> {
@@ -590,19 +910,29 @@ fn store_embedding(
     }
     conn.execute(
         "
-        INSERT INTO chunk_embeddings(chunk_id, model_id, source_text_hash, embedding_dim, vector_blob, status, created_at_ms, last_error)
-        VALUES (?1, ?2, ?3, ?4, ?5, 'Current', ?6, NULL)
+        INSERT INTO chunk_embeddings(
+            chunk_id, model_id, model_version, source_text_hash, embedding_dim, vector_blob,
+            status, attempt_count, last_error_class, next_retry_after_ms, computed_at_ms,
+            created_at_ms, last_error
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Current', 1, NULL, NULL, ?7, ?7, NULL)
         ON CONFLICT(chunk_id, model_id) DO UPDATE SET
+            model_version = excluded.model_version,
             source_text_hash = excluded.source_text_hash,
             embedding_dim = excluded.embedding_dim,
             vector_blob = excluded.vector_blob,
             status = excluded.status,
+            attempt_count = chunk_embeddings.attempt_count + 1,
+            last_error_class = NULL,
+            next_retry_after_ms = NULL,
+            computed_at_ms = excluded.computed_at_ms,
             created_at_ms = excluded.created_at_ms,
             last_error = NULL
         ",
         params![
             chunk.id,
             embedder.model_id(),
+            model_version,
             chunk.text_hash,
             i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
             encode_vector(vector),
@@ -612,32 +942,45 @@ fn store_embedding(
     Ok(())
 }
 
-fn store_blocked_embedding(
+fn store_failed_embedding(
     conn: &Connection,
-    model_id: &str,
-    embedding_dim: Option<i64>,
+    embedder: &dyn Embedder,
+    model_version: &str,
     chunk: &CurrentChunk,
-    reason: &str,
+    error: &str,
 ) -> anyhow::Result<()> {
+    let retry_at = now_ms().saturating_add(60_000);
     conn.execute(
         "
-        INSERT INTO chunk_embeddings(chunk_id, model_id, source_text_hash, embedding_dim, vector_blob, status, created_at_ms, last_error)
-        VALUES (?1, ?2, ?3, ?4, x'', 'Blocked', ?5, ?6)
+        INSERT INTO chunk_embeddings(
+            chunk_id, model_id, model_version, source_text_hash, embedding_dim, vector_blob,
+            status, attempt_count, last_error_class, next_retry_after_ms, computed_at_ms,
+            created_at_ms, last_error
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, x'', 'Failed', 1, ?6, ?7, NULL, ?8, ?9)
         ON CONFLICT(chunk_id, model_id) DO UPDATE SET
+            model_version = excluded.model_version,
             source_text_hash = excluded.source_text_hash,
             embedding_dim = excluded.embedding_dim,
             vector_blob = x'',
-            status = 'Blocked',
+            status = 'Failed',
+            attempt_count = chunk_embeddings.attempt_count + 1,
+            last_error_class = excluded.last_error_class,
+            next_retry_after_ms = excluded.next_retry_after_ms,
+            computed_at_ms = NULL,
             created_at_ms = excluded.created_at_ms,
             last_error = excluded.last_error
         ",
         params![
             chunk.id,
-            model_id,
+            embedder.model_id(),
+            model_version,
             chunk.text_hash,
-            embedding_dim.unwrap_or(0),
+            i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
+            "Transient",
+            retry_at,
             now_ms(),
-            reason
+            error
         ],
     )?;
     Ok(())
@@ -686,8 +1029,24 @@ pub fn active_embedding_model_id(conn: &Connection) -> anyhow::Result<String> {
     Ok(HASH_MODEL_ID.to_string())
 }
 
+pub fn active_embedding_model_version(conn: &Connection, model_id: &str) -> anyhow::Result<String> {
+    if let Some(version) = reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)? {
+        return Ok(version);
+    }
+    Ok(default_model_version(model_id).to_string())
+}
+
+fn default_model_version(model_id: &str) -> &'static str {
+    match model_id {
+        HASH_MODEL_ID => "hash-v1",
+        FASTEMBED_MODEL_ID => "fastembed-all-minilm-l6-v2-v1",
+        _ => "v1",
+    }
+}
+
 pub fn current_embedding_count(conn: &Connection, model_id: &str) -> anyhow::Result<u64> {
     ensure_model_manifest(conn)?;
+    let model_version = active_embedding_model_version(conn, model_id)?;
     let count: i64 = conn.query_row(
         "
         SELECT COUNT(*)
@@ -701,8 +1060,9 @@ pub fn current_embedding_count(conn: &Connection, model_id: &str) -> anyhow::Res
           AND chunk_embeddings.embedding_dim = ai_models.embedding_dim
           AND chunk_embeddings.status = 'Current'
           AND chunk_embeddings.source_text_hash = chunks.text_hash
+          AND chunk_embeddings.model_version = ?2
         ",
-        params![model_id],
+        params![model_id, model_version],
         |row| row.get(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
@@ -862,18 +1222,22 @@ fn current_artifact_count(
     capability: &str,
     model_id: &str,
 ) -> anyhow::Result<u64> {
+    let model_version = active_embedding_model_version(conn, model_id)?;
     let sql = artifact_table_sql(
         capability,
         "
         SELECT COUNT(*)
         FROM {table}
         JOIN chunks ON chunks.id = {table}.chunk_id
+        JOIN ai_models ON ai_models.model_id = {table}.model_id
         WHERE {table}.model_id = ?1
           AND {table}.status = 'Current'
           AND {table}.source_text_hash = chunks.text_hash
+          AND {table}.model_version = ?2
+          AND {table}.embedding_dim = ai_models.embedding_dim
     ",
     );
-    count_query(conn, &sql, model_id)
+    count_query2(conn, &sql, model_id, &model_version)
 }
 
 fn stale_artifact_count(
@@ -881,17 +1245,24 @@ fn stale_artifact_count(
     capability: &str,
     model_id: &str,
 ) -> anyhow::Result<u64> {
+    let model_version = active_embedding_model_version(conn, model_id)?;
     let sql = artifact_table_sql(
         capability,
         "
         SELECT COUNT(*)
         FROM {table}
         JOIN chunks ON chunks.id = {table}.chunk_id
+        JOIN ai_models ON ai_models.model_id = {table}.model_id
         WHERE {table}.model_id = ?1
-          AND {table}.source_text_hash != chunks.text_hash
+          AND (
+            {table}.source_text_hash != chunks.text_hash
+            OR {table}.model_version != ?2
+            OR {table}.embedding_dim != ai_models.embedding_dim
+            OR {table}.status = 'Stale'
+          )
     ",
     );
-    count_query(conn, &sql, model_id)
+    count_query2(conn, &sql, model_id, &model_version)
 }
 
 fn status_artifact_count(
@@ -913,8 +1284,8 @@ fn status_artifact_count(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-fn count_query(conn: &Connection, sql: &str, model_id: &str) -> anyhow::Result<u64> {
-    let count = conn.query_row(sql, [model_id], |row| row.get::<_, i64>(0))?;
+fn count_query2(conn: &Connection, sql: &str, model_id: &str, value: &str) -> anyhow::Result<u64> {
+    let count = conn.query_row(sql, params![model_id, value], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -935,6 +1306,21 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
 fn meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row("SELECT value FROM index_meta WHERE key = ?1", [key], |row| row.get(0))
+        .optional()?)
+}
+
+fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO reconcile_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT value FROM reconcile_meta WHERE key = ?1", [key], |row| row.get(0))
         .optional()?)
 }
 
