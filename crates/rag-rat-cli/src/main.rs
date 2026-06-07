@@ -239,7 +239,21 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
     let batch_size = option_value(args, "--batch-size").map(|value| value.parse()).transpose()?;
     let force = has_flag(args, "--force");
-    print_json(&db.reconcile_with_progress(limit, batch_size, force, render_reconcile_progress)?)
+    let max_seconds = option_value(args, "--max-seconds").map(|value| value.parse()).transpose()?;
+    let max_embedding_chars = option_value(args, "--max-embedding-chars")
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(rag_rat_core::index::ai::DEFAULT_MAX_EMBEDDING_CHARS);
+    let options = rag_rat_core::index::ai::ReconcileOptions {
+        limit,
+        batch_size,
+        force,
+        until_clean: has_flag(args, "--until-clean"),
+        changed_first: has_flag(args, "--changed-first"),
+        max_seconds,
+        max_embedding_chars,
+    };
+    print_json(&db.reconcile_with_options_progress(options, render_reconcile_progress)?)
 }
 
 fn print_reconcile_plan(plan: &rag_rat_core::index::ai::ReconcilePlan) {
@@ -260,6 +274,19 @@ fn print_reconcile_plan(plan: &rag_rat_core::index::ai::ReconcilePlan) {
     println!("  failed_retryable: {}", embeddings.failed_retryable);
     println!("  failed_waiting: {}", embeddings.failed_waiting);
     println!("  blocked: {}", embeddings.blocked);
+    println!("  skipped: {}", embeddings.skipped_total);
+    if !embeddings.skipped_by_policy.is_empty() {
+        println!("  skipped_by_policy:");
+        for (policy, count) in &embeddings.skipped_by_policy {
+            println!("    {policy}: {count}");
+        }
+    }
+    if !embeddings.missing_by_priority.is_empty() {
+        println!("  missing_by_priority:");
+        for (priority, count) in &embeddings.missing_by_priority {
+            println!("    {priority}: {count}");
+        }
+    }
     println!();
     println!("Summaries");
     println!(
@@ -422,6 +449,8 @@ fn usage() {
          rag-rat models install fastembed-all-minilm-l6-v2 --config rag-rat.toml\n\
          rag-rat reconcile --plan --config rag-rat.toml\n\
          rag-rat reconcile --limit 100 --batch-size 32 --config rag-rat.toml\n\
+         rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64 --config rag-rat.toml\n\
+         rag-rat reconcile --until-clean --batch-size 64 --config rag-rat.toml\n\
          rag-rat reconcile --force --limit 100 --batch-size 32 --config rag-rat.toml\n\
          rag-rat eval --config rag-rat.toml\n\
          rag-rat eval --json --config rag-rat.toml\n\

@@ -942,6 +942,14 @@ impl IndexDatabase {
         ai::reconcile_with_progress(self.storage.connection(), limit, batch_size, force, progress)
     }
 
+    pub fn reconcile_with_options_progress(
+        &self,
+        options: ai::ReconcileOptions,
+        progress: impl FnMut(ai::ReconcileProgress),
+    ) -> anyhow::Result<ReconcileReport> {
+        ai::reconcile_with_options_progress(self.storage.connection(), options, progress)
+    }
+
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
         ai::current_embedding_count(self.storage.connection(), model_id)
     }
@@ -1423,14 +1431,30 @@ impl IndexDatabase {
         chunks: &[Chunk],
         full_text: &str,
     ) -> anyhow::Result<()> {
+        let (path, language, kind) = self.storage.connection().query_row(
+            "SELECT path, language, kind FROM files WHERE id = ?1",
+            [file_id],
+            |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            },
+        )?;
         for chunk in chunks {
             let anchor =
                 anchors::anchor_for_text(&chunk.text, chunk.start_line, chunk.end_line, full_text);
+            let embedding_policy = ai::embedding_policy_for_chunk(
+                Path::new(&path),
+                &language,
+                &kind,
+                chunk.kind,
+                chunk.symbol_path.as_deref(),
+                &chunk.text,
+                ai::DEFAULT_MAX_EMBEDDING_CHARS,
+            );
             self.storage.connection().execute(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line, text, text_hash,
                                     source_revision, anchor_version, normalized_hash, start_boundary_hash, end_boundary_hash,
-                                    start_context_hash, end_context_hash, context_radius)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                                    start_context_hash, end_context_hash, context_radius, embedding_policy, embedding_priority)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     file_id,
                     chunk.kind,
@@ -1449,6 +1473,8 @@ impl IndexDatabase {
                     anchor.start_context_hash,
                     anchor.end_context_hash,
                     anchor.context_radius,
+                    embedding_policy.policy,
+                    embedding_policy.priority,
                 ],
             )?;
             let chunk_id = self.storage.connection().last_insert_rowid();
@@ -2416,6 +2442,12 @@ mod schema_bootstrap_tests {
         assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
         let embedding_columns = table_columns(&db, "chunk_embeddings");
         assert!(embedding_columns.contains(&"model_version".to_string()));
+        assert!(embedding_columns.contains(&"input_hash".to_string()));
+        assert!(embedding_columns.contains(&"embedding_text_version".to_string()));
+        assert!(embedding_columns.contains(&"embedding_policy".to_string()));
+        assert!(embedding_columns.contains(&"embedding_priority".to_string()));
+        assert!(embedding_columns.contains(&"input_chars".to_string()));
+        assert!(embedding_columns.contains(&"input_truncated".to_string()));
         assert!(embedding_columns.contains(&"attempt_count".to_string()));
         assert!(embedding_columns.contains(&"next_retry_after_ms".to_string()));
         assert!(embedding_columns.contains(&"computed_at_ms".to_string()));
@@ -2430,7 +2462,7 @@ mod schema_bootstrap_tests {
         assert!(edge_columns.contains(&"evidence".to_string()));
         assert!(edge_columns.contains(&"receiver_hint".to_string()));
         assert!(edge_columns.contains(&"resolution".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 5);
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 6);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2658,7 +2690,9 @@ mod schema_bootstrap_tests {
 
     #[test]
     fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
-        let (root, config) = markdown_config("alpha token\nsecond line\n");
+        let (root, config) = markdown_config(
+            "alpha token\nsecond line with enough detail for the semantic embedding policy to keep this chunk\nthird line with runtime context\n",
+        );
         let db = IndexDatabase::rebuild(&config).unwrap();
         let chunk_id = first_chunk_id(&db);
 
@@ -2669,7 +2703,7 @@ mod schema_bootstrap_tests {
 
         let hits = db.search("alpha", 10, false).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].summary, "alpha token\nsecond line");
+        assert!(hits[0].summary.contains("alpha token"));
 
         let blocked = db.reconcile(Some(1), Some(8)).unwrap();
         assert_eq!(blocked.processed_chunks, 0);
@@ -2712,7 +2746,7 @@ mod schema_bootstrap_tests {
         assert_eq!(embedding_bytes, (ai::HASH_EMBEDDING_DIM * 4) as i64);
 
         let hits = db.search("alpha", 10, false).unwrap();
-        assert_eq!(hits[0].summary, "alpha token\nsecond line");
+        assert!(hits[0].summary.contains("alpha token"));
 
         db.storage.connection().execute("DELETE FROM chunk_fts", []).unwrap();
         let vector_hits = db.search("alpha", 10, false).unwrap();
@@ -2741,7 +2775,9 @@ mod schema_bootstrap_tests {
 
     #[test]
     fn reconcile_without_limit_processes_all_chunks() {
-        let (root, config) = markdown_config("# One\nalpha token\n\n# Two\nbeta token\n");
+        let (root, config) = markdown_config(
+            "# One\nalpha token with enough surrounding detail for embedding eligibility and useful semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding eligibility and useful semantic context\n",
+        );
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.install_model(ai::HASH_MODEL_ID).unwrap();
 
@@ -2758,8 +2794,28 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn reconcile_policy_skips_tiny_chunks_before_embedding() {
+        let (root, config) = markdown_config("tiny\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+        let plan = db.reconcile_plan().unwrap();
+        assert_eq!(plan.embeddings.missing, 0);
+        assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+
+        let report = db.reconcile(None, Some(8)).unwrap();
+        assert_eq!(report.embeddings_written, 0);
+        assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+        assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn search_explain_reports_weighted_score_components() {
-        let (root, config) = markdown_config("alpha runtime shutdown\nsecond line\n");
+        let (root, config) = markdown_config(
+            "alpha runtime shutdown\nsecond line with enough detail for embedding eligibility and semantic vector scoring\nthird line\n",
+        );
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.install_model(ai::HASH_MODEL_ID).unwrap();
         db.reconcile(None, Some(8)).unwrap();

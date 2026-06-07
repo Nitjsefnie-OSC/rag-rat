@@ -265,6 +265,8 @@ fn vector_candidates(
           AND chunk_embeddings.status = 'Current'
           AND chunk_embeddings.source_text_hash = chunks.text_hash
           AND chunk_embeddings.model_version = ?3
+          AND chunk_embeddings.embedding_text_version = ?4
+          AND chunk_embeddings.input_hash != ''
           AND {generated_filter}
         ",
     );
@@ -273,7 +275,8 @@ fn vector_candidates(
         params![
             query_embedding.model_id,
             i64::try_from(query_embedding.dim).unwrap_or(i64::MAX),
-            model_version
+            model_version,
+            ai::EMBEDDING_TEXT_VERSION
         ],
         |row| {
             let text: String = row.get(7)?;

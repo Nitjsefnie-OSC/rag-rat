@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 5;
+pub const LATEST_SCHEMA_VERSION: u32 = 6;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -22,6 +22,9 @@ const MIGRATION_005_ID: &str = "005_edge_evidence_and_resolution";
 const MIGRATION_005_CHECKSUM: &str = "sha256:rag-rat-edge-evidence-resolution-v5";
 const MIGRATION_005_DESCRIPTION: &str =
     "Add raw graph edge evidence, receiver hints, qualified targets, and resolution reasons";
+const MIGRATION_006_ID: &str = "006_embedding_policy_and_input_hash";
+const MIGRATION_006_CHECKSUM: &str = "sha256:rag-rat-embedding-policy-input-hash-v6";
+const MIGRATION_006_DESCRIPTION: &str = "Add embedding eligibility policy, priority, bounded input hash, and reconcile throughput metadata";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +87,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_004_ID, MIGRATION_004_CHECKSUM, MIGRATION_004_DESCRIPTION)?;
     apply_edge_evidence_and_resolution(conn)?;
     record_migration(conn, MIGRATION_005_ID, MIGRATION_005_CHECKSUM, MIGRATION_005_DESCRIPTION)?;
+    apply_embedding_policy_and_input_hash(conn)?;
+    record_migration(conn, MIGRATION_006_ID, MIGRATION_006_CHECKSUM, MIGRATION_006_DESCRIPTION)?;
     Ok(())
 }
 
@@ -211,6 +216,8 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             start_context_hash TEXT NOT NULL DEFAULT '',
             end_context_hash TEXT NOT NULL DEFAULT '',
             context_radius INTEGER NOT NULL DEFAULT 2,
+            embedding_policy TEXT NOT NULL DEFAULT 'Embed',
+            embedding_priority INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
         );
 
@@ -287,6 +294,12 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             model_id TEXT NOT NULL,
             model_version TEXT NOT NULL DEFAULT 'v1',
             source_text_hash TEXT NOT NULL,
+            input_hash TEXT NOT NULL DEFAULT '',
+            embedding_text_version TEXT NOT NULL DEFAULT '',
+            embedding_policy TEXT NOT NULL DEFAULT 'Embed',
+            embedding_priority INTEGER NOT NULL DEFAULT 1,
+            input_chars INTEGER NOT NULL DEFAULT 0,
+            input_truncated INTEGER NOT NULL DEFAULT 0,
             embedding_dim INTEGER NOT NULL DEFAULT 0,
             vector_blob BLOB NOT NULL,
             status TEXT NOT NULL,
@@ -329,6 +342,9 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             processed_chunks INTEGER NOT NULL DEFAULT 0,
             embeddings_written INTEGER NOT NULL DEFAULT 0,
             blocked_chunks INTEGER NOT NULL DEFAULT 0,
+            elapsed_ms INTEGER NOT NULL DEFAULT 0,
+            input_chars INTEGER NOT NULL DEFAULT 0,
+            batch_size INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             message TEXT
         );
@@ -514,6 +530,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_embedding_vector_metadata(conn)?;
     apply_derived_artifact_reconcile_metadata(conn)?;
     apply_edge_source_target_spans(conn)?;
+    apply_embedding_policy_and_input_hash(conn)?;
     Ok(())
 }
 
@@ -546,6 +563,8 @@ fn migrate_chunks(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "chunks", "start_context_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "end_context_hash", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "chunks", "context_radius", "INTEGER NOT NULL DEFAULT 2")?;
+    add_column_if_missing(conn, "chunks", "embedding_policy", "TEXT NOT NULL DEFAULT 'Embed'")?;
+    add_column_if_missing(conn, "chunks", "embedding_priority", "INTEGER NOT NULL DEFAULT 1")?;
     conn.execute(
         "
         UPDATE chunks
@@ -695,6 +714,41 @@ fn apply_derived_artifact_reconcile_metadata(conn: &Connection) -> rusqlite::Res
     Ok(())
 }
 
+fn apply_embedding_policy_and_input_hash(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "chunks", "embedding_policy", "TEXT NOT NULL DEFAULT 'Embed'")?;
+    add_column_if_missing(conn, "chunks", "embedding_priority", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "chunk_embeddings", "input_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "embedding_text_version",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "embedding_policy",
+        "TEXT NOT NULL DEFAULT 'Embed'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "embedding_priority",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(conn, "chunk_embeddings", "input_chars", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "input_truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "reconcile_attempts", "elapsed_ms", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "reconcile_attempts", "input_chars", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "reconcile_attempts", "batch_size", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
 fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -727,6 +781,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_003_ID => Some(3),
             MIGRATION_004_ID => Some(4),
             MIGRATION_005_ID => Some(5),
+            MIGRATION_006_ID => Some(6),
             _ => None,
         })
         .max()
@@ -741,6 +796,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_003_ID
             | MIGRATION_004_ID
             | MIGRATION_005_ID
+            | MIGRATION_006_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -752,6 +808,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_003_ID => migration.checksum != MIGRATION_003_CHECKSUM,
         MIGRATION_004_ID => migration.checksum != MIGRATION_004_CHECKSUM,
         MIGRATION_005_ID => migration.checksum != MIGRATION_005_CHECKSUM,
+        MIGRATION_006_ID => migration.checksum != MIGRATION_006_CHECKSUM,
         _ => false,
     }
 }

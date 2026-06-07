@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -17,6 +21,9 @@ const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_versio
 const LAST_EMBEDDING_RECONCILE_STARTED_META: &str = "last_embedding_reconcile_started_at_ms";
 const LAST_EMBEDDING_RECONCILE_FINISHED_META: &str = "last_embedding_reconcile_finished_at_ms";
 const DEFAULT_BATCH_SIZE: usize = 32;
+pub const DEFAULT_MAX_EMBEDDING_CHARS: usize = 6_000;
+const MIN_EMBEDDING_CHARS: usize = 80;
+pub const EMBEDDING_TEXT_VERSION: &str = "embedding-text-v2";
 const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
 
 pub trait Embedder {
@@ -133,6 +140,7 @@ pub struct LocalAiStatus {
     pub embedding: CapabilityStatus,
     pub artifacts: ArtifactCounts,
     pub fastembed: FastEmbedOperationalStatus,
+    pub last_reconcile: Option<LastReconcileStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -181,6 +189,22 @@ pub struct ArtifactCounts {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LastReconcileStatus {
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub batch_size: u64,
+    pub processed_chunks: u64,
+    pub embeddings_written: u64,
+    pub blocked_chunks: u64,
+    pub elapsed_ms: u64,
+    pub input_chars: u64,
+    pub chunks_per_sec: f64,
+    pub chars_per_sec: f64,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelInfo {
     pub model_id: String,
     pub capability: String,
@@ -197,14 +221,26 @@ pub struct ModelInfo {
 pub struct ReconcileReport {
     pub processed_chunks: u64,
     pub embeddings_written: u64,
+    pub skipped_chunks: u64,
     pub failed_chunks: u64,
     pub blocked_chunks: u64,
     pub model_id: String,
     pub model_version: String,
     pub embedding_dim: usize,
     pub batch_size: usize,
+    pub max_embedding_chars: usize,
     pub forced: bool,
+    pub changed_first: bool,
+    pub until_clean: bool,
+    pub max_seconds: Option<u64>,
     pub work_reasons: BTreeMap<String, u64>,
+    pub skipped_by_policy: BTreeMap<String, u64>,
+    pub input_chars: u64,
+    pub truncated_inputs: u64,
+    pub elapsed_ms: u64,
+    pub chunks_per_sec: f64,
+    pub chars_per_sec: f64,
+    pub avg_chars_per_chunk: f64,
     pub status: String,
     pub message: Option<String>,
 }
@@ -230,6 +266,9 @@ pub struct EmbeddingReconcilePlan {
     pub failed_waiting: u64,
     pub blocked: u64,
     pub disabled: u64,
+    pub skipped_total: u64,
+    pub skipped_by_policy: BTreeMap<String, u64>,
+    pub missing_by_priority: BTreeMap<String, u64>,
     pub message: Option<String>,
 }
 
@@ -243,6 +282,7 @@ pub struct SummaryReconcilePlan {
 enum ReconcileReason {
     Missing,
     SourceChanged,
+    InputChanged,
     ModelChanged,
     DimChanged,
     RetryAfterFailure,
@@ -254,12 +294,45 @@ impl ReconcileReason {
         match self {
             Self::Missing => "Missing",
             Self::SourceChanged => "SourceChanged",
+            Self::InputChanged => "InputChanged",
             Self::ModelChanged => "ModelChanged",
             Self::DimChanged => "DimChanged",
             Self::RetryAfterFailure => "RetryAfterFailure",
             Self::Forced => "Forced",
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconcileOptions {
+    pub limit: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub force: bool,
+    pub until_clean: bool,
+    pub changed_first: bool,
+    pub max_seconds: Option<u64>,
+    pub max_embedding_chars: usize,
+}
+
+impl Default for ReconcileOptions {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            batch_size: None,
+            force: false,
+            until_clean: false,
+            changed_first: false,
+            max_seconds: None,
+            max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingPolicyDecision {
+    pub policy: String,
+    pub priority: i64,
+    pub eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +436,7 @@ pub fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
         embedding,
         artifacts: ArtifactCounts { current, missing, stale, failed, blocked, disabled: 0 },
         fastembed,
+        last_reconcile: last_reconcile_status(conn)?,
     })
 }
 
@@ -398,68 +472,73 @@ fn embedding_reconcile_plan(
     available: bool,
     message: Option<String>,
 ) -> anyhow::Result<EmbeddingReconcilePlan> {
-    let row = conn.query_row(
-        "
-        SELECT
-          SUM(CASE
-              WHEN e.chunk_id IS NOT NULL
-               AND e.status = 'Current'
-               AND e.source_text_hash = c.text_hash
-               AND e.model_version = ?2
-               AND e.embedding_dim = ?3
-              THEN 1 ELSE 0 END) AS current_count,
-          SUM(CASE WHEN e.chunk_id IS NULL THEN 1 ELSE 0 END) AS missing_count,
-          SUM(CASE WHEN e.chunk_id IS NOT NULL AND e.source_text_hash != c.text_hash THEN 1 ELSE 0 END) AS stale_count,
-          SUM(CASE WHEN e.chunk_id IS NOT NULL AND e.model_version != ?2 THEN 1 ELSE 0 END) AS model_changed_count,
-          SUM(CASE WHEN e.chunk_id IS NOT NULL AND e.embedding_dim != ?3 THEN 1 ELSE 0 END) AS dim_changed_count,
-          SUM(CASE
-              WHEN e.status = 'Failed'
-               AND COALESCE(e.next_retry_after_ms, 0) <= ?4
-              THEN 1 ELSE 0 END) AS failed_retryable_count,
-          SUM(CASE
-              WHEN e.status = 'Failed'
-               AND e.next_retry_after_ms > ?4
-              THEN 1 ELSE 0 END) AS failed_waiting_count,
-          SUM(CASE WHEN e.status = 'Blocked' THEN 1 ELSE 0 END) AS blocked_count
-        FROM chunks c
-        LEFT JOIN chunk_embeddings e
-          ON e.chunk_id = c.id
-         AND e.model_id = ?1
-        WHERE c.text IS NOT NULL
-        ",
-        params![
-            model.model_id,
-            model_version,
-            i64::try_from(dim).unwrap_or(i64::MAX),
-            now_ms()
-        ],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(7)?.unwrap_or(0),
-            ))
-        },
-    )?;
+    let jobs = embedding_job_candidates(conn, &model.model_id, model_version, dim, None, false)?;
+    let mut skipped_by_policy = BTreeMap::new();
+    let mut missing_by_priority = BTreeMap::new();
+    let mut current = 0_u64;
+    let mut missing = 0_u64;
+    let mut stale = 0_u64;
+    let mut model_changed = 0_u64;
+    let mut dim_changed = 0_u64;
+    let mut failed_retryable = 0_u64;
+    let mut failed_waiting = 0_u64;
+    let mut blocked = 0_u64;
+    for job in jobs {
+        let policy = policy_for_job(&job, DEFAULT_MAX_EMBEDDING_CHARS);
+        if !policy.eligible {
+            *skipped_by_policy.entry(policy.policy).or_default() += 1;
+            continue;
+        }
+        let current_artifact = job.embedding_status.as_deref() == Some("Current")
+            && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
+            && job.model_version.as_deref() == Some(model_version)
+            && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
+            && job.embedding_text_version.as_deref() == Some(EMBEDDING_TEXT_VERSION)
+            && job.input_hash.as_deref().is_some_and(|input_hash| {
+                let input = build_embedding_input(&job, DEFAULT_MAX_EMBEDDING_CHARS);
+                input_hash == embedding_input_hash(&model.model_id, model_version, &input.text)
+            });
+        if current_artifact {
+            current += 1;
+            continue;
+        }
+        let reason = job.reason(model_version, dim, now_ms(), DEFAULT_MAX_EMBEDDING_CHARS);
+        match reason {
+            ReconcileReason::Missing => missing += 1,
+            ReconcileReason::SourceChanged => stale += 1,
+            ReconcileReason::InputChanged => stale += 1,
+            ReconcileReason::ModelChanged => model_changed += 1,
+            ReconcileReason::DimChanged => dim_changed += 1,
+            ReconcileReason::RetryAfterFailure => failed_retryable += 1,
+            ReconcileReason::Forced => missing += 1,
+        }
+        *missing_by_priority.entry(priority_label(policy.priority).to_string()).or_default() += 1;
+        if job.embedding_status.as_deref() == Some("Failed")
+            && job.next_retry_after_ms.unwrap_or(0) > now_ms()
+        {
+            failed_waiting += 1;
+        }
+        if job.embedding_status.as_deref() == Some("Blocked") {
+            blocked += 1;
+        }
+    }
     Ok(EmbeddingReconcilePlan {
         model_id: model.model_id.clone(),
         model_version: model_version.to_string(),
         dim,
         available,
-        current: u64::try_from(row.0).unwrap_or(0),
-        missing: u64::try_from(row.1).unwrap_or(0),
-        stale: u64::try_from(row.2).unwrap_or(0),
-        model_changed: u64::try_from(row.3).unwrap_or(0),
-        dim_changed: u64::try_from(row.4).unwrap_or(0),
-        failed_retryable: u64::try_from(row.5).unwrap_or(0),
-        failed_waiting: u64::try_from(row.6).unwrap_or(0),
-        blocked: u64::try_from(row.7).unwrap_or(0),
+        current,
+        missing,
+        stale,
+        model_changed,
+        dim_changed,
+        failed_retryable,
+        failed_waiting,
+        blocked,
         disabled: u64::from(model.disabled),
+        skipped_total: skipped_by_policy.values().sum(),
+        skipped_by_policy,
+        missing_by_priority,
         message,
     })
 }
@@ -469,7 +548,11 @@ pub fn reconcile(
     limit: Option<u32>,
     batch_size: Option<u32>,
 ) -> anyhow::Result<ReconcileReport> {
-    reconcile_with_progress(conn, limit, batch_size, false, |_| {})
+    reconcile_with_options_progress(
+        conn,
+        ReconcileOptions { limit, batch_size, ..ReconcileOptions::default() },
+        |_| {},
+    )
 }
 
 pub fn reconcile_with_progress(
@@ -477,6 +560,18 @@ pub fn reconcile_with_progress(
     limit: Option<u32>,
     batch_size: Option<u32>,
     force: bool,
+    progress: impl FnMut(ReconcileProgress),
+) -> anyhow::Result<ReconcileReport> {
+    reconcile_with_options_progress(
+        conn,
+        ReconcileOptions { limit, batch_size, force, ..ReconcileOptions::default() },
+        progress,
+    )
+}
+
+pub fn reconcile_with_options_progress(
+    conn: &Connection,
+    options: ReconcileOptions,
     mut progress: impl FnMut(ReconcileProgress),
 ) -> anyhow::Result<ReconcileReport> {
     ensure_model_manifest(conn)?;
@@ -484,31 +579,50 @@ pub fn reconcile_with_progress(
     let model = model(conn, &active_model_id)?;
     let model_version = active_embedding_model_version(conn, &active_model_id)?;
     let embedding_dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
-    let batch_size = batch_size
+    let batch_size = options
+        .batch_size
         .map(usize::try_from)
         .transpose()?
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BATCH_SIZE);
+    let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
     let started = now_ms();
     set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_STARTED_META, &started.to_string())?;
     conn.execute(
-        "INSERT INTO reconcile_attempts(started_at_ms, limit_count, status) VALUES (?1, ?2, 'Running')",
-        params![started, limit.map(i64::from)],
+        "INSERT INTO reconcile_attempts(started_at_ms, limit_count, status, batch_size) VALUES (?1, ?2, 'Running', ?3)",
+        params![
+            started,
+            options.limit.map(i64::from),
+            i64::try_from(batch_size).unwrap_or(i64::MAX)
+        ],
     )?;
     let attempt_id = conn.last_insert_rowid();
+    let timer = Instant::now();
 
     let embedder = active_embedder(conn);
     let mut report = ReconcileReport {
         processed_chunks: 0,
         embeddings_written: 0,
+        skipped_chunks: 0,
         failed_chunks: 0,
         blocked_chunks: 0,
         model_id: active_model_id.clone(),
         model_version: model_version.clone(),
         embedding_dim,
         batch_size,
-        forced: force,
+        max_embedding_chars,
+        forced: options.force,
+        changed_first: options.changed_first,
+        until_clean: options.until_clean,
+        max_seconds: options.max_seconds,
         work_reasons: BTreeMap::new(),
+        skipped_by_policy: BTreeMap::new(),
+        input_chars: 0,
+        truncated_inputs: 0,
+        elapsed_ms: 0,
+        chunks_per_sec: 0.0,
+        chars_per_sec: 0.0,
+        avg_chars_per_chunk: 0.0,
         status: "Current".to_string(),
         message: None,
     };
@@ -536,66 +650,117 @@ pub fn reconcile_with_progress(
         },
     };
 
-    let chunks = if force {
-        current_chunks(conn, limit)?
-    } else {
-        chunks_needing_embedding(conn, &active_model_id, &model_version, embedding_dim, limit)?
-    };
-    report.processed_chunks = u64::try_from(chunks.len()).unwrap_or(u64::MAX);
-    for chunk in &chunks {
-        *report.work_reasons.entry(chunk.reason.as_str().to_string()).or_default() += 1;
-    }
+    let total_chunks = estimated_reconcile_jobs(
+        conn,
+        &active_model_id,
+        &model_version,
+        embedding_dim,
+        &options,
+        max_embedding_chars,
+    )?;
     progress(ReconcileProgress::Started {
         model_id: active_model_id.clone(),
-        total_chunks: report.processed_chunks,
+        total_chunks,
         batch_size,
     });
 
-    for batch in chunks.chunks(batch_size) {
-        let texts = batch.iter().map(|chunk| chunk.text.clone()).collect::<Vec<_>>();
+    let mut remaining = options.limit.map(u64::from);
+    loop {
+        if remaining == Some(0) {
+            break;
+        }
+        if options.max_seconds.is_some_and(|seconds| timer.elapsed().as_secs() >= seconds) {
+            report.status = "Partial".to_string();
+            report.message = Some(format!(
+                "max_seconds={} reached; rerun reconcile to continue",
+                options.max_seconds.unwrap_or_default()
+            ));
+            break;
+        }
+        let batch_limit = remaining
+            .map(|value| value.min(u64::try_from(batch_size).unwrap_or(u64::MAX)))
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(u32::try_from(batch_size).unwrap_or(u32::MAX));
+        let selected = select_reconcile_batch(
+            conn,
+            &active_model_id,
+            &model_version,
+            embedding_dim,
+            batch_limit,
+            &options,
+            max_embedding_chars,
+        )?;
+        if selected.jobs.is_empty() {
+            for (policy, count) in selected.skipped_by_policy {
+                *report.skipped_by_policy.entry(policy).or_default() += count;
+                report.skipped_chunks = report.skipped_chunks.saturating_add(count);
+            }
+            break;
+        }
+        for (policy, count) in selected.skipped_by_policy {
+            *report.skipped_by_policy.entry(policy).or_default() += count;
+            report.skipped_chunks = report.skipped_chunks.saturating_add(count);
+        }
+        for job in &selected.jobs {
+            *report.work_reasons.entry(job.reason.as_str().to_string()).or_default() += 1;
+            report.input_chars = report
+                .input_chars
+                .saturating_add(u64::try_from(job.input_chars).unwrap_or(u64::MAX));
+            if job.input_truncated {
+                report.truncated_inputs += 1;
+            }
+        }
+        let texts = selected.jobs.iter().map(|chunk| chunk.input_text.clone()).collect::<Vec<_>>();
         match embedder.embed_batch(&texts) {
-            Ok(vectors) if vectors.len() == batch.len() => {
+            Ok(vectors) if vectors.len() == selected.jobs.len() => {
                 write_current_embedding_batch(
                     conn,
                     embedder.as_ref(),
                     &model_version,
-                    batch,
+                    &selected.jobs,
                     &vectors,
                 )?;
-                report.embeddings_written += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                report.embeddings_written += u64::try_from(selected.jobs.len()).unwrap_or(u64::MAX);
             },
             Ok(vectors) => {
                 let error = format!(
                     "embedder {} returned {} vectors for {} texts",
                     embedder.model_id(),
                     vectors.len(),
-                    batch.len()
+                    selected.jobs.len()
                 );
                 write_failed_embedding_batch(
                     conn,
                     embedder.as_ref(),
                     &model_version,
-                    batch,
+                    &selected.jobs,
                     &error,
                 )?;
-                report.failed_chunks += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                report.failed_chunks += u64::try_from(selected.jobs.len()).unwrap_or(u64::MAX);
             },
             Err(err) => {
                 write_failed_embedding_batch(
                     conn,
                     embedder.as_ref(),
                     &model_version,
-                    batch,
+                    &selected.jobs,
                     &err.to_string(),
                 )?;
-                report.failed_chunks += u64::try_from(batch.len()).unwrap_or(u64::MAX);
+                report.failed_chunks += u64::try_from(selected.jobs.len()).unwrap_or(u64::MAX);
             },
+        }
+        report.processed_chunks = report
+            .embeddings_written
+            .saturating_add(report.failed_chunks)
+            .saturating_add(report.blocked_chunks);
+        if let Some(value) = remaining.as_mut() {
+            *value = value.saturating_sub(u64::try_from(selected.jobs.len()).unwrap_or(0));
         }
         progress(ReconcileProgress::Batch {
             processed_chunks: report.embeddings_written
                 + report.failed_chunks
                 + report.blocked_chunks,
-            total_chunks: report.processed_chunks,
+            total_chunks,
             embeddings_written: report.embeddings_written,
             blocked_chunks: report.blocked_chunks,
         });
@@ -605,6 +770,7 @@ pub fn reconcile_with_progress(
         report.message =
             Some(format!("{} chunks failed; retry after backoff", report.failed_chunks));
     }
+    finalize_reconcile_throughput(&mut report, timer.elapsed().as_millis());
 
     finish_reconcile_attempt(conn, attempt_id, &report)?;
     progress(ReconcileProgress::Finished {
@@ -629,7 +795,10 @@ fn finish_reconcile_attempt(
             embeddings_written = ?4,
             blocked_chunks = ?5,
             status = ?6,
-            message = ?7
+            message = ?7,
+            elapsed_ms = ?8,
+            input_chars = ?9,
+            batch_size = ?10
         WHERE id = ?1
         ",
         params![
@@ -640,10 +809,68 @@ fn finish_reconcile_attempt(
             i64::try_from(report.blocked_chunks).unwrap_or(i64::MAX),
             report.status,
             report.message,
+            i64::try_from(report.elapsed_ms).unwrap_or(i64::MAX),
+            i64::try_from(report.input_chars).unwrap_or(i64::MAX),
+            i64::try_from(report.batch_size).unwrap_or(i64::MAX),
         ],
     )?;
     set_reconcile_meta(conn, LAST_EMBEDDING_RECONCILE_FINISHED_META, &finished.to_string())?;
     Ok(())
+}
+
+fn last_reconcile_status(conn: &Connection) -> anyhow::Result<Option<LastReconcileStatus>> {
+    conn.query_row(
+        "
+        SELECT started_at_ms,
+               finished_at_ms,
+               batch_size,
+               processed_chunks,
+               embeddings_written,
+               blocked_chunks,
+               elapsed_ms,
+               input_chars,
+               status,
+               message
+        FROM reconcile_attempts
+        ORDER BY started_at_ms DESC, id DESC
+        LIMIT 1
+        ",
+        [],
+        |row| {
+            let elapsed_ms = u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+            let input_chars = u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0);
+            let embeddings_written = u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0);
+            let elapsed_secs = (elapsed_ms as f64 / 1000.0).max(0.001);
+            Ok(LastReconcileStatus {
+                started_at_ms: row.get(0)?,
+                finished_at_ms: row.get(1)?,
+                batch_size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                processed_chunks: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                embeddings_written,
+                blocked_chunks: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                elapsed_ms,
+                input_chars,
+                chunks_per_sec: embeddings_written as f64 / elapsed_secs,
+                chars_per_sec: input_chars as f64 / elapsed_secs,
+                status: row.get(8)?,
+                message: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn finalize_reconcile_throughput(report: &mut ReconcileReport, elapsed_ms: u128) {
+    report.elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+    let elapsed_secs = (report.elapsed_ms as f64 / 1000.0).max(0.001);
+    report.chunks_per_sec = report.embeddings_written as f64 / elapsed_secs;
+    report.chars_per_sec = report.input_chars as f64 / elapsed_secs;
+    report.avg_chars_per_chunk = if report.embeddings_written > 0 {
+        report.input_chars as f64 / report.embeddings_written as f64
+    } else {
+        0.0
+    };
 }
 
 fn upsert_model(
@@ -824,72 +1051,105 @@ fn model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelInfo> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CurrentChunk {
     id: i64,
+    path: String,
+    language: String,
+    file_kind: String,
+    chunk_kind: String,
+    symbol_path: Option<String>,
     text: String,
     text_hash: String,
+    embedding_status: Option<String>,
+    source_text_hash: Option<String>,
+    model_version: Option<String>,
+    embedding_dim: Option<i64>,
+    input_hash: Option<String>,
+    embedding_text_version: Option<String>,
+    next_retry_after_ms: Option<i64>,
     reason: ReconcileReason,
 }
 
+#[derive(Debug)]
+struct PreparedEmbeddingJob {
+    id: i64,
+    text_hash: String,
+    input_text: String,
+    input_hash: String,
+    input_chars: usize,
+    input_truncated: bool,
+    policy: String,
+    priority: i64,
+    reason: ReconcileReason,
+}
+
+struct SelectedBatch {
+    jobs: Vec<PreparedEmbeddingJob>,
+    skipped_by_policy: BTreeMap<String, u64>,
+}
+
 fn current_chunks(conn: &Connection, limit: Option<u32>) -> anyhow::Result<Vec<CurrentChunk>> {
-    let rows = if let Some(limit) = limit {
-        let mut stmt =
-            conn.prepare("SELECT id, text, text_hash FROM chunks ORDER BY id LIMIT ?1")?;
-        let rows = stmt.query_map(params![i64::from(limit)], current_chunk_row)?;
-        collect_rows(rows)?
-    } else {
-        let mut stmt = conn.prepare("SELECT id, text, text_hash FROM chunks ORDER BY id")?;
-        let rows = stmt.query_map([], current_chunk_row)?;
-        collect_rows(rows)?
-    };
-    Ok(rows)
+    embedding_job_candidates(conn, "", "", 0, limit, false)
 }
 
 fn current_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CurrentChunk> {
     Ok(CurrentChunk {
         id: row.get(0)?,
-        text: row.get(1)?,
-        text_hash: row.get(2)?,
+        path: row.get(1)?,
+        language: row.get(2)?,
+        file_kind: row.get(3)?,
+        chunk_kind: row.get(4)?,
+        symbol_path: row.get(5)?,
+        text: row.get(6)?,
+        text_hash: row.get(7)?,
+        embedding_status: row.get(8)?,
+        source_text_hash: row.get(9)?,
+        model_version: row.get(10)?,
+        embedding_dim: row.get(11)?,
+        input_hash: row.get(12)?,
+        embedding_text_version: row.get(13)?,
+        next_retry_after_ms: row.get(14)?,
         reason: ReconcileReason::Forced,
     })
 }
 
-fn chunks_needing_embedding(
+fn embedding_job_candidates(
     conn: &Connection,
     model_id: &str,
     model_version: &str,
     dim: usize,
     limit: Option<u32>,
+    changed_first: bool,
 ) -> anyhow::Result<Vec<CurrentChunk>> {
-    let sql = "
+    let changed_order = if changed_first {
+        "chunks.source_revision DESC,"
+    } else {
+        "chunks.embedding_priority ASC,"
+    };
+    let sql = format!(
+        "
         SELECT chunks.id,
+               files.path,
+               files.language,
+               files.kind,
+               chunks.chunk_kind,
+               chunks.symbol_path,
                chunks.text,
                chunks.text_hash,
-               CASE
-                   WHEN chunk_embeddings.chunk_id IS NULL THEN 'Missing'
-                   WHEN chunk_embeddings.source_text_hash != chunks.text_hash THEN 'SourceChanged'
-                   WHEN chunk_embeddings.model_version != ?2 THEN 'ModelChanged'
-                   WHEN chunk_embeddings.embedding_dim != ?3 THEN 'DimChanged'
-                   WHEN chunk_embeddings.status = 'Failed' THEN 'RetryAfterFailure'
-                   ELSE 'Missing'
-               END AS reason
+               chunk_embeddings.status,
+               chunk_embeddings.source_text_hash,
+               chunk_embeddings.model_version,
+               chunk_embeddings.embedding_dim,
+               chunk_embeddings.input_hash,
+               chunk_embeddings.embedding_text_version,
+               chunk_embeddings.next_retry_after_ms
         FROM chunks
+        JOIN files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
           ON chunk_embeddings.chunk_id = chunks.id
          AND chunk_embeddings.model_id = ?1
         WHERE chunks.text IS NOT NULL
-          AND (
-            chunk_embeddings.chunk_id IS NULL
-            OR chunk_embeddings.source_text_hash != chunks.text_hash
-            OR chunk_embeddings.model_version != ?2
-            OR chunk_embeddings.embedding_dim != ?3
-            OR chunk_embeddings.status IN ('Missing', 'Stale')
-            OR (
-              chunk_embeddings.status = 'Failed'
-              AND COALESCE(chunk_embeddings.next_retry_after_ms, 0) <= ?4
-            )
-          )
         ORDER BY
           CASE
             WHEN chunk_embeddings.chunk_id IS NULL THEN 0
@@ -897,11 +1157,12 @@ fn chunks_needing_embedding(
             WHEN chunk_embeddings.status = 'Failed' THEN 2
             ELSE 3
           END,
-          chunks.source_revision DESC,
+          {changed_order}
           chunks.id
         LIMIT ?5
-    ";
-    let mut stmt = conn.prepare(sql)?;
+    "
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
             model_id,
@@ -910,34 +1171,365 @@ fn chunks_needing_embedding(
             now_ms(),
             limit.map(i64::from).unwrap_or(i64::MAX)
         ],
-        |row| {
-            Ok(CurrentChunk {
-                id: row.get(0)?,
-                text: row.get(1)?,
-                text_hash: row.get(2)?,
-                reason: reconcile_reason(row.get::<_, String>(3)?.as_str()),
-            })
-        },
+        current_chunk_row,
     )?;
-    collect_rows(rows)
+    let mut chunks = collect_rows(rows)?;
+    if !model_id.is_empty() {
+        for chunk in &mut chunks {
+            chunk.reason = ReconcileReason::Missing;
+        }
+    }
+    Ok(chunks)
 }
 
-fn reconcile_reason(value: &str) -> ReconcileReason {
-    match value {
-        "SourceChanged" => ReconcileReason::SourceChanged,
-        "ModelChanged" => ReconcileReason::ModelChanged,
-        "DimChanged" => ReconcileReason::DimChanged,
-        "RetryAfterFailure" => ReconcileReason::RetryAfterFailure,
-        "Forced" => ReconcileReason::Forced,
-        _ => ReconcileReason::Missing,
+impl CurrentChunk {
+    fn reason(
+        &self,
+        model_version: &str,
+        dim: usize,
+        now_ms: i64,
+        _max_embedding_chars: usize,
+    ) -> ReconcileReason {
+        if self.reason == ReconcileReason::Forced {
+            return ReconcileReason::Forced;
+        }
+        if self.embedding_status.is_none() {
+            return ReconcileReason::Missing;
+        }
+        if self.source_text_hash.as_deref() != Some(self.text_hash.as_str()) {
+            return ReconcileReason::SourceChanged;
+        }
+        if self.input_hash.as_deref().is_none_or(str::is_empty) {
+            return ReconcileReason::InputChanged;
+        }
+        if self.model_version.as_deref() != Some(model_version)
+            || self.embedding_text_version.as_deref() != Some(EMBEDDING_TEXT_VERSION)
+        {
+            return ReconcileReason::ModelChanged;
+        }
+        if self.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX)) {
+            return ReconcileReason::DimChanged;
+        }
+        if self.embedding_status.as_deref() == Some("Failed")
+            && self.next_retry_after_ms.unwrap_or(0) <= now_ms
+        {
+            return ReconcileReason::RetryAfterFailure;
+        }
+        ReconcileReason::Missing
     }
+}
+
+fn estimated_reconcile_jobs(
+    conn: &Connection,
+    model_id: &str,
+    model_version: &str,
+    dim: usize,
+    options: &ReconcileOptions,
+    max_embedding_chars: usize,
+) -> anyhow::Result<u64> {
+    let candidates = if options.force {
+        current_chunks(conn, options.limit)?
+    } else {
+        embedding_job_candidates(
+            conn,
+            model_id,
+            model_version,
+            dim,
+            options.limit,
+            options.changed_first,
+        )?
+    };
+    let count = candidates
+        .iter()
+        .filter(|candidate| {
+            policy_for_job(candidate, max_embedding_chars).eligible
+                && (options.force
+                    || needs_embedding(
+                        candidate,
+                        model_id,
+                        model_version,
+                        dim,
+                        max_embedding_chars,
+                    ))
+        })
+        .count();
+    Ok(u64::try_from(count).unwrap_or(u64::MAX))
+}
+
+fn select_reconcile_batch(
+    conn: &Connection,
+    model_id: &str,
+    model_version: &str,
+    dim: usize,
+    limit: u32,
+    options: &ReconcileOptions,
+    max_embedding_chars: usize,
+) -> anyhow::Result<SelectedBatch> {
+    let scan_limit = options.limit.unwrap_or(100_000).max(limit);
+    let candidates = if options.force {
+        current_chunks(conn, Some(scan_limit))?
+    } else {
+        embedding_job_candidates(
+            conn,
+            model_id,
+            model_version,
+            dim,
+            Some(scan_limit),
+            options.changed_first,
+        )?
+    };
+    let mut skipped_by_policy = BTreeMap::new();
+    let mut jobs = Vec::new();
+    for candidate in candidates {
+        let policy = policy_for_job(&candidate, max_embedding_chars);
+        if !policy.eligible {
+            *skipped_by_policy.entry(policy.policy).or_default() += 1;
+            continue;
+        }
+        if !options.force
+            && !needs_embedding(&candidate, model_id, model_version, dim, max_embedding_chars)
+        {
+            continue;
+        }
+        let input = build_embedding_input(&candidate, max_embedding_chars);
+        let reason = if options.force {
+            ReconcileReason::Forced
+        } else {
+            candidate.reason(model_version, dim, now_ms(), max_embedding_chars)
+        };
+        jobs.push(PreparedEmbeddingJob {
+            id: candidate.id,
+            text_hash: candidate.text_hash,
+            input_hash: embedding_input_hash(model_id, model_version, &input.text),
+            input_chars: input.chars,
+            input_truncated: input.truncated,
+            input_text: input.text,
+            policy: policy.policy,
+            priority: policy.priority,
+            reason,
+        });
+        if jobs.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
+            break;
+        }
+    }
+    Ok(SelectedBatch { jobs, skipped_by_policy })
+}
+
+fn needs_embedding(
+    chunk: &CurrentChunk,
+    model_id: &str,
+    model_version: &str,
+    dim: usize,
+    max_embedding_chars: usize,
+) -> bool {
+    let input = build_embedding_input(chunk, max_embedding_chars);
+    let expected_input_hash = embedding_input_hash(model_id, model_version, &input.text);
+    chunk.embedding_status.as_deref() != Some("Current")
+        || chunk.source_text_hash.as_deref() != Some(chunk.text_hash.as_str())
+        || chunk.model_version.as_deref() != Some(model_version)
+        || chunk.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX))
+        || chunk.input_hash.as_deref() != Some(expected_input_hash.as_str())
+        || chunk.embedding_text_version.as_deref() != Some(EMBEDDING_TEXT_VERSION)
+}
+
+pub fn embedding_policy_for_chunk(
+    path: &Path,
+    language: &str,
+    file_kind: &str,
+    chunk_kind: &str,
+    symbol_path: Option<&str>,
+    text: &str,
+    max_embedding_chars: usize,
+) -> EmbeddingPolicyDecision {
+    let path_text = path.to_string_lossy();
+    let trimmed = text.trim();
+    if trimmed.chars().count() > max_embedding_chars.saturating_mul(4)
+        && (file_kind == "generated" || chunk_kind == "generated" || symbol_path.is_none())
+    {
+        return policy("SkipTooLarge", 9, false);
+    }
+    if file_kind == "generated" || chunk_kind == "generated" || looks_generated_path(&path_text) {
+        return policy("SkipGenerated", 9, false);
+    }
+    if is_test_fixture_path(&path_text) {
+        return policy("SkipTestFixture", 9, false);
+    }
+    if !matches!(language, "rust" | "typescript" | "kotlin" | "markdown") {
+        return policy("SkipLanguageUnsupported", 9, false);
+    }
+    if trimmed.chars().count() < MIN_EMBEDDING_CHARS {
+        return policy("SkipTooSmall", 9, false);
+    }
+    if is_low_signal_chunk(language, chunk_kind, symbol_path, trimmed) {
+        return policy("SkipLowSignal", 9, false);
+    }
+    policy("Embed", embedding_priority(&path_text, language, chunk_kind, symbol_path), true)
+}
+
+fn policy(name: &str, priority: i64, eligible: bool) -> EmbeddingPolicyDecision {
+    EmbeddingPolicyDecision { policy: name.to_string(), priority, eligible }
+}
+
+fn policy_for_job(chunk: &CurrentChunk, max_embedding_chars: usize) -> EmbeddingPolicyDecision {
+    embedding_policy_for_chunk(
+        Path::new(&chunk.path),
+        &chunk.language,
+        &chunk.file_kind,
+        &chunk.chunk_kind,
+        chunk.symbol_path.as_deref(),
+        &chunk.text,
+        max_embedding_chars,
+    )
+}
+
+fn embedding_priority(
+    path: &str,
+    language: &str,
+    chunk_kind: &str,
+    symbol_path: Option<&str>,
+) -> i64 {
+    if symbol_path.is_some()
+        && matches!(chunk_kind, "code")
+        && !is_test_path(path)
+        && language != "markdown"
+    {
+        return 0;
+    }
+    if language == "markdown" {
+        return 1;
+    }
+    if is_test_path(path) {
+        return 2;
+    }
+    1
+}
+
+fn priority_label(priority: i64) -> &'static str {
+    match priority {
+        0 => "source_symbols",
+        1 => "source_or_docs",
+        2 => "tests",
+        3 => "low_signal",
+        9 => "skipped",
+        _ => "other",
+    }
+}
+
+fn looks_generated_path(path: &str) -> bool {
+    path.contains("/generated/")
+        || path.contains("/src/generated/")
+        || path.contains("/target/")
+        || path.ends_with("Cargo.lock")
+        || path.ends_with("package-lock.json")
+        || path.ends_with("pnpm-lock.yaml")
+}
+
+fn is_test_path(path: &str) -> bool {
+    path.contains("/tests/")
+        || path.contains("/test/")
+        || path.contains("__tests__")
+        || path.ends_with("_test.rs")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".spec.ts")
+        || path.ends_with(".test.tsx")
+        || path.ends_with(".spec.tsx")
+}
+
+fn is_test_fixture_path(path: &str) -> bool {
+    path.contains("/fixtures/")
+        || path.contains("/__fixtures__/")
+        || path.contains("/testdata/")
+        || path.contains("/snapshots/")
+        || path.ends_with(".snap")
+}
+
+fn is_low_signal_chunk(
+    language: &str,
+    chunk_kind: &str,
+    symbol_path: Option<&str>,
+    text: &str,
+) -> bool {
+    if language == "markdown" {
+        return false;
+    }
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with("/*"))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return true;
+    }
+    if symbol_path.is_none() && chunk_kind == "code" && lines.len() <= 3 {
+        return true;
+    }
+    lines.iter().all(|line| {
+        line.starts_with("use ")
+            || line.starts_with("pub use ")
+            || line.starts_with("import ")
+            || line.starts_with("export ")
+            || line.starts_with("mod ")
+            || line.starts_with("pub mod ")
+            || *line == "}"
+            || *line == "{"
+    })
+}
+
+struct EmbeddingInput {
+    text: String,
+    chars: usize,
+    truncated: bool,
+}
+
+fn build_embedding_input(chunk: &CurrentChunk, max_chars: usize) -> EmbeddingInput {
+    let mut input = String::new();
+    input.push_str("path: ");
+    input.push_str(&chunk.path);
+    input.push('\n');
+    input.push_str("language: ");
+    input.push_str(&chunk.language);
+    input.push('\n');
+    input.push_str("kind: ");
+    input.push_str(&chunk.chunk_kind);
+    input.push('\n');
+    if let Some(symbol_path) = &chunk.symbol_path {
+        input.push_str("symbol: ");
+        input.push_str(symbol_path);
+        input.push('\n');
+    }
+    input.push_str("body:\n");
+    let prefix_chars = input.chars().count();
+    let budget = max_chars.saturating_sub(prefix_chars).max(MIN_EMBEDDING_CHARS);
+    let (body, truncated) = truncate_chars(&chunk.text, budget);
+    input.push_str(&body);
+    let chars = input.chars().count();
+    EmbeddingInput { text: input, chars, truncated }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
+    if text.chars().count() <= max_chars {
+        return (text.to_string(), false);
+    }
+    (text.chars().take(max_chars).collect(), true)
+}
+
+fn embedding_input_hash(model_id: &str, model_version: &str, input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(model_version.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(EMBEDDING_TEXT_VERSION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn write_current_embedding_batch(
     conn: &Connection,
     embedder: &dyn Embedder,
     model_version: &str,
-    batch: &[CurrentChunk],
+    batch: &[PreparedEmbeddingJob],
     vectors: &[Vec<f32>],
 ) -> anyhow::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -954,7 +1546,7 @@ fn write_failed_embedding_batch(
     conn: &Connection,
     embedder: &dyn Embedder,
     model_version: &str,
-    batch: &[CurrentChunk],
+    batch: &[PreparedEmbeddingJob],
     error: &str,
 ) -> anyhow::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -984,7 +1576,7 @@ fn store_embedding(
     conn: &Connection,
     embedder: &dyn Embedder,
     model_version: &str,
-    chunk: &CurrentChunk,
+    chunk: &PreparedEmbeddingJob,
     vector: &[f32],
 ) -> anyhow::Result<()> {
     if vector.len() != embedder.dim() {
@@ -998,14 +1590,22 @@ fn store_embedding(
     conn.execute(
         "
         INSERT INTO chunk_embeddings(
-            chunk_id, model_id, model_version, source_text_hash, embedding_dim, vector_blob,
+            chunk_id, model_id, model_version, source_text_hash, input_hash,
+            embedding_text_version, embedding_policy, embedding_priority, input_chars,
+            input_truncated, embedding_dim, vector_blob,
             status, attempt_count, last_error_class, next_retry_after_ms, computed_at_ms,
             created_at_ms, last_error
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'Current', 1, NULL, NULL, ?7, ?7, NULL)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'Current', 1, NULL, NULL, ?13, ?13, NULL)
         ON CONFLICT(chunk_id, model_id) DO UPDATE SET
             model_version = excluded.model_version,
             source_text_hash = excluded.source_text_hash,
+            input_hash = excluded.input_hash,
+            embedding_text_version = excluded.embedding_text_version,
+            embedding_policy = excluded.embedding_policy,
+            embedding_priority = excluded.embedding_priority,
+            input_chars = excluded.input_chars,
+            input_truncated = excluded.input_truncated,
             embedding_dim = excluded.embedding_dim,
             vector_blob = excluded.vector_blob,
             status = excluded.status,
@@ -1021,6 +1621,12 @@ fn store_embedding(
             embedder.model_id(),
             model_version,
             chunk.text_hash,
+            chunk.input_hash,
+            EMBEDDING_TEXT_VERSION,
+            chunk.policy,
+            chunk.priority,
+            i64::try_from(chunk.input_chars).unwrap_or(i64::MAX),
+            chunk.input_truncated,
             i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
             encode_vector(vector),
             now_ms()
@@ -1033,21 +1639,29 @@ fn store_failed_embedding(
     conn: &Connection,
     embedder: &dyn Embedder,
     model_version: &str,
-    chunk: &CurrentChunk,
+    chunk: &PreparedEmbeddingJob,
     error: &str,
 ) -> anyhow::Result<()> {
     let retry_at = now_ms().saturating_add(60_000);
     conn.execute(
         "
         INSERT INTO chunk_embeddings(
-            chunk_id, model_id, model_version, source_text_hash, embedding_dim, vector_blob,
+            chunk_id, model_id, model_version, source_text_hash, input_hash,
+            embedding_text_version, embedding_policy, embedding_priority, input_chars,
+            input_truncated, embedding_dim, vector_blob,
             status, attempt_count, last_error_class, next_retry_after_ms, computed_at_ms,
             created_at_ms, last_error
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, x'', 'Failed', 1, ?6, ?7, NULL, ?8, ?9)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, x'', 'Failed', 1, ?12, ?13, NULL, ?14, ?15)
         ON CONFLICT(chunk_id, model_id) DO UPDATE SET
             model_version = excluded.model_version,
             source_text_hash = excluded.source_text_hash,
+            input_hash = excluded.input_hash,
+            embedding_text_version = excluded.embedding_text_version,
+            embedding_policy = excluded.embedding_policy,
+            embedding_priority = excluded.embedding_priority,
+            input_chars = excluded.input_chars,
+            input_truncated = excluded.input_truncated,
             embedding_dim = excluded.embedding_dim,
             vector_blob = x'',
             status = 'Failed',
@@ -1063,6 +1677,12 @@ fn store_failed_embedding(
             embedder.model_id(),
             model_version,
             chunk.text_hash,
+            chunk.input_hash,
+            EMBEDDING_TEXT_VERSION,
+            chunk.policy,
+            chunk.priority,
+            i64::try_from(chunk.input_chars).unwrap_or(i64::MAX),
+            chunk.input_truncated,
             i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
             "Transient",
             retry_at,
@@ -1148,8 +1768,10 @@ pub fn current_embedding_count(conn: &Connection, model_id: &str) -> anyhow::Res
           AND chunk_embeddings.status = 'Current'
           AND chunk_embeddings.source_text_hash = chunks.text_hash
           AND chunk_embeddings.model_version = ?2
+          AND chunk_embeddings.embedding_text_version = ?3
+          AND chunk_embeddings.input_hash != ''
         ",
-        params![model_id, model_version],
+        params![model_id, model_version, EMBEDDING_TEXT_VERSION],
         |row| row.get(0),
     )?;
     Ok(u64::try_from(count).unwrap_or(0))
@@ -1334,10 +1956,12 @@ fn current_artifact_count(
           AND {table}.status = 'Current'
           AND {table}.source_text_hash = chunks.text_hash
           AND {table}.model_version = ?2
+          AND {table}.embedding_text_version = ?3
+          AND {table}.input_hash != ''
           AND {table}.embedding_dim = ai_models.embedding_dim
     ",
     );
-    count_query2(conn, &sql, model_id, &model_version)
+    count_query3(conn, &sql, model_id, &model_version, EMBEDDING_TEXT_VERSION)
 }
 
 fn stale_artifact_count(
@@ -1357,12 +1981,14 @@ fn stale_artifact_count(
           AND (
             {table}.source_text_hash != chunks.text_hash
             OR {table}.model_version != ?2
+            OR {table}.embedding_text_version != ?3
+            OR {table}.input_hash = ''
             OR {table}.embedding_dim != ai_models.embedding_dim
             OR {table}.status = 'Stale'
           )
     ",
     );
-    count_query2(conn, &sql, model_id, &model_version)
+    count_query3(conn, &sql, model_id, &model_version, EMBEDDING_TEXT_VERSION)
 }
 
 fn status_artifact_count(
@@ -1384,8 +2010,14 @@ fn status_artifact_count(
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-fn count_query2(conn: &Connection, sql: &str, model_id: &str, value: &str) -> anyhow::Result<u64> {
-    let count = conn.query_row(sql, params![model_id, value], |row| row.get::<_, i64>(0))?;
+fn count_query3(
+    conn: &Connection,
+    sql: &str,
+    model_id: &str,
+    left: &str,
+    right: &str,
+) -> anyhow::Result<u64> {
+    let count = conn.query_row(sql, params![model_id, left, right], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 

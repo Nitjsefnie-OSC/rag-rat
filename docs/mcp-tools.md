@@ -13,7 +13,7 @@ cargo install --path tools/rag-rat --bin rag-rat --features fastembed
 rag-rat migrate --config /home/kk/src/held/rag-rat.toml
 rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
 rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
-rag-rat reconcile --limit 500 --config /home/kk/src/held/rag-rat.toml
+rag-rat reconcile --changed-first --limit 500 --batch-size 64 --config /home/kk/src/held/rag-rat.toml
 rag-rat doctor --config /home/kk/src/held/rag-rat.toml
 ```
 
@@ -300,24 +300,37 @@ last sync time, and whether the `gh` CLI capability is available.
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
-Local AI artifacts are explicit and current-only. `local_ai_status` reports embedding model state
-and artifact counts. The CLI-only `models install embedding-hash` command selects the deterministic
-baseline embedder. Building with `--features fastembed` enables the real local
+Local AI artifacts are explicit and current-only. `local_ai_status` reports embedding model state,
+artifact counts, FastEmbed build/cache/model details, and the last reconcile throughput summary when
+available. The CLI-only `models install embedding-hash` command selects the deterministic baseline
+embedder. Building with `--features fastembed` enables the real local
 `fastembed-all-minilm-l6-v2` backend; `models install fastembed-all-minilm-l6-v2` is the intended
 FastEmbed cache-population step. `doctor` reports FastEmbed build support, cache path, model,
-dimension, current/stale/missing/failed embedding counts, and the next command needed to make local
-AI current. `reconcile` writes model-id, dimension, and text-hash-bound chunk embeddings in
-configurable batches for current chunk hashes only.
+dimension, current/stale/missing/failed embedding counts, last reconcile throughput, and the next
+command needed to make local AI current. `reconcile` writes model-id, dimension, text-hash-bound, and
+embedding-input-hash-bound chunk embeddings in configurable batches for eligible current chunks
+only.
 `semantic_search` combines BM25 candidates, vector similarity, symbol/name/path boosts,
 graph-neighborhood boosts, and optional git/GitHub papertrail boosts. Embeddings are used only when
 the active model is installed, the embedding dimension matches active model metadata, the artifact
-status is `Current`, and the artifact text hash matches the current chunk text hash; stale
-embeddings are treated as absent. There is no summarizer or LLM runtime in this milestone.
+status is `Current`, the artifact text hash matches the current chunk text hash, and the stored
+embedding input hash matches the current bounded embedding input; stale embeddings are treated as
+absent. There is no summarizer or LLM runtime in this milestone.
 
-Indexing and reconcile use a Rayon worker pool for CPU-heavy preparation: file reads, hashing,
-tree-sitter chunk/symbol preparation, git-log parsing, and embedding computation run across available
-cores. SQLite writes are still serialized through the local index connection and transaction-batched
-where the command owns the write scope.
+Reconcile intentionally does not embed every chunk. It skips generated/coarse chunks, tiny chunks,
+oversized low-value chunks, unsupported languages, low-signal import/export barrels, and test
+fixtures with explicit policy reasons such as `SkipGenerated`, `SkipTooSmall`, `SkipTooLarge`,
+`SkipLowSignal`, `SkipLanguageUnsupported`, and `SkipTestFixture`. Source symbols and docs are
+prioritized ahead of tests and low-signal chunks. `rag-rat reconcile --plan` reports skipped counts
+by policy and missing work by priority; reconcile JSON reports batch size, input character counts,
+truncated input counts, `chunks_per_sec`, `chars_per_sec`, and average input size. Use
+`rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64` for bounded daily catch-up and
+`rag-rat reconcile --until-clean --batch-size 64` for a full backlog pass.
+
+Indexing uses a Rayon worker pool for CPU-heavy preparation: file reads, hashing, tree-sitter
+chunk/symbol preparation, and git-log parsing run across available cores. Reconcile builds bounded
+embedding inputs, runs model inference outside SQLite transactions, then writes vectors through one
+short serialized transaction per batch.
 
 Parser failures are visible through `index_status.parser_failure_paths`, with path, language, and
 message for each failed source parse. Markdown files are chunked by headings instead of parsed with

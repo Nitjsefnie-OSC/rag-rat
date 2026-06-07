@@ -31,15 +31,20 @@ Local AI artifacts are explicit. `embedding-hash` is the deterministic baseline 
 `fastembed-all-minilm-l6-v2` is the first real local embedding backend and requires building with
 `--features fastembed`. `models install` selects the active embedding model and is the intended
 FastEmbed cache-population step. `doctor` reports whether this binary has FastEmbed compiled in, the
-model cache path, model name, dimension, current/stale/missing/failed embedding counts, and the next
-command to run. `reconcile` writes model-id, dimension, and text-hash-bound chunk embeddings only for
-current chunks. `semantic_search` uses embeddings only when the model is installed, the stored
-dimension matches the active model metadata, the artifact is `Current`, and the artifact text hash
-matches the current chunk text hash. Stale AI artifacts are treated as absent.
+model cache path, model name, dimension, current/stale/missing/failed embedding counts, last
+reconcile throughput, and the next command to run. `reconcile` treats SQLite as the derived-artifact
+queue: it embeds only eligible current chunks whose bounded embedding input is missing, stale by
+input hash, stale by model/version/dimension, or retryable after failure. Low-signal chunks are
+skipped with visible policy reasons such as `SkipGenerated`, `SkipTooSmall`, `SkipTooLarge`,
+`SkipLowSignal`, `SkipLanguageUnsupported`, and `SkipTestFixture`. `semantic_search` uses embeddings
+only when the model is installed, the stored dimension matches active model metadata, the artifact is
+`Current`, and both source text hash and embedding input hash match the current chunk. Stale AI
+artifacts are treated as absent.
 
 CPU-heavy index work uses the Rayon worker pool. File reads, source hashing, tree-sitter preparation,
-git-log parsing, and embedding computation run in parallel across available cores; SQLite writes stay
-on one deterministic writer path and are transaction-batched where the command owns the write scope.
+and git-log parsing run in parallel across available cores. Reconcile batches embedding inputs,
+runs model inference outside SQLite transactions, then writes vectors through one short serialized
+transaction per batch so the database is not held open while FastEmbed/ONNX is doing CPU work.
 
 ## Commands
 
@@ -58,6 +63,8 @@ cargo run --bin rag-rat -- models list --config rag-rat.toml
 cargo run --bin rag-rat -- models install embedding-hash --config rag-rat.toml
 cargo run --features fastembed --bin rag-rat -- models install fastembed-all-minilm-l6-v2 --config rag-rat.toml
 cargo run --bin rag-rat -- reconcile --limit 100 --batch-size 32 --config rag-rat.toml
+cargo run --bin rag-rat -- reconcile --changed-first --max-seconds 60 --batch-size 64 --config rag-rat.toml
+cargo run --bin rag-rat -- reconcile --until-clean --batch-size 64 --config rag-rat.toml
 cargo run --bin rag-rat -- eval --config rag-rat.toml
 cargo run --bin rag-rat -- eval --json --config rag-rat.toml
 cargo run --bin rag-rat -- eval --update-baseline --config rag-rat.toml
@@ -79,7 +86,7 @@ cargo install --path tools/rag-rat --bin rag-rat --features fastembed
 rag-rat migrate --config /home/kk/src/held/rag-rat.toml
 rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
 rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
-rag-rat reconcile --limit 500 --config /home/kk/src/held/rag-rat.toml
+rag-rat reconcile --changed-first --limit 500 --batch-size 64 --config /home/kk/src/held/rag-rat.toml
 rag-rat doctor --config /home/kk/src/held/rag-rat.toml
 ```
 
@@ -150,6 +157,16 @@ such as `3 unindexed source files detected. Run rag-rat index --full or rag-rat 
 Search never runs silently against stale FTS state. The index records a content revision for the
 current `files`/`chunks` rows, tracks whether FTS is dirty after writes, and synchronizes FTS before
 search when `fts_source_revision` no longer matches `content_revision`.
+
+`reconcile --plan` reports the embedding backlog by validity reason, priority class, and skip
+policy. Eligible chunks are prioritized before tests and low-signal material; generated/coarse,
+too-small, too-large, unsupported-language, fixture, import-only, and export-barrel chunks are
+skipped intentionally rather than embedded just to reach 100 percent vector coverage. Embedding input
+is bounded by `--max-embedding-chars` and hashed with the active model id, model version, and
+embedding text builder version, so indexing metadata churn does not recompute unchanged embedding
+inputs. Use `--changed-first --max-seconds 60 --batch-size 64` for daily catch-up, and
+`--until-clean --batch-size 64` for a full backlog pass. Reconcile JSON reports `chunks_per_sec`,
+`chars_per_sec`, average input size, truncated input count, and `skipped_by_policy`.
 
 `eval` runs the fixture-driven ranking and freshness harness from `evals/queries.toml` plus
 `evals/expected_hits.toml`. It reports MRR@10, Recall@10, path hit rate, symbol hit rate,
