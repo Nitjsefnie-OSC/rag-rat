@@ -14,8 +14,14 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         "index" => {
-            let db = if has_flag(&args, "--full") {
+            let db = if has_flag(&args, "--watch") {
+                anyhow::bail!(
+                    "index --watch is not implemented yet; use --changed, --discover, or --full"
+                );
+            } else if has_flag(&args, "--full") {
                 IndexDatabase::rebuild_with_progress(&config, render_index_progress)?
+            } else if has_flag(&args, "--discover") {
+                IndexDatabase::index_discover_with_progress(&config, render_index_progress)?
             } else {
                 IndexDatabase::index_changed_with_progress(&config, render_index_progress)?
             };
@@ -114,23 +120,23 @@ fn migrate(config: &Config, args: &[String]) -> anyhow::Result<()> {
 
 fn doctor(config: &Config) -> anyhow::Result<()> {
     let schema = IndexDatabase::migration_check(&config.database)?;
-    let index = if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
-        let db = IndexDatabase::open(&config.database)?;
-        Some(serde_json::to_value(db.status(&config.database)?)?)
-    } else {
-        None
-    };
-    let storage = if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
-        let db = IndexDatabase::open(&config.database)?;
-        Some(serde_json::to_value(db.storage_status()?)?)
-    } else {
-        None
-    };
+    let (index, discovery, storage) =
+        if schema.state == rag_rat_core::index::schema::SchemaState::Compatible {
+            let db = IndexDatabase::open(&config.database)?;
+            (
+                Some(serde_json::to_value(db.status(&config.database)?)?),
+                Some(serde_json::to_value(db.discovery_status(config)?)?),
+                Some(serde_json::to_value(db.storage_status()?)?),
+            )
+        } else {
+            (None, None, None)
+        };
     print_json(&serde_json::json!({
         "config_root": config.root,
         "database": config.database,
         "schema": schema,
         "storage": storage,
+        "discovery": discovery,
         "targets": config.targets.iter().map(|target| serde_json::json!({
             "name": target.name,
             "language": target.language.as_str(),
@@ -175,9 +181,8 @@ fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
 
 fn render_index_progress(progress: IndexProgress) {
     match progress {
-        IndexProgress::Started { database, full_rebuild } => {
-            let mode = if full_rebuild { "full rebuild" } else { "changed files" };
-            eprintln!("index: {mode} using {}", database.display());
+        IndexProgress::Started { database, mode } => {
+            eprintln!("index: {} using {}", mode.label(), database.display());
         },
         IndexProgress::Discovering => {
             eprintln!("index: discovering files");
@@ -208,7 +213,10 @@ fn usage() {
         "usage: rag-rat <index|doctor|migrate|query|mcp|github|models|reconcile|dump-config> --config <path> [query]\n\
          examples:\n\
          rag-rat index --config rag-rat.toml\n\
+         rag-rat index --changed --config rag-rat.toml\n\
+         rag-rat index --discover --config rag-rat.toml\n\
          rag-rat index --full --config rag-rat.toml\n\
+         rag-rat index --watch --config rag-rat.toml\n\
          rag-rat migrate --check --config rag-rat.toml\n\
          rag-rat github sync --from-refs --config rag-rat.toml\n\
          rag-rat models list --config rag-rat.toml\n\

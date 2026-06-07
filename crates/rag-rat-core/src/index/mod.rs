@@ -59,7 +59,7 @@ pub struct IndexDatabase {
 pub enum IndexProgress {
     Started {
         database: PathBuf,
-        full_rebuild: bool,
+        mode: IndexMode,
     },
     Discovering,
     Discovered {
@@ -76,6 +76,24 @@ pub enum IndexProgress {
     Finished {
         files: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMode {
+    Changed,
+    Discover,
+    Full,
+}
+
+impl IndexMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Changed => "changed files",
+            Self::Discover => "discovery",
+            Self::Full => "full rebuild",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +132,18 @@ pub struct ParserFailure {
     pub path: String,
     pub language: String,
     pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoveryStatus {
+    pub discovered_files: usize,
+    pub indexed_files: usize,
+    pub unindexed_files: usize,
+    pub unindexed_source_files: usize,
+    pub changed_indexed_files: usize,
+    pub removed_indexed_files: usize,
+    pub unindexed_sample: Vec<String>,
+    pub warning: Option<String>,
 }
 
 const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
@@ -177,7 +207,10 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: true });
+        progress(IndexProgress::Started {
+            database: config.database.clone(),
+            mode: IndexMode::Full,
+        });
         remove_database_files(&config.database)?;
         let mut db = Self::create_or_migrate(&config.database)?;
         let result = (|| -> anyhow::Result<()> {
@@ -210,6 +243,28 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
+        Self::index_incremental_with_progress(config, IndexMode::Changed, &mut progress)
+    }
+
+    pub fn index_discover(config: &Config) -> anyhow::Result<Self> {
+        Self::index_discover_with_progress(config, |_| {})
+    }
+
+    pub fn index_discover_with_progress<F>(config: &Config, mut progress: F) -> anyhow::Result<Self>
+    where
+        F: FnMut(IndexProgress),
+    {
+        Self::index_incremental_with_progress(config, IndexMode::Discover, &mut progress)
+    }
+
+    fn index_incremental_with_progress<F>(
+        config: &Config,
+        mode: IndexMode,
+        progress: &mut F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnMut(IndexProgress),
+    {
         if !config.database.exists() {
             return Self::rebuild_with_progress(config, progress);
         }
@@ -221,14 +276,18 @@ impl IndexDatabase {
         if db.indexed_file_count()? == 0 {
             return Self::rebuild_with_progress(config, progress);
         }
-        progress(IndexProgress::Started { database: config.database.clone(), full_rebuild: false });
+        progress(IndexProgress::Started { database: config.database.clone(), mode });
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             db.index_git_history(&config.root)?;
-            let indexed = db.index_changed_files_with_progress(config, &mut progress)?;
+            let indexed = match mode {
+                IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
+                IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
+                IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
+            };
             db.resolve_edges()?;
             if indexed > 0 {
                 db.sync_fts()?;
@@ -304,10 +363,35 @@ impl IndexDatabase {
         progress(IndexProgress::Discovering);
         let changes = git_changed_paths(&config.root)?;
         let files = collect_changed_index_files(config, &changes)?;
+        self.apply_incremental_file_plan(files, changes.deleted, progress)
+    }
+
+    fn index_discovered_files_with_progress<F>(
+        &self,
+        config: &Config,
+        progress: &mut F,
+    ) -> anyhow::Result<usize>
+    where
+        F: FnMut(IndexProgress),
+    {
+        progress(IndexProgress::Discovering);
+        let plan = discovery_plan(self.storage.connection(), config)?;
+        self.apply_incremental_file_plan(plan.files, plan.deleted, progress)
+    }
+
+    fn apply_incremental_file_plan<F>(
+        &self,
+        files: Vec<IndexFile>,
+        deleted: BTreeSet<PathBuf>,
+        progress: &mut F,
+    ) -> anyhow::Result<usize>
+    where
+        F: FnMut(IndexProgress),
+    {
         progress(IndexProgress::Discovered { files: files.len() });
 
-        let deleted_count = changes.deleted.len();
-        for path in changes.deleted {
+        let deleted_count = deleted.len();
+        for path in deleted {
             self.remove_file(&path)?;
         }
 
@@ -386,6 +470,29 @@ impl IndexDatabase {
 
     pub fn storage_status(&self) -> anyhow::Result<StorageStatus> {
         self.storage.status()
+    }
+
+    pub fn discovery_status(&self, config: &Config) -> anyhow::Result<DiscoveryStatus> {
+        let plan = discovery_plan(self.storage.connection(), config)?;
+        let unindexed_source_files =
+            plan.unindexed.iter().filter(|file| file.kind == TargetKind::Source).count();
+        let unindexed_sample =
+            plan.unindexed.iter().take(10).map(|file| path_string(&file.relative_path)).collect();
+        let warning = (unindexed_source_files > 0).then(|| {
+            format!(
+                "{unindexed_source_files} unindexed source files detected. Run `rag-rat index --full` or `rag-rat index --discover`."
+            )
+        });
+        Ok(DiscoveryStatus {
+            discovered_files: plan.discovered_files,
+            indexed_files: plan.indexed_files,
+            unindexed_files: plan.unindexed.len(),
+            unindexed_source_files,
+            changed_indexed_files: plan.changed.len(),
+            removed_indexed_files: plan.deleted.len(),
+            unindexed_sample,
+            warning,
+        })
     }
 
     pub fn search(
@@ -1224,12 +1331,22 @@ struct IndexedFile {
     sha256: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IndexFile {
     full_path: PathBuf,
     relative_path: PathBuf,
     language: Language,
     kind: TargetKind,
+}
+
+#[derive(Debug)]
+struct DiscoveryPlan {
+    files: Vec<IndexFile>,
+    deleted: BTreeSet<PathBuf>,
+    unindexed: Vec<IndexFile>,
+    changed: Vec<PathBuf>,
+    discovered_files: usize,
+    indexed_files: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1281,6 +1398,61 @@ fn collect_changed_index_files(
             continue;
         };
         files.push(IndexFile { full_path, relative_path: relative_path.clone(), language, kind });
+    }
+    Ok(files)
+}
+
+fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Result<DiscoveryPlan> {
+    let discovered = collect_index_files(config)?;
+    let mut indexed = indexed_file_map(conn)?;
+    let mut current_paths = BTreeSet::new();
+    let mut files = Vec::new();
+    let mut unindexed = Vec::new();
+    let mut changed = Vec::new();
+
+    for file in discovered {
+        let relative = path_string(&file.relative_path);
+        current_paths.insert(file.relative_path.clone());
+        let Some(indexed_hash) = indexed.remove(&relative) else {
+            unindexed.push(file.clone());
+            files.push(file);
+            continue;
+        };
+        let text = fs::read(&file.full_path)?;
+        let current_hash = hex_sha256(&text);
+        if current_hash != indexed_hash {
+            changed.push(file.relative_path.clone());
+            files.push(file);
+        }
+    }
+
+    let deleted = indexed
+        .into_keys()
+        .map(PathBuf::from)
+        .filter(|path| !current_paths.contains(path))
+        .collect::<BTreeSet<_>>();
+
+    Ok(DiscoveryPlan {
+        discovered_files: current_paths.len(),
+        indexed_files: current_paths
+            .len()
+            .saturating_add(deleted.len())
+            .saturating_sub(unindexed.len()),
+        files,
+        deleted,
+        unindexed,
+        changed,
+    })
+}
+
+fn indexed_file_map(conn: &rusqlite::Connection) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT path, sha256 FROM files ORDER BY path")?;
+    let rows =
+        stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let mut files = BTreeMap::new();
+    for row in rows {
+        let (path, sha256) = row?;
+        files.insert(path, sha256);
     }
     Ok(files)
 }
@@ -1554,6 +1726,34 @@ mod schema_bootstrap_tests {
         assert_eq!(newer.state, schema::SchemaState::Newer);
         let err = IndexDatabase::open(&database).unwrap_err().to_string();
         assert!(err.contains("newer rag-rat"), "{err}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_mode_indexes_new_files_and_removes_deleted_files() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn old_symbol() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        assert_eq!(db.discovery_status(&config).unwrap().unindexed_source_files, 0);
+
+        fs::write(root.join("src/new.rs"), "pub fn new_symbol() {}\n").unwrap();
+        fs::remove_file(root.join("src/lib.rs")).unwrap();
+        let drift = db.discovery_status(&config).unwrap();
+        assert_eq!(drift.unindexed_source_files, 1);
+        assert_eq!(drift.removed_indexed_files, 1);
+        assert!(drift.warning.as_deref().unwrap().contains("rag-rat index --discover"));
+
+        let db = IndexDatabase::index_discover(&config).unwrap();
+        let fresh = db.discovery_status(&config).unwrap();
+        assert_eq!(fresh.unindexed_source_files, 0);
+        assert_eq!(fresh.removed_indexed_files, 0);
+        assert!(fresh.warning.is_none());
+        assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
+        assert!(db.symbols("old_symbol", Some(Language::Rust), 10).unwrap().is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }

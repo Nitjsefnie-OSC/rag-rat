@@ -32,6 +32,8 @@ chunks. Stale AI artifacts are treated as absent.
 
 ```bash
 cargo run --bin rag-rat -- index --config rag-rat.toml
+cargo run --bin rag-rat -- index --changed --config rag-rat.toml
+cargo run --bin rag-rat -- index --discover --config rag-rat.toml
 cargo run --bin rag-rat -- index --full --config rag-rat.toml
 cargo run --bin rag-rat -- doctor --config rag-rat.toml
 cargo run --bin rag-rat -- migrate --check --config rag-rat.toml
@@ -58,8 +60,14 @@ dirty or partial migrations are refused with a rebuild instruction.
 Use `migrate --check` for CI/preflight and `migrate` to apply the current index schema baseline.
 Because the index is derived, hard migration failures should be resolved with `index --full`.
 
-`index` updates files currently changed in git status. Use `index --full` to rebuild every file
-and rebuild the SQLite FTS5 table from stored chunks.
+`index` defaults to `--changed`: it uses git status to index changed/new paths and remove deleted
+indexed paths. `index --discover` walks configured targets, detects new files, changed indexed
+files, and removed indexed files, then updates only that delta. Use `index --full` to rebuild every
+file and rebuild the SQLite FTS5 table from stored chunks. `index --watch` is reserved for a later
+file-watcher mode and currently exits with an explicit not-implemented error.
+
+`doctor` reports discovery drift. If configured source files are not indexed, it returns a warning
+such as `3 unindexed source files detected. Run rag-rat index --full or rag-rat index --discover.`
 
 Search never runs silently against stale FTS state. The index records a content revision for the
 current `files`/`chunks` rows, tracks whether FTS is dirty after writes, and synchronizes FTS before
