@@ -920,6 +920,14 @@ impl IndexDatabase {
     }
 
     pub fn github_sync_from_refs(&self, offline: bool) -> anyhow::Result<GitHubSyncReport> {
+        self.github_sync_from_refs_with_progress(offline, |_| {})
+    }
+
+    pub fn github_sync_from_refs_with_progress(
+        &self,
+        offline: bool,
+        progress: impl FnMut(github::GitHubSyncProgress),
+    ) -> anyhow::Result<GitHubSyncReport> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("index has no source_root metadata; rebuild required");
         };
@@ -932,7 +940,13 @@ impl IndexDatabase {
             )
         } else {
             let client = github::GhCliGitHubClient;
-            github::sync_from_refs(self.storage.connection(), root, Some(&client), false)
+            github::sync_from_refs_with_progress(
+                self.storage.connection(),
+                root,
+                Some(&client),
+                false,
+                progress,
+            )
         }
     }
 
@@ -3086,7 +3100,10 @@ mod schema_bootstrap_tests {
         let member_columns = table_columns(&db, "logical_symbol_members");
         assert!(member_columns.contains(&"symbol_id".to_string()));
         assert!(member_columns.contains(&"signature_hash".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 8);
+        let github_ref_sync_columns = table_columns(&db, "github_ref_sync");
+        assert!(github_ref_sync_columns.contains(&"status".to_string()));
+        assert!(github_ref_sync_columns.contains(&"last_error".to_string()));
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 9);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5030,6 +5047,36 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
     }
 
     #[test]
+    fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
+        let (root, config) = markdown_config(
+            "# Decision\nRefs cq27-dev/rag-rat#42 and cq27-dev/rag-rat#404\nwe will keep sqlite\n",
+        );
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let mock = PartiallyFailingGitHubClient;
+
+        let report =
+            github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        assert_eq!(report.discovered_refs, 2);
+        assert_eq!(report.synced_items, 5);
+        assert_eq!(report.failed_refs, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].number, 404);
+        assert_eq!(report.errors[0].status, "not_found");
+
+        let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+        assert_eq!(issue_hits.len(), 1);
+        assert_eq!(issue_hits[0].number, 42);
+
+        let second =
+            github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        assert_eq!(second.synced_items, 0);
+        assert_eq!(second.skipped_refs, 2);
+        assert_eq!(second.failed_refs, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn search_recovers_when_fts_is_marked_dirty() {
         let (root, config) = markdown_config("alpha token");
         let db = IndexDatabase::rebuild(&config).unwrap();
@@ -5445,6 +5492,58 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                 created_at: Some("2026-01-01T03:00:00Z".to_string()),
                 updated_at: Some("2026-01-01T03:00:00Z".to_string()),
             }])
+        }
+    }
+
+    struct PartiallyFailingGitHubClient;
+
+    impl github::GitHubClient for PartiallyFailingGitHubClient {
+        fn issue(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<github::GitHubIssue> {
+            if number == 404 {
+                anyhow::bail!("gh: Not Found (HTTP 404)");
+            }
+            MockGitHubClient.issue(owner, repo, number)
+        }
+
+        fn issue_comments(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Vec<github::GitHubComment>> {
+            MockGitHubClient.issue_comments(owner, repo, number)
+        }
+
+        fn pull(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Option<github::GitHubPullRequest>> {
+            MockGitHubClient.pull(owner, repo, number)
+        }
+
+        fn pull_reviews(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Vec<github::GitHubReview>> {
+            MockGitHubClient.pull_reviews(owner, repo, number)
+        }
+
+        fn pull_review_comments(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> anyhow::Result<Vec<github::GitHubReviewComment>> {
+            MockGitHubClient.pull_review_comments(owner, repo, number)
         }
     }
 }

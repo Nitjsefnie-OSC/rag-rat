@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 8;
+pub const LATEST_SCHEMA_VERSION: u32 = 9;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -33,6 +33,10 @@ const MIGRATION_008_ID: &str = "008_commit_addressable_worktrees";
 const MIGRATION_008_CHECKSUM: &str = "sha256:rag-rat-commit-addressable-worktrees-v8";
 const MIGRATION_008_DESCRIPTION: &str =
     "Add commit_sha and worktree_id to files table for multi-worktree / multi-branch support";
+const MIGRATION_009_ID: &str = "009_github_ref_sync_state";
+const MIGRATION_009_CHECKSUM: &str = "sha256:rag-rat-github-ref-sync-state-v9";
+const MIGRATION_009_DESCRIPTION: &str =
+    "Add per-GitHub-ref sync state for resumable papertrail cache updates";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +105,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_007_ID, MIGRATION_007_CHECKSUM, MIGRATION_007_DESCRIPTION)?;
     apply_commit_addressable_worktrees(conn)?;
     record_migration(conn, MIGRATION_008_ID, MIGRATION_008_CHECKSUM, MIGRATION_008_DESCRIPTION)?;
+    apply_github_ref_sync(conn)?;
+    record_migration(conn, MIGRATION_009_ID, MIGRATION_009_CHECKSUM, MIGRATION_009_DESCRIPTION)?;
     Ok(())
 }
 
@@ -513,6 +519,16 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             synced_at_ms INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS github_ref_sync(
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            synced_at_ms INTEGER NOT NULL,
+            last_error TEXT,
+            PRIMARY KEY(owner, repo, number)
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
             text,
             content='chunks',
@@ -574,6 +590,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_edge_source_target_spans(conn)?;
     apply_embedding_policy_and_input_hash(conn)?;
     apply_logical_symbol_groups(conn)?;
+    apply_github_ref_sync(conn)?;
     Ok(())
 }
 
@@ -792,6 +809,23 @@ fn apply_embedding_policy_and_input_hash(conn: &Connection) -> rusqlite::Result<
     Ok(())
 }
 
+fn apply_github_ref_sync(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS github_ref_sync(
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            synced_at_ms INTEGER NOT NULL,
+            last_error TEXT,
+            PRIMARY KEY(owner, repo, number)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -862,6 +896,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_006_ID => Some(6),
             MIGRATION_007_ID => Some(7),
             MIGRATION_008_ID => Some(8),
+            MIGRATION_009_ID => Some(9),
             _ => None,
         })
         .max()
@@ -879,6 +914,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_006_ID
             | MIGRATION_007_ID
             | MIGRATION_008_ID
+            | MIGRATION_009_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -893,6 +929,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_006_ID => migration.checksum != MIGRATION_006_CHECKSUM,
         MIGRATION_007_ID => migration.checksum != MIGRATION_007_CHECKSUM,
         MIGRATION_008_ID => migration.checksum != MIGRATION_008_CHECKSUM,
+        MIGRATION_009_ID => migration.checksum != MIGRATION_009_CHECKSUM,
         _ => false,
     }
 }

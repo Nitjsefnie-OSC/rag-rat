@@ -22,8 +22,40 @@ pub struct GitHubStatus {
 pub struct GitHubSyncReport {
     pub offline: bool,
     pub discovered_refs: usize,
+    pub skipped_refs: usize,
+    pub failed_refs: usize,
     pub synced_items: usize,
+    pub errors: Vec<GitHubSyncError>,
     pub status: GitHubStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitHubSyncError {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub status: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GitHubSyncProgress {
+    pub current: usize,
+    pub total: usize,
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub action: GitHubSyncAction,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubSyncAction {
+    Syncing,
+    Skipped,
+    Synced,
+    Failed,
+    RebuildingFts,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,18 +258,31 @@ pub fn sync_from_refs<C: GitHubClient>(
     client: Option<&C>,
     offline: bool,
 ) -> anyhow::Result<GitHubSyncReport> {
+    sync_from_refs_with_progress(conn, root, client, offline, |_| {})
+}
+
+pub fn sync_from_refs_with_progress<C: GitHubClient>(
+    conn: &Connection,
+    root: &Path,
+    client: Option<&C>,
+    offline: bool,
+    mut progress: impl FnMut(GitHubSyncProgress),
+) -> anyhow::Result<GitHubSyncReport> {
     let refs = discover_and_store_refs(conn, root)?;
-    let synced = if offline {
-        0
+    let sync = if offline {
+        SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter())?
+        sync_refs(conn, client, refs.iter(), &mut progress)?
     };
     set_meta(conn, "github_last_sync_ms", &now_ms().to_string())?;
     Ok(GitHubSyncReport {
         offline,
         discovered_refs: refs.len(),
-        synced_items: synced,
+        skipped_refs: sync.skipped_refs,
+        failed_refs: sync.failed_refs,
+        synced_items: sync.synced_items,
+        errors: sync.errors,
         status: status(conn)?,
     })
 }
@@ -264,17 +309,20 @@ pub fn sync_issue<C: GitHubClient>(
         },
     )?;
     let refs = refs(conn)?;
-    let synced = if offline {
-        0
+    let sync = if offline {
+        SyncRefsReport::default()
     } else {
         let client = client.ok_or_else(|| anyhow::anyhow!("github sync requires a client"))?;
-        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number))?
+        sync_refs(conn, client, refs.iter().filter(|r| r.number == parsed.number), &mut |_| {})?
     };
     set_meta(conn, "github_last_sync_ms", &now_ms().to_string())?;
     Ok(GitHubSyncReport {
         offline,
         discovered_refs: refs.len(),
-        synced_items: synced,
+        skipped_refs: sync.skipped_refs,
+        failed_refs: sync.failed_refs,
+        synced_items: sync.synced_items,
+        errors: sync.errors,
         status: status(conn)?,
     })
 }
@@ -355,12 +403,13 @@ pub fn papertrail_for_symbol(
     let mut evidence = evidence_for_path(conn, &symbol.path, limit)?;
     evidence.extend(rationale_search(conn, &symbol.qualified_name, limit)?);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let (start_line, end_line, chunk_id) = current_symbol_span(conn, symbol)?;
     Ok(Papertrail {
         current_source: Some(CurrentSourceEvidence {
-            chunk_id: None,
+            chunk_id,
             path: symbol.path.clone(),
-            start_line: None,
-            end_line: None,
+            start_line,
+            end_line,
             symbol: Some(symbol.qualified_name.clone()),
         }),
         github_evidence: evidence,
@@ -422,43 +471,178 @@ pub fn discover_and_store_refs(conn: &Connection, root: &Path) -> anyhow::Result
     Ok(refs)
 }
 
+#[derive(Default)]
+struct SyncRefsReport {
+    synced_items: usize,
+    skipped_refs: usize,
+    failed_refs: usize,
+    errors: Vec<GitHubSyncError>,
+}
+
 fn sync_refs<'a, C: GitHubClient>(
     conn: &Connection,
     client: &C,
     refs: impl Iterator<Item = &'a GitHubRef>,
-) -> anyhow::Result<usize> {
-    let mut synced = 0;
+    progress: &mut impl FnMut(GitHubSyncProgress),
+) -> anyhow::Result<SyncRefsReport> {
+    let refs = refs.collect::<Vec<_>>();
+    let total = refs
+        .iter()
+        .map(|reference| (reference.owner.clone(), reference.repo.clone(), reference.number))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut report = SyncRefsReport::default();
     let mut seen = BTreeSet::new();
     for reference in refs {
         if !seen.insert((reference.owner.clone(), reference.repo.clone(), reference.number)) {
             continue;
         }
-        let issue = client.issue(&reference.owner, &reference.repo, reference.number)?;
-        store_issue(conn, &issue)?;
-        synced += 1;
-        for comment in client.issue_comments(&reference.owner, &reference.repo, reference.number)? {
-            store_comment(conn, &comment)?;
-            synced += 1;
+        let current = seen.len();
+        if github_ref_synced(conn, reference)? {
+            report.skipped_refs += 1;
+            progress(sync_progress(reference, current, total, GitHubSyncAction::Skipped, None));
+            continue;
         }
-        if let Some(pull) = client.pull(&reference.owner, &reference.repo, reference.number)? {
-            store_pull(conn, &pull)?;
-            synced += 1;
-            for review in
-                client.pull_reviews(&reference.owner, &reference.repo, reference.number)?
-            {
-                store_review(conn, &review)?;
-                synced += 1;
-            }
-            for comment in
-                client.pull_review_comments(&reference.owner, &reference.repo, reference.number)?
-            {
-                store_review_comment(conn, &comment)?;
-                synced += 1;
-            }
+        progress(sync_progress(reference, current, total, GitHubSyncAction::Syncing, None));
+        match sync_one_ref(conn, client, reference) {
+            Ok(items) => {
+                report.synced_items += items;
+                mark_ref_sync(conn, reference, "synced", None)?;
+                progress(sync_progress(reference, current, total, GitHubSyncAction::Synced, None));
+            },
+            Err(err) => {
+                let message = err.to_string();
+                let status = if is_not_found_error(&message) { "not_found" } else { "failed" };
+                mark_ref_sync(conn, reference, status, Some(&message))?;
+                report.failed_refs += 1;
+                report.errors.push(GitHubSyncError {
+                    owner: reference.owner.clone(),
+                    repo: reference.repo.clone(),
+                    number: reference.number,
+                    status: status.to_string(),
+                    error: message.clone(),
+                });
+                progress(sync_progress(
+                    reference,
+                    current,
+                    total,
+                    GitHubSyncAction::Failed,
+                    Some(message),
+                ));
+            },
         }
     }
+    progress(GitHubSyncProgress {
+        current: total,
+        total,
+        owner: String::new(),
+        repo: String::new(),
+        number: 0,
+        action: GitHubSyncAction::RebuildingFts,
+        message: None,
+    });
     rebuild_fts(conn)?;
+    Ok(report)
+}
+
+fn sync_one_ref<C: GitHubClient>(
+    conn: &Connection,
+    client: &C,
+    reference: &GitHubRef,
+) -> anyhow::Result<usize> {
+    let mut synced = 0;
+    let issue = client.issue(&reference.owner, &reference.repo, reference.number)?;
+    store_issue(conn, &issue)?;
+    synced += 1;
+    for comment in client.issue_comments(&reference.owner, &reference.repo, reference.number)? {
+        store_comment(conn, &comment)?;
+        synced += 1;
+    }
+    if let Some(pull) = client.pull(&reference.owner, &reference.repo, reference.number)? {
+        store_pull(conn, &pull)?;
+        synced += 1;
+        for review in client.pull_reviews(&reference.owner, &reference.repo, reference.number)? {
+            store_review(conn, &review)?;
+            synced += 1;
+        }
+        for comment in
+            client.pull_review_comments(&reference.owner, &reference.repo, reference.number)?
+        {
+            store_review_comment(conn, &comment)?;
+            synced += 1;
+        }
+    }
     Ok(synced)
+}
+
+fn sync_progress(
+    reference: &GitHubRef,
+    current: usize,
+    total: usize,
+    action: GitHubSyncAction,
+    message: Option<String>,
+) -> GitHubSyncProgress {
+    GitHubSyncProgress {
+        current,
+        total,
+        owner: reference.owner.clone(),
+        repo: reference.repo.clone(),
+        number: reference.number,
+        action,
+        message,
+    }
+}
+
+fn github_ref_synced(conn: &Connection, reference: &GitHubRef) -> anyhow::Result<bool> {
+    let status = conn
+        .query_row(
+            "
+            SELECT status
+            FROM github_ref_sync
+            WHERE owner = ?1 AND repo = ?2 AND number = ?3
+            ",
+            params![reference.owner, reference.repo, reference.number],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if matches!(status.as_deref(), Some("synced" | "not_found")) {
+        return Ok(true);
+    }
+    let cached_issue = conn.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1 FROM github_issues
+            WHERE owner = ?1 AND repo = ?2 AND number = ?3
+        )
+        ",
+        params![reference.owner, reference.repo, reference.number],
+        |row| row.get::<_, bool>(0),
+    )?;
+    Ok(cached_issue)
+}
+
+fn mark_ref_sync(
+    conn: &Connection,
+    reference: &GitHubRef,
+    status: &str,
+    error: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "
+        INSERT INTO github_ref_sync(owner, repo, number, status, synced_at_ms, last_error)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(owner, repo, number) DO UPDATE SET
+            status = excluded.status,
+            synced_at_ms = excluded.synced_at_ms,
+            last_error = excluded.last_error
+        ",
+        params![reference.owner, reference.repo, reference.number, status, now_ms(), error],
+    )?;
+    Ok(())
+}
+
+fn is_not_found_error(message: &str) -> bool {
+    message.contains("HTTP 404") || message.to_ascii_lowercase().contains("not found")
 }
 
 fn discover_commit_refs(
@@ -893,6 +1077,35 @@ fn evidence_for_path(
     }
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(evidence)
+}
+
+fn current_symbol_span(
+    conn: &Connection,
+    symbol: &crate::query::symbol::SymbolHit,
+) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>)> {
+    let span = conn
+        .query_row(
+            "
+            SELECT chunks.id, chunks.start_line, chunks.end_line
+            FROM chunks
+            JOIN files ON files.id = chunks.file_id
+            WHERE files.path = ?1
+              AND (chunks.symbol_path = ?2 OR chunks.symbol_path = ?3)
+            ORDER BY
+              CASE WHEN chunks.symbol_path = ?2 THEN 0 ELSE 1 END,
+              chunks.start_line
+            LIMIT 1
+            ",
+            params![symbol.path, symbol.qualified_name, symbol.symbol_path],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        )
+        .optional()?;
+    Ok(match span {
+        Some((chunk_id, start_line, end_line)) => {
+            (Some(start_line), Some(end_line), Some(chunk_id))
+        },
+        None => (None, None, None),
+    })
 }
 
 fn evidence_for_issue(

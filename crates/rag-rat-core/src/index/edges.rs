@@ -74,6 +74,7 @@ struct EdgeCandidate {
 struct IndexedSymbol {
     id: i64,
     file_id: i64,
+    language: String,
     name: String,
     qualified_name: String,
     kind: String,
@@ -160,6 +161,7 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             evidence.as_deref(),
             receiver_hint.as_deref(),
             source_file_id,
+            source_language(&symbols, source_file_id),
             &symbols,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
@@ -208,6 +210,7 @@ fn resolve_symbol<'a>(
     evidence: Option<&str>,
     receiver_hint: Option<&str>,
     source_file_id: i64,
+    source_language: Option<&str>,
     symbols: &'a [IndexedSymbol],
 ) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
     let kind_matches = |symbol: &IndexedSymbol| {
@@ -232,7 +235,14 @@ fn resolve_symbol<'a>(
             [_, ..] => return None,
             [] => {},
         }
-        if !allow_unqualified_fallback(edge_kind, qualified, name, evidence, receiver_hint) {
+        if !allow_unqualified_fallback(
+            edge_kind,
+            qualified,
+            name,
+            evidence,
+            receiver_hint,
+            source_language,
+        ) {
             return None;
         }
     }
@@ -283,6 +293,7 @@ fn allow_unqualified_fallback(
     name: &str,
     evidence: Option<&str>,
     receiver_hint: Option<&str>,
+    source_language: Option<&str>,
 ) -> bool {
     if edge_kind == EdgeKind::UsesMacro.as_str() {
         return false;
@@ -298,10 +309,17 @@ fn allow_unqualified_fallback(
     if matches!(qualifier, "crate" | "self" | "super") {
         return true;
     }
+    if receiver_hint
+        .is_some_and(|receiver| looks_like_type_name(receiver) && !is_common_member_name(target))
+        && matches!(source_language, Some("rust" | "kotlin"))
+    {
+        return true;
+    }
     if receiver_hint.is_some_and(|receiver| !matches!(receiver, "self" | "Self"))
         && evidence.is_some_and(|value| value.contains('.'))
     {
-        return false;
+        return source_language == Some(Language::Kotlin.as_str())
+            && !is_common_member_name(target);
     }
     if is_external_rust_root(qualifier) {
         return false;
@@ -310,6 +328,13 @@ fn allow_unqualified_fallback(
         return false;
     }
     true
+}
+
+fn source_language(symbols: &[IndexedSymbol], source_file_id: i64) -> Option<&str> {
+    symbols
+        .iter()
+        .find(|symbol| symbol.file_id == source_file_id)
+        .map(|symbol| symbol.language.as_str())
 }
 
 fn is_external_rust_root(value: &str) -> bool {
@@ -993,7 +1018,7 @@ fn short_name(name: &str) -> &str {
 fn symbols_for_file(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT symbols.id, symbols.file_id, symbols.name, symbols.qualified_name, symbols.kind,
+        SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, symbols.qualified_name, symbols.kind,
                symbols.start_byte, symbols.end_byte,
                COALESCE((
                  SELECT chunks.start_byte
@@ -1034,7 +1059,7 @@ fn symbols_for_file(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<Index
 fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT symbols.id, symbols.file_id, symbols.name, symbols.qualified_name, symbols.kind,
+        SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, symbols.qualified_name, symbols.kind,
                symbols.start_byte, symbols.end_byte,
                COALESCE((
                  SELECT chunks.start_byte
@@ -1072,19 +1097,20 @@ fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
 }
 
 fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
-    let start_byte = usize::try_from(row.get::<_, i64>(5)?).unwrap_or(0);
-    let end_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
-    let chunk_start_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(start_byte);
-    let chunk_start_line = row.get::<_, i64>(8)?;
-    let chunk_text: String = row.get(9)?;
+    let start_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+    let end_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0);
+    let chunk_start_byte = usize::try_from(row.get::<_, i64>(8)?).unwrap_or(start_byte);
+    let chunk_start_line = row.get::<_, i64>(9)?;
+    let chunk_text: String = row.get(10)?;
     let start_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, start_byte);
     let end_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, end_byte);
     Ok(IndexedSymbol {
         id: row.get(0)?,
         file_id: row.get(1)?,
-        name: row.get(2)?,
-        qualified_name: row.get(3)?,
-        kind: row.get(4)?,
+        language: row.get(2)?,
+        name: row.get(3)?,
+        qualified_name: row.get(4)?,
+        kind: row.get(5)?,
         start_byte,
         end_byte,
         start_line,

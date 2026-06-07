@@ -6,7 +6,9 @@ use std::{
 };
 
 use rag_rat_core::{
-    Config, IndexDatabase, config::EmbeddingRuntimeConfig, index::IndexProgress,
+    Config, IndexDatabase,
+    config::EmbeddingRuntimeConfig,
+    index::{IndexProgress, github::GitHubSyncAction},
     search::lexical::SearchHit,
 };
 
@@ -435,13 +437,42 @@ fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {
             let report = if let Some(issue) = option_value(args, "--issue") {
                 db.github_sync_issue(&issue, offline)?
             } else if has_flag(args, "--from-refs") {
-                db.github_sync_from_refs(offline)?
+                db.github_sync_from_refs_with_progress(offline, render_github_sync_progress)?
             } else {
                 anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
             };
             print_json(&report)
         },
         other => anyhow::bail!("unknown github subcommand `{other}`"),
+    }
+}
+
+fn render_github_sync_progress(progress: rag_rat_core::index::github::GitHubSyncProgress) {
+    match progress.action {
+        GitHubSyncAction::Syncing => eprintln!(
+            "github sync: {}/{} fetching {}/{}#{}",
+            progress.current, progress.total, progress.owner, progress.repo, progress.number
+        ),
+        GitHubSyncAction::Skipped => eprintln!(
+            "github sync: {}/{} skip cached {}/{}#{}",
+            progress.current, progress.total, progress.owner, progress.repo, progress.number
+        ),
+        GitHubSyncAction::Synced => eprintln!(
+            "github sync: {}/{} synced {}/{}#{}",
+            progress.current, progress.total, progress.owner, progress.repo, progress.number
+        ),
+        GitHubSyncAction::Failed => eprintln!(
+            "github sync: {}/{} failed {}/{}#{}: {}",
+            progress.current,
+            progress.total,
+            progress.owner,
+            progress.repo,
+            progress.number,
+            progress.message.unwrap_or_else(|| "unknown error".to_string())
+        ),
+        GitHubSyncAction::RebuildingFts => {
+            eprintln!("github sync: rebuilding GitHub FTS cache")
+        },
     }
 }
 
