@@ -1,4 +1,4 @@
-use std::{path::Path, str::FromStr};
+use std::{fmt, path::Path, str::FromStr};
 
 use rag_rat_core::{
     Config, IndexDatabase,
@@ -13,6 +13,110 @@ use rag_rat_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpGraphMode {
+    None,
+    Compact,
+    Full,
+}
+
+impl McpGraphMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Compact => "compact",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for McpGraphMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = McpGraphMode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("none, compact, or full")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(if value { McpGraphMode::Compact } else { McpGraphMode::None })
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    "none" | "false" => Ok(McpGraphMode::None),
+                    "compact" | "true" => Ok(McpGraphMode::Compact),
+                    "full" => Ok(McpGraphMode::Full),
+                    other => Err(E::custom(format!(
+                        "unknown graph metadata mode `{other}`; expected none, compact, or full"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpGraphResolutionMode {
+    Exact,
+    Syntactic,
+    Fuzzy,
+}
+
+impl McpGraphResolutionMode {
+    fn core(self) -> GraphResolutionMode {
+        match self {
+            Self::Exact => GraphResolutionMode::Exact,
+            Self::Syntactic => GraphResolutionMode::Syntactic,
+            Self::Fuzzy => GraphResolutionMode::Fuzzy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpGraphEdgeKind {
+    CallsName,
+    Constructs,
+    UsesMacro,
+    ReferencesType,
+    Imports,
+    Exports,
+    Contains,
+    Implements,
+}
+
+impl McpGraphEdgeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CallsName => "calls_name",
+            Self::Constructs => "constructs",
+            Self::UsesMacro => "uses_macro",
+            Self::ReferencesType => "references_type",
+            Self::Imports => "imports",
+            Self::Exports => "exports",
+            Self::Contains => "contains",
+            Self::Implements => "implements",
+        }
+    }
+}
 
 pub const TOOL_NAMES: &[&str] = &[
     "semantic_search",
@@ -55,7 +159,7 @@ pub struct SearchArgs {
     #[serde(default = "default_true")]
     pub include_papertrail: bool,
     #[serde(default = "default_search_graph_mode")]
-    pub include_graph: String,
+    pub include_graph: McpGraphMode,
     #[serde(default = "default_search_graph_limit")]
     pub graph_limit: u32,
 }
@@ -79,7 +183,7 @@ pub struct SymbolGraphArgs {
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
-    pub resolution: Option<String>,
+    pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
     #[serde(default)]
@@ -92,7 +196,7 @@ pub struct SymbolGraphArgs {
     pub include_macros: bool,
     #[serde(default)]
     pub include_common_methods: bool,
-    pub edge_kinds: Option<Vec<String>>,
+    pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -102,7 +206,7 @@ pub struct CompareGraphTextArgs {
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
-    pub resolution: Option<String>,
+    pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_compare_limit")]
     pub limit: u32,
     #[serde(default = "default_true")]
@@ -117,7 +221,7 @@ pub struct CompareGraphTextArgs {
     pub include_macros: bool,
     #[serde(default)]
     pub include_common_methods: bool,
-    pub edge_kinds: Option<Vec<String>>,
+    pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -127,7 +231,7 @@ pub struct ImpactArgs {
     pub symbol_path: Option<String>,
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
-    pub resolution: Option<String>,
+    pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default)]
     pub allow_ambiguous: bool,
     #[serde(default = "default_graph_limit")]
@@ -154,7 +258,7 @@ pub struct LimitArgs {
 pub struct ReadChunkArgs {
     pub chunk_id: i64,
     #[serde(default = "default_read_chunk_graph_mode")]
-    pub include_graph: String,
+    pub include_graph: McpGraphMode,
     #[serde(default = "default_read_chunk_graph_limit")]
     pub graph_limit: u32,
 }
@@ -224,7 +328,7 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
-            let graph_mode = GraphMetaMode::parse(&args.include_graph)?;
+            let graph_mode = GraphMetaMode::parse(args.include_graph.as_str())?;
             let options = SearchOptions {
                 include_git: args.include_git,
                 include_papertrail: args.include_papertrail,
@@ -255,22 +359,22 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
         },
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
-            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            let resolution_mode = resolution_mode(args.resolution);
             graph_tool(db, args, resolution_mode, true)?
         },
         "trace_callees" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
-            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            let resolution_mode = resolution_mode(args.resolution);
             graph_tool(db, args, resolution_mode, false)?
         },
         "compare_graph_to_text" => {
             let args: CompareGraphTextArgs = serde_json::from_value(arguments)?;
-            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            let resolution_mode = resolution_mode(args.resolution);
             compare_graph_to_text_tool(db, args, resolution_mode)?
         },
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
-            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            let resolution_mode = resolution_mode(args.resolution);
             impact_tool(db, args, resolution_mode)?
         },
         "ffi_surface" => {
@@ -285,7 +389,7 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
             json!(db.read_chunk_with_graph(
                 args.chunk_id,
-                GraphMetaMode::parse(&args.include_graph)?,
+                GraphMetaMode::parse(args.include_graph.as_str())?,
                 args.graph_limit
             )?)
         },
@@ -356,7 +460,7 @@ fn graph_tool(
     let include_unresolved = args.include_unresolved;
     let include_macros = args.include_macros;
     let include_common_methods = args.include_common_methods;
-    let edge_kinds = args.edge_kinds.clone();
+    let edge_kinds = graph_edge_kinds(args.edge_kinds.as_deref());
     let allow_ambiguous = args.allow_ambiguous;
     let selector = graph_symbol_selector(&args)?;
     let selected = db.select_symbol(&selector)?;
@@ -442,7 +546,7 @@ fn compare_graph_to_text_tool(
                 include_unresolved: args.include_unresolved,
                 include_macros: args.include_macros,
                 include_common_methods: args.include_common_methods,
-                edge_kinds: args.edge_kinds,
+                edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
                 logical_symbol_id: args.logical_symbol_id,
@@ -550,6 +654,16 @@ fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
         language: optional_language(args.language)?,
         allow_ambiguous: args.allow_ambiguous,
         limit: args.limit,
+    })
+}
+
+fn resolution_mode(value: Option<McpGraphResolutionMode>) -> GraphResolutionMode {
+    value.map(McpGraphResolutionMode::core).unwrap_or_default()
+}
+
+fn graph_edge_kinds(edge_kinds: Option<&[McpGraphEdgeKind]>) -> Option<Vec<String>> {
+    edge_kinds.map(|edge_kinds| {
+        edge_kinds.iter().map(|edge_kind| edge_kind.as_str().to_string()).collect()
     })
 }
 
@@ -669,16 +783,16 @@ fn default_true() -> bool {
     true
 }
 
-fn default_search_graph_mode() -> String {
-    "compact".to_string()
+fn default_search_graph_mode() -> McpGraphMode {
+    McpGraphMode::Compact
 }
 
 fn default_search_graph_limit() -> u32 {
     3
 }
 
-fn default_read_chunk_graph_mode() -> String {
-    "full".to_string()
+fn default_read_chunk_graph_mode() -> McpGraphMode {
+    McpGraphMode::Full
 }
 
 fn default_read_chunk_graph_limit() -> u32 {
@@ -750,6 +864,12 @@ mod tests {
 
         assert_schema_requires(tools, "semantic_search", "query");
         assert_schema_has_property(tools, "semantic_search", "include_graph");
+        assert_schema_property_enum(
+            tools,
+            "semantic_search",
+            "include_graph",
+            &["none", "compact", "full"],
+        );
         assert_schema_has_property(tools, "semantic_search", "graph_limit");
         assert_schema_has_property(tools, "semantic_search", "include_git");
         assert_schema_has_property(tools, "semantic_search", "include_papertrail");
@@ -761,6 +881,27 @@ mod tests {
         assert_schema_has_property(tools, "find_callers", "include_common_methods");
         assert_schema_has_property(tools, "find_callers", "edge_kinds");
         assert_schema_has_property(tools, "find_callers", "resolution");
+        assert_schema_property_enum(
+            tools,
+            "find_callers",
+            "resolution",
+            &["exact", "syntactic", "fuzzy"],
+        );
+        assert_schema_array_item_enum(
+            tools,
+            "find_callers",
+            "edge_kinds",
+            &[
+                "calls_name",
+                "constructs",
+                "uses_macro",
+                "references_type",
+                "imports",
+                "exports",
+                "contains",
+                "implements",
+            ],
+        );
         assert_schema_has_property(tools, "find_callers", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "find_callers");
         assert_schema_has_property(tools, "trace_callees", "include_references");
@@ -793,10 +934,43 @@ mod tests {
         assert_symbol_selector_schema(tools, "papertrail_for_symbol");
         assert_schema_requires(tools, "read_chunk", "chunk_id");
         assert_schema_has_property(tools, "read_chunk", "include_graph");
+        assert_schema_property_enum(
+            tools,
+            "read_chunk",
+            "include_graph",
+            &["none", "compact", "full"],
+        );
         assert_schema_has_property(tools, "read_chunk", "graph_limit");
         assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
         assert_schema_has_property(tools, "heal_index", "limit");
         assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
+    }
+
+    #[test]
+    fn enum_like_tool_args_reject_unknown_values_during_decoding() {
+        let err = serde_json::from_value::<SearchArgs>(json!({
+            "query": "alpha",
+            "include_graph": "auto"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expected none, compact, or full"), "{err}");
+
+        let err = serde_json::from_value::<SymbolGraphArgs>(json!({
+            "symbol": "alpha",
+            "resolution": "maybe"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown variant"), "{err}");
+
+        let err = serde_json::from_value::<SymbolGraphArgs>(json!({
+            "symbol": "alpha",
+            "edge_kinds": ["calls_name", "bogus"]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown variant"), "{err}");
     }
 
     #[test]
@@ -1004,6 +1178,71 @@ mod tests {
     fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
         let schema = tool_schema(tools, name);
         assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
+    }
+
+    fn assert_schema_property_enum(tools: &[Value], name: &str, field: &str, expected: &[&str]) {
+        let schema = tool_schema(tools, name);
+        let property = schema["properties"].get(field).expect("schema property");
+        let resolved = resolve_schema_ref(schema, property);
+        let enum_schema = enum_schema(schema, resolved);
+        assert_enum_values(enum_schema, expected, &format!("{name}.{field}"));
+    }
+
+    fn assert_schema_array_item_enum(tools: &[Value], name: &str, field: &str, expected: &[&str]) {
+        let schema = tool_schema(tools, name);
+        let property = schema["properties"].get(field).expect("schema property");
+        let resolved = resolve_schema_ref(schema, property);
+        let items = resolved
+            .get("items")
+            .or_else(|| {
+                resolved.get("anyOf").and_then(|any| {
+                    any.as_array()?
+                        .iter()
+                        .find(|schema| schema.get("type").and_then(Value::as_str) == Some("array"))?
+                        .get("items")
+                })
+            })
+            .expect("array items schema");
+        let items = resolve_schema_ref(schema, items);
+        assert_enum_values(items, expected, &format!("{name}.{field}[]"));
+    }
+
+    fn resolve_schema_ref<'a>(root: &'a Value, value: &'a Value) -> &'a Value {
+        let Some(reference) = value.get("$ref").and_then(Value::as_str) else {
+            return value;
+        };
+        let Some(definition) = reference.strip_prefix("#/$defs/") else {
+            return value;
+        };
+        &root["$defs"][definition]
+    }
+
+    fn enum_schema<'a>(root: &'a Value, value: &'a Value) -> &'a Value {
+        if value.get("enum").is_some() {
+            return value;
+        }
+        if let Some(any_of) = value.get("anyOf").and_then(Value::as_array) {
+            for candidate in any_of {
+                if candidate.get("type").and_then(Value::as_str) == Some("null") {
+                    continue;
+                }
+                let resolved = resolve_schema_ref(root, candidate);
+                if resolved.get("enum").is_some() {
+                    return resolved;
+                }
+            }
+        }
+        value
+    }
+
+    fn assert_enum_values(schema: &Value, expected: &[&str], label: &str) {
+        let values = schema["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{label} should expose enum values: {schema:?}"))
+            .iter()
+            .map(|value| value.as_str().expect("string enum value"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected, "{label} enum mismatch");
     }
 
     fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
