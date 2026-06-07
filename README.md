@@ -27,10 +27,12 @@ comments, reviews, and review comments are indexed as historical GitHub evidence
 Local AI artifacts are explicit. `embedding-hash` is the deterministic baseline embedder.
 `fastembed-all-minilm-l6-v2` is the first real local embedding backend and requires building with
 `--features fastembed`. `models install` selects the active embedding model and is the intended
-FastEmbed cache-population step. `reconcile` writes model-id, dimension, and text-hash-bound chunk
-embeddings only for current chunks. `semantic_search` uses embeddings only when the model is
-installed, the stored dimension matches the active model metadata, the artifact is `Current`, and the
-artifact text hash matches the current chunk text hash. Stale AI artifacts are treated as absent.
+FastEmbed cache-population step. `doctor` reports whether this binary has FastEmbed compiled in, the
+model cache path, model name, dimension, current/stale/missing/failed embedding counts, and the next
+command to run. `reconcile` writes model-id, dimension, and text-hash-bound chunk embeddings only for
+current chunks. `semantic_search` uses embeddings only when the model is installed, the stored
+dimension matches the active model metadata, the artifact is `Current`, and the artifact text hash
+matches the current chunk text hash. Stale AI artifacts are treated as absent.
 
 CPU-heavy index work uses the Rayon worker pool. File reads, source hashing, tree-sitter preparation,
 git-log parsing, and embedding computation run in parallel across available cores; SQLite writes stay

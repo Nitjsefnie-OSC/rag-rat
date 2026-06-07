@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -8,8 +8,10 @@ use crate::index::now_ms;
 
 pub const HASH_MODEL_ID: &str = "embedding-hash";
 pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
+pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 pub const HASH_EMBEDDING_DIM: usize = 384;
 pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
+pub const FASTEMBED_MISSING_FEATURE_MESSAGE: &str = "FastEmbed backend requested, but this binary was built without `--features fastembed`.\nRebuild with:\n  cargo install rag-rat --features fastembed";
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
 const LAST_EMBEDDING_RECONCILE_STARTED_META: &str = "last_embedding_reconcile_started_at_ms";
@@ -77,7 +79,9 @@ impl FastEmbedEmbedder {
     pub fn new() -> anyhow::Result<Self> {
         use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                .with_cache_dir(fastembed_cache_dir())
+                .with_show_download_progress(true),
         )?;
         Ok(Self { model: std::sync::Mutex::new(model) })
     }
@@ -128,6 +132,7 @@ impl ArtifactStatus {
 pub struct LocalAiStatus {
     pub embedding: CapabilityStatus,
     pub artifacts: ArtifactCounts,
+    pub fastembed: FastEmbedOperationalStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +147,27 @@ pub struct CapabilityStatus {
     pub failed_artifacts: u64,
     pub blocked_artifacts: u64,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FastEmbedOperationalStatus {
+    pub backend: String,
+    pub build_feature_enabled: bool,
+    pub model_id: String,
+    pub model: String,
+    pub dim: usize,
+    pub cache: String,
+    pub installed: bool,
+    pub active: bool,
+    pub status: String,
+    pub current_embeddings: u64,
+    pub stale_embeddings: u64,
+    pub missing_embeddings: u64,
+    pub failed_embeddings: u64,
+    pub failed_retryable_embeddings: u64,
+    pub failed_waiting_embeddings: u64,
+    pub message: Option<String>,
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,9 +358,11 @@ pub fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     let failed = embedding.failed_artifacts;
     let blocked = embedding.blocked_artifacts;
     let missing = total_chunks.saturating_sub(current + stale + failed + blocked);
+    let fastembed = fastembed_operational_status(conn, &active_model_id)?;
     Ok(LocalAiStatus {
         embedding,
         artifacts: ArtifactCounts { current, missing, stale, failed, blocked, disabled: 0 },
+        fastembed,
     })
 }
 
@@ -665,15 +693,74 @@ fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<
             "UPDATE ai_models
              SET installed = 0, disabled = 0, status = 'MissingRuntime', last_error = ?2
              WHERE model_id = ?1",
-            params![
-                model_id,
-                "fastembed backend is not compiled; rebuild with --features fastembed"
-            ],
+            params![model_id, FASTEMBED_MISSING_FEATURE_MESSAGE],
         )?;
-        anyhow::bail!(
-            "fastembed backend is not compiled; rebuild rag-rat with --features fastembed"
-        )
+        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
     }
+}
+
+fn fastembed_operational_status(
+    conn: &Connection,
+    active_model_id: &str,
+) -> anyhow::Result<FastEmbedOperationalStatus> {
+    let model = model(conn, FASTEMBED_MODEL_ID)?;
+    let model_version = active_embedding_model_version(conn, FASTEMBED_MODEL_ID)?;
+    let plan = embedding_reconcile_plan(
+        conn,
+        &model,
+        &model_version,
+        FASTEMBED_EMBEDDING_DIM,
+        validate_ready_model(&model).is_ok(),
+        model.last_error.clone(),
+    )?;
+    let failed = plan.failed_retryable.saturating_add(plan.failed_waiting);
+    Ok(FastEmbedOperationalStatus {
+        backend: "fastembed".to_string(),
+        build_feature_enabled: fastembed_build_feature_enabled(),
+        model_id: FASTEMBED_MODEL_ID.to_string(),
+        model: FASTEMBED_DISPLAY_MODEL.to_string(),
+        dim: FASTEMBED_EMBEDDING_DIM,
+        cache: fastembed_cache_dir().display().to_string(),
+        installed: model.installed,
+        active: active_model_id == FASTEMBED_MODEL_ID,
+        status: model.status,
+        current_embeddings: plan.current,
+        stale_embeddings: plan
+            .stale
+            .saturating_add(plan.model_changed)
+            .saturating_add(plan.dim_changed),
+        missing_embeddings: plan.missing,
+        failed_embeddings: failed,
+        failed_retryable_embeddings: plan.failed_retryable,
+        failed_waiting_embeddings: plan.failed_waiting,
+        message: model.last_error,
+        next: fastembed_next_command(&plan),
+    })
+}
+
+fn fastembed_next_command(plan: &EmbeddingReconcilePlan) -> Option<String> {
+    if !fastembed_build_feature_enabled() {
+        return Some("cargo install rag-rat --features fastembed".to_string());
+    }
+    if !plan.available {
+        return Some(format!("rag-rat models install {}", FASTEMBED_MODEL_ID));
+    }
+    if plan.missing > 0
+        || plan.stale > 0
+        || plan.model_changed > 0
+        || plan.dim_changed > 0
+        || plan.failed_retryable > 0
+    {
+        return Some("rag-rat reconcile --limit 500".to_string());
+    }
+    if plan.failed_waiting > 0 {
+        return Some("rag-rat reconcile --plan".to_string());
+    }
+    None
+}
+
+fn fastembed_build_feature_enabled() -> bool {
+    cfg!(feature = "fastembed")
 }
 
 fn capability_status(
@@ -1102,6 +1189,8 @@ fn validate_ready_model(model: &ModelInfo) -> anyhow::Result<()> {
 fn model_not_ready_reason(model: &ModelInfo) -> String {
     if model.disabled {
         "Disabled".to_string()
+    } else if let Some(last_error) = &model.last_error {
+        last_error.clone()
     } else if !model.installed {
         "MissingModel".to_string()
     } else {
@@ -1124,10 +1213,21 @@ fn fastembed_embedder() -> anyhow::Result<Box<dyn Embedder>> {
     }
     #[cfg(not(feature = "fastembed"))]
     {
-        anyhow::bail!(
-            "fastembed backend is not compiled; rebuild rag-rat with --features fastembed"
-        )
+        anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
     }
+}
+
+pub fn fastembed_cache_dir() -> PathBuf {
+    if let Ok(cache) = std::env::var("RAG_RAT_MODEL_CACHE") {
+        return PathBuf::from(cache);
+    }
+    if let Ok(cache) = std::env::var("XDG_CACHE_HOME") {
+        return PathBuf::from(cache).join("rag-rat").join("models");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".cache").join("rag-rat").join("models");
+    }
+    PathBuf::from(".rag-rat").join("models")
 }
 
 pub fn decode_vector(blob: &[u8], dim: usize) -> Option<Vec<f32>> {

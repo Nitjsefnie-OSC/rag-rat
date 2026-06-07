@@ -86,8 +86,10 @@ Local AI artifacts are explicit and current-only. `local_ai_status` reports embe
 and artifact counts. The CLI-only `models install embedding-hash` command selects the deterministic
 baseline embedder. Building with `--features fastembed` enables the real local
 `fastembed-all-minilm-l6-v2` backend; `models install fastembed-all-minilm-l6-v2` is the intended
-FastEmbed cache-population step. `reconcile` writes model-id, dimension, and text-hash-bound chunk
-embeddings in configurable batches for current chunk hashes only.
+FastEmbed cache-population step. `doctor` reports FastEmbed build support, cache path, model,
+dimension, current/stale/missing/failed embedding counts, and the next command needed to make local
+AI current. `reconcile` writes model-id, dimension, and text-hash-bound chunk embeddings in
+configurable batches for current chunk hashes only.
 `semantic_search` combines BM25 candidates, vector similarity, symbol/name/path boosts,
 graph-neighborhood boosts, and optional git/GitHub papertrail boosts. Embeddings are used only when
 the active model is installed, the embedding dimension matches active model metadata, the artifact

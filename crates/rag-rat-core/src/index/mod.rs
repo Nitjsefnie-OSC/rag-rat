@@ -2054,8 +2054,37 @@ mod schema_bootstrap_tests {
         assert!(!status.git_history.available);
         assert_eq!(status.git_history.commit_count, 0);
         assert_eq!(status.local_ai.embedding.state, "MissingModel");
+        assert_eq!(status.local_ai.fastembed.backend, "fastembed");
+        assert_eq!(status.local_ai.fastembed.model, ai::FASTEMBED_DISPLAY_MODEL);
+        assert_eq!(status.local_ai.fastembed.dim, ai::FASTEMBED_EMBEDDING_DIM);
+        assert!(!status.local_ai.fastembed.cache.is_empty());
+        assert_eq!(status.local_ai.fastembed.build_feature_enabled, cfg!(feature = "fastembed"));
         assert_eq!(indexed_revision_count(&db), 1);
         assert_eq!(chunk_source_revision_count(&db), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn fastembed_missing_feature_reports_rebuild_command() {
+        let (root, config) = markdown_config("alpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let err = db.install_model(ai::FASTEMBED_MODEL_ID).unwrap_err();
+        assert!(err.to_string().contains(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
+
+        let status = db.local_ai_status().unwrap();
+        assert!(!status.fastembed.build_feature_enabled);
+        assert_eq!(status.fastembed.status, "MissingRuntime");
+        assert_eq!(
+            status.fastembed.message.as_deref(),
+            Some(ai::FASTEMBED_MISSING_FEATURE_MESSAGE)
+        );
+        assert_eq!(
+            status.fastembed.next.as_deref(),
+            Some("cargo install rag-rat --features fastembed")
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
