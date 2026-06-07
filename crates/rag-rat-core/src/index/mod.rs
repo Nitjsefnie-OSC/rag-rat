@@ -1256,6 +1256,20 @@ impl IndexDatabase {
         )
     }
 
+    pub fn impact_surface_report_for_selected_symbol(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        limit: u32,
+        options: &crate::query::impact::ImpactSurfaceOptions,
+    ) -> anyhow::Result<crate::query::impact::ImpactSurfaceReport> {
+        crate::query::impact::impact_surface_report_for_symbol(
+            self.storage.connection(),
+            symbol,
+            limit,
+            options,
+        )
+    }
+
     pub fn rebuild_fts(&self) -> anyhow::Result<()> {
         schema::rebuild_fts(self.storage.connection())?;
         self.record_content_revision()?;

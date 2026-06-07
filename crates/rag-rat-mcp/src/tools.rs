@@ -6,6 +6,7 @@ use rag_rat_core::{
     query::{
         graph::{GraphResolutionMode, GraphTraversalOptions},
         graph_meta::GraphMetaMode,
+        impact::ImpactSurfaceOptions,
         symbol::SymbolSelector,
     },
     search::lexical::SearchOptions,
@@ -125,6 +126,16 @@ pub struct ImpactArgs {
     pub allow_ambiguous: bool,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
+    #[serde(default = "default_true")]
+    pub include_tests: bool,
+    #[serde(default = "default_true")]
+    pub include_docs: bool,
+    #[serde(default = "default_true")]
+    pub include_git: bool,
+    #[serde(default = "default_true")]
+    pub include_papertrail: bool,
+    #[serde(default = "default_true")]
+    pub include_text_fallback: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -459,6 +470,14 @@ fn impact_tool(
     args: ImpactArgs,
     resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Value> {
+    let options = ImpactSurfaceOptions {
+        resolution_mode,
+        include_tests: args.include_tests,
+        include_docs: args.include_docs,
+        include_git: args.include_git,
+        include_papertrail: args.include_papertrail,
+        include_text_fallback: args.include_text_fallback,
+    };
     if args.symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
         let selector = SymbolSelector {
             symbol_id: args.symbol_id,
@@ -469,11 +488,9 @@ fn impact_tool(
             limit: args.limit,
         };
         return match db.select_symbol(&selector)? {
-            Ok(Some(symbol)) => Ok(json!(db.impact_surface_for_selected_symbol(
-                &symbol,
-                args.limit,
-                resolution_mode
-            )?)),
+            Ok(Some(symbol)) => Ok(json!(
+                db.impact_surface_report_for_selected_symbol(&symbol, args.limit, &options)?
+            )),
             Ok(None) if selector.allow_ambiguous => {
                 let Some(symbol) = selector.symbol.as_deref() else {
                     return Ok(Value::Null);
@@ -724,6 +741,11 @@ mod tests {
         assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
         assert_symbol_selector_schema(tools, "compare_graph_to_text");
         assert_schema_has_property(tools, "impact_surface", "resolution");
+        assert_schema_has_property(tools, "impact_surface", "include_tests");
+        assert_schema_has_property(tools, "impact_surface", "include_docs");
+        assert_schema_has_property(tools, "impact_surface", "include_git");
+        assert_schema_has_property(tools, "impact_surface", "include_papertrail");
+        assert_schema_has_property(tools, "impact_surface", "include_text_fallback");
         assert_symbol_selector_schema(tools, "impact_surface");
         assert_symbol_selector_schema(tools, "docs_for_symbol");
         assert_symbol_selector_schema(tools, "git_history_for_symbol");
@@ -891,6 +913,29 @@ mod tests {
         assert_eq!(comparison["summary"]["graph_only"], 0);
         assert_eq!(comparison["matched_hits"].as_array().unwrap().len(), 1);
         assert_eq!(comparison["text_only_hits"].as_array().unwrap().len(), 1);
+
+        let impact = call_tool(
+            &config.database,
+            "impact_surface",
+            json!({
+                "symbol_id": one["symbol_id"].as_i64().unwrap(),
+                "resolution": "exact",
+                "include_tests": true,
+                "include_docs": true,
+                "include_git": true,
+                "include_papertrail": true,
+                "include_text_fallback": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(impact["query"]["symbol_id"], one["symbol_id"]);
+        assert_eq!(impact["query"]["resolution"], "exact");
+        assert!(impact["direct_semantic_callers"].as_array().unwrap().len() == 1);
+        assert!(impact["direct_semantic_callees"].as_array().unwrap().is_empty());
+        assert!(impact["text_fallback_hits"].is_array());
+        assert!(impact["completeness_and_caveats"]["caveats"].as_array().unwrap().iter().any(
+            |note| note.as_str().is_some_and(|value| value.contains("tree-sitter/syntactic"))
+        ));
 
         let papertrail = call_tool(
             &config.database,

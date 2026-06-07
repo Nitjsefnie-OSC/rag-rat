@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::query::graph::GraphResolutionMode;
+use crate::query::graph::{self, GraphHop, GraphResolutionMode, GraphTraversalOptions};
 use crate::query::symbol::SymbolHit;
 
 #[derive(Debug, Serialize)]
@@ -17,12 +17,155 @@ pub struct ImpactItem {
     pub evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ImpactSurfaceOptions {
+    pub resolution_mode: GraphResolutionMode,
+    pub include_tests: bool,
+    pub include_docs: bool,
+    pub include_git: bool,
+    pub include_papertrail: bool,
+    pub include_text_fallback: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactSurfaceReport {
+    pub query: ImpactSurfaceQuery,
+    pub direct_semantic_callers: Vec<GraphHop>,
+    pub direct_semantic_callees: Vec<GraphHop>,
+    pub import_export_dependents: Vec<ImpactItem>,
+    pub tests_touching_symbol_path: Vec<ImpactItem>,
+    pub docs_mentioning_symbol_path: Vec<ImpactItem>,
+    pub text_fallback_hits: Vec<ImpactItem>,
+    pub recent_commits_touching_symbol_path: Vec<ImpactItem>,
+    pub github_rationale_issues_prs: Vec<ImpactItem>,
+    pub completeness_and_caveats: ImpactCompleteness,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactSurfaceQuery {
+    pub symbol_id: Option<i64>,
+    pub symbol_path: Option<String>,
+    pub query: Option<String>,
+    pub resolution: String,
+    pub include_tests: bool,
+    pub include_docs: bool,
+    pub include_git: bool,
+    pub include_papertrail: bool,
+    pub include_text_fallback: bool,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ImpactCompleteness {
+    pub exact_graph_callers: u64,
+    pub graph_callees: u64,
+    pub text_fallback_hits: u64,
+    pub parser_failures: u64,
+    pub source_stale_files: u64,
+    pub caveats: Vec<String>,
+}
+
+impl Default for ImpactSurfaceOptions {
+    fn default() -> Self {
+        Self {
+            resolution_mode: GraphResolutionMode::Syntactic,
+            include_tests: true,
+            include_docs: true,
+            include_git: true,
+            include_papertrail: true,
+            include_text_fallback: true,
+        }
+    }
+}
+
 pub fn impact_surface(
     conn: &Connection,
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     impact_surface_with_options(conn, query, limit, GraphResolutionMode::Syntactic)
+}
+
+pub fn impact_surface_report_for_symbol(
+    conn: &Connection,
+    symbol: &SymbolHit,
+    limit: u32,
+    options: &ImpactSurfaceOptions,
+) -> anyhow::Result<ImpactSurfaceReport> {
+    let graph_options = GraphTraversalOptions {
+        resolution_mode: options.resolution_mode,
+        symbol_id: Some(symbol.symbol_id),
+        ..Default::default()
+    };
+    let direct_semantic_callers =
+        graph::traverse_with_options(conn, &symbol.qualified_name, true, limit, &graph_options)?;
+    let direct_semantic_callees =
+        graph::traverse_with_options(conn, &symbol.qualified_name, false, limit, &graph_options)?;
+    let names = vec![symbol.name.clone(), symbol.qualified_name.clone()];
+    let import_export_dependents =
+        import_export_items(conn, symbol.symbol_id, &symbol.qualified_name, &names, limit)?;
+    let tests_touching_symbol_path =
+        if options.include_tests { test_items(conn, symbol, &names, limit)? } else { Vec::new() };
+    let docs_mentioning_symbol_path =
+        if options.include_docs { docs_items(conn, symbol, &names, limit)? } else { Vec::new() };
+    let text_fallback_hits = if options.include_text_fallback {
+        text_fallback_items(conn, symbol, &names, limit)?
+    } else {
+        Vec::new()
+    };
+    let recent_commits_touching_symbol_path = if options.include_git {
+        git_commit_items(conn, std::slice::from_ref(&symbol.path), limit)?
+    } else {
+        Vec::new()
+    };
+    let github_rationale_issues_prs = if options.include_papertrail {
+        let mut items = github_ref_items(conn, std::slice::from_ref(&symbol.path), limit)?;
+        items.extend(github_rationale_items(conn, &symbol.qualified_name, limit)?);
+        items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        items
+    } else {
+        Vec::new()
+    };
+    let mut caveats = vec![
+        "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.".to_string(),
+    ];
+    if options.resolution_mode == GraphResolutionMode::Exact
+        && direct_semantic_callers.is_empty()
+        && !text_fallback_hits.is_empty()
+    {
+        caveats.push(format!(
+            "No exact graph callers found. Text search found {} symbol/path hits. This likely indicates graph extraction or resolution gaps.",
+            text_fallback_hits.len()
+        ));
+    }
+    Ok(ImpactSurfaceReport {
+        query: ImpactSurfaceQuery {
+            symbol_id: Some(symbol.symbol_id),
+            symbol_path: Some(symbol.qualified_name.clone()),
+            query: None,
+            resolution: options.resolution_mode.as_str().to_string(),
+            include_tests: options.include_tests,
+            include_docs: options.include_docs,
+            include_git: options.include_git,
+            include_papertrail: options.include_papertrail,
+            include_text_fallback: options.include_text_fallback,
+        },
+        completeness_and_caveats: ImpactCompleteness {
+            exact_graph_callers: u64::try_from(direct_semantic_callers.len()).unwrap_or(u64::MAX),
+            graph_callees: u64::try_from(direct_semantic_callees.len()).unwrap_or(u64::MAX),
+            text_fallback_hits: u64::try_from(text_fallback_hits.len()).unwrap_or(u64::MAX),
+            parser_failures: parser_failure_count(conn)?,
+            source_stale_files: 0,
+            caveats,
+        },
+        direct_semantic_callers,
+        direct_semantic_callees,
+        import_export_dependents,
+        tests_touching_symbol_path,
+        docs_mentioning_symbol_path,
+        text_fallback_hits,
+        recent_commits_touching_symbol_path,
+        github_rationale_issues_prs,
+    })
 }
 
 pub fn impact_surface_with_options(
@@ -620,6 +763,242 @@ fn textual_fallback(
         surface.push(ImpactCategory::ProbableTextual, file_symbol, "textual_fallback", evidence);
     }
     Ok(())
+}
+
+fn import_export_items(
+    conn: &Connection,
+    symbol_id: i64,
+    qualified_name: &str,
+    names: &[String],
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut items = Vec::new();
+    let mut stmt = conn.prepare(
+        "
+        SELECT files.path, files.language, files.kind, edges.from_name,
+               edges.edge_kind, edges.confidence
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.edge_kind IN ('imports', 'exports')
+          AND (edges.to_symbol_id = ?1 OR edges.to_name = ?2)
+        ORDER BY files.kind, files.path, edges.edge_kind
+        LIMIT ?3
+        ",
+    )?;
+    for name in std::iter::once(qualified_name).chain(names.iter().map(String::as_str)) {
+        let rows = stmt.query_map(params![symbol_id, name, i64::from(limit)], |row| {
+            impact_item_row(row, "Import/export dependents", "import_export_dependent")
+        })?;
+        items.extend(rows_to_items(rows)?);
+        if items.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
+            break;
+        }
+    }
+    dedupe_items(&mut items);
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(items)
+}
+
+fn test_items(
+    conn: &Connection,
+    symbol: &SymbolHit,
+    names: &[String],
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut items = Vec::new();
+    for name in names_for_like(symbol, names) {
+        items.extend(section_like_items(
+            conn,
+            &name,
+            "Tests touching this symbol/path",
+            "test_mentions_symbol_or_path",
+            "
+            files.kind = 'source'
+            AND (
+                files.path LIKE '%test%'
+                OR files.path LIKE '%spec%'
+                OR chunks.text LIKE '%#[cfg(test)]%'
+                OR chunks.text LIKE '%describe(%'
+                OR chunks.text LIKE '%it(%'
+                OR chunks.text LIKE '%test(%'
+            )
+            ",
+            limit,
+        )?);
+    }
+    dedupe_items(&mut items);
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(items)
+}
+
+fn docs_items(
+    conn: &Connection,
+    symbol: &SymbolHit,
+    names: &[String],
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut items = Vec::new();
+    for name in names_for_like(symbol, names) {
+        items.extend(section_like_items(
+            conn,
+            &name,
+            "Docs mentioning symbol/path",
+            "docs_mentions_symbol_or_path",
+            "files.kind = 'docs'",
+            limit,
+        )?);
+    }
+    dedupe_items(&mut items);
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(items)
+}
+
+fn text_fallback_items(
+    conn: &Connection,
+    symbol: &SymbolHit,
+    names: &[String],
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut items = Vec::new();
+    for name in names_for_like(symbol, names) {
+        items.extend(section_like_items(
+            conn,
+            &name,
+            "Text fallback hits",
+            "text_fallback",
+            "1 = 1",
+            limit,
+        )?);
+    }
+    dedupe_items(&mut items);
+    items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(items)
+}
+
+fn names_for_like(symbol: &SymbolHit, names: &[String]) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    out.insert(symbol.name.clone());
+    out.insert(symbol.qualified_name.clone());
+    out.insert(symbol.path.clone());
+    for name in names {
+        out.insert(name.clone());
+    }
+    out.into_iter().collect()
+}
+
+fn section_like_items(
+    conn: &Connection,
+    needle: &str,
+    category: &str,
+    reason: &str,
+    filter: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let like = format!("%{needle}%");
+    let sql = format!(
+        "
+        SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name,
+               CASE
+                   WHEN files.path LIKE ?1 THEN 'path match'
+                   WHEN symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1 THEN 'symbol match'
+                   ELSE 'chunk text match'
+               END
+        FROM files
+        LEFT JOIN symbols ON symbols.file_id = files.id
+        LEFT JOIN chunks ON chunks.file_id = files.id
+        WHERE ({filter})
+          AND (
+              files.path LIKE ?1
+              OR symbols.name LIKE ?1
+              OR symbols.qualified_name LIKE ?1
+              OR chunks.text LIKE ?1
+          )
+        ORDER BY files.kind, files.path, symbols.qualified_name
+        LIMIT ?2
+        "
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![like, i64::from(limit)], |row| {
+        Ok(ImpactItem {
+            path: row.get(0)?,
+            language: row.get(1)?,
+            kind: row.get(2)?,
+            symbol: row.get(3)?,
+            category: category.to_string(),
+            reason: reason.to_string(),
+            evidence: vec![format!("{} for `{needle}`", row.get::<_, String>(4)?)],
+        })
+    })?;
+    rows_to_items(rows)
+}
+
+fn git_commit_items(
+    conn: &Connection,
+    paths: &[String],
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut surface = ImpactSurface::default();
+    git_commits_for_paths(conn, paths, &mut surface, usize::try_from(limit).unwrap_or(usize::MAX))?;
+    Ok(surface.into_items(usize::try_from(limit).unwrap_or(usize::MAX)))
+}
+
+fn github_ref_items(
+    conn: &Connection,
+    paths: &[String],
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut surface = ImpactSurface::default();
+    github_refs_for_paths(conn, paths, &mut surface, usize::try_from(limit).unwrap_or(usize::MAX))?;
+    Ok(surface.into_items(usize::try_from(limit).unwrap_or(usize::MAX)))
+}
+
+fn github_rationale_items(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let mut surface = ImpactSurface::default();
+    github_rationale_for_query(
+        conn,
+        query,
+        &mut surface,
+        usize::try_from(limit).unwrap_or(usize::MAX),
+    )?;
+    Ok(surface.into_items(usize::try_from(limit).unwrap_or(usize::MAX)))
+}
+
+fn impact_item_row(
+    row: &rusqlite::Row<'_>,
+    category: &'static str,
+    reason: &'static str,
+) -> rusqlite::Result<ImpactItem> {
+    Ok(ImpactItem {
+        path: row.get(0)?,
+        language: row.get(1)?,
+        kind: row.get(2)?,
+        symbol: row.get(3)?,
+        category: category.to_string(),
+        reason: reason.to_string(),
+        evidence: vec![format!("{} edge ({})", row.get::<_, String>(4)?, row.get::<_, String>(5)?)],
+    })
+}
+
+fn dedupe_items(items: &mut Vec<ImpactItem>) {
+    let mut seen = BTreeSet::new();
+    items.retain(|item| {
+        seen.insert((
+            item.category.clone(),
+            item.path.clone(),
+            item.symbol.clone(),
+            item.reason.clone(),
+        ))
+    });
+}
+
+fn parser_failure_count(conn: &Connection) -> anyhow::Result<u64> {
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM parser_failures", [], |row| row.get(0))?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 fn historical_evidence(

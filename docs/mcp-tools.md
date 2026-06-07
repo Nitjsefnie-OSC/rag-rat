@@ -70,7 +70,7 @@ Development config without installing:
 - `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number }`
+- `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_docs"?: boolean, "include_git"?: boolean, "include_papertrail"?: boolean, "include_text_fallback"?: boolean }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number }`
@@ -251,13 +251,26 @@ current source line no longer appears to support the edge. The tool includes the
 object as graph traversal envelopes so audit output can be checked for stale source and parser
 failures before treating the counts as authoritative.
 
-`impact_surface` is graph-backed first and defaults to `resolution: "syntactic"`. It layers exact
-symbol definitions, direct callers, direct callees, import/export dependents, same-file siblings,
-git commits touching those files, and cached GitHub papertrail. Pass `resolution: "fuzzy"` to include
-possible name-only graph evidence; those rows remain labeled by confidence and should be treated as
-possible impact. Text/path LIKE matching is used only as `Probable textual impact` fallback. Each
-item includes `category`, `reason`, and `evidence`; categories are `Direct structural impact`,
-`Probable textual impact`, and `Historical/papertrail evidence`.
+`impact_surface` is the graph-backed rg replacement path for a selected symbol. For `symbol_id`,
+`symbol_path`, or `symbol` requests it returns sections instead of a flat list:
+
+1. `direct_semantic_callers`
+2. `direct_semantic_callees`
+3. `import_export_dependents`
+4. `tests_touching_symbol_path`
+5. `docs_mentioning_symbol_path`
+6. `text_fallback_hits`
+7. `recent_commits_touching_symbol_path`
+8. `github_rationale_issues_prs`
+9. `completeness_and_caveats`
+
+Use the same disambiguation controls as graph tools. `resolution: "exact"` means direct graph
+callers/callees are verified against the selected `symbol_id`; `syntactic` allows qualified
+tree-sitter evidence; `fuzzy` is for navigation only. Optional section controls are `include_tests`,
+`include_docs`, `include_git`, `include_papertrail`, and `include_text_fallback`, all enabled by
+default. If exact graph callers are empty but text fallback finds symbol/path hits, the caveats
+section explicitly says that graph extraction or resolution gaps are likely. Free-text `query`
+requests retain the older flat impact item shape for compatibility.
 
 Git history tools return historical evidence. `commit_search` searches commit subjects and bodies;
 `git_history_for_path` returns commits touching a current path; `git_history_for_symbol` resolves
