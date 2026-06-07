@@ -53,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
         "reconcile" => {
             reconcile(&config, &args)?;
         },
+        "eval" => {
+            eval(&config, &args)?;
+        },
         "dump-config" => {
             let targets = config
                 .targets
@@ -81,6 +84,65 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn eval(config: &Config, args: &[String]) -> anyhow::Result<()> {
+    let options = rag_rat_core::eval::EvalOptions {
+        queries_path: option_value(args, "--queries")
+            .map(Into::into)
+            .unwrap_or_else(|| "evals/queries.toml".into()),
+        expected_path: option_value(args, "--expected")
+            .map(Into::into)
+            .unwrap_or_else(|| "evals/expected_hits.toml".into()),
+        update_baseline: has_flag(args, "--update-baseline"),
+    };
+    let report = rag_rat_core::eval::run(config, &options)?;
+    if has_flag(args, "--json") || options.update_baseline {
+        print_json(&report)?;
+    } else {
+        print_eval_summary(&report);
+    }
+    if !report.pass {
+        anyhow::bail!(
+            "eval failed: stale_current_source_violations={}, failed_queries={}",
+            report.metrics.stale_current_source_violations,
+            report.results.iter().filter(|result| !result.passed).count()
+        );
+    }
+    Ok(())
+}
+
+fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
+    println!(
+        "eval: pass={} queries={} mrr@10={:.3} recall@10={:.3} path_hit_rate={:.3} symbol_hit_rate={:.3}",
+        report.pass,
+        report.queries,
+        report.metrics.mrr_at_10,
+        report.metrics.recall_at_10,
+        report.metrics.path_hit_rate,
+        report.metrics.symbol_hit_rate
+    );
+    println!(
+        "eval: stale_current_source_violations={} stale_hit_rate={:.3} latency_p50_ms={:.1} latency_p95_ms={:.1}",
+        report.metrics.stale_current_source_violations,
+        report.metrics.stale_hit_rate,
+        report.metrics.latency_p50_ms,
+        report.metrics.latency_p95_ms
+    );
+    if let Some(precision) = report.metrics.papertrail_precision_sample {
+        println!("eval: papertrail_precision_sample={precision:.3}");
+    }
+    for result in report.results.iter().filter(|result| !result.passed) {
+        println!(
+            "eval: failed {} missing_paths={:?} missing_symbols={:?} missing_git_subjects={:?} missing_papertrail_kinds={:?} stale_current_source_violations={}",
+            result.id,
+            result.missing_paths,
+            result.missing_symbols,
+            result.missing_git_subjects,
+            result.missing_papertrail_kinds,
+            result.stale_current_source_violations
+        );
+    }
 }
 
 fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
@@ -210,7 +272,7 @@ fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <index|doctor|migrate|query|mcp|github|models|reconcile|dump-config> --config <path> [query]\n\
+        "usage: rag-rat <index|doctor|migrate|query|mcp|github|models|reconcile|eval|dump-config> --config <path> [query]\n\
          examples:\n\
          rag-rat index --config rag-rat.toml\n\
          rag-rat index --changed --config rag-rat.toml\n\
@@ -222,6 +284,9 @@ fn usage() {
          rag-rat models list --config rag-rat.toml\n\
          rag-rat models install embedding-small --config rag-rat.toml\n\
          rag-rat reconcile --limit 100 --config rag-rat.toml\n\
+         rag-rat eval --config rag-rat.toml\n\
+         rag-rat eval --json --config rag-rat.toml\n\
+         rag-rat eval --update-baseline --config rag-rat.toml\n\
          rag-rat query --config rag-rat.toml \"semantic recall\""
     );
 }

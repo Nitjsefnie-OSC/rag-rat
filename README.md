@@ -50,6 +50,9 @@ cargo run --bin rag-rat -- github sync --from-refs --offline --config rag-rat.to
 cargo run --bin rag-rat -- models list --config rag-rat.toml
 cargo run --bin rag-rat -- models install embedding-small --config rag-rat.toml
 cargo run --bin rag-rat -- reconcile --limit 100 --config rag-rat.toml
+cargo run --bin rag-rat -- eval --config rag-rat.toml
+cargo run --bin rag-rat -- eval --json --config rag-rat.toml
+cargo run --bin rag-rat -- eval --update-baseline --config rag-rat.toml
 cargo run --bin rag-rat -- query --config rag-rat.toml "semantic recall"
 cargo run --bin rag-rat -- mcp --config rag-rat.toml
 ```
@@ -78,6 +81,12 @@ such as `3 unindexed source files detected. Run rag-rat index --full or rag-rat 
 Search never runs silently against stale FTS state. The index records a content revision for the
 current `files`/`chunks` rows, tracks whether FTS is dirty after writes, and synchronizes FTS before
 search when `fts_source_revision` no longer matches `content_revision`.
+
+`eval` runs the fixture-driven ranking and freshness harness from `evals/queries.toml` plus
+`evals/expected_hits.toml`. It reports MRR@10, Recall@10, path hit rate, symbol hit rate,
+stale-hit rate, current-source violation count, papertrail precision sample, and latency p50/p95.
+`stale_current_source_violations` must remain zero. Use `eval --json` for machine-readable output
+and `eval --update-baseline` to rewrite `expected_hits.toml` from observed top-10 evidence.
 
 Non-git target roots still index source and docs; git history status reports unavailable with zero
 commit/path rows.

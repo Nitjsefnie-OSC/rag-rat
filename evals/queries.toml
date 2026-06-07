@@ -1,0 +1,36 @@
+[[query]]
+id = "rust-open-database"
+text = "open the local database"
+must_include_paths = [
+  "src/lib.rs",
+]
+must_include_symbols = [
+  "open_database",
+]
+
+[[query]]
+id = "typescript-bridge-client"
+text = "bridge client open database"
+must_include_paths = [
+  "src/index.ts",
+]
+must_include_symbols = [
+  "BridgeClient",
+]
+
+[[query]]
+id = "kotlin-sync-once"
+text = "suspend sync once bridge"
+must_include_paths = [
+  "src/Main.kt",
+]
+must_include_symbols = [
+  "syncOnce",
+]
+
+[[query]]
+id = "markdown-semantic-recall"
+text = "semantic recall and FTS routing"
+must_include_paths = [
+  "docs/search.md",
+]

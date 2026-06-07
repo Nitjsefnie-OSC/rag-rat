@@ -77,15 +77,16 @@ fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Ve
     let symbols = parser::parse_symbols(path, language, text)?;
     let mut chunks = Vec::new();
     for symbol in symbols {
-        let Some(symbol_text) = text.get(symbol.start_byte..symbol.end_byte) else {
+        let Some(symbol_span) = line_span(text, symbol.start_line, symbol.end_line) else {
             continue;
         };
-        if symbol_text.trim().is_empty() {
+        if symbol_span.text.trim().is_empty() {
             continue;
         }
-        for (part_idx, part) in split_symbol(symbol_text, symbol.start_byte, symbol.start_line, 120)
-            .into_iter()
-            .enumerate()
+        for (part_idx, part) in
+            split_symbol(&symbol_span.text, symbol_span.start_byte, symbol.start_line, 120)
+                .into_iter()
+                .enumerate()
         {
             chunks.push(make_chunk(
                 "code",
@@ -103,6 +104,36 @@ fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Ve
         }
     }
     if chunks.is_empty() { Ok(whole_file_chunk(path, text)) } else { Ok(chunks) }
+}
+
+struct LineSpan {
+    start_byte: usize,
+    text: String,
+}
+
+fn line_span(text: &str, start_line: usize, end_line: usize) -> Option<LineSpan> {
+    if start_line == 0 || end_line < start_line {
+        return None;
+    }
+    let mut byte = 0;
+    let mut start_byte = None;
+    let mut out = String::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line_no == start_line {
+            start_byte = Some(byte);
+        }
+        if line_no >= start_line && line_no <= end_line {
+            out.push_str(line);
+            out.push('\n');
+        }
+        byte += line.len() + 1;
+        if line_no >= end_line {
+            break;
+        }
+    }
+    let start_byte = start_byte?;
+    (!out.trim().is_empty()).then_some(LineSpan { start_byte, text: out })
 }
 
 fn whole_file_chunk(path: &Path, text: &str) -> Vec<Chunk> {

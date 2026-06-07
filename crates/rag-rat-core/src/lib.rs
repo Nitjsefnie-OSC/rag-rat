@@ -1,4 +1,5 @@
 pub mod config;
+pub mod eval;
 pub mod index;
 pub mod language;
 pub mod query;

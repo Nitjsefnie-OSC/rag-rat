@@ -1,0 +1,15 @@
+# Baseline expectations are merged with queries.toml. Hand-authored
+# must_include_* fields remain the hard gates; update with:
+# rag-rat eval --update-baseline
+
+[[expected]]
+id = "rust-open-database"
+
+[[expected]]
+id = "typescript-bridge-client"
+
+[[expected]]
+id = "kotlin-sync-once"
+
+[[expected]]
+id = "markdown-semantic-recall"
