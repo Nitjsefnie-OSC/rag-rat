@@ -4,14 +4,14 @@
 
 ## Tools
 
-- `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean }`
+- `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "counts" | "compact" | "full", "graph_limit"?: number, "explain"?: boolean }`
 - `symbol_lookup`: `{ "symbol": string, "language"?: string, "limit"?: number }`
 - `find_callers`: `{ "symbol": string, "limit"?: number }`
 - `trace_callees`: `{ "symbol": string, "limit"?: number }`
 - `impact_surface`: `{ "query": string, "limit"?: number }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol": string, "limit"?: number }`
-- `read_chunk`: `{ "chunk_id": number }`
+- `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "counts" | "compact" | "full", "graph_limit"?: number }`
 - `commit_search`: `{ "query": string, "limit"?: number }`
 - `git_history_for_path`: `{ "path": string, "limit"?: number }`
 - `git_history_for_symbol`: `{ "symbol": string, "language"?: string, "limit"?: number }`
@@ -48,7 +48,9 @@ Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `impo
 `calls_name`, `references_type`, `implements`, and `contains`; confidence is reported as
 `edge_confidence` (`confidence` is retained as the compatibility alias) with values `Exact`,
 `Syntactic`, `NameOnly`, or `Ambiguous`. These are intentionally not compiler-grade resolved call
-graphs.
+graphs. Search results default to compact graph evidence with bounded caller/callee lists; `read_chunk`
+defaults to full graph evidence. Caller and callee entries include exact tree-sitter callsite spans:
+`callsite.path`, `callsite.line`, and `callsite.span` (`[start_line, end_line]`).
 
 `impact_surface` is graph-backed first. It layers exact symbol definitions, direct callers, direct
 callees, import/export dependents, same-file siblings, git commits touching those files, and cached

@@ -59,6 +59,7 @@ struct EdgeCandidate {
     from_symbol_id: Option<i64>,
     from_name: Option<String>,
     to_name: String,
+    source_span: EdgeSpan,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 }
@@ -71,6 +72,27 @@ struct IndexedSymbol {
     kind: String,
     start_byte: usize,
     end_byte: usize,
+    start_line: i64,
+    end_line: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeSpan {
+    start_line: i64,
+    end_line: i64,
+    start_byte: i64,
+    end_byte: i64,
+}
+
+impl IndexedSymbol {
+    fn span(&self) -> EdgeSpan {
+        EdgeSpan {
+            start_line: self.start_line,
+            end_line: self.end_line,
+            start_byte: i64::try_from(self.start_byte).unwrap_or(i64::MAX),
+            end_byte: i64::try_from(self.end_byte).unwrap_or(i64::MAX),
+        }
+    }
 }
 
 pub fn index_file_edges(
@@ -120,17 +142,31 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             } else {
                 EdgeConfidence::NameOnly
             };
-            if current_confidence != confidence.as_str() {
-                conn.execute(
-                    "UPDATE edges SET to_symbol_id = NULL, confidence = ?2 WHERE id = ?1",
-                    params![edge_id, confidence.as_str()],
-                )?;
-            }
+            conn.execute(
+                "UPDATE edges
+                 SET to_symbol_id = NULL,
+                     target_start_line = NULL,
+                     target_end_line = NULL,
+                     confidence = ?2
+                 WHERE id = ?1",
+                params![edge_id, confidence.as_str()],
+            )?;
             continue;
         };
         conn.execute(
-            "UPDATE edges SET to_symbol_id = ?2, confidence = ?3 WHERE id = ?1",
-            params![edge_id, to_symbol_id, confidence.as_str()],
+            "UPDATE edges
+             SET to_symbol_id = ?2,
+                 confidence = ?3,
+                 target_start_line = ?4,
+                 target_end_line = ?5
+             WHERE id = ?1",
+            params![
+                edge_id,
+                to_symbol_id.id,
+                confidence.as_str(),
+                to_symbol_id.start_line,
+                to_symbol_id.end_line
+            ],
         )?;
     }
     Ok(())
@@ -141,17 +177,17 @@ fn resolve_symbol<'a>(
     edge_kind: &str,
     by_name: &BTreeMap<String, Vec<&'a IndexedSymbol>>,
     by_qualified: &BTreeMap<String, &'a IndexedSymbol>,
-) -> Option<(i64, EdgeConfidence)> {
+) -> Option<(&'a IndexedSymbol, EdgeConfidence)> {
     if let Some(symbol) = by_qualified.get(name) {
-        return Some((symbol.id, EdgeConfidence::Exact));
+        return Some((symbol, EdgeConfidence::Exact));
     }
     let short = short_name(name);
     let matches = by_name.get(short)?;
     let preferred = preferred_matches(edge_kind, matches);
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
-        [symbol] => Some((symbol.id, EdgeConfidence::Syntactic)),
-        [symbol, ..] => Some((symbol.id, EdgeConfidence::Ambiguous)),
+        [symbol] => Some((symbol, EdgeConfidence::Syntactic)),
+        [symbol, ..] => Some((symbol, EdgeConfidence::Ambiguous)),
         [] => None,
     }
 }
@@ -188,6 +224,7 @@ fn contains_edges(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
                 from_symbol_id: Some(parent.id),
                 from_name: Some(parent.qualified_name.clone()),
                 to_name: child.qualified_name.clone(),
+                source_span: child.span(),
                 edge_kind: EdgeKind::Contains,
                 confidence: EdgeConfidence::Exact,
             });
@@ -256,7 +293,13 @@ fn rust_edges(
             let is_reexport = node_text(node, text).trim_start().starts_with("pub use ");
             for name in names {
                 if !is_rust_path_keyword(&name) {
-                    out.push(file_edge(path, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                    out.push(file_edge(
+                        path,
+                        node,
+                        name,
+                        EdgeKind::Imports,
+                        EdgeConfidence::NameOnly,
+                    ));
                 }
             }
             if is_reexport {
@@ -264,6 +307,7 @@ fn rust_edges(
                     if !is_rust_path_keyword(&name) {
                         out.push(file_edge(
                             path,
+                            node,
                             name,
                             EdgeKind::Exports,
                             EdgeConfidence::NameOnly,
@@ -274,14 +318,14 @@ fn rust_edges(
         },
         "mod_item" => {
             if let Some(name) = child_name_text(node, text) {
-                out.push(file_edge(path, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                out.push(file_edge(path, node, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
             }
         },
         "call_expression" => {
             if let Some(name) = call_target_name(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
@@ -290,7 +334,7 @@ fn rust_edges(
             if let Some(receiver) = scoped_receiver_name(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -301,7 +345,7 @@ fn rust_edges(
             if let Some(name) = first_identifier_text(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::Ambiguous,
@@ -313,7 +357,7 @@ fn rust_edges(
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -345,13 +389,14 @@ fn rust_impl_edges(
             from_symbol_id: containing_symbol(symbols, node.start_byte()).map(|symbol| symbol.id),
             from_name: Some(type_name),
             to_name: trait_name,
+            source_span: span_for_node(node),
             edge_kind: EdgeKind::Implements,
             confidence: EdgeConfidence::NameOnly,
         });
     } else if let Some(type_name) = type_names.first() {
         out.push(symbol_edge(
             symbols,
-            node.start_byte(),
+            node,
             type_name.clone(),
             EdgeKind::ReferencesType,
             EdgeConfidence::NameOnly,
@@ -369,12 +414,12 @@ fn typescript_edges(
     match node.kind() {
         "import_statement" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(path, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                out.push(file_edge(path, node, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
             }
         },
         "export_statement" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(path, name, EdgeKind::Exports, EdgeConfidence::NameOnly));
+                out.push(file_edge(path, node, name, EdgeKind::Exports, EdgeConfidence::NameOnly));
             }
         },
         "call_expression" | "new_expression" => {
@@ -384,7 +429,7 @@ fn typescript_edges(
             {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
@@ -393,7 +438,7 @@ fn typescript_edges(
             if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -404,7 +449,7 @@ fn typescript_edges(
             if let Some(name) = first_identifier_text(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -415,7 +460,7 @@ fn typescript_edges(
             if let Some(name) = node.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -436,7 +481,7 @@ fn kotlin_edges(
     match node.kind() {
         "import_header" | "import_directive" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(path, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                out.push(file_edge(path, node, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
             }
         },
         "call_expression" => {
@@ -446,7 +491,7 @@ fn kotlin_edges(
             {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
@@ -455,7 +500,7 @@ fn kotlin_edges(
             if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     receiver,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -466,7 +511,7 @@ fn kotlin_edges(
             {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     constructor,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -477,7 +522,7 @@ fn kotlin_edges(
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
@@ -488,7 +533,7 @@ fn kotlin_edges(
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
                     symbols,
-                    node.start_byte(),
+                    node,
                     name,
                     EdgeKind::Implements,
                     EdgeConfidence::NameOnly,
@@ -501,6 +546,7 @@ fn kotlin_edges(
 
 fn file_edge(
     path: &Path,
+    node: Node<'_>,
     to_name: String,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
@@ -509,6 +555,7 @@ fn file_edge(
         from_symbol_id: None,
         from_name: Some(path.to_string_lossy().replace('\\', "/")),
         to_name,
+        source_span: span_for_node(node),
         edge_kind,
         confidence,
     }
@@ -516,16 +563,18 @@ fn file_edge(
 
 fn symbol_edge(
     symbols: &[IndexedSymbol],
-    byte: usize,
+    node: Node<'_>,
     to_name: String,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 ) -> EdgeCandidate {
+    let byte = node.start_byte();
     let source = containing_symbol(symbols, byte);
     EdgeCandidate {
         from_symbol_id: source.map(|symbol| symbol.id),
         from_name: source.map(|symbol| symbol.qualified_name.clone()),
         to_name,
+        source_span: span_for_node(node),
         edge_kind,
         confidence,
     }
@@ -653,10 +702,38 @@ fn short_name(name: &str) -> &str {
 fn symbols_for_file(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, qualified_name, kind, start_byte, end_byte
+        SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+               symbols.start_byte, symbols.end_byte,
+               COALESCE((
+                 SELECT chunks.start_byte
+                 FROM chunks
+                 WHERE chunks.file_id = symbols.file_id
+                   AND symbols.start_byte >= chunks.start_byte
+                   AND symbols.start_byte < chunks.end_byte
+                 ORDER BY chunks.end_byte - chunks.start_byte ASC
+                 LIMIT 1
+               ), symbols.start_byte) AS chunk_start_byte,
+               COALESCE((
+                 SELECT chunks.start_line
+                 FROM chunks
+                 WHERE chunks.file_id = symbols.file_id
+                   AND symbols.start_byte >= chunks.start_byte
+                   AND symbols.start_byte < chunks.end_byte
+                 ORDER BY chunks.end_byte - chunks.start_byte ASC
+                 LIMIT 1
+               ), 1) AS chunk_start_line,
+               COALESCE((
+                 SELECT chunks.text
+                 FROM chunks
+                 WHERE chunks.file_id = symbols.file_id
+                   AND symbols.start_byte >= chunks.start_byte
+                   AND symbols.start_byte < chunks.end_byte
+                 ORDER BY chunks.end_byte - chunks.start_byte ASC
+                 LIMIT 1
+               ), '') AS chunk_text
         FROM symbols
         WHERE file_id = ?1
-        ORDER BY start_byte, end_byte
+        ORDER BY symbols.start_byte, symbols.end_byte
         ",
     )?;
     let rows = stmt.query_map([file_id], symbol_row)?;
@@ -666,9 +743,37 @@ fn symbols_for_file(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<Index
 fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, qualified_name, kind, start_byte, end_byte
+        SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+               symbols.start_byte, symbols.end_byte,
+               COALESCE((
+                 SELECT chunks.start_byte
+                 FROM chunks
+                 WHERE chunks.file_id = symbols.file_id
+                   AND symbols.start_byte >= chunks.start_byte
+                   AND symbols.start_byte < chunks.end_byte
+                 ORDER BY chunks.end_byte - chunks.start_byte ASC
+                 LIMIT 1
+               ), symbols.start_byte) AS chunk_start_byte,
+               COALESCE((
+                 SELECT chunks.start_line
+                 FROM chunks
+                 WHERE chunks.file_id = symbols.file_id
+                   AND symbols.start_byte >= chunks.start_byte
+                   AND symbols.start_byte < chunks.end_byte
+                 ORDER BY chunks.end_byte - chunks.start_byte ASC
+                 LIMIT 1
+               ), 1) AS chunk_start_line,
+               COALESCE((
+                 SELECT chunks.text
+                 FROM chunks
+                 WHERE chunks.file_id = symbols.file_id
+                   AND symbols.start_byte >= chunks.start_byte
+                   AND symbols.start_byte < chunks.end_byte
+                 ORDER BY chunks.end_byte - chunks.start_byte ASC
+                 LIMIT 1
+               ), '') AS chunk_text
         FROM symbols
-        ORDER BY qualified_name
+        ORDER BY symbols.qualified_name
         ",
     )?;
     let rows = stmt.query_map([], symbol_row)?;
@@ -676,13 +781,22 @@ fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
 }
 
 fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
+    let start_byte = usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0);
+    let end_byte = usize::try_from(row.get::<_, i64>(5)?).unwrap_or(0);
+    let chunk_start_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(start_byte);
+    let chunk_start_line = row.get::<_, i64>(7)?;
+    let chunk_text: String = row.get(8)?;
+    let start_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, start_byte);
+    let end_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, end_byte);
     Ok(IndexedSymbol {
         id: row.get(0)?,
         name: row.get(1)?,
         qualified_name: row.get(2)?,
         kind: row.get(3)?,
-        start_byte: usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
-        end_byte: usize::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+        start_byte,
+        end_byte,
+        start_line,
+        end_line,
     })
 }
 
@@ -705,26 +819,59 @@ fn insert_candidates(
             candidate.from_name.clone(),
             to_name.to_string(),
             candidate.edge_kind,
+            candidate.source_span.start_byte,
+            candidate.source_span.end_byte,
         );
         if !seen.insert(key) {
             continue;
         }
         conn.execute(
             "
-            INSERT INTO edges(source_file_id, from_symbol_id, from_name, to_name, edge_kind, confidence)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO edges(
+                source_file_id, from_symbol_id, from_name, to_name,
+                source_start_line, source_end_line, source_start_byte, source_end_byte,
+                edge_kind, confidence
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ",
             params![
                 file_id,
                 candidate.from_symbol_id,
                 candidate.from_name,
                 to_name,
+                candidate.source_span.start_line,
+                candidate.source_span.end_line,
+                candidate.source_span.start_byte,
+                candidate.source_span.end_byte,
                 candidate.edge_kind.as_str(),
                 candidate.confidence.as_str(),
             ],
         )?;
     }
     Ok(())
+}
+
+fn span_for_node(node: Node<'_>) -> EdgeSpan {
+    EdgeSpan {
+        start_line: i64::try_from(node.start_position().row).unwrap_or(i64::MAX).saturating_add(1),
+        end_line: i64::try_from(node.end_position().row).unwrap_or(i64::MAX).saturating_add(1),
+        start_byte: i64::try_from(node.start_byte()).unwrap_or(i64::MAX),
+        end_byte: i64::try_from(node.end_byte()).unwrap_or(i64::MAX),
+    }
+}
+
+fn line_for_byte(
+    chunk_text: &str,
+    chunk_start_byte: usize,
+    chunk_start_line: i64,
+    absolute_byte: usize,
+) -> i64 {
+    let relative_byte = absolute_byte.saturating_sub(chunk_start_byte).min(chunk_text.len());
+    chunk_start_line
+        + i64::try_from(
+            chunk_text.as_bytes()[..relative_byte].iter().filter(|ch| **ch == b'\n').count(),
+        )
+        .unwrap_or(0)
 }
 
 fn collect_rows<T>(

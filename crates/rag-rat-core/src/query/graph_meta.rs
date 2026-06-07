@@ -67,6 +67,7 @@ pub struct CallerEvidence {
     pub symbol_path: String,
     pub path: String,
     pub line: i64,
+    pub callsite: CallsiteEvidence,
     pub edge_kind: String,
     pub confidence: String,
 }
@@ -80,8 +81,16 @@ pub struct CalleeEvidence {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<i64>,
+    pub callsite: CallsiteEvidence,
     pub edge_kind: String,
     pub confidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CallsiteEvidence {
+    pub path: String,
+    pub line: i64,
+    pub span: [i64; 2],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,7 +325,8 @@ fn callers(
         SELECT DISTINCT
                source_files.path,
                COALESCE(source_symbols.qualified_name, edges.from_name, source_files.path),
-               COALESCE(source_chunks.start_line, 1),
+               COALESCE(NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
                edges.edge_kind,
                edges.confidence
         FROM edges
@@ -342,12 +352,19 @@ fn callers(
     let rows = stmt.query_map(params![symbol.id, symbol.name, expanded_limit(limit)], |row| {
         let path: String = row.get(0)?;
         let qualified_name: String = row.get(1)?;
+        let source_start_line = row.get(2)?;
+        let source_end_line = row.get(3)?;
         Ok(CallerEvidence {
             symbol_path: symbol_path(&path, &qualified_name),
-            path,
-            line: row.get(2)?,
-            edge_kind: row.get(3)?,
-            confidence: confidence(row.get::<_, String>(4)?.as_str()).to_string(),
+            path: path.clone(),
+            line: source_start_line,
+            callsite: CallsiteEvidence {
+                path,
+                line: source_start_line,
+                span: [source_start_line, source_end_line],
+            },
+            edge_kind: row.get(4)?,
+            confidence: confidence(row.get::<_, String>(5)?.as_str()).to_string(),
         })
     })?;
     let mut seen = BTreeSet::new();
@@ -366,11 +383,14 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
                edges.to_name,
                target_files.path,
                target_symbols.qualified_name,
-               target_chunks.start_line,
-               COALESCE(source_chunks.start_line, 1),
+               COALESCE(edges.target_start_line, target_chunks.start_line),
+               source_files.path,
+               COALESCE(NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
                edges.edge_kind,
                edges.confidence
         FROM edges
+        JOIN files source_files ON source_files.id = edges.source_file_id
         LEFT JOIN symbols target_symbols ON target_symbols.id = edges.to_symbol_id
         LEFT JOIN files target_files ON target_files.id = target_symbols.file_id
         LEFT JOIN chunks target_chunks ON target_chunks.file_id = target_symbols.file_id
@@ -398,6 +418,9 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
         let target: String = row.get(0)?;
         let path: Option<String> = row.get(1)?;
         let qualified_name: Option<String> = row.get(2)?;
+        let callsite_path: String = row.get(4)?;
+        let callsite_start_line = row.get(5)?;
+        let callsite_end_line = row.get(6)?;
         Ok(CalleeEvidence {
             target,
             resolved_symbol_path: path
@@ -406,8 +429,13 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
                 .map(|(path, qualified_name)| symbol_path(path, qualified_name)),
             path,
             line: row.get(3)?,
-            edge_kind: row.get(5)?,
-            confidence: confidence(row.get::<_, String>(6)?.as_str()).to_string(),
+            callsite: CallsiteEvidence {
+                path: callsite_path,
+                line: callsite_start_line,
+                span: [callsite_start_line, callsite_end_line],
+            },
+            edge_kind: row.get(7)?,
+            confidence: confidence(row.get::<_, String>(8)?.as_str()).to_string(),
         })
     })?;
     let mut seen = BTreeSet::new();

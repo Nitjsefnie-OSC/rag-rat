@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 3;
+pub const LATEST_SCHEMA_VERSION: u32 = 4;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -14,6 +14,10 @@ const MIGRATION_002_DESCRIPTION: &str =
 const MIGRATION_003_ID: &str = "003_derived_artifact_reconcile_metadata";
 const MIGRATION_003_CHECKSUM: &str = "sha256:rag-rat-derived-artifact-reconcile-metadata-v3";
 const MIGRATION_003_DESCRIPTION: &str = "Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation";
+const MIGRATION_004_ID: &str = "004_edge_source_target_spans";
+const MIGRATION_004_CHECKSUM: &str = "sha256:rag-rat-edge-source-target-spans-v4";
+const MIGRATION_004_DESCRIPTION: &str =
+    "Add exact source call-site spans and resolved target line spans to graph edges";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +76,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_002_ID, MIGRATION_002_CHECKSUM, MIGRATION_002_DESCRIPTION)?;
     apply_derived_artifact_reconcile_metadata(conn)?;
     record_migration(conn, MIGRATION_003_ID, MIGRATION_003_CHECKSUM, MIGRATION_003_DESCRIPTION)?;
+    apply_edge_source_target_spans(conn)?;
+    record_migration(conn, MIGRATION_004_ID, MIGRATION_004_CHECKSUM, MIGRATION_004_DESCRIPTION)?;
     Ok(())
 }
 
@@ -223,6 +229,12 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             to_symbol_id INTEGER,
             from_name TEXT,
             to_name TEXT NOT NULL,
+            source_start_line INTEGER NOT NULL DEFAULT 0,
+            source_end_line INTEGER NOT NULL DEFAULT 0,
+            source_start_byte INTEGER NOT NULL DEFAULT 0,
+            source_end_byte INTEGER NOT NULL DEFAULT 0,
+            target_start_line INTEGER,
+            target_end_line INTEGER,
             edge_kind TEXT NOT NULL,
             confidence TEXT NOT NULL,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
@@ -491,6 +503,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     apply_embedding_vector_metadata(conn)?;
     apply_derived_artifact_reconcile_metadata(conn)?;
+    apply_edge_source_target_spans(conn)?;
     Ok(())
 }
 
@@ -542,6 +555,7 @@ fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges", "source_file_id", "INTEGER")?;
     add_column_if_missing(conn, "edges", "from_name", "TEXT")?;
     add_column_if_missing(conn, "edges", "to_name", "TEXT NOT NULL DEFAULT ''")?;
+    apply_edge_source_target_spans(conn)?;
     conn.execute(
         "
         UPDATE edges
@@ -564,6 +578,16 @@ fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
         ",
         [],
     )?;
+    Ok(())
+}
+
+fn apply_edge_source_target_spans(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "source_start_line", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "source_end_line", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "source_start_byte", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "source_end_byte", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "target_start_line", "INTEGER")?;
+    add_column_if_missing(conn, "edges", "target_end_line", "INTEGER")?;
     Ok(())
 }
 
@@ -669,6 +693,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_001_ID => Some(1),
             MIGRATION_002_ID => Some(2),
             MIGRATION_003_ID => Some(3),
+            MIGRATION_004_ID => Some(4),
             _ => None,
         })
         .max()
@@ -676,7 +701,14 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
 }
 
 fn known_migration(id: &str) -> bool {
-    matches!(id, MIGRATION_001_ID | MIGRATION_002_ID | MIGRATION_003_ID | DIRTY_MIGRATION_ID)
+    matches!(
+        id,
+        MIGRATION_001_ID
+            | MIGRATION_002_ID
+            | MIGRATION_003_ID
+            | MIGRATION_004_ID
+            | DIRTY_MIGRATION_ID
+    )
 }
 
 fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
@@ -684,6 +716,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_001_ID => migration.checksum != MIGRATION_001_CHECKSUM,
         MIGRATION_002_ID => migration.checksum != MIGRATION_002_CHECKSUM,
         MIGRATION_003_ID => migration.checksum != MIGRATION_003_CHECKSUM,
+        MIGRATION_004_ID => migration.checksum != MIGRATION_004_CHECKSUM,
         _ => false,
     }
 }

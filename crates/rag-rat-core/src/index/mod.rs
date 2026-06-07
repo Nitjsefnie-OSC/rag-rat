@@ -1856,7 +1856,14 @@ mod schema_bootstrap_tests {
         assert!(embedding_columns.contains(&"attempt_count".to_string()));
         assert!(embedding_columns.contains(&"next_retry_after_ms".to_string()));
         assert!(embedding_columns.contains(&"computed_at_ms".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 3);
+        let edge_columns = table_columns(&db, "edges");
+        assert!(edge_columns.contains(&"source_start_line".to_string()));
+        assert!(edge_columns.contains(&"source_end_line".to_string()));
+        assert!(edge_columns.contains(&"source_start_byte".to_string()));
+        assert!(edge_columns.contains(&"source_end_byte".to_string()));
+        assert!(edge_columns.contains(&"target_start_line".to_string()));
+        assert!(edge_columns.contains(&"target_end_line".to_string()));
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 4);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1945,6 +1952,12 @@ mod schema_bootstrap_tests {
         let columns = table_columns(&db, "edges");
         assert!(columns.contains(&"from_name".to_string()));
         assert!(columns.contains(&"to_name".to_string()));
+        assert!(columns.contains(&"source_start_line".to_string()));
+        assert!(columns.contains(&"source_end_line".to_string()));
+        assert!(columns.contains(&"source_start_byte".to_string()));
+        assert!(columns.contains(&"source_end_byte".to_string()));
+        assert!(columns.contains(&"target_start_line".to_string()));
+        assert!(columns.contains(&"target_end_line".to_string()));
         assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
         assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
 
@@ -2342,9 +2355,12 @@ fn caller() {
             .expect("helper search hit");
         let helper_graph = helper_hit.graph.as_ref().expect("helper graph evidence");
         assert_eq!(helper_graph.caller_count, 1);
-        assert!(helper_graph.top_callers.iter().any(
-            |caller| caller.symbol_path.ends_with("caller") && caller.confidence == "syntactic"
-        ));
+        assert!(helper_graph.top_callers.iter().any(|caller| {
+            caller.symbol_path.ends_with("caller")
+                && caller.callsite.line == 4
+                && caller.callsite.span == [4, 4]
+                && caller.confidence == "syntactic"
+        }));
         assert!(helper_graph.callers.is_empty(), "search keeps graph compact");
 
         let caller_hit = hits
@@ -2352,17 +2368,22 @@ fn caller() {
             .find(|hit| hit.symbol_path.as_deref().is_some_and(|path| path.ends_with("caller")))
             .expect("caller search hit");
         let caller_graph = caller_hit.graph.as_ref().expect("caller graph evidence");
-        assert!(
-            caller_graph
-                .top_callees
-                .iter()
-                .any(|callee| { callee.target == "helper" && callee.confidence == "syntactic" })
-        );
+        assert!(caller_graph.top_callees.iter().any(|callee| {
+            callee.target == "helper"
+                && callee.callsite.line == 4
+                && callee.callsite.span == [4, 4]
+                && callee.confidence == "syntactic"
+        }));
 
         let chunk = db.read_chunk(caller_hit.chunk_id).unwrap().expect("caller chunk");
         let full_graph = chunk.graph.as_ref().expect("full read_chunk graph");
         assert!(full_graph.symbol.as_ref().is_some_and(|symbol| symbol.name == "caller"));
-        assert!(full_graph.callees.iter().any(|callee| callee.target == "helper"));
+        assert!(
+            full_graph
+                .callees
+                .iter()
+                .any(|callee| callee.target == "helper" && callee.callsite.line == 4)
+        );
         assert!(full_graph.notes.iter().any(|note| note.contains("tree-sitter/syntactic")));
 
         fs::remove_dir_all(root).unwrap();
