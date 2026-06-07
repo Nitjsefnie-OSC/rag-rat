@@ -25,11 +25,16 @@ pub struct GraphTraversalOptions {
     pub edge_kinds: Option<Vec<String>>,
     pub resolution_mode: GraphResolutionMode,
     pub symbol_id: Option<i64>,
+    pub logical_symbol_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct GraphTraversalReport {
     pub query: GraphTraversalQuery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_symbol: Option<LogicalSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<LogicalSymbolVariant>,
     pub summary: GraphTraversalSummary,
     pub coverage: GraphCoverage,
     pub results: Vec<GraphHop>,
@@ -39,8 +44,26 @@ pub struct GraphTraversalReport {
 pub struct GraphTraversalQuery {
     pub tool: String,
     pub symbol_id: Option<i64>,
+    pub logical_symbol_id: Option<i64>,
     pub symbol_path: String,
     pub resolution: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogicalSymbol {
+    pub logical_symbol_id: i64,
+    pub qualified_name: String,
+    pub variant_count: u64,
+    pub group_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogicalSymbolVariant {
+    pub symbol_id: i64,
+    pub cfg_expr: Option<String>,
+    pub signature_hash: Option<String>,
+    pub start_line: i64,
+    pub end_line: i64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -129,6 +152,10 @@ impl GraphTraversalOptions {
 #[derive(Debug, Serialize)]
 pub struct CompareGraphTextReport {
     pub query: CompareGraphTextQuery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_symbol: Option<LogicalSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<LogicalSymbolVariant>,
     pub summary: CompareGraphTextSummary,
     pub coverage: GraphCoverage,
     pub matched_hits: Vec<MatchedGraphTextHit>,
@@ -140,6 +167,7 @@ pub struct CompareGraphTextReport {
 #[derive(Debug, Serialize)]
 pub struct CompareGraphTextQuery {
     pub symbol_id: Option<i64>,
+    pub logical_symbol_id: Option<i64>,
     pub symbol_path: String,
     pub pattern: String,
     pub resolution: String,
@@ -240,7 +268,7 @@ pub fn traverse_with_options(
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;
     let sql = if reverse {
-        let predicate = reverse_predicate(mode);
+        let predicate = reverse_predicate(mode, options.logical_symbol_id.is_some());
         let tier = reverse_tier(mode);
         format!(
             "
@@ -277,7 +305,7 @@ pub fn traverse_with_options(
             "
         )
     } else {
-        let predicate = forward_source_predicate(mode);
+        let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
         let target_filter = forward_target_filter(mode, options);
         let visibility_filter = forward_visibility_filter(options);
         format!(
@@ -318,7 +346,14 @@ pub fn traverse_with_options(
             "
         )
     };
-    let params = traversal_params(symbol, limit, &edge_kinds, options.symbol_id, unique_short_name);
+    let params = traversal_params(
+        symbol,
+        limit,
+        &edge_kinds,
+        options.symbol_id,
+        options.logical_symbol_id,
+        unique_short_name,
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
         let edge_kind: String = row.get(2)?;
@@ -370,7 +405,7 @@ pub fn traversal_summary(
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;
     let sql = if reverse {
-        let predicate = reverse_predicate(mode);
+        let predicate = reverse_predicate(mode, options.logical_symbol_id.is_some());
         format!(
             "
             SELECT
@@ -387,7 +422,7 @@ pub fn traversal_summary(
             "
         )
     } else {
-        let predicate = forward_source_predicate(mode);
+        let predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
         let target_filter = forward_target_filter(mode, options);
         let visibility_filter = forward_visibility_filter(options);
         format!(
@@ -409,7 +444,14 @@ pub fn traversal_summary(
             "
         )
     };
-    let params = traversal_params(symbol, limit, &edge_kinds, options.symbol_id, unique_short_name);
+    let params = traversal_params(
+        symbol,
+        limit,
+        &edge_kinds,
+        options.symbol_id,
+        options.logical_symbol_id,
+        unique_short_name,
+    );
     let mut summary = conn.query_row(&sql, params_from_iter(params), |row| {
         Ok(GraphTraversalSummary {
             returned_count: u64::try_from(returned_count).unwrap_or(u64::MAX),
@@ -481,7 +523,7 @@ fn hidden_unresolved_candidate_count(
     let mode = options.resolution_mode;
     let quoted = quoted_placeholders(edge_kinds.len());
     let sql = if reverse {
-        let predicate = reverse_predicate(mode);
+        let predicate = reverse_predicate(mode, options.logical_symbol_id.is_some());
         format!(
             "
             SELECT COUNT(*)
@@ -498,7 +540,7 @@ fn hidden_unresolved_candidate_count(
             "
         )
     } else {
-        let source_predicate = forward_source_predicate(mode);
+        let source_predicate = forward_source_predicate(mode, options.logical_symbol_id.is_some());
         let target_filter = forward_target_filter(mode, options);
         let visibility_filter = forward_visibility_filter(options);
         format!(
@@ -514,7 +556,14 @@ fn hidden_unresolved_candidate_count(
             "
         )
     };
-    let params = traversal_params(symbol, 0, edge_kinds, options.symbol_id, unique_short_name);
+    let params = traversal_params(
+        symbol,
+        0,
+        edge_kinds,
+        options.symbol_id,
+        options.logical_symbol_id,
+        unique_short_name,
+    );
     let count = conn.query_row(&sql, params_from_iter(params), |row| count_col(row, 0))?;
     Ok(count)
 }
@@ -533,6 +582,7 @@ fn traversal_params(
     limit: u32,
     edge_kinds: &[String],
     symbol_id: Option<i64>,
+    logical_symbol_id: Option<i64>,
     unique_short_name: bool,
 ) -> Vec<String> {
     let qualified = symbol.to_string();
@@ -547,16 +597,50 @@ fn traversal_params(
         limit.to_string(),
         symbol_id.unwrap_or(-1).to_string(),
         unique_short_name.to_string(),
+        logical_symbol_id.unwrap_or(-1).to_string(),
     ];
     params.extend(edge_kinds.iter().cloned());
     params
 }
 
 fn quoted_placeholders(count: usize) -> String {
-    (0..count).map(|index| format!("?{}", index + 8)).collect::<Vec<_>>().join(", ")
+    (0..count).map(|index| format!("?{}", index + 9)).collect::<Vec<_>>().join(", ")
 }
 
-fn reverse_predicate(mode: GraphResolutionMode) -> &'static str {
+fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'static str {
+    if logical {
+        return match mode {
+            GraphResolutionMode::Exact => {
+                "edges.to_symbol_id IS NOT NULL
+                 AND edges.to_symbol_id IN (
+                    SELECT symbol_id
+                    FROM logical_symbol_members
+                    WHERE logical_symbol_id = ?8
+                 )"
+            },
+            GraphResolutionMode::Syntactic => {
+                "(edges.to_symbol_id IN (
+                    SELECT symbol_id
+                    FROM logical_symbol_members
+                    WHERE logical_symbol_id = ?8
+                  )
+                  OR edges.target_qualified_name = ?1)"
+            },
+            GraphResolutionMode::Fuzzy => {
+                "edges.to_symbol_id IN (
+                    SELECT symbol_id
+                    FROM logical_symbol_members
+                    WHERE logical_symbol_id = ?8
+                 )
+                 OR to_symbols.name = ?3
+                 OR to_symbols.qualified_name = ?1
+                 OR to_symbols.qualified_name LIKE ?2
+                 OR edges.target_qualified_name = ?1
+                 OR edges.target_qualified_name LIKE ?2
+                 OR (?4 = 'true' AND edges.to_name = ?3)"
+            },
+        };
+    }
     match mode {
         GraphResolutionMode::Exact => {
             "edges.to_symbol_id IS NOT NULL
@@ -600,7 +684,39 @@ fn reverse_tier(mode: GraphResolutionMode) -> &'static str {
     }
 }
 
-fn forward_source_predicate(mode: GraphResolutionMode) -> &'static str {
+fn forward_source_predicate(mode: GraphResolutionMode, logical: bool) -> &'static str {
+    if logical {
+        return match mode {
+            GraphResolutionMode::Exact => {
+                "from_symbols.id IS NOT NULL
+                 AND from_symbols.id IN (
+                    SELECT symbol_id
+                    FROM logical_symbol_members
+                    WHERE logical_symbol_id = ?8
+                 )"
+            },
+            GraphResolutionMode::Syntactic => {
+                "from_symbols.id IN (
+                    SELECT symbol_id
+                    FROM logical_symbol_members
+                    WHERE logical_symbol_id = ?8
+                 )
+                 OR edges.from_name = ?1"
+            },
+            GraphResolutionMode::Fuzzy => {
+                "from_symbols.id IN (
+                    SELECT symbol_id
+                    FROM logical_symbol_members
+                    WHERE logical_symbol_id = ?8
+                 )
+                 OR from_symbols.name = ?3
+                 OR from_symbols.qualified_name = ?1
+                 OR from_symbols.qualified_name LIKE ?2
+                 OR edges.from_name = ?1
+                 OR edges.from_name LIKE ?2"
+            },
+        };
+    }
     match mode {
         GraphResolutionMode::Exact => {
             "from_symbols.id IS NOT NULL

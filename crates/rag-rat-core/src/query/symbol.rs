@@ -6,6 +6,12 @@ use crate::language::Language;
 #[derive(Debug, Serialize)]
 pub struct SymbolHit {
     pub symbol_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_symbol_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_variant_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_group_reason: Option<String>,
     pub file_id: i64,
     pub path: String,
     pub file_kind: String,
@@ -26,8 +32,30 @@ pub struct SymbolLookup {
     pub disambiguation_required: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LogicalSymbolHit {
+    pub logical_symbol_id: i64,
+    pub language: String,
+    pub path: String,
+    pub logical_name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub variant_count: u64,
+    pub group_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LogicalSymbolMember {
+    pub symbol_id: i64,
+    pub cfg_expr: Option<String>,
+    pub signature_hash: Option<String>,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SymbolSelector {
+    pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
     pub symbol: Option<String>,
@@ -48,7 +76,9 @@ pub fn lookup(
     language: Option<Language>,
     limit: u32,
 ) -> anyhow::Result<Vec<SymbolHit>> {
-    lookup_name(conn, name, language, limit)
+    let mut hits = lookup_name(conn, name, language, limit)?;
+    enrich_symbol_hits(conn, &mut hits)?;
+    Ok(hits)
 }
 
 pub fn lookup_candidates(
@@ -70,6 +100,9 @@ pub fn select_one(
     if candidates.is_empty() {
         return Ok(Ok(None));
     }
+    if selector.logical_symbol_id.is_some() {
+        return Ok(Ok(Some(candidates.remove(0))));
+    }
     if needs_disambiguation(&candidates, selector.allow_ambiguous) {
         return Ok(Err(SymbolDisambiguation { candidates, disambiguation_required: true }));
     }
@@ -77,7 +110,8 @@ pub fn select_one(
 }
 
 pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<SymbolHit>> {
-    conn.query_row(
+    let mut hit = conn
+        .query_row(
         "
         SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, symbols.qualified_name,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
@@ -88,24 +122,34 @@ pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<
         [symbol_id],
         symbol_hit_row,
     )
-    .optional()
-    .map_err(Into::into)
+        .optional()?;
+    if let Some(hit) = hit.as_mut() {
+        enrich_symbol_hit(conn, hit)?;
+    }
+    Ok(hit)
 }
 
 fn candidates_for_selector(
     conn: &Connection,
     selector: &SymbolSelector,
 ) -> anyhow::Result<Vec<SymbolHit>> {
+    if let Some(logical_symbol_id) = selector.logical_symbol_id {
+        return lookup_logical_members(conn, logical_symbol_id, selector.limit);
+    }
     if let Some(symbol_id) = selector.symbol_id {
         return Ok(lookup_by_id(conn, symbol_id)?.into_iter().collect());
     }
     if let Some(symbol_path) = selector.symbol_path.as_deref() {
-        return lookup_symbol_path(conn, symbol_path, selector.language, selector.limit);
+        let mut hits = lookup_symbol_path(conn, symbol_path, selector.language, selector.limit)?;
+        enrich_symbol_hits(conn, &mut hits)?;
+        return Ok(hits);
     }
     let Some(symbol) = selector.symbol.as_deref() else {
         anyhow::bail!("one of symbol_id, symbol_path, or symbol is required");
     };
-    lookup_name(conn, symbol, selector.language, selector.limit)
+    let mut hits = lookup_name(conn, symbol, selector.language, selector.limit)?;
+    enrich_symbol_hits(conn, &mut hits)?;
+    Ok(hits)
 }
 
 fn lookup_name(
@@ -135,6 +179,98 @@ fn lookup_name(
         stmt.query_map(params![name, fuzzy, limit], symbol_hit_row)?
     };
 
+    let mut hits = Vec::new();
+    for row in rows {
+        hits.push(row?);
+    }
+    enrich_symbol_hits(conn, &mut hits)?;
+    Ok(hits)
+}
+
+pub fn lookup_logical_by_id(
+    conn: &Connection,
+    logical_symbol_id: i64,
+) -> anyhow::Result<Option<LogicalSymbolHit>> {
+    conn.query_row(
+        "
+        SELECT id, language, path, logical_name, qualified_name, kind, variant_count, group_reason
+        FROM logical_symbols
+        WHERE id = ?1
+        ",
+        [logical_symbol_id],
+        logical_symbol_hit_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn logical_for_symbol_id(
+    conn: &Connection,
+    symbol_id: i64,
+) -> anyhow::Result<Option<LogicalSymbolHit>> {
+    conn.query_row(
+        "
+        SELECT logical_symbols.id, logical_symbols.language, logical_symbols.path,
+               logical_symbols.logical_name, logical_symbols.qualified_name, logical_symbols.kind,
+               logical_symbols.variant_count, logical_symbols.group_reason
+        FROM logical_symbol_members
+        JOIN logical_symbols ON logical_symbols.id = logical_symbol_members.logical_symbol_id
+        WHERE logical_symbol_members.symbol_id = ?1
+        ",
+        [symbol_id],
+        logical_symbol_hit_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn logical_members(
+    conn: &Connection,
+    logical_symbol_id: i64,
+) -> anyhow::Result<Vec<LogicalSymbolMember>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT symbol_id, cfg_expr, signature_hash, start_line, end_line
+        FROM logical_symbol_members
+        WHERE logical_symbol_id = ?1
+        ORDER BY start_line, symbol_id
+        ",
+    )?;
+    let rows = stmt.query_map([logical_symbol_id], |row| {
+        Ok(LogicalSymbolMember {
+            symbol_id: row.get(0)?,
+            cfg_expr: row.get(1)?,
+            signature_hash: row.get(2)?,
+            start_line: row.get(3)?,
+            end_line: row.get(4)?,
+        })
+    })?;
+    let mut members = Vec::new();
+    for row in rows {
+        members.push(row?);
+    }
+    Ok(members)
+}
+
+fn lookup_logical_members(
+    conn: &Connection,
+    logical_symbol_id: i64,
+    limit: u32,
+) -> anyhow::Result<Vec<SymbolHit>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name,
+               symbols.qualified_name, symbols.kind, symbols.start_byte, symbols.end_byte,
+               symbols.signature, symbols.docs
+        FROM logical_symbol_members
+        JOIN symbols ON symbols.id = logical_symbol_members.symbol_id
+        JOIN files ON files.id = symbols.file_id
+        WHERE logical_symbol_members.logical_symbol_id = ?1
+        ORDER BY symbols.start_byte, symbols.id
+        LIMIT ?2
+        ",
+    )?;
+    let rows = stmt.query_map(params![logical_symbol_id, limit], symbol_hit_row)?;
     let mut hits = Vec::new();
     for row in rows {
         hits.push(row?);
@@ -183,6 +319,9 @@ fn symbol_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
     let qualified_name = row.get(6)?;
     Ok(SymbolHit {
         symbol_id: row.get(0)?,
+        logical_symbol_id: None,
+        logical_variant_count: None,
+        logical_group_reason: None,
         file_id: row.get(1)?,
         path: row.get(2)?,
         file_kind: row.get(3)?,
@@ -196,4 +335,34 @@ fn symbol_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SymbolHit> {
         signature: row.get(10)?,
         docs: row.get(11)?,
     })
+}
+
+fn logical_symbol_hit_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogicalSymbolHit> {
+    let variant_count = u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+    Ok(LogicalSymbolHit {
+        logical_symbol_id: row.get(0)?,
+        language: row.get(1)?,
+        path: row.get(2)?,
+        logical_name: row.get(3)?,
+        qualified_name: row.get(4)?,
+        kind: row.get(5)?,
+        variant_count,
+        group_reason: row.get(7)?,
+    })
+}
+
+fn enrich_symbol_hits(conn: &Connection, hits: &mut [SymbolHit]) -> anyhow::Result<()> {
+    for hit in hits {
+        enrich_symbol_hit(conn, hit)?;
+    }
+    Ok(())
+}
+
+fn enrich_symbol_hit(conn: &Connection, hit: &mut SymbolHit) -> anyhow::Result<()> {
+    if let Some(logical) = logical_for_symbol_id(conn, hit.symbol_id)? {
+        hit.logical_symbol_id = Some(logical.logical_symbol_id);
+        hit.logical_variant_count = Some(logical.variant_count);
+        hit.logical_group_reason = Some(logical.group_reason);
+    }
+    Ok(())
 }

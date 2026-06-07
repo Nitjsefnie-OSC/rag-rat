@@ -226,6 +226,7 @@ impl IndexDatabase {
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
             db.index_git_history(&config.root)?;
+            db.rebuild_logical_symbols()?;
             db.resolve_edges()?;
             db.mark_graph_index_current()?;
             progress(IndexProgress::RebuildingFts);
@@ -295,6 +296,7 @@ impl IndexDatabase {
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
+            db.rebuild_logical_symbols()?;
             db.resolve_edges()?;
             db.mark_graph_index_current()?;
             if indexed > 0 {
@@ -1074,6 +1076,7 @@ impl IndexDatabase {
             options,
             results.len(),
         )?;
+        let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
         let mut paths = BTreeSet::new();
         paths.insert(symbol.path.clone());
         for result in &results {
@@ -1092,9 +1095,12 @@ impl IndexDatabase {
             query: crate::query::graph::GraphTraversalQuery {
                 tool: tool.to_string(),
                 symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: options.logical_symbol_id,
                 symbol_path: symbol.qualified_name.clone(),
                 resolution: options.resolution_mode.as_str().to_string(),
             },
+            logical_symbol,
+            variants,
             summary,
             coverage,
             results,
@@ -1124,6 +1130,7 @@ impl IndexDatabase {
             options,
             graph_edges.len(),
         )?;
+        let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
         let text_hits = self.regex_hits(pattern, &regex)?;
         let text_by_location = text_hits
             .iter()
@@ -1213,10 +1220,13 @@ impl IndexDatabase {
         Ok(crate::query::graph::CompareGraphTextReport {
             query: crate::query::graph::CompareGraphTextQuery {
                 symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: options.logical_symbol_id,
                 symbol_path: symbol.qualified_name.clone(),
                 pattern: pattern.to_string(),
                 resolution: options.resolution_mode.as_str().to_string(),
             },
+            logical_symbol,
+            variants,
             summary: crate::query::graph::CompareGraphTextSummary {
                 graph_edges: graph_summary.total_matching_edges,
                 text_hits: u64::try_from(text_hits.len()).unwrap_or(u64::MAX),
@@ -1233,6 +1243,47 @@ impl IndexDatabase {
             graph_only_edges,
             likely_false_positives,
         })
+    }
+
+    fn graph_logical_symbol(
+        &self,
+        logical_symbol_id: Option<i64>,
+    ) -> anyhow::Result<(
+        Option<crate::query::graph::LogicalSymbol>,
+        Vec<crate::query::graph::LogicalSymbolVariant>,
+    )> {
+        let Some(logical_symbol_id) = logical_symbol_id else {
+            return Ok((None, Vec::new()));
+        };
+        let Some(logical) = crate::query::symbol::lookup_logical_by_id(
+            self.storage.connection(),
+            logical_symbol_id,
+        )?
+        else {
+            return Ok((None, Vec::new()));
+        };
+        let variants = crate::query::symbol::logical_members(
+            self.storage.connection(),
+            logical.logical_symbol_id,
+        )?
+        .into_iter()
+        .map(|member| crate::query::graph::LogicalSymbolVariant {
+            symbol_id: member.symbol_id,
+            cfg_expr: member.cfg_expr,
+            signature_hash: member.signature_hash,
+            start_line: member.start_line,
+            end_line: member.end_line,
+        })
+        .collect::<Vec<_>>();
+        Ok((
+            Some(crate::query::graph::LogicalSymbol {
+                logical_symbol_id: logical.logical_symbol_id,
+                qualified_name: logical.qualified_name,
+                variant_count: logical.variant_count,
+                group_reason: logical.group_reason,
+            }),
+            variants,
+        ))
     }
 
     pub fn impact_surface(
@@ -1322,6 +1373,7 @@ impl IndexDatabase {
         let text = fs::read_to_string(&full_path)?;
         self.remove_file(path)?;
         self.index_file(path, row.language, row.kind, file_metadata_ms(&full_path)?, &text)?;
+        self.rebuild_logical_symbols()?;
         self.resolve_edges()
     }
 
@@ -1540,6 +1592,116 @@ impl IndexDatabase {
 
     fn resolve_edges(&self) -> anyhow::Result<()> {
         edges::resolve_all_edges(self.storage.connection())
+    }
+
+    fn rebuild_logical_symbols(&self) -> anyhow::Result<()> {
+        self.storage.connection().execute("DELETE FROM logical_symbol_members", [])?;
+        self.storage.connection().execute("DELETE FROM logical_symbols", [])?;
+
+        let mut stmt = self.storage.connection().prepare(
+            "
+            SELECT symbols.id, symbols.file_id, files.path, symbols.language, symbols.name,
+                   symbols.qualified_name, symbols.kind, symbols.start_byte, symbols.end_byte,
+                   symbols.signature,
+                   COALESCE((
+                     SELECT chunks.start_byte
+                     FROM chunks
+                     WHERE chunks.file_id = symbols.file_id
+                       AND symbols.start_byte >= chunks.start_byte
+                       AND symbols.start_byte < chunks.end_byte
+                     ORDER BY chunks.end_byte - chunks.start_byte ASC
+                     LIMIT 1
+                   ), symbols.start_byte) AS chunk_start_byte,
+                   COALESCE((
+                     SELECT chunks.start_line
+                     FROM chunks
+                     WHERE chunks.file_id = symbols.file_id
+                       AND symbols.start_byte >= chunks.start_byte
+                       AND symbols.start_byte < chunks.end_byte
+                     ORDER BY chunks.end_byte - chunks.start_byte ASC
+                     LIMIT 1
+                   ), 1) AS chunk_start_line,
+                   COALESCE((
+                     SELECT chunks.text
+                     FROM chunks
+                     WHERE chunks.file_id = symbols.file_id
+                       AND symbols.start_byte >= chunks.start_byte
+                       AND symbols.start_byte < chunks.end_byte
+                     ORDER BY chunks.end_byte - chunks.start_byte ASC
+                     LIMIT 1
+                   ), '') AS chunk_text
+            FROM symbols
+            JOIN files ON files.id = symbols.file_id
+            ORDER BY files.path, symbols.language, symbols.qualified_name, symbols.kind,
+                     symbols.start_byte, symbols.end_byte
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let start_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0);
+            let end_byte = usize::try_from(row.get::<_, i64>(8)?).unwrap_or(0);
+            let chunk_start_byte = usize::try_from(row.get::<_, i64>(10)?).unwrap_or(start_byte);
+            let chunk_start_line = row.get::<_, i64>(11)?;
+            let chunk_text: String = row.get(12)?;
+            let start_line =
+                symbol_line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, start_byte);
+            let end_line =
+                symbol_line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, end_byte);
+            Ok(LogicalSymbolMemberRow {
+                symbol_id: row.get(0)?,
+                path: row.get(2)?,
+                language: row.get(3)?,
+                name: row.get(4)?,
+                qualified_name: row.get(5)?,
+                kind: row.get(6)?,
+                signature: row.get(9)?,
+                start_line,
+                end_line,
+            })
+        })?;
+        let mut groups: BTreeMap<LogicalSymbolKey, Vec<LogicalSymbolMemberRow>> = BTreeMap::new();
+        for row in rows {
+            let row = row?;
+            groups.entry(LogicalSymbolKey::from(&row)).or_default().push(row);
+        }
+        for (key, members) in groups {
+            let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
+            self.storage.connection().execute(
+                "
+                INSERT INTO logical_symbols(language, path, logical_name, qualified_name, kind, variant_count, group_reason)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    key.language,
+                    key.path,
+                    key.name,
+                    key.qualified_name,
+                    key.kind,
+                    i64::try_from(members.len()).unwrap_or(i64::MAX),
+                    group_reason,
+                ],
+            )?;
+            let logical_symbol_id = self.storage.connection().last_insert_rowid();
+            for member in members {
+                let signature_hash =
+                    member.signature.as_deref().map(|signature| hex_sha256(signature.as_bytes()));
+                self.storage.connection().execute(
+                    "
+                    INSERT INTO logical_symbol_members(
+                        logical_symbol_id, symbol_id, cfg_expr, signature_hash, start_line, end_line
+                    )
+                    VALUES (?1, ?2, NULL, ?3, ?4, ?5)
+                    ",
+                    params![
+                        logical_symbol_id,
+                        member.symbol_id,
+                        signature_hash,
+                        member.start_line,
+                        member.end_line,
+                    ],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn graph_coverage(
@@ -2027,6 +2189,54 @@ struct GraphPathRow {
     indexed_revision: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LogicalSymbolKey {
+    language: String,
+    path: String,
+    name: String,
+    qualified_name: String,
+    kind: String,
+}
+
+impl LogicalSymbolKey {
+    fn from(row: &LogicalSymbolMemberRow) -> Self {
+        Self {
+            language: row.language.clone(),
+            path: row.path.clone(),
+            name: row.name.clone(),
+            qualified_name: row.qualified_name.clone(),
+            kind: row.kind.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LogicalSymbolMemberRow {
+    symbol_id: i64,
+    path: String,
+    language: String,
+    name: String,
+    qualified_name: String,
+    kind: String,
+    signature: Option<String>,
+    start_line: i64,
+    end_line: i64,
+}
+
+fn symbol_line_for_byte(
+    text: &str,
+    chunk_start_byte: usize,
+    chunk_start_line: i64,
+    byte: usize,
+) -> i64 {
+    if byte <= chunk_start_byte {
+        return chunk_start_line.max(1);
+    }
+    let local = byte.saturating_sub(chunk_start_byte).min(text.len());
+    chunk_start_line
+        + i64::try_from(text[..local].bytes().filter(|byte| *byte == b'\n').count()).unwrap_or(0)
+}
+
 fn graph_only_reason(edge: &crate::query::graph::GraphHop, current_line: Option<&str>) -> String {
     let Some(line) = current_line else {
         return "missing_current_source_line".to_string();
@@ -2462,7 +2672,13 @@ mod schema_bootstrap_tests {
         assert!(edge_columns.contains(&"evidence".to_string()));
         assert!(edge_columns.contains(&"receiver_hint".to_string()));
         assert!(edge_columns.contains(&"resolution".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 6);
+        let logical_columns = table_columns(&db, "logical_symbols");
+        assert!(logical_columns.contains(&"qualified_name".to_string()));
+        assert!(logical_columns.contains(&"variant_count".to_string()));
+        let member_columns = table_columns(&db, "logical_symbol_members");
+        assert!(member_columns.contains(&"symbol_id".to_string()));
+        assert!(member_columns.contains(&"signature_hash".to_string()));
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 7);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3106,6 +3322,91 @@ fn caller() {
             "exact callees: {exact_callees:?}"
         );
         assert!(exact_callees.iter().all(|edge| edge.verified_target_symbol));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logical_symbol_exact_mode_covers_duplicate_rust_variants() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_blocking() {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_blocking() {}
+
+pub fn caller() {
+    spawn_blocking();
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let lookup = db
+            .symbol_candidates(&crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("spawn_blocking".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            })
+            .unwrap();
+        let logical_symbol_id = lookup.candidates[0].logical_symbol_id.expect("logical id");
+        assert_eq!(lookup.candidates[0].logical_variant_count, Some(2));
+        assert_eq!(lookup.candidates[0].logical_group_reason.as_deref(), Some("cfg_variant"));
+
+        let exact_variant_callers = db
+            .find_callers_with_options(
+                "spawn_blocking",
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    symbol_id: Some(lookup.candidates[1].symbol_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            exact_variant_callers.is_empty(),
+            "single variant exact should not imply the sibling cfg body: {exact_variant_callers:?}"
+        );
+
+        let exact_logical = db
+            .graph_traversal_report(
+                "find_callers",
+                &lookup.candidates[0],
+                true,
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    symbol_id: Some(lookup.candidates[0].symbol_id),
+                    logical_symbol_id: Some(logical_symbol_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(exact_logical.query.logical_symbol_id, Some(logical_symbol_id));
+        assert_eq!(
+            exact_logical.logical_symbol.as_ref().map(|symbol| symbol.variant_count),
+            Some(2)
+        );
+        assert_eq!(exact_logical.variants.len(), 2);
+        assert!(exact_logical.results.iter().all(|edge| edge.verified_target_symbol));
+        assert!(
+            exact_logical.results.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|symbol| symbol.ends_with("caller"))
+                    && edge.target.as_deref() == Some("spawn_blocking")
+            }),
+            "logical exact callers: {exact_logical:?}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

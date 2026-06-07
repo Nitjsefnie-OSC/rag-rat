@@ -94,6 +94,7 @@ pub fn impact_surface_report_for_symbol(
     let graph_options = GraphTraversalOptions {
         resolution_mode: options.resolution_mode,
         symbol_id: Some(symbol.symbol_id),
+        logical_symbol_id: symbol.logical_symbol_id,
         ..Default::default()
     };
     let direct_semantic_callers =

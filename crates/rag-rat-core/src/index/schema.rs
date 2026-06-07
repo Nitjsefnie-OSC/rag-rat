@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 6;
+pub const LATEST_SCHEMA_VERSION: u32 = 7;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -25,6 +25,10 @@ const MIGRATION_005_DESCRIPTION: &str =
 const MIGRATION_006_ID: &str = "006_embedding_policy_and_input_hash";
 const MIGRATION_006_CHECKSUM: &str = "sha256:rag-rat-embedding-policy-input-hash-v6";
 const MIGRATION_006_DESCRIPTION: &str = "Add embedding eligibility policy, priority, bounded input hash, and reconcile throughput metadata";
+const MIGRATION_007_ID: &str = "007_logical_symbol_groups";
+const MIGRATION_007_CHECKSUM: &str = "sha256:rag-rat-logical-symbol-groups-v7";
+const MIGRATION_007_DESCRIPTION: &str =
+    "Add logical symbol groups for cfg variants and duplicate definitions";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -89,6 +93,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_005_ID, MIGRATION_005_CHECKSUM, MIGRATION_005_DESCRIPTION)?;
     apply_embedding_policy_and_input_hash(conn)?;
     record_migration(conn, MIGRATION_006_ID, MIGRATION_006_CHECKSUM, MIGRATION_006_DESCRIPTION)?;
+    apply_logical_symbol_groups(conn)?;
+    record_migration(conn, MIGRATION_007_ID, MIGRATION_007_CHECKSUM, MIGRATION_007_DESCRIPTION)?;
     Ok(())
 }
 
@@ -233,6 +239,29 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             signature TEXT,
             docs TEXT,
             FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS logical_symbols(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            language TEXT NOT NULL,
+            path TEXT NOT NULL,
+            logical_name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            variant_count INTEGER NOT NULL,
+            group_reason TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS logical_symbol_members(
+            logical_symbol_id INTEGER NOT NULL,
+            symbol_id INTEGER NOT NULL,
+            cfg_expr TEXT,
+            signature_hash TEXT,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            PRIMARY KEY(logical_symbol_id, symbol_id),
+            FOREIGN KEY(logical_symbol_id) REFERENCES logical_symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS edges(
@@ -507,6 +536,10 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
+            ON logical_symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
+            ON logical_symbol_members(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_edges_from_symbol ON edges(from_symbol_id);
         CREATE INDEX IF NOT EXISTS idx_edges_to_symbol ON edges(to_symbol_id);
         CREATE INDEX IF NOT EXISTS idx_git_file_changes_path ON git_file_changes(path);
@@ -531,6 +564,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_derived_artifact_reconcile_metadata(conn)?;
     apply_edge_source_target_spans(conn)?;
     apply_embedding_policy_and_input_hash(conn)?;
+    apply_logical_symbol_groups(conn)?;
     Ok(())
 }
 
@@ -749,6 +783,41 @@ fn apply_embedding_policy_and_input_hash(conn: &Connection) -> rusqlite::Result<
     Ok(())
 }
 
+fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS logical_symbols(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            language TEXT NOT NULL,
+            path TEXT NOT NULL,
+            logical_name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            variant_count INTEGER NOT NULL,
+            group_reason TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS logical_symbol_members(
+            logical_symbol_id INTEGER NOT NULL,
+            symbol_id INTEGER NOT NULL,
+            cfg_expr TEXT,
+            signature_hash TEXT,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            PRIMARY KEY(logical_symbol_id, symbol_id),
+            FOREIGN KEY(logical_symbol_id) REFERENCES logical_symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
+            ON logical_symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
+            ON logical_symbol_members(symbol_id);
+        ",
+    )?;
+    Ok(())
+}
+
 fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -782,6 +851,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_004_ID => Some(4),
             MIGRATION_005_ID => Some(5),
             MIGRATION_006_ID => Some(6),
+            MIGRATION_007_ID => Some(7),
             _ => None,
         })
         .max()
@@ -797,6 +867,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_004_ID
             | MIGRATION_005_ID
             | MIGRATION_006_ID
+            | MIGRATION_007_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -809,6 +880,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_004_ID => migration.checksum != MIGRATION_004_CHECKSUM,
         MIGRATION_005_ID => migration.checksum != MIGRATION_005_CHECKSUM,
         MIGRATION_006_ID => migration.checksum != MIGRATION_006_CHECKSUM,
+        MIGRATION_007_ID => migration.checksum != MIGRATION_007_CHECKSUM,
         _ => false,
     }
 }

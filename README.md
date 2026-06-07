@@ -12,6 +12,9 @@ records pragmatic `imports`, `exports`, `calls_name`, `constructs`, `uses_macro`
 name collisions do not masquerade as normal callees. Raw edge evidence, receiver hints, call-site
 spans, and resolution reasons are stored with each edge. This makes `find_callers`,
 `trace_callees`, and impact routing useful while keeping approximate edges explicit.
+Duplicate Rust definitions that represent one cfg-gated API are grouped as logical symbols, so
+`logical_symbol_id` plus exact graph resolution can ask for callers of the logical API without
+weakening exactness to bare-name fallback.
 
 Tree-sitter grammars are exact-pinned in `Cargo.toml` so parser node coverage changes deliberately.
 

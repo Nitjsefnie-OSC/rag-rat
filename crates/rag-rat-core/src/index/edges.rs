@@ -226,6 +226,9 @@ fn resolve_symbol<'a>(
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "qualified_suffix")),
+            [_, ..] if same_logical_symbol(&matches) => {
+                return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));
+            },
             [_, ..] => return None,
             [] => {},
         }
@@ -243,6 +246,9 @@ fn resolve_symbol<'a>(
     match matches {
         [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
         [_, ..] => {
+            if same_logical_symbol(matches) {
+                return Some((matches[0], EdgeConfidence::Syntactic, "logical_variant"));
+            }
             let same_file = matches
                 .iter()
                 .copied()
@@ -250,11 +256,25 @@ fn resolve_symbol<'a>(
                 .collect::<Vec<_>>();
             match same_file.as_slice() {
                 [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "same_file_name")),
+                [_, ..] if same_logical_symbol(&same_file) => {
+                    Some((same_file[0], EdgeConfidence::Syntactic, "logical_variant"))
+                },
                 _ => None,
             }
         },
         [] => None,
     }
+}
+
+fn same_logical_symbol(symbols: &[&IndexedSymbol]) -> bool {
+    let Some(first) = symbols.first() else {
+        return false;
+    };
+    symbols.iter().all(|symbol| {
+        symbol.qualified_name == first.qualified_name
+            && symbol.name == first.name
+            && symbol.kind == first.kind
+    })
 }
 
 fn allow_unqualified_fallback(

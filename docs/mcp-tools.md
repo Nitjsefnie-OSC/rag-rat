@@ -66,11 +66,11 @@ Development config without installing:
 ## Tools
 
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`
-- `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
-- `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_docs"?: boolean, "include_git"?: boolean, "include_papertrail"?: boolean, "include_text_fallback"?: boolean }`
+- `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_docs"?: boolean, "include_git"?: boolean, "include_papertrail"?: boolean, "include_text_fallback"?: boolean }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number }`
@@ -100,6 +100,9 @@ used by the handlers. Existing tool names and response fields are kept stable fo
   "candidates": [
     {
       "symbol_id": 3150,
+      "logical_symbol_id": 98,
+      "logical_variant_count": 2,
+      "logical_group_reason": "cfg_variant",
       "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
       "qualified_name": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
       "kind": "function",
@@ -110,10 +113,17 @@ used by the handlers. Existing tool names and response fields are kept stable fo
 }
 ```
 
-Graph, docs, git-history, papertrail, and symbol-specific impact tools accept `symbol_id`,
-`symbol_path`, or `symbol` and resolve them in that priority order. If a bare `symbol` maps to
-multiple candidates, the tool returns the same candidate object instead of guessing. Pass
+Graph, docs, git-history, papertrail, and symbol-specific impact tools accept `logical_symbol_id`,
+`symbol_id`, `symbol_path`, or `symbol` and resolve them in that priority order. If a bare `symbol`
+maps to multiple candidates, the tool returns the same candidate object instead of guessing. Pass
 `allow_ambiguous: true` only for navigation/debugging when name fallback is acceptable.
+
+Logical symbols group multiple concrete symbol rows that represent one source-level API, such as
+Rust `#[cfg]` variants of the same function in the same file. Use `logical_symbol_id` with
+`resolution: "exact"` when callers target the logical API rather than one cfg body. Exact logical
+mode only returns edges whose verified `target_symbol_id` is a member of the group. Graph envelopes
+include the selected `logical_symbol` and its `variants`; `cfg_expr` may be `null` until cfg
+attribute extraction is recorded by the parser.
 
 Search tools return chunk IDs, paths, line spans, current-text snippets in the `summary` field, and
 scores. Search and `read_chunk` validate stored chunk anchors against current source before
@@ -159,8 +169,9 @@ Graph tools and `impact_surface` accept `resolution`:
   ambiguous candidates. Treat these rows as possible evidence, not proof.
 
 Use `symbol_id` with `resolution: "exact"` when a previous `symbol_lookup` result selected one
-specific symbol. Bare names in `exact` mode intentionally return little or nothing unless
-`symbol_id` is provided.
+specific concrete symbol. Use `logical_symbol_id` with `resolution: "exact"` when the lookup result
+shows multiple cfg/duplicate variants of the same logical API. Bare names in `exact` mode
+intentionally return little or nothing unless `symbol_id` or `logical_symbol_id` is provided.
 
 `find_callers` and `trace_callees` return a graph envelope, not a bare row array:
 

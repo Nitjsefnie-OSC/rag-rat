@@ -64,6 +64,7 @@ pub struct SearchArgs {
 pub struct SymbolArgs {
     pub symbol: Option<String>,
     pub symbol_path: Option<String>,
+    pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub language: Option<String>,
     #[serde(default)]
@@ -75,6 +76,7 @@ pub struct SymbolArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
     pub symbol: Option<String>,
+    pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
     pub resolution: Option<String>,
@@ -97,6 +99,7 @@ pub struct SymbolGraphArgs {
 pub struct CompareGraphTextArgs {
     pub pattern: String,
     pub symbol: Option<String>,
+    pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub symbol_path: Option<String>,
     pub resolution: Option<String>,
@@ -120,6 +123,7 @@ pub struct ImpactArgs {
     pub query: Option<String>,
     pub symbol: Option<String>,
     pub symbol_path: Option<String>,
+    pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub resolution: Option<String>,
     #[serde(default)]
@@ -351,6 +355,7 @@ fn graph_tool(
                 edge_kinds,
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: args.logical_symbol_id,
             };
             Ok(json!(db.graph_traversal_report(
                 if reverse { "find_callers" } else { "trace_callees" },
@@ -372,6 +377,7 @@ fn graph_tool(
                 edge_kinds,
                 resolution_mode,
                 symbol_id: args.symbol_id,
+                logical_symbol_id: args.logical_symbol_id,
             };
             let hops = if reverse {
                 db.find_callers_with_options(symbol, limit, &options)?
@@ -406,6 +412,7 @@ fn compare_graph_to_text_tool(
     resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Value> {
     let selector = SymbolSelector {
+        logical_symbol_id: args.logical_symbol_id,
         symbol_id: args.symbol_id,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
@@ -423,6 +430,7 @@ fn compare_graph_to_text_tool(
                 edge_kinds: args.edge_kinds,
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: args.logical_symbol_id,
             };
             Ok(json!(db.compare_graph_to_text(&symbol, &args.pattern, args.limit, &options)?))
         },
@@ -478,8 +486,13 @@ fn impact_tool(
         include_papertrail: args.include_papertrail,
         include_text_fallback: args.include_text_fallback,
     };
-    if args.symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
+    if args.logical_symbol_id.is_some()
+        || args.symbol_id.is_some()
+        || args.symbol_path.is_some()
+        || args.symbol.is_some()
+    {
         let selector = SymbolSelector {
+            logical_symbol_id: args.logical_symbol_id,
             symbol_id: args.symbol_id,
             symbol_path: args.symbol_path,
             symbol: args.symbol,
@@ -509,6 +522,7 @@ fn impact_tool(
 
 fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
+        logical_symbol_id: args.logical_symbol_id,
         symbol_id: args.symbol_id,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
@@ -520,6 +534,7 @@ fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
 
 fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
+        logical_symbol_id: args.logical_symbol_id,
         symbol_id: args.symbol_id,
         symbol_path: args.symbol_path.clone(),
         symbol: args.symbol.clone(),
@@ -725,6 +740,7 @@ mod tests {
         assert_schema_has_property(tools, "find_callers", "include_common_methods");
         assert_schema_has_property(tools, "find_callers", "edge_kinds");
         assert_schema_has_property(tools, "find_callers", "resolution");
+        assert_schema_has_property(tools, "find_callers", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "find_callers");
         assert_schema_has_property(tools, "trace_callees", "include_references");
         assert_schema_has_property(tools, "trace_callees", "include_unresolved");
@@ -732,6 +748,7 @@ mod tests {
         assert_schema_has_property(tools, "trace_callees", "include_common_methods");
         assert_schema_has_property(tools, "trace_callees", "edge_kinds");
         assert_schema_has_property(tools, "trace_callees", "resolution");
+        assert_schema_has_property(tools, "trace_callees", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "trace_callees");
         assert_schema_requires(tools, "compare_graph_to_text", "pattern");
         assert_schema_has_property(tools, "compare_graph_to_text", "include_unresolved");
@@ -739,6 +756,7 @@ mod tests {
         assert_schema_has_property(tools, "compare_graph_to_text", "include_common_methods");
         assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
         assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
+        assert_schema_has_property(tools, "compare_graph_to_text", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "compare_graph_to_text");
         assert_schema_has_property(tools, "impact_surface", "resolution");
         assert_schema_has_property(tools, "impact_surface", "include_tests");
@@ -746,6 +764,7 @@ mod tests {
         assert_schema_has_property(tools, "impact_surface", "include_git");
         assert_schema_has_property(tools, "impact_surface", "include_papertrail");
         assert_schema_has_property(tools, "impact_surface", "include_text_fallback");
+        assert_schema_has_property(tools, "impact_surface", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "impact_surface");
         assert_symbol_selector_schema(tools, "docs_for_symbol");
         assert_symbol_selector_schema(tools, "git_history_for_symbol");
@@ -961,7 +980,8 @@ mod tests {
     }
 
     fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
-        for field in ["symbol", "symbol_path", "symbol_id", "allow_ambiguous"] {
+        for field in ["symbol", "symbol_path", "symbol_id", "logical_symbol_id", "allow_ambiguous"]
+        {
             assert_schema_has_property(tools, name, field);
         }
     }
