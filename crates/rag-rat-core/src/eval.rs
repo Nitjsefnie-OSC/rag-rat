@@ -28,9 +28,21 @@ pub struct EvalQuery {
     pub id: String,
     pub text: String,
     #[serde(default)]
+    pub evidence_class: Option<String>,
+    #[serde(default)]
+    pub requires_papertrail_cache: bool,
+    #[serde(default)]
     pub must_include_paths: Vec<String>,
     #[serde(default)]
     pub must_include_symbols: Vec<String>,
+    #[serde(default)]
+    pub must_include_graph_targets: Vec<String>,
+    #[serde(default)]
+    pub must_include_impact_categories: Vec<String>,
+    #[serde(default)]
+    pub must_include_impact_paths: Vec<String>,
+    #[serde(default)]
+    pub must_include_impact_symbols: Vec<String>,
     #[serde(default)]
     pub should_include_git_subjects: Vec<String>,
     #[serde(default)]
@@ -44,6 +56,14 @@ pub struct ExpectedQuery {
     pub must_include_paths: Vec<String>,
     #[serde(default)]
     pub must_include_symbols: Vec<String>,
+    #[serde(default)]
+    pub must_include_graph_targets: Vec<String>,
+    #[serde(default)]
+    pub must_include_impact_categories: Vec<String>,
+    #[serde(default)]
+    pub must_include_impact_paths: Vec<String>,
+    #[serde(default)]
+    pub must_include_impact_symbols: Vec<String>,
     #[serde(default)]
     pub should_include_git_subjects: Vec<String>,
     #[serde(default)]
@@ -84,6 +104,10 @@ pub struct EvalMetrics {
     pub recall_at_10: f64,
     pub path_hit_rate: f64,
     pub symbol_hit_rate: f64,
+    pub graph_evidence_hit_rate: f64,
+    pub impact_hit_rate: f64,
+    pub git_evidence_hit_rate: f64,
+    pub papertrail_evidence_hit_rate: f64,
     pub stale_hit_rate: f64,
     pub stale_current_source_violations: u64,
     pub current_source_violation_count: u64,
@@ -97,12 +121,23 @@ pub struct EvalQueryReport {
     pub id: String,
     pub text: String,
     pub passed: bool,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
     pub reciprocal_rank_at_10: f64,
     pub recall_at_10: f64,
     pub path_hits: Vec<String>,
     pub missing_paths: Vec<String>,
     pub symbol_hits: Vec<String>,
     pub missing_symbols: Vec<String>,
+    pub graph_target_hits: Vec<String>,
+    pub missing_graph_targets: Vec<String>,
+    pub impact_category_hits: Vec<String>,
+    pub missing_impact_categories: Vec<String>,
+    pub impact_path_hits: Vec<String>,
+    pub missing_impact_paths: Vec<String>,
+    pub impact_symbol_hits: Vec<String>,
+    pub missing_impact_symbols: Vec<String>,
     pub git_subject_hits: Vec<String>,
     pub missing_git_subjects: Vec<String>,
     pub papertrail_kind_hits: Vec<String>,
@@ -195,8 +230,26 @@ fn merge_expected(query: EvalQuery, expected: Option<&ExpectedQuery>) -> EvalQue
     EvalQuery {
         id: query.id,
         text: query.text,
+        evidence_class: query.evidence_class,
+        requires_papertrail_cache: query.requires_papertrail_cache,
         must_include_paths: union(query.must_include_paths, &expected.must_include_paths),
         must_include_symbols: union(query.must_include_symbols, &expected.must_include_symbols),
+        must_include_graph_targets: union(
+            query.must_include_graph_targets,
+            &expected.must_include_graph_targets,
+        ),
+        must_include_impact_categories: union(
+            query.must_include_impact_categories,
+            &expected.must_include_impact_categories,
+        ),
+        must_include_impact_paths: union(
+            query.must_include_impact_paths,
+            &expected.must_include_impact_paths,
+        ),
+        must_include_impact_symbols: union(
+            query.must_include_impact_symbols,
+            &expected.must_include_impact_symbols,
+        ),
         should_include_git_subjects: union(
             query.should_include_git_subjects,
             &expected.should_include_git_subjects,
@@ -224,6 +277,13 @@ fn evaluate_query(
     query: &EvalQuery,
     mode: SearchMode,
 ) -> anyhow::Result<EvalQueryReport> {
+    if query.requires_papertrail_cache && !papertrail_cache_available(db)? {
+        return Ok(skipped_report(
+            query,
+            "papertrail cache is empty; run `rag-rat github sync --from-refs`",
+        ));
+    }
+
     let started = Instant::now();
     let mut hits = search(db, mode, &query.text)?;
     let mut latency_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -254,6 +314,50 @@ fn evaluate_query(
         .cloned()
         .collect::<Vec<_>>();
     let missing_symbols = missing(&query.must_include_symbols, &symbol_hits);
+
+    let graph_target_hits = query
+        .must_include_graph_targets
+        .iter()
+        .filter(|expected| hits.iter().any(|hit| graph_hit_matches(hit, expected)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_graph_targets = missing(&query.must_include_graph_targets, &graph_target_hits);
+
+    let impact = if query.must_include_impact_categories.is_empty()
+        && query.must_include_impact_paths.is_empty()
+        && query.must_include_impact_symbols.is_empty()
+    {
+        Vec::new()
+    } else {
+        db.impact_surface(&query.text, TOP_K as u32).unwrap_or_default()
+    };
+    let impact_category_hits = query
+        .must_include_impact_categories
+        .iter()
+        .filter(|expected| impact.iter().any(|item| item.category == **expected))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_impact_categories =
+        missing(&query.must_include_impact_categories, &impact_category_hits);
+    let impact_path_hits = query
+        .must_include_impact_paths
+        .iter()
+        .filter(|expected| impact.iter().any(|item| item.path == **expected))
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_impact_paths = missing(&query.must_include_impact_paths, &impact_path_hits);
+    let impact_symbol_hits = query
+        .must_include_impact_symbols
+        .iter()
+        .filter(|expected| {
+            impact
+                .iter()
+                .filter_map(|item| item.symbol.as_deref())
+                .any(|symbol| symbol == expected.as_str() || symbol.ends_with(expected.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_impact_symbols = missing(&query.must_include_impact_symbols, &impact_symbol_hits);
 
     let commit_hits = db.commit_search(&query.text, TOP_K as u32).unwrap_or_default();
     let git_subject_hits = query
@@ -307,6 +411,10 @@ fn evaluate_query(
     let passed = stale_current_source_violations == 0
         && missing_paths.is_empty()
         && missing_symbols.is_empty()
+        && missing_graph_targets.is_empty()
+        && missing_impact_categories.is_empty()
+        && missing_impact_paths.is_empty()
+        && missing_impact_symbols.is_empty()
         && missing_git_subjects.is_empty()
         && missing_papertrail_kinds.is_empty();
 
@@ -314,12 +422,22 @@ fn evaluate_query(
         id: query.id.clone(),
         text: query.text.clone(),
         passed,
+        skipped: false,
+        skip_reason: None,
         reciprocal_rank_at_10,
         recall_at_10,
         path_hits,
         missing_paths,
         symbol_hits,
         missing_symbols,
+        graph_target_hits,
+        missing_graph_targets,
+        impact_category_hits,
+        missing_impact_categories,
+        impact_path_hits,
+        missing_impact_paths,
+        impact_symbol_hits,
+        missing_impact_symbols,
         git_subject_hits,
         missing_git_subjects,
         papertrail_kind_hits,
@@ -330,6 +448,44 @@ fn evaluate_query(
         latency_ms,
         top_hits,
     })
+}
+
+fn skipped_report(query: &EvalQuery, reason: impl Into<String>) -> EvalQueryReport {
+    EvalQueryReport {
+        id: query.id.clone(),
+        text: query.text.clone(),
+        passed: true,
+        skipped: true,
+        skip_reason: Some(reason.into()),
+        reciprocal_rank_at_10: 0.0,
+        recall_at_10: 1.0,
+        path_hits: Vec::new(),
+        missing_paths: Vec::new(),
+        symbol_hits: Vec::new(),
+        missing_symbols: Vec::new(),
+        graph_target_hits: Vec::new(),
+        missing_graph_targets: Vec::new(),
+        impact_category_hits: Vec::new(),
+        missing_impact_categories: Vec::new(),
+        impact_path_hits: Vec::new(),
+        missing_impact_paths: Vec::new(),
+        impact_symbol_hits: Vec::new(),
+        missing_impact_symbols: Vec::new(),
+        git_subject_hits: Vec::new(),
+        missing_git_subjects: Vec::new(),
+        papertrail_kind_hits: Vec::new(),
+        missing_papertrail_kinds: Vec::new(),
+        papertrail_precision_sample: None,
+        stale_current_source_violations: 0,
+        current_source_violations: Vec::new(),
+        latency_ms: 0.0,
+        top_hits: Vec::new(),
+    }
+}
+
+fn papertrail_cache_available(db: &IndexDatabase) -> anyhow::Result<bool> {
+    let status = db.github_sync_status()?;
+    Ok(status.issues + status.comments + status.pulls + status.reviews + status.review_comments > 0)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -398,6 +554,27 @@ fn relevant(hit: &crate::search::lexical::SearchHit, query: &EvalQuery) -> bool 
                 .iter()
                 .any(|expected| symbol == expected || symbol.ends_with(expected))
         })
+        || query.must_include_graph_targets.iter().any(|expected| graph_hit_matches(hit, expected))
+}
+
+fn graph_hit_matches(hit: &crate::search::lexical::SearchHit, expected: &str) -> bool {
+    let Some(graph) = &hit.graph else {
+        return false;
+    };
+    graph.top_callers.iter().chain(graph.callers.iter()).any(|caller| {
+        caller.symbol_path.ends_with(expected) || caller.symbol_path.contains(expected)
+    }) || graph.top_callees.iter().chain(graph.callees.iter()).any(|callee| {
+        callee.target == expected
+            || callee.target.ends_with(expected)
+            || callee
+                .resolved_symbol_path
+                .as_deref()
+                .is_some_and(|symbol| symbol.ends_with(expected) || symbol.contains(expected))
+    }) || graph.imports.iter().any(|import| import.target.contains(expected))
+        || graph
+            .referenced_types
+            .iter()
+            .any(|ty| ty.name == expected || ty.name.ends_with(expected))
 }
 
 fn missing(expected: &[String], found: &[String]) -> Vec<String> {
@@ -470,31 +647,68 @@ fn normalize_kind(kind: &str) -> String {
 }
 
 fn aggregate(results: &[EvalQueryReport]) -> EvalMetrics {
-    let query_count = results.len().max(1) as f64;
-    let total_hits = results.iter().map(|r| r.top_hits.len() as u64).sum::<u64>();
-    let stale = results.iter().map(|r| r.stale_current_source_violations).sum::<u64>();
+    let measured = results.iter().filter(|result| !result.skipped).collect::<Vec<_>>();
+    let query_count = measured.len().max(1) as f64;
+    let total_hits = measured.iter().map(|r| r.top_hits.len() as u64).sum::<u64>();
+    let stale = measured.iter().map(|r| r.stale_current_source_violations).sum::<u64>();
     let papertrail_samples =
-        results.iter().filter_map(|r| r.papertrail_precision_sample).collect::<Vec<_>>();
+        measured.iter().filter_map(|r| r.papertrail_precision_sample).collect::<Vec<_>>();
     EvalMetrics {
-        mrr_at_10: results.iter().map(|r| r.reciprocal_rank_at_10).sum::<f64>() / query_count,
-        recall_at_10: results.iter().map(|r| r.recall_at_10).sum::<f64>() / query_count,
-        path_hit_rate: hit_rate(results, |r| r.missing_paths.is_empty()),
-        symbol_hit_rate: hit_rate(results, |r| r.missing_symbols.is_empty()),
+        mrr_at_10: measured.iter().map(|r| r.reciprocal_rank_at_10).sum::<f64>() / query_count,
+        recall_at_10: measured.iter().map(|r| r.recall_at_10).sum::<f64>() / query_count,
+        path_hit_rate: hit_rate(&measured, |r| r.missing_paths.is_empty()),
+        symbol_hit_rate: hit_rate(&measured, |r| r.missing_symbols.is_empty()),
+        graph_evidence_hit_rate: expected_hit_rate(&measured, |r| {
+            (!r.graph_target_hits.is_empty() || !r.missing_graph_targets.is_empty())
+                .then_some(r.missing_graph_targets.is_empty())
+        }),
+        impact_hit_rate: expected_hit_rate(&measured, |r| {
+            (!r.impact_category_hits.is_empty()
+                || !r.missing_impact_categories.is_empty()
+                || !r.impact_path_hits.is_empty()
+                || !r.missing_impact_paths.is_empty()
+                || !r.impact_symbol_hits.is_empty()
+                || !r.missing_impact_symbols.is_empty())
+            .then_some(
+                r.missing_impact_categories.is_empty()
+                    && r.missing_impact_paths.is_empty()
+                    && r.missing_impact_symbols.is_empty(),
+            )
+        }),
+        git_evidence_hit_rate: expected_hit_rate(&measured, |r| {
+            (!r.git_subject_hits.is_empty() || !r.missing_git_subjects.is_empty())
+                .then_some(r.missing_git_subjects.is_empty())
+        }),
+        papertrail_evidence_hit_rate: expected_hit_rate(&measured, |r| {
+            (!r.papertrail_kind_hits.is_empty() || !r.missing_papertrail_kinds.is_empty())
+                .then_some(r.missing_papertrail_kinds.is_empty())
+        }),
         stale_hit_rate: if total_hits == 0 { 0.0 } else { stale as f64 / total_hits as f64 },
         stale_current_source_violations: stale,
         current_source_violation_count: stale,
         papertrail_precision_sample: (!papertrail_samples.is_empty())
             .then(|| papertrail_samples.iter().sum::<f64>() / papertrail_samples.len() as f64),
-        latency_p50_ms: percentile(results.iter().map(|r| r.latency_ms).collect(), 0.50),
-        latency_p95_ms: percentile(results.iter().map(|r| r.latency_ms).collect(), 0.95),
+        latency_p50_ms: percentile(measured.iter().map(|r| r.latency_ms).collect(), 0.50),
+        latency_p95_ms: percentile(measured.iter().map(|r| r.latency_ms).collect(), 0.95),
     }
 }
 
-fn hit_rate(results: &[EvalQueryReport], predicate: fn(&EvalQueryReport) -> bool) -> f64 {
+fn hit_rate(results: &[&EvalQueryReport], predicate: fn(&EvalQueryReport) -> bool) -> f64 {
     if results.is_empty() {
         return 1.0;
     }
     results.iter().filter(|result| predicate(result)).count() as f64 / results.len() as f64
+}
+
+fn expected_hit_rate(
+    results: &[&EvalQueryReport],
+    predicate: fn(&EvalQueryReport) -> Option<bool>,
+) -> f64 {
+    let applicable = results.iter().filter_map(|result| predicate(result)).collect::<Vec<_>>();
+    if applicable.is_empty() {
+        return 1.0;
+    }
+    applicable.iter().filter(|passed| **passed).count() as f64 / applicable.len() as f64
 }
 
 fn percentile(mut values: Vec<f64>, percentile: f64) -> f64 {
@@ -516,6 +730,10 @@ fn observed_expected(report: &EvalQueryReport) -> ExpectedQuery {
         id: report.id.clone(),
         must_include_paths: paths,
         must_include_symbols: symbols,
+        must_include_graph_targets: report.graph_target_hits.clone(),
+        must_include_impact_categories: report.impact_category_hits.clone(),
+        must_include_impact_paths: report.impact_path_hits.clone(),
+        must_include_impact_symbols: report.impact_symbol_hits.clone(),
         should_include_git_subjects: report.git_subject_hits.clone(),
         should_include_papertrail_kinds: report.papertrail_kind_hits.clone(),
     }

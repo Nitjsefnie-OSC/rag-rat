@@ -1,6 +1,7 @@
 [[query]]
 id = "rust-open-database"
 text = "open the local database"
+evidence_class = "lexical"
 must_include_paths = [
   "src/lib.rs",
 ]
@@ -11,6 +12,7 @@ must_include_symbols = [
 [[query]]
 id = "typescript-bridge-client"
 text = "bridge client open database"
+evidence_class = "symbol"
 must_include_paths = [
   "src/index.ts",
 ]
@@ -21,6 +23,7 @@ must_include_symbols = [
 [[query]]
 id = "kotlin-sync-once"
 text = "suspend sync once bridge"
+evidence_class = "symbol"
 must_include_paths = [
   "src/Main.kt",
 ]
@@ -31,6 +34,65 @@ must_include_symbols = [
 [[query]]
 id = "markdown-semantic-recall"
 text = "semantic recall and FTS routing"
+evidence_class = "lexical"
 must_include_paths = [
   "docs/search.md",
+]
+
+[[query]]
+id = "rust-constant-symbol"
+text = "maximum open databases constant"
+evidence_class = "symbol-name"
+must_include_paths = [
+  "src/lib.rs",
+]
+must_include_symbols = [
+  "MAX_OPEN_DATABASES",
+]
+
+[[query]]
+id = "typescript-const-arrow-hook"
+text = "bridge hook returns bridge name"
+evidence_class = "symbol-name"
+must_include_paths = [
+  "src/index.ts",
+]
+must_include_symbols = [
+  "useBridge",
+]
+
+[[query]]
+id = "kotlin-companion-create"
+text = "companion factory creates main bridge"
+evidence_class = "symbol-name"
+must_include_paths = [
+  "src/Main.kt",
+]
+must_include_symbols = [
+  "MainBridge::create",
+]
+
+[[query]]
+id = "graph-open-database-neighbor"
+text = "native held core open database call"
+evidence_class = "graph-neighbor"
+must_include_paths = [
+  "src/index.ts",
+]
+must_include_graph_targets = [
+  "openDatabase",
+]
+
+[[query]]
+id = "impact-open-database"
+text = "open_database"
+evidence_class = "impact"
+must_include_impact_categories = [
+  "Direct structural impact",
+]
+must_include_impact_paths = [
+  "src/lib.rs",
+]
+must_include_impact_symbols = [
+  "open_database",
 ]

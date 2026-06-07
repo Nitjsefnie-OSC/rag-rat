@@ -13,3 +13,18 @@ id = "kotlin-sync-once"
 
 [[expected]]
 id = "markdown-semantic-recall"
+
+[[expected]]
+id = "rust-constant-symbol"
+
+[[expected]]
+id = "typescript-const-arrow-hook"
+
+[[expected]]
+id = "kotlin-companion-create"
+
+[[expected]]
+id = "graph-open-database-neighbor"
+
+[[expected]]
+id = "impact-open-database"

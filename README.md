@@ -87,9 +87,12 @@ search when `fts_source_revision` no longer matches `content_revision`.
 
 `eval` runs the fixture-driven ranking and freshness harness from `evals/queries.toml` plus
 `evals/expected_hits.toml`. It reports MRR@10, Recall@10, path hit rate, symbol hit rate,
+graph evidence hit rate, impact hit rate, git evidence hit rate, papertrail evidence hit rate,
 stale-hit rate, current-source violation count, papertrail precision sample, and latency p50/p95.
-`stale_current_source_violations` must remain zero. Use `eval --json` for machine-readable output
-and `eval --update-baseline` to rewrite `expected_hits.toml` from observed top-10 evidence.
+`stale_current_source_violations` must remain zero. Papertrail cases can be marked
+`requires_papertrail_cache = true`; they are skipped until local GitHub evidence has been synced.
+Use `eval --json` for machine-readable output and `eval --update-baseline` to rewrite
+`expected_hits.toml` from observed top-10 evidence.
 
 Non-git target roots still index source and docs; git history status reports unavailable with zero
 commit/path rows.

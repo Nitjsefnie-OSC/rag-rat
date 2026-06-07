@@ -122,9 +122,10 @@ fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
 
 fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     println!(
-        "eval: pass={} queries={} mrr@10={:.3} recall@10={:.3} path_hit_rate={:.3} symbol_hit_rate={:.3}",
+        "eval: pass={} queries={} skipped={} mrr@10={:.3} recall@10={:.3} path_hit_rate={:.3} symbol_hit_rate={:.3}",
         report.pass,
         report.queries,
+        report.results.iter().filter(|result| result.skipped).count(),
         report.metrics.mrr_at_10,
         report.metrics.recall_at_10,
         report.metrics.path_hit_rate,
@@ -136,6 +137,13 @@ fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
         report.metrics.stale_hit_rate,
         report.metrics.latency_p50_ms,
         report.metrics.latency_p95_ms
+    );
+    println!(
+        "eval: graph_evidence_hit_rate={:.3} impact_hit_rate={:.3} git_evidence_hit_rate={:.3} papertrail_evidence_hit_rate={:.3}",
+        report.metrics.graph_evidence_hit_rate,
+        report.metrics.impact_hit_rate,
+        report.metrics.git_evidence_hit_rate,
+        report.metrics.papertrail_evidence_hit_rate
     );
     if let Some(precision) = report.metrics.papertrail_precision_sample {
         println!("eval: papertrail_precision_sample={precision:.3}");
@@ -152,13 +160,24 @@ fn print_eval_summary(report: &rag_rat_core::eval::EvalReport) {
     );
     for result in report.results.iter().filter(|result| !result.passed) {
         println!(
-            "eval: failed {} missing_paths={:?} missing_symbols={:?} missing_git_subjects={:?} missing_papertrail_kinds={:?} stale_current_source_violations={}",
+            "eval: failed {} missing_paths={:?} missing_symbols={:?} missing_graph_targets={:?} missing_impact_categories={:?} missing_impact_paths={:?} missing_impact_symbols={:?} missing_git_subjects={:?} missing_papertrail_kinds={:?} stale_current_source_violations={}",
             result.id,
             result.missing_paths,
             result.missing_symbols,
+            result.missing_graph_targets,
+            result.missing_impact_categories,
+            result.missing_impact_paths,
+            result.missing_impact_symbols,
             result.missing_git_subjects,
             result.missing_papertrail_kinds,
             result.stale_current_source_violations
+        );
+    }
+    for result in report.results.iter().filter(|result| result.skipped) {
+        println!(
+            "eval: skipped {} reason={}",
+            result.id,
+            result.skip_reason.as_deref().unwrap_or("not applicable")
         );
     }
 }
