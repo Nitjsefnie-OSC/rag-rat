@@ -126,6 +126,69 @@ impl GraphTraversalOptions {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CompareGraphTextReport {
+    pub query: CompareGraphTextQuery,
+    pub summary: CompareGraphTextSummary,
+    pub coverage: GraphCoverage,
+    pub matched_hits: Vec<MatchedGraphTextHit>,
+    pub text_only_hits: Vec<TextOnlyHit>,
+    pub graph_only_edges: Vec<GraphOnlyEdge>,
+    pub likely_false_positives: Vec<GraphOnlyEdge>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompareGraphTextQuery {
+    pub symbol_id: Option<i64>,
+    pub symbol_path: String,
+    pub pattern: String,
+    pub resolution: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct CompareGraphTextSummary {
+    pub graph_edges: u64,
+    pub text_hits: u64,
+    pub matched: u64,
+    pub graph_only: u64,
+    pub text_only: u64,
+    pub likely_false_positives: u64,
+    pub likely_index_gaps: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatchedGraphTextHit {
+    pub path: String,
+    pub line: i64,
+    pub text: String,
+    pub target: Option<String>,
+    pub edge_kind: String,
+    pub confidence: String,
+    pub resolution: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TextOnlyHit {
+    pub path: String,
+    pub line: i64,
+    pub text: String,
+    pub reason: String,
+    pub likely_gap: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphOnlyEdge {
+    pub path: String,
+    pub line: i64,
+    pub target: Option<String>,
+    pub edge_kind: String,
+    pub confidence: String,
+    pub resolution: String,
+    pub evidence: Option<String>,
+    pub reason: String,
+    pub likely_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GraphHop {
     pub from_symbol: Option<String>,
     pub to_symbol: Option<String>,
@@ -147,7 +210,7 @@ pub struct GraphHop {
     pub callsite: Option<Callsite>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Callsite {
     pub path: String,
     pub line: i64,

@@ -69,6 +69,7 @@ Development config without installing:
 - `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
 - `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
@@ -206,6 +207,40 @@ with `resolution`, `verified_target_symbol`, raw `evidence`, and optional `recei
 can treat name-only or ambiguous edges as possible evidence instead of compiler truth. Rust macro
 invocations are stored as `uses_macro` and are not resolved to same-named normal modules or
 functions.
+
+`compare_graph_to_text` is the graph-vs-rg audit bridge. It resolves a selected symbol, runs the
+same reverse caller graph traversal used by `find_callers`, runs a line-oriented regex search over
+currently indexed source files, then compares `(path, line)` sets:
+
+```json
+{
+  "query": {
+    "symbol_id": 3150,
+    "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+    "pattern": "crate::runtime::task_spawn::spawn_blocking\\(",
+    "resolution": "syntactic"
+  },
+  "summary": {
+    "graph_edges": 38,
+    "text_hits": 42,
+    "matched": 36,
+    "graph_only": 2,
+    "text_only": 6,
+    "likely_false_positives": 1,
+    "likely_index_gaps": 5
+  },
+  "matched_hits": [],
+  "text_only_hits": [],
+  "graph_only_edges": [],
+  "likely_false_positives": []
+}
+```
+
+Use `text_only_hits` as candidate parser/call-extraction gaps, `graph_only_edges` as candidate
+regex-too-narrow or imported/unqualified callsites, and `likely_false_positives` as graph rows whose
+current source line no longer appears to support the edge. The tool includes the same `coverage`
+object as graph traversal envelopes so audit output can be checked for stale source and parser
+failures before treating the counts as authoritative.
 
 `impact_surface` is graph-backed first and defaults to `resolution: "syntactic"`. It layers exact
 symbol definitions, direct callers, direct callees, import/export dependents, same-file siblings,

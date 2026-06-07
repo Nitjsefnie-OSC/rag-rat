@@ -14,8 +14,9 @@ use rmcp::{
 use serde_json::{Map, Value, json};
 
 use crate::tools::{
-    BlameChunkArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs, PapertrailChunkArgs,
-    PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
+    PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, SearchArgs,
+    SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -81,6 +82,17 @@ impl RagRatService {
         Parameters(args): Parameters<SymbolGraphArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("trace_callees", json!(args))
+    }
+
+    #[tool(
+        name = "compare_graph_to_text",
+        description = "Compare graph caller edges for a symbol against regex text hits in indexed source."
+    )]
+    fn compare_graph_to_text(
+        &self,
+        Parameters(args): Parameters<CompareGraphTextArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("compare_graph_to_text", json!(args))
     }
 
     #[tool(

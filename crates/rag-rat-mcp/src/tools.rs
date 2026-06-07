@@ -18,6 +18,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "symbol_lookup",
     "find_callers",
     "trace_callees",
+    "compare_graph_to_text",
     "impact_surface",
     "ffi_surface",
     "docs_for_symbol",
@@ -77,6 +78,22 @@ pub struct SymbolGraphArgs {
     pub symbol_path: Option<String>,
     pub resolution: Option<String>,
     #[serde(default = "default_graph_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
+    #[serde(default)]
+    pub include_references: bool,
+    pub edge_kinds: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CompareGraphTextArgs {
+    pub pattern: String,
+    pub symbol: Option<String>,
+    pub symbol_id: Option<i64>,
+    pub symbol_path: Option<String>,
+    pub resolution: Option<String>,
+    #[serde(default = "default_compare_limit")]
     pub limit: u32,
     #[serde(default)]
     pub allow_ambiguous: bool,
@@ -203,6 +220,11 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
             graph_tool(&db, args, resolution_mode, false)?
+        },
+        "compare_graph_to_text" => {
+            let args: CompareGraphTextArgs = serde_json::from_value(arguments)?;
+            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            compare_graph_to_text_tool(&db, args, resolution_mode)?
         },
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
@@ -346,6 +368,34 @@ fn docs_for_symbol_tool(db: &IndexDatabase, args: SymbolGraphArgs) -> anyhow::Re
     }
 }
 
+fn compare_graph_to_text_tool(
+    db: &IndexDatabase,
+    args: CompareGraphTextArgs,
+    resolution_mode: GraphResolutionMode,
+) -> anyhow::Result<Value> {
+    let selector = SymbolSelector {
+        symbol_id: args.symbol_id,
+        symbol_path: args.symbol_path,
+        symbol: args.symbol,
+        language: None,
+        allow_ambiguous: args.allow_ambiguous,
+        limit: args.limit,
+    };
+    match db.select_symbol(&selector)? {
+        Ok(Some(symbol)) => {
+            let options = GraphTraversalOptions {
+                include_references: args.include_references,
+                edge_kinds: args.edge_kinds,
+                resolution_mode,
+                symbol_id: Some(symbol.symbol_id),
+            };
+            Ok(json!(db.compare_graph_to_text(&symbol, &args.pattern, args.limit, &options)?))
+        },
+        Ok(None) => Ok(Value::Null),
+        Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
 fn git_history_for_symbol_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
     let selector = symbol_selector(args)?;
     match db.select_symbol(&selector)? {
@@ -446,6 +496,9 @@ pub fn description(name: &str) -> &'static str {
         "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin symbols.",
         "find_callers" => "Traverse tree-sitter-derived reverse graph edges for callers.",
         "trace_callees" => "Traverse tree-sitter-derived forward graph edges for callees.",
+        "compare_graph_to_text" => {
+            "Compare graph caller edges for a symbol against regex text hits in indexed source."
+        },
         "impact_surface" => {
             "Graph-backed coding preflight with structural, textual fallback, and papertrail evidence."
         },
@@ -488,6 +541,7 @@ pub fn schema(name: &str) -> Value {
             schema_for::<SymbolArgs>()
         },
         "find_callers" | "trace_callees" | "docs_for_symbol" => schema_for::<SymbolGraphArgs>(),
+        "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
         "impact_surface" => schema_for::<ImpactArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
@@ -562,6 +616,10 @@ fn default_graph_limit() -> u32 {
     50
 }
 
+fn default_compare_limit() -> u32 {
+    10_000
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -589,6 +647,7 @@ mod tests {
             "symbol_lookup",
             "find_callers",
             "trace_callees",
+            "compare_graph_to_text",
             "impact_surface",
             "ffi_surface",
             "docs_for_symbol",
@@ -627,6 +686,10 @@ mod tests {
         assert_schema_has_property(tools, "trace_callees", "edge_kinds");
         assert_schema_has_property(tools, "trace_callees", "resolution");
         assert_symbol_selector_schema(tools, "trace_callees");
+        assert_schema_requires(tools, "compare_graph_to_text", "pattern");
+        assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
+        assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
+        assert_symbol_selector_schema(tools, "compare_graph_to_text");
         assert_schema_has_property(tools, "impact_surface", "resolution");
         assert_symbol_selector_schema(tools, "impact_surface");
         assert_symbol_selector_schema(tools, "docs_for_symbol");
@@ -775,6 +838,26 @@ mod tests {
         assert_eq!(exact_results.len(), 1, "exact callers: {exact:?}");
         assert_eq!(exact_results[0]["verified_target_symbol"], true);
         assert!(exact_results[0]["from_symbol"].as_str().unwrap().contains("caller"));
+
+        let comparison = call_tool(
+            &config.database,
+            "compare_graph_to_text",
+            json!({
+                "symbol_id": one["symbol_id"].as_i64().unwrap(),
+                "pattern": "    shared\\(",
+                "resolution": "exact",
+                "edge_kinds": ["calls_name"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(comparison["query"]["symbol_id"], one["symbol_id"]);
+        assert_eq!(comparison["summary"]["graph_edges"], 1);
+        assert_eq!(comparison["summary"]["text_hits"], 2);
+        assert_eq!(comparison["summary"]["matched"], 1);
+        assert_eq!(comparison["summary"]["text_only"], 1);
+        assert_eq!(comparison["summary"]["graph_only"], 0);
+        assert_eq!(comparison["matched_hits"].as_array().unwrap().len(), 1);
+        assert_eq!(comparison["text_only_hits"].as_array().unwrap().len(), 1);
 
         let papertrail = call_tool(
             &config.database,

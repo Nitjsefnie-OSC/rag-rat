@@ -27,6 +27,7 @@ use gix::{
     status::{UntrackedFiles, tree_index},
 };
 use rayon::prelude::*;
+use regex::Regex;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1085,6 +1086,140 @@ impl IndexDatabase {
         })
     }
 
+    pub fn compare_graph_to_text(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        pattern: &str,
+        limit: u32,
+        options: &crate::query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<crate::query::graph::CompareGraphTextReport> {
+        let regex = Regex::new(pattern)?;
+        let graph_edges = crate::query::graph::traverse_with_options(
+            self.storage.connection(),
+            &symbol.qualified_name,
+            true,
+            limit,
+            options,
+        )?;
+        let graph_summary = crate::query::graph::traversal_summary(
+            self.storage.connection(),
+            &symbol.qualified_name,
+            true,
+            limit,
+            options,
+            graph_edges.len(),
+        )?;
+        let text_hits = self.regex_hits(pattern, &regex)?;
+        let text_by_location = text_hits
+            .iter()
+            .map(|hit| ((hit.path.clone(), hit.line), hit))
+            .collect::<BTreeMap<_, _>>();
+        let graph_by_location = graph_edges
+            .iter()
+            .filter_map(|edge| {
+                edge.callsite
+                    .as_ref()
+                    .map(|callsite| ((callsite.path.clone(), callsite.line), edge))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut paths = BTreeSet::new();
+        paths.insert(symbol.path.clone());
+        for hit in &text_hits {
+            paths.insert(hit.path.clone());
+        }
+        for edge in &graph_edges {
+            if let Some(callsite) = &edge.callsite {
+                paths.insert(callsite.path.clone());
+            }
+        }
+
+        let parser_failure_paths = self
+            .parser_failure_paths()?
+            .into_iter()
+            .map(|failure| failure.path)
+            .collect::<BTreeSet<_>>();
+        let mut matched_hits = Vec::new();
+        let mut text_only_hits = Vec::new();
+        for hit in &text_hits {
+            if let Some(edge) = graph_by_location.get(&(hit.path.clone(), hit.line)) {
+                matched_hits.push(crate::query::graph::MatchedGraphTextHit {
+                    path: hit.path.clone(),
+                    line: hit.line,
+                    text: hit.text.clone(),
+                    target: edge.target.clone(),
+                    edge_kind: edge.edge_kind.clone(),
+                    confidence: edge.confidence.clone(),
+                    resolution: edge.resolution.clone(),
+                });
+            } else {
+                text_only_hits.push(crate::query::graph::TextOnlyHit {
+                    path: hit.path.clone(),
+                    line: hit.line,
+                    text: hit.text.clone(),
+                    reason: "no graph edge extracted".to_string(),
+                    likely_gap: if parser_failure_paths.contains(&hit.path) {
+                        "parser_failure"
+                    } else {
+                        "parser_call_extraction"
+                    }
+                    .to_string(),
+                });
+            }
+        }
+
+        let mut graph_only_edges = Vec::new();
+        let mut likely_false_positives = Vec::new();
+        for edge in &graph_edges {
+            let Some(callsite) = &edge.callsite else {
+                continue;
+            };
+            if text_by_location.contains_key(&(callsite.path.clone(), callsite.line)) {
+                continue;
+            }
+            let current_line = self.current_line_text(&callsite.path, callsite.line)?;
+            let graph_only = crate::query::graph::GraphOnlyEdge {
+                path: callsite.path.clone(),
+                line: callsite.line,
+                target: edge.target.clone(),
+                edge_kind: edge.edge_kind.clone(),
+                confidence: edge.confidence.clone(),
+                resolution: edge.resolution.clone(),
+                evidence: edge.evidence.clone(),
+                reason: "graph edge exists but pattern did not match text".to_string(),
+                likely_reason: graph_only_reason(edge, current_line.as_deref()),
+            };
+            if graph_only.likely_reason == "stale_or_overbroad_graph_edge" {
+                likely_false_positives.push(graph_only.clone());
+            }
+            graph_only_edges.push(graph_only);
+        }
+
+        Ok(crate::query::graph::CompareGraphTextReport {
+            query: crate::query::graph::CompareGraphTextQuery {
+                symbol_id: Some(symbol.symbol_id),
+                symbol_path: symbol.qualified_name.clone(),
+                pattern: pattern.to_string(),
+                resolution: options.resolution_mode.as_str().to_string(),
+            },
+            summary: crate::query::graph::CompareGraphTextSummary {
+                graph_edges: graph_summary.total_matching_edges,
+                text_hits: u64::try_from(text_hits.len()).unwrap_or(u64::MAX),
+                matched: u64::try_from(matched_hits.len()).unwrap_or(u64::MAX),
+                graph_only: u64::try_from(graph_only_edges.len()).unwrap_or(u64::MAX),
+                text_only: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+                likely_false_positives: u64::try_from(likely_false_positives.len())
+                    .unwrap_or(u64::MAX),
+                likely_index_gaps: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+            },
+            coverage: self.graph_coverage(paths)?,
+            matched_hits,
+            text_only_hits,
+            graph_only_edges,
+            likely_false_positives,
+        })
+    }
+
     pub fn impact_surface(
         &self,
         query: &str,
@@ -1449,6 +1584,51 @@ impl IndexDatabase {
         hex_sha256(&bytes) != indexed_sha256
     }
 
+    fn regex_hits(
+        &self,
+        pattern: &str,
+        regex: &Regex,
+    ) -> anyhow::Result<Vec<crate::query::graph::TextOnlyHit>> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!("cannot compare graph to text: source_root is missing from index_meta");
+        };
+        let mut stmt = self.storage.connection().prepare("SELECT path FROM files ORDER BY path")?;
+        let paths =
+            stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        let mut hits = Vec::new();
+        for path in paths {
+            let full_path = root.join(&path);
+            let Ok(text) = fs::read_to_string(&full_path) else {
+                continue;
+            };
+            for (index, line) in text.lines().enumerate() {
+                if regex.is_match(line) {
+                    hits.push(crate::query::graph::TextOnlyHit {
+                        path: path.clone(),
+                        line: i64::try_from(index + 1).unwrap_or(i64::MAX),
+                        text: line.trim().to_string(),
+                        reason: "text pattern matched".to_string(),
+                        likely_gap: pattern.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    fn current_line_text(&self, path: &str, line: i64) -> anyhow::Result<Option<String>> {
+        let Some(root) = self.storage.source_root() else {
+            return Ok(None);
+        };
+        let Ok(text) = fs::read_to_string(root.join(path)) else {
+            return Ok(None);
+        };
+        let Some(index) = usize::try_from(line.saturating_sub(1)).ok() else {
+            return Ok(None);
+        };
+        Ok(text.lines().nth(index).map(|line| line.trim().to_string()))
+    }
+
     fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
         if self.meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION) {
             return Ok(());
@@ -1797,6 +1977,30 @@ struct GraphPathRow {
     language: String,
     sha256: String,
     indexed_revision: String,
+}
+
+fn graph_only_reason(edge: &crate::query::graph::GraphHop, current_line: Option<&str>) -> String {
+    let Some(line) = current_line else {
+        return "missing_current_source_line".to_string();
+    };
+    if edge
+        .target_qualified_name
+        .as_deref()
+        .is_some_and(|qualified| !qualified.is_empty() && line.contains(qualified))
+    {
+        return "qualified_call_pattern_mismatch".to_string();
+    }
+    if edge.target.as_deref().is_some_and(|target| !target.is_empty() && line.contains(target)) {
+        return "imported_or_unqualified_call".to_string();
+    }
+    if edge
+        .evidence
+        .as_deref()
+        .is_some_and(|evidence| !evidence.is_empty() && line.contains(evidence.trim()))
+    {
+        return "regex_too_narrow".to_string();
+    }
+    "stale_or_overbroad_graph_edge".to_string()
 }
 
 #[derive(Debug)]

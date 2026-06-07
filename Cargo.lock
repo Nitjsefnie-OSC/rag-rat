@@ -2487,6 +2487,7 @@ dependencies = [
  "fastembed",
  "gix",
  "rayon",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
