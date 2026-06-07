@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::index::ai;
+use crate::{index::ai, query::graph_meta::GraphEvidence};
 
 const BM25_WEIGHT: f64 = 0.45;
 const VECTOR_WEIGHT: f64 = 0.35;
@@ -23,6 +23,8 @@ pub struct SearchHit {
     pub symbol_path: Option<String>,
     pub score: f64,
     pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GraphEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score_components: Option<ScoreComponents>,
 }
@@ -190,6 +192,7 @@ fn bm25_candidates(
             symbol_path: row.get(6)?,
             score: row.get(7)?,
             summary: snippet(&text, query),
+            graph: None,
             score_components: None,
         })
     })?;
@@ -251,6 +254,7 @@ fn vector_candidates(
                     symbol_path: row.get(6)?,
                     score: 0.0,
                     summary: snippet(&text, query),
+                    graph: None,
                     score_components: None,
                 },
                 blob,

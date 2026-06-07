@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod graph_meta;
 pub mod impact;
 pub mod symbol;
 
@@ -15,6 +16,8 @@ pub struct ReadChunk {
     pub end_line: i64,
     pub symbol_path: Option<String>,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<graph_meta::GraphEvidence>,
 }
 
 pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ReadChunk>> {
@@ -38,6 +41,7 @@ pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Rea
                     end_line: row.get(5)?,
                     symbol_path: row.get(6)?,
                     text: row.get(7)?,
+                    graph: None,
                 })
             },
         )

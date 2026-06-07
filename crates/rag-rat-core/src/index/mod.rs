@@ -46,6 +46,7 @@ use crate::{
         symbols::Symbol,
     },
     language::Language,
+    query::graph_meta::{self, GraphMetaMode},
     search::lexical::SearchHit,
     storage::IndexConnection,
     storage::StorageStatus,
@@ -470,8 +471,7 @@ impl IndexDatabase {
         limit: u32,
         include_generated: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
-        self.ensure_fts_fresh()?;
-        self.search_with_heal(query, limit, include_generated, true, false)
+        self.search_with_graph_meta(query, limit, include_generated, GraphMetaMode::Compact, 3)
     }
 
     pub fn search_explain(
@@ -480,8 +480,51 @@ impl IndexDatabase {
         limit: u32,
         include_generated: bool,
     ) -> anyhow::Result<Vec<SearchHit>> {
+        self.search_explain_with_graph_meta(
+            query,
+            limit,
+            include_generated,
+            GraphMetaMode::Compact,
+            3,
+        )
+    }
+
+    pub fn search_with_graph_meta(
+        &self,
+        query: &str,
+        limit: u32,
+        include_generated: bool,
+        graph_mode: GraphMetaMode,
+        graph_limit: u32,
+    ) -> anyhow::Result<Vec<SearchHit>> {
         self.ensure_fts_fresh()?;
-        self.search_with_heal(query, limit, include_generated, true, true)
+        let mut hits = self.search_with_heal(query, limit, include_generated, true, false)?;
+        graph_meta::attach_to_search_hits(
+            self.storage.connection(),
+            &mut hits,
+            graph_mode,
+            graph_limit,
+        )?;
+        Ok(hits)
+    }
+
+    pub fn search_explain_with_graph_meta(
+        &self,
+        query: &str,
+        limit: u32,
+        include_generated: bool,
+        graph_mode: GraphMetaMode,
+        graph_limit: u32,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        self.ensure_fts_fresh()?;
+        let mut hits = self.search_with_heal(query, limit, include_generated, true, true)?;
+        graph_meta::attach_to_search_hits(
+            self.storage.connection(),
+            &mut hits,
+            graph_mode,
+            graph_limit,
+        )?;
+        Ok(hits)
     }
 
     pub fn symbols(
@@ -494,6 +537,28 @@ impl IndexDatabase {
     }
 
     pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+        self.read_chunk_with_graph(chunk_id, GraphMetaMode::Full, 20)
+    }
+
+    pub fn read_chunk_with_graph(
+        &self,
+        chunk_id: i64,
+        graph_mode: GraphMetaMode,
+        graph_limit: u32,
+    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+        let Some(mut chunk) = self.read_chunk_current(chunk_id)? else {
+            return Ok(None);
+        };
+        graph_meta::attach_to_read_chunk(
+            self.storage.connection(),
+            &mut chunk,
+            graph_mode,
+            graph_limit,
+        )?;
+        Ok(Some(chunk))
+    }
+
+    fn read_chunk_current(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let Some(mut chunk) = crate::query::read_chunk(self.storage.connection(), chunk_id)? else {
             return Ok(None);
         };
@@ -2253,6 +2318,52 @@ fn caller() {
             }),
             "helper callers: {callers:?}"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_and_read_chunk_attach_bounded_graph_evidence() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn helper() {}\n\npub fn caller() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let hits = db.search("helper caller", 10, false).unwrap();
+        let helper_hit = hits
+            .iter()
+            .find(|hit| hit.symbol_path.as_deref().is_some_and(|path| path.ends_with("helper")))
+            .expect("helper search hit");
+        let helper_graph = helper_hit.graph.as_ref().expect("helper graph evidence");
+        assert_eq!(helper_graph.caller_count, 1);
+        assert!(helper_graph.top_callers.iter().any(
+            |caller| caller.symbol_path.ends_with("caller") && caller.confidence == "syntactic"
+        ));
+        assert!(helper_graph.callers.is_empty(), "search keeps graph compact");
+
+        let caller_hit = hits
+            .iter()
+            .find(|hit| hit.symbol_path.as_deref().is_some_and(|path| path.ends_with("caller")))
+            .expect("caller search hit");
+        let caller_graph = caller_hit.graph.as_ref().expect("caller graph evidence");
+        assert!(
+            caller_graph
+                .top_callees
+                .iter()
+                .any(|callee| { callee.target == "helper" && callee.confidence == "syntactic" })
+        );
+
+        let chunk = db.read_chunk(caller_hit.chunk_id).unwrap().expect("caller chunk");
+        let full_graph = chunk.graph.as_ref().expect("full read_chunk graph");
+        assert!(full_graph.symbol.as_ref().is_some_and(|symbol| symbol.name == "caller"));
+        assert!(full_graph.callees.iter().any(|callee| callee.target == "helper"));
+        assert!(full_graph.notes.iter().any(|note| note.contains("tree-sitter/syntactic")));
 
         fs::remove_dir_all(root).unwrap();
     }

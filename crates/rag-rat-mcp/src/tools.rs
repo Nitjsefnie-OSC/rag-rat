@@ -1,6 +1,6 @@
 use std::{path::Path, str::FromStr};
 
-use rag_rat_core::{IndexDatabase, language::Language};
+use rag_rat_core::{IndexDatabase, language::Language, query::graph_meta::GraphMetaMode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -39,6 +39,10 @@ pub struct SearchArgs {
     pub include_generated: bool,
     #[serde(default)]
     pub explain: bool,
+    #[serde(default = "default_search_graph_mode")]
+    pub include_graph: String,
+    #[serde(default = "default_search_graph_limit")]
+    pub graph_limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -72,6 +76,10 @@ pub struct LimitArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadChunkArgs {
     pub chunk_id: i64,
+    #[serde(default = "default_read_chunk_graph_mode")]
+    pub include_graph: String,
+    #[serde(default = "default_read_chunk_graph_limit")]
+    pub graph_limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -126,10 +134,23 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
+            let graph_mode = GraphMetaMode::parse(&args.include_graph)?;
             if args.explain {
-                json!(db.search_explain(&args.query, args.limit, args.include_generated)?)
+                json!(db.search_explain_with_graph_meta(
+                    &args.query,
+                    args.limit,
+                    args.include_generated,
+                    graph_mode,
+                    args.graph_limit
+                )?)
             } else {
-                json!(db.search(&args.query, args.limit, args.include_generated)?)
+                json!(db.search_with_graph_meta(
+                    &args.query,
+                    args.limit,
+                    args.include_generated,
+                    graph_mode,
+                    args.graph_limit
+                )?)
             }
         },
         "symbol_lookup" => {
@@ -158,7 +179,11 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "read_chunk" => {
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
-            json!(db.read_chunk(args.chunk_id)?)
+            json!(db.read_chunk_with_graph(
+                args.chunk_id,
+                GraphMetaMode::parse(&args.include_graph)?,
+                args.graph_limit
+            )?)
         },
         "commit_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -299,6 +324,22 @@ fn default_search_limit() -> u32 {
     10
 }
 
+fn default_search_graph_mode() -> String {
+    "compact".to_string()
+}
+
+fn default_search_graph_limit() -> u32 {
+    3
+}
+
+fn default_read_chunk_graph_mode() -> String {
+    "full".to_string()
+}
+
+fn default_read_chunk_graph_limit() -> u32 {
+    20
+}
+
 fn default_symbol_limit() -> u32 {
     20
 }
@@ -358,7 +399,11 @@ mod tests {
         }
 
         assert_schema_requires(tools, "semantic_search", "query");
+        assert_schema_has_property(tools, "semantic_search", "include_graph");
+        assert_schema_has_property(tools, "semantic_search", "graph_limit");
         assert_schema_requires(tools, "read_chunk", "chunk_id");
+        assert_schema_has_property(tools, "read_chunk", "include_graph");
+        assert_schema_has_property(tools, "read_chunk", "graph_limit");
         assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
         assert_schema_has_property(tools, "heal_index", "limit");
         assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
