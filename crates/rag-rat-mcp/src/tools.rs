@@ -6,6 +6,7 @@ use rag_rat_core::{
     query::{
         graph::{GraphResolutionMode, GraphTraversalOptions},
         graph_meta::GraphMetaMode,
+        symbol::SymbolSelector,
     },
     search::lexical::SearchOptions,
 };
@@ -59,19 +60,26 @@ pub struct SearchArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolArgs {
-    pub symbol: String,
+    pub symbol: Option<String>,
+    pub symbol_path: Option<String>,
+    pub symbol_id: Option<i64>,
     pub language: Option<String>,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
-    pub symbol: String,
+    pub symbol: Option<String>,
     pub symbol_id: Option<i64>,
+    pub symbol_path: Option<String>,
     pub resolution: Option<String>,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
     #[serde(default)]
     pub include_references: bool,
     pub edge_kinds: Option<Vec<String>>,
@@ -79,8 +87,13 @@ pub struct SymbolGraphArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ImpactArgs {
-    pub query: String,
+    pub query: Option<String>,
+    pub symbol: Option<String>,
+    pub symbol_path: Option<String>,
+    pub symbol_id: Option<i64>,
     pub resolution: Option<String>,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
 }
@@ -179,40 +192,22 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "symbol_lookup" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            json!(db.symbols(&args.symbol, optional_language(args.language)?, args.limit)?)
+            json!(db.symbol_candidates(&symbol_selector(args)?)?)
         },
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            json!(db.find_callers_with_options(
-                &args.symbol,
-                args.limit,
-                &GraphTraversalOptions {
-                    include_references: args.include_references,
-                    edge_kinds: args.edge_kinds,
-                    resolution_mode,
-                    symbol_id: args.symbol_id,
-                }
-            )?)
+            graph_tool(&db, args, resolution_mode, true)?
         },
         "trace_callees" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            json!(db.trace_callees_with_options(
-                &args.symbol,
-                args.limit,
-                &GraphTraversalOptions {
-                    include_references: args.include_references,
-                    edge_kinds: args.edge_kinds,
-                    resolution_mode,
-                    symbol_id: args.symbol_id,
-                }
-            )?)
+            graph_tool(&db, args, resolution_mode, false)?
         },
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
             let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
-            json!(db.impact_surface_with_options(&args.query, args.limit, resolution_mode)?)
+            impact_tool(&db, args, resolution_mode)?
         },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;
@@ -220,7 +215,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "docs_for_symbol" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
-            json!(db.docs_for_symbol(&args.symbol, args.limit)?)
+            docs_for_symbol_tool(&db, args)?
         },
         "read_chunk" => {
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
@@ -240,11 +235,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "git_history_for_symbol" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            json!(db.git_history_for_symbol(
-                &args.symbol,
-                optional_language(args.language)?,
-                args.limit
-            )?)
+            git_history_for_symbol_tool(&db, args)?
         },
         "commits_touching_query" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -260,11 +251,7 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "papertrail_for_symbol" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            json!(db.papertrail_for_symbol(
-                &args.symbol,
-                optional_language(args.language)?,
-                args.limit
-            )?)
+            papertrail_for_symbol_tool(&db, args)?
         },
         "papertrail_for_commit" => {
             let args: PapertrailCommitArgs = serde_json::from_value(arguments)?;
@@ -292,6 +279,162 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         other => anyhow::bail!("unknown tool `{other}`"),
     };
     Ok(result)
+}
+
+fn graph_tool(
+    db: &IndexDatabase,
+    args: SymbolGraphArgs,
+    resolution_mode: GraphResolutionMode,
+    reverse: bool,
+) -> anyhow::Result<Value> {
+    let limit = args.limit;
+    let include_references = args.include_references;
+    let edge_kinds = args.edge_kinds.clone();
+    let allow_ambiguous = args.allow_ambiguous;
+    let selector = graph_symbol_selector(&args)?;
+    let selected = db.select_symbol(&selector)?;
+    match selected {
+        Ok(Some(symbol)) => {
+            let options = GraphTraversalOptions {
+                include_references,
+                edge_kinds,
+                resolution_mode,
+                symbol_id: Some(symbol.symbol_id),
+            };
+            let hops = if reverse {
+                db.find_callers_with_options(&symbol.qualified_name, limit, &options)?
+            } else {
+                db.trace_callees_with_options(&symbol.qualified_name, limit, &options)?
+            };
+            Ok(json!(hops))
+        },
+        Ok(None) if allow_ambiguous => {
+            let Some(symbol) = args.symbol.as_deref() else {
+                return Ok(Value::Null);
+            };
+            let options = GraphTraversalOptions {
+                include_references,
+                edge_kinds,
+                resolution_mode,
+                symbol_id: args.symbol_id,
+            };
+            let hops = if reverse {
+                db.find_callers_with_options(symbol, limit, &options)?
+            } else {
+                db.trace_callees_with_options(symbol, limit, &options)?
+            };
+            Ok(json!(hops))
+        },
+        Ok(None) => Ok(Value::Null),
+        Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
+fn docs_for_symbol_tool(db: &IndexDatabase, args: SymbolGraphArgs) -> anyhow::Result<Value> {
+    let selector = graph_symbol_selector(&args)?;
+    match db.select_symbol(&selector)? {
+        Ok(Some(symbol)) => Ok(json!(db.docs_for_symbol(&symbol.qualified_name, args.limit)?)),
+        Ok(None) if args.allow_ambiguous => {
+            let Some(symbol) = args.symbol.as_deref() else {
+                return Ok(Value::Null);
+            };
+            Ok(json!(db.docs_for_symbol(symbol, args.limit)?))
+        },
+        Ok(None) => Ok(Value::Null),
+        Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
+fn git_history_for_symbol_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
+    let selector = symbol_selector(args)?;
+    match db.select_symbol(&selector)? {
+        Ok(Some(symbol)) => Ok(json!(db.git_history_for_symbol(
+            &symbol.qualified_name,
+            optional_language(Some(symbol.language.clone()))?,
+            selector.limit
+        )?)),
+        Ok(None) if selector.allow_ambiguous => {
+            let Some(symbol) = selector.symbol.as_deref() else {
+                return Ok(Value::Null);
+            };
+            Ok(json!(db.git_history_for_symbol(symbol, selector.language, selector.limit)?))
+        },
+        Ok(None) => Ok(Value::Null),
+        Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
+fn papertrail_for_symbol_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
+    let selector = symbol_selector(args)?;
+    match db.select_symbol(&selector)? {
+        Ok(Some(symbol)) => Ok(json!(db.papertrail_for_selected_symbol(&symbol, selector.limit)?)),
+        Ok(None) if selector.allow_ambiguous => {
+            let Some(symbol) = selector.symbol.as_deref() else {
+                return Ok(Value::Null);
+            };
+            Ok(json!(db.papertrail_for_symbol(symbol, selector.language, selector.limit)?))
+        },
+        Ok(None) => Ok(Value::Null),
+        Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
+fn impact_tool(
+    db: &IndexDatabase,
+    args: ImpactArgs,
+    resolution_mode: GraphResolutionMode,
+) -> anyhow::Result<Value> {
+    if args.symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
+        let selector = SymbolSelector {
+            symbol_id: args.symbol_id,
+            symbol_path: args.symbol_path,
+            symbol: args.symbol,
+            language: None,
+            allow_ambiguous: args.allow_ambiguous,
+            limit: args.limit,
+        };
+        return match db.select_symbol(&selector)? {
+            Ok(Some(symbol)) => Ok(json!(db.impact_surface_for_selected_symbol(
+                &symbol,
+                args.limit,
+                resolution_mode
+            )?)),
+            Ok(None) if selector.allow_ambiguous => {
+                let Some(symbol) = selector.symbol.as_deref() else {
+                    return Ok(Value::Null);
+                };
+                Ok(json!(db.impact_surface_with_options(symbol, args.limit, resolution_mode)?))
+            },
+            Ok(None) => Ok(Value::Null),
+            Err(disambiguation) => Ok(json!(disambiguation)),
+        };
+    }
+    let Some(query) = args.query.as_deref() else {
+        anyhow::bail!("impact_surface requires query, symbol_id, symbol_path, or symbol");
+    };
+    Ok(json!(db.impact_surface_with_options(query, args.limit, resolution_mode)?))
+}
+
+fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
+    Ok(SymbolSelector {
+        symbol_id: args.symbol_id,
+        symbol_path: args.symbol_path,
+        symbol: args.symbol,
+        language: optional_language(args.language)?,
+        allow_ambiguous: args.allow_ambiguous,
+        limit: args.limit,
+    })
+}
+
+fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<SymbolSelector> {
+    Ok(SymbolSelector {
+        symbol_id: args.symbol_id,
+        symbol_path: args.symbol_path.clone(),
+        symbol: args.symbol.clone(),
+        language: None,
+        allow_ambiguous: args.allow_ambiguous,
+        limit: args.limit,
+    })
 }
 
 pub fn description(name: &str) -> &'static str {
@@ -474,15 +617,20 @@ mod tests {
         assert_schema_has_property(tools, "semantic_search", "include_git");
         assert_schema_has_property(tools, "semantic_search", "include_papertrail");
         assert_schema_has_property(tools, "semantic_search", "explain");
+        assert_symbol_selector_schema(tools, "symbol_lookup");
         assert_schema_has_property(tools, "find_callers", "include_references");
         assert_schema_has_property(tools, "find_callers", "edge_kinds");
         assert_schema_has_property(tools, "find_callers", "resolution");
-        assert_schema_has_property(tools, "find_callers", "symbol_id");
+        assert_symbol_selector_schema(tools, "find_callers");
         assert_schema_has_property(tools, "trace_callees", "include_references");
         assert_schema_has_property(tools, "trace_callees", "edge_kinds");
         assert_schema_has_property(tools, "trace_callees", "resolution");
-        assert_schema_has_property(tools, "trace_callees", "symbol_id");
+        assert_symbol_selector_schema(tools, "trace_callees");
         assert_schema_has_property(tools, "impact_surface", "resolution");
+        assert_symbol_selector_schema(tools, "impact_surface");
+        assert_symbol_selector_schema(tools, "docs_for_symbol");
+        assert_symbol_selector_schema(tools, "git_history_for_symbol");
+        assert_symbol_selector_schema(tools, "papertrail_for_symbol");
         assert_schema_requires(tools, "read_chunk", "chunk_id");
         assert_schema_has_property(tools, "read_chunk", "include_graph");
         assert_schema_has_property(tools, "read_chunk", "graph_limit");
@@ -565,6 +713,69 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn mcp_symbol_id_selection_disambiguates_graph_tools() {
+        let root = unique_temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod one;\npub mod two;\n").unwrap();
+        fs::write(
+            root.join("src/one.rs"),
+            "pub fn shared() {}\npub fn caller_one() {\n    shared();\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/two.rs"),
+            "pub fn shared() {}\npub fn caller_two() {\n    shared();\n}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        drop(db);
+
+        let lookup =
+            call_tool(&config.database, "symbol_lookup", json!({"symbol": "shared"})).unwrap();
+        assert_eq!(lookup["disambiguation_required"], true);
+        let candidates = lookup["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|candidate| {
+            candidate["symbol_id"].is_i64() && candidate["symbol_path"].as_str().is_some()
+        }));
+
+        let ambiguous =
+            call_tool(&config.database, "find_callers", json!({"symbol": "shared"})).unwrap();
+        assert_eq!(ambiguous["disambiguation_required"], true);
+        assert_eq!(ambiguous["candidates"].as_array().unwrap().len(), 2);
+
+        let one = candidates
+            .iter()
+            .find(|candidate| candidate["symbol_path"].as_str().unwrap().contains("one.rs"))
+            .unwrap();
+        let exact = call_tool(
+            &config.database,
+            "find_callers",
+            json!({
+                "symbol_id": one["symbol_id"].as_i64().unwrap(),
+                "resolution": "exact",
+                "edge_kinds": ["calls_name"]
+            }),
+        )
+        .unwrap();
+        let exact = exact.as_array().unwrap();
+        assert_eq!(exact.len(), 1, "exact callers: {exact:?}");
+        assert_eq!(exact[0]["verified_target_symbol"], true);
+        assert!(exact[0]["from_symbol"].as_str().unwrap().contains("caller"));
+
+        let papertrail = call_tool(
+            &config.database,
+            "papertrail_for_symbol",
+            json!({"symbol_id": one["symbol_id"].as_i64().unwrap()}),
+        )
+        .unwrap();
+        assert!(papertrail["current_source"]["symbol"].as_str().unwrap().contains("shared"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
         let schema = tool_schema(tools, name);
         let required = schema["required"].as_array().expect("required array");
@@ -574,6 +785,12 @@ mod tests {
     fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
         let schema = tool_schema(tools, name);
         assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
+    }
+
+    fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
+        for field in ["symbol", "symbol_path", "symbol_id", "allow_ambiguous"] {
+            assert_schema_has_property(tools, name, field);
+        }
     }
 
     fn tool_schema<'a>(tools: &'a [Value], name: &str) -> &'a Value {
@@ -636,6 +853,21 @@ mod tests {
                 }],
             },
         )
+    }
+
+    fn rust_config(root: PathBuf) -> Config {
+        Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+        }
     }
 
     fn unique_temp_root() -> PathBuf {

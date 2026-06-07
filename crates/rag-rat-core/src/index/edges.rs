@@ -73,6 +73,7 @@ struct EdgeCandidate {
 #[derive(Debug, Clone)]
 struct IndexedSymbol {
     id: i64,
+    file_id: i64,
     name: String,
     qualified_name: String,
     kind: String,
@@ -126,22 +127,24 @@ pub fn index_file_edges(
 pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT id, to_name, target_qualified_name, edge_kind, confidence, evidence, receiver_hint FROM edges ORDER BY id",
+        "SELECT id, source_file_id, to_name, target_qualified_name, edge_kind, confidence, evidence, receiver_hint FROM edges ORDER BY id",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
     for (
         edge_id,
+        source_file_id,
         to_name,
         target_qualified_name,
         edge_kind,
@@ -156,6 +159,7 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             &edge_kind,
             evidence.as_deref(),
             receiver_hint.as_deref(),
+            source_file_id,
             &symbols,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
@@ -203,6 +207,7 @@ fn resolve_symbol<'a>(
     edge_kind: &str,
     evidence: Option<&str>,
     receiver_hint: Option<&str>,
+    source_file_id: i64,
     symbols: &'a [IndexedSymbol],
 ) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
     let kind_matches = |symbol: &IndexedSymbol| {
@@ -221,7 +226,7 @@ fn resolve_symbol<'a>(
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "qualified_suffix")),
-            [symbol, ..] => return Some((*symbol, EdgeConfidence::Ambiguous, "qualified_suffix")),
+            [_, ..] => return None,
             [] => {},
         }
         if !allow_unqualified_fallback(edge_kind, qualified, name, evidence, receiver_hint) {
@@ -237,7 +242,17 @@ fn resolve_symbol<'a>(
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
         [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
-        [symbol, ..] => Some((*symbol, EdgeConfidence::Ambiguous, "target_name_fallback")),
+        [_, ..] => {
+            let same_file = matches
+                .iter()
+                .copied()
+                .filter(|symbol| symbol.file_id == source_file_id)
+                .collect::<Vec<_>>();
+            match same_file.as_slice() {
+                [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "same_file_name")),
+                _ => None,
+            }
+        },
         [] => None,
     }
 }
@@ -950,7 +965,7 @@ fn short_name(name: &str) -> &str {
 fn symbols_for_file(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+        SELECT symbols.id, symbols.file_id, symbols.name, symbols.qualified_name, symbols.kind,
                symbols.start_byte, symbols.end_byte,
                COALESCE((
                  SELECT chunks.start_byte
@@ -991,7 +1006,7 @@ fn symbols_for_file(conn: &Connection, file_id: i64) -> anyhow::Result<Vec<Index
 fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
     let mut stmt = conn.prepare(
         "
-        SELECT symbols.id, symbols.name, symbols.qualified_name, symbols.kind,
+        SELECT symbols.id, symbols.file_id, symbols.name, symbols.qualified_name, symbols.kind,
                symbols.start_byte, symbols.end_byte,
                COALESCE((
                  SELECT chunks.start_byte
@@ -1029,18 +1044,19 @@ fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol>> {
 }
 
 fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
-    let start_byte = usize::try_from(row.get::<_, i64>(4)?).unwrap_or(0);
-    let end_byte = usize::try_from(row.get::<_, i64>(5)?).unwrap_or(0);
-    let chunk_start_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(start_byte);
-    let chunk_start_line = row.get::<_, i64>(7)?;
-    let chunk_text: String = row.get(8)?;
+    let start_byte = usize::try_from(row.get::<_, i64>(5)?).unwrap_or(0);
+    let end_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
+    let chunk_start_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(start_byte);
+    let chunk_start_line = row.get::<_, i64>(8)?;
+    let chunk_text: String = row.get(9)?;
     let start_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, start_byte);
     let end_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, end_byte);
     Ok(IndexedSymbol {
         id: row.get(0)?,
-        name: row.get(1)?,
-        qualified_name: row.get(2)?,
-        kind: row.get(3)?,
+        file_id: row.get(1)?,
+        name: row.get(2)?,
+        qualified_name: row.get(3)?,
+        kind: row.get(4)?,
         start_byte,
         end_byte,
         start_line,

@@ -149,7 +149,7 @@ pub struct DiscoveryStatus {
 }
 
 const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
-const GRAPH_INDEX_VERSION: &str = "5";
+const GRAPH_INDEX_VERSION: &str = "6";
 
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -581,6 +581,22 @@ impl IndexDatabase {
         crate::query::symbol::lookup(self.storage.connection(), name, language, limit)
     }
 
+    pub fn symbol_candidates(
+        &self,
+        selector: &crate::query::symbol::SymbolSelector,
+    ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
+        crate::query::symbol::lookup_candidates(self.storage.connection(), selector)
+    }
+
+    pub fn select_symbol(
+        &self,
+        selector: &crate::query::symbol::SymbolSelector,
+    ) -> anyhow::Result<
+        Result<Option<crate::query::symbol::SymbolHit>, crate::query::symbol::SymbolDisambiguation>,
+    > {
+        crate::query::symbol::select_one(self.storage.connection(), selector)
+    }
+
     pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         self.read_chunk_with_graph(chunk_id, GraphMetaMode::Full, 20)
     }
@@ -869,10 +885,18 @@ impl IndexDatabase {
         language: Option<Language>,
         limit: u32,
     ) -> anyhow::Result<Option<Papertrail>> {
-        let Some(symbol) = self.symbols(symbol, language, 1)?.into_iter().next() else {
+        let Some(symbol) = self.symbols(symbol, language, limit)?.into_iter().next() else {
             return Ok(None);
         };
         Ok(Some(github::papertrail_for_symbol(self.storage.connection(), &symbol, limit)?))
+    }
+
+    pub fn papertrail_for_selected_symbol(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        limit: u32,
+    ) -> anyhow::Result<Papertrail> {
+        github::papertrail_for_symbol(self.storage.connection(), symbol, limit)
     }
 
     pub fn papertrail_for_commit(
@@ -1035,6 +1059,20 @@ impl IndexDatabase {
         crate::query::impact::impact_surface_with_options(
             self.storage.connection(),
             query,
+            limit,
+            resolution_mode,
+        )
+    }
+
+    pub fn impact_surface_for_selected_symbol(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        limit: u32,
+        resolution_mode: crate::query::graph::GraphResolutionMode,
+    ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        crate::query::impact::impact_surface_for_symbol(
+            self.storage.connection(),
+            symbol,
             limit,
             resolution_mode,
         )

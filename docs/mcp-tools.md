@@ -66,20 +66,20 @@ Development config without installing:
 ## Tools
 
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`
-- `symbol_lookup`: `{ "symbol": string, "language"?: string, "limit"?: number }`
-- `find_callers`: `{ "symbol": string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `trace_callees`: `{ "symbol": string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `impact_surface`: `{ "query": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "limit"?: number }`
+- `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number }`
 - `ffi_surface`: `{ "limit"?: number }`
-- `docs_for_symbol`: `{ "symbol": string, "limit"?: number }`
+- `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number }`
 - `commit_search`: `{ "query": string, "limit"?: number }`
 - `git_history_for_path`: `{ "path": string, "limit"?: number }`
-- `git_history_for_symbol`: `{ "symbol": string, "language"?: string, "limit"?: number }`
+- `git_history_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `commits_touching_query`: `{ "query": string, "limit"?: number }`
 - `git_blame_chunk`: `{ "chunk_id": number }`
 - `papertrail_for_chunk`: `{ "chunk_id": number, "limit"?: number }`
-- `papertrail_for_symbol`: `{ "symbol": string, "language"?: string, "limit"?: number }`
+- `papertrail_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `papertrail_for_commit`: `{ "commit_hash": string, "limit"?: number }`
 - `github_issue_search`: `{ "query": string, "limit"?: number }`
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
@@ -91,6 +91,28 @@ Development config without installing:
 
 `tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
 used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.
+
+`symbol_lookup` is the candidate-selection step for symbol-shaped tools. It returns:
+
+```json
+{
+  "candidates": [
+    {
+      "symbol_id": 3150,
+      "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+      "qualified_name": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+      "kind": "function",
+      "signature": "pub(crate) async fn spawn_blocking<F, T>(...)"
+    }
+  ],
+  "disambiguation_required": true
+}
+```
+
+Graph, docs, git-history, papertrail, and symbol-specific impact tools accept `symbol_id`,
+`symbol_path`, or `symbol` and resolve them in that priority order. If a bare `symbol` maps to
+multiple candidates, the tool returns the same candidate object instead of guessing. Pass
+`allow_ambiguous: true` only for navigation/debugging when name fallback is acceptable.
 
 Search tools return chunk IDs, paths, line spans, current-text snippets in the `summary` field, and
 scores. Search and `read_chunk` validate stored chunk anchors against current source before

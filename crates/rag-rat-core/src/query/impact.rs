@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::query::graph::GraphResolutionMode;
+use crate::query::symbol::SymbolHit;
 
 #[derive(Debug, Serialize)]
 pub struct ImpactItem {
@@ -30,9 +31,46 @@ pub fn impact_surface_with_options(
     limit: u32,
     resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Vec<ImpactItem>> {
+    impact_surface_from_targets(conn, query, None, limit, resolution_mode)
+}
+
+pub fn impact_surface_for_symbol(
+    conn: &Connection,
+    symbol: &SymbolHit,
+    limit: u32,
+    resolution_mode: GraphResolutionMode,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    let target = SymbolTarget {
+        id: symbol.symbol_id,
+        file_id: symbol.file_id,
+        path: symbol.path.clone(),
+        language: symbol.language.clone(),
+        file_kind: symbol.file_kind.clone(),
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+    };
+    impact_surface_from_targets(
+        conn,
+        &symbol.qualified_name,
+        Some(vec![target]),
+        limit,
+        resolution_mode,
+    )
+}
+
+fn impact_surface_from_targets(
+    conn: &Connection,
+    query: &str,
+    selected_targets: Option<Vec<SymbolTarget>>,
+    limit: u32,
+    resolution_mode: GraphResolutionMode,
+) -> anyhow::Result<Vec<ImpactItem>> {
     let max_items = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut surface = ImpactSurface::default();
-    let targets = exact_symbols(conn, query)?;
+    let targets = match selected_targets {
+        Some(targets) => targets,
+        None => exact_symbols(conn, query)?,
+    };
     let target_names = target_names(query, &targets);
 
     for symbol in &targets {
