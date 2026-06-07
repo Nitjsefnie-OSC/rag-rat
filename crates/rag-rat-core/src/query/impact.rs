@@ -250,27 +250,72 @@ fn impact_surface_from_targets(
 pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactItem>> {
     let mut stmt = conn.prepare(
         "
-        SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name
-        FROM files
-        LEFT JOIN symbols ON symbols.file_id = files.id
-        LEFT JOIN chunks ON chunks.file_id = files.id
-        WHERE chunks.text LIKE '%uniffi::export%'
-           OR files.path LIKE '%generated%'
-           OR symbols.name LIKE '%NativeHeldCore%'
-           OR chunks.text LIKE '%NativeHeldCore%'
-        ORDER BY files.kind DESC, files.path
+        WITH rust_exports AS (
+            SELECT DISTINCT
+                   files.path AS path,
+                   files.language AS language,
+                   files.kind AS kind,
+                   COALESCE(symbols.qualified_name, chunks.symbol_path) AS symbol,
+                   'rust_uniffi_export' AS reason
+            FROM chunks
+            JOIN files ON files.id = chunks.file_id
+            LEFT JOIN symbols
+              ON symbols.file_id = files.id
+             AND symbols.start_byte >= chunks.start_byte
+             AND symbols.end_byte <= chunks.end_byte
+             AND symbols.kind IN ('function', 'method', 'struct', 'enum', 'trait', 'class')
+            WHERE files.language = 'rust'
+              AND chunks.text LIKE '%uniffi::export%'
+              AND (
+                  chunks.text LIKE '%#[uniffi::export]%fn %'
+               OR chunks.text LIKE '%#[::uniffi::export]%fn %'
+               OR chunks.text LIKE '%#[uniffi::export]%impl %'
+               OR chunks.text LIKE '%#[::uniffi::export]%impl %'
+               OR chunks.text LIKE '%#[uniffi::export]%struct %'
+               OR chunks.text LIKE '%#[::uniffi::export]%struct %'
+               OR chunks.text LIKE '%#[uniffi::export]%enum %'
+               OR chunks.text LIKE '%#[::uniffi::export]%enum %'
+              )
+        ),
+        binding_refs AS (
+            SELECT DISTINCT
+                   files.path AS path,
+                   files.language AS language,
+                   files.kind AS kind,
+                   chunks.symbol_path AS symbol,
+                   CASE
+                       WHEN chunks.text LIKE '%NativeHeldCore%'
+                         OR chunks.text LIKE '%uniffi_held_core_%'
+                         OR chunks.text LIKE '%ffi_held_core_%'
+                           THEN 'native_binding_reference'
+                       ELSE 'generated_binding_artifact'
+                   END AS reason
+            FROM files
+            JOIN chunks ON chunks.file_id = files.id
+            WHERE chunks.text LIKE '%NativeHeldCore%'
+               OR chunks.text LIKE '%uniffi_held_core_%'
+               OR chunks.text LIKE '%ffi_held_core_%'
+               OR files.path LIKE '%/src/generated/%'
+               OR files.path LIKE '%/generated/%'
+               OR files.path LIKE '%generated-manifest.json'
+        )
+        SELECT path, language, kind, symbol, reason FROM rust_exports
+        UNION
+        SELECT path, language, kind, symbol, reason FROM binding_refs
+        ORDER BY reason, kind DESC, path
         LIMIT ?1
         ",
     )?;
     rows_to_items(stmt.query_map([limit], |row| {
+        let reason: String = row.get(4)?;
         Ok(ImpactItem {
             path: row.get(0)?,
             language: row.get(1)?,
             kind: row.get(2)?,
             symbol: row.get(3)?,
             category: ImpactCategory::ProbableTextual.as_str().to_string(),
-            reason: "ffi_candidate".to_string(),
-            evidence: vec!["ffi text/path heuristic".to_string()],
+            reason: reason.clone(),
+            evidence: vec![format!("ffi_surface evidence class: {reason}")],
         })
     })?)
 }

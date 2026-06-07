@@ -377,6 +377,7 @@ fn is_common_member_name(value: &str) -> bool {
             | "iter"
             | "map"
             | "collect"
+            | "build"
             | "unwrap"
             | "expect"
             | "ok"

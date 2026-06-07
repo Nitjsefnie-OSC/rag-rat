@@ -190,6 +190,8 @@ pub struct CompareGraphTextSummary {
     pub likely_index_gaps: u64,
     pub complete: bool,
     pub recommended_fallback: String,
+    pub pattern_match_mode: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

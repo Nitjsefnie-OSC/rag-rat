@@ -169,6 +169,8 @@ pub struct FastEmbedOperationalStatus {
     pub active: bool,
     pub status: String,
     pub current_embeddings: u64,
+    pub eligible_embeddings: u64,
+    pub skipped_embeddings: u64,
     pub stale_embeddings: u64,
     pub missing_embeddings: u64,
     pub failed_embeddings: u64,
@@ -180,6 +182,9 @@ pub struct FastEmbedOperationalStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArtifactCounts {
+    pub total_chunks: u64,
+    pub eligible_chunks: u64,
+    pub skipped_chunks: u64,
     pub current: u64,
     pub missing: u64,
     pub stale: u64,
@@ -426,15 +431,27 @@ pub fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     let total_chunks = chunk_count(conn)?;
     let active_model_id = active_embedding_model_id(conn)?;
     let embedding = capability_status(conn, "embedding", &active_model_id, total_chunks)?;
+    let fastembed = fastembed_operational_status(conn, &active_model_id)?;
     let current = embedding.current_artifacts;
     let stale = embedding.stale_artifacts;
     let failed = embedding.failed_artifacts;
     let blocked = embedding.blocked_artifacts;
     let missing = total_chunks.saturating_sub(current + stale + failed + blocked);
-    let fastembed = fastembed_operational_status(conn, &active_model_id)?;
+    let skipped_chunks = fastembed.skipped_embeddings;
+    let eligible_chunks = total_chunks.saturating_sub(skipped_chunks);
     Ok(LocalAiStatus {
         embedding,
-        artifacts: ArtifactCounts { current, missing, stale, failed, blocked, disabled: 0 },
+        artifacts: ArtifactCounts {
+            total_chunks,
+            eligible_chunks,
+            skipped_chunks,
+            current,
+            missing,
+            stale,
+            failed,
+            blocked,
+            disabled: 0,
+        },
         fastembed,
         last_reconcile: last_reconcile_status(conn)?,
     })
@@ -987,6 +1004,16 @@ fn fastembed_operational_status(
         active: active_model_id == FASTEMBED_MODEL_ID,
         status: model.status,
         current_embeddings: plan.current,
+        eligible_embeddings: plan
+            .current
+            .saturating_add(plan.missing)
+            .saturating_add(plan.stale)
+            .saturating_add(plan.model_changed)
+            .saturating_add(plan.dim_changed)
+            .saturating_add(plan.failed_retryable)
+            .saturating_add(plan.failed_waiting)
+            .saturating_add(plan.blocked),
+        skipped_embeddings: plan.skipped_total,
         stale_embeddings: plan
             .stale
             .saturating_add(plan.model_changed)

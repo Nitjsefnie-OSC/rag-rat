@@ -1131,8 +1131,27 @@ mod tests {
         assert_eq!(comparison["summary"]["graph_only"], 0);
         assert_eq!(comparison["summary"]["complete"], false);
         assert_eq!(comparison["summary"]["recommended_fallback"], "text");
+        assert_eq!(comparison["summary"]["pattern_match_mode"], "identifier_or_call");
+        assert!(comparison["summary"]["warnings"].as_array().unwrap().is_empty());
         assert_eq!(comparison["matched_hits"].as_array().unwrap().len(), 1);
         assert_eq!(comparison["text_only_hits"].as_array().unwrap().len(), 1);
+
+        let substring_comparison = call_tool(
+            &config.database,
+            "compare_graph_to_text",
+            json!({
+                "symbol_id": one["symbol_id"].as_i64().unwrap(),
+                "pattern": "shared",
+                "resolution": "exact",
+                "edge_kinds": ["calls_name"]
+            }),
+        )
+        .unwrap();
+        assert_eq!(substring_comparison["summary"]["pattern_match_mode"], "substring_identifier");
+        assert!(
+            !substring_comparison["summary"]["warnings"].as_array().unwrap().is_empty(),
+            "substring comparison should warn: {substring_comparison:?}"
+        );
         assert_eq!(comparison["likely_parser_gaps"].as_array().unwrap().len(), 1);
 
         let impact = call_tool(

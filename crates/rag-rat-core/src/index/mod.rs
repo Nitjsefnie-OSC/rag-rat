@@ -1351,6 +1351,14 @@ impl IndexDatabase {
         let complete = likely_parser_gaps.is_empty() && likely_false_positives.is_empty();
         let recommended_fallback =
             recommended_graph_text_fallback(&likely_parser_gaps, &graph_only_edges);
+        let pattern_match_mode = compare_pattern_match_mode(pattern, &symbol.name);
+        let mut warnings = Vec::new();
+        if pattern_match_mode == "substring_identifier" {
+            warnings.push(format!(
+                "pattern may match identifiers that merely contain `{}`; use an identifier boundary or escaped call suffix for exact text auditing",
+                symbol.name
+            ));
+        }
 
         Ok(crate::query::graph::CompareGraphTextReport {
             query: crate::query::graph::CompareGraphTextQuery {
@@ -1376,6 +1384,8 @@ impl IndexDatabase {
                 likely_index_gaps: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
                 complete,
                 recommended_fallback,
+                pattern_match_mode,
+                warnings,
             },
             coverage: self.graph_coverage(paths)?,
             matched_hits,
@@ -2644,6 +2654,26 @@ fn recommended_graph_text_fallback(
     .to_string()
 }
 
+fn compare_pattern_match_mode(pattern: &str, symbol_name: &str) -> String {
+    if symbol_name.is_empty() {
+        return "regex".to_string();
+    }
+    let escaped_call = format!("{symbol_name}\\(");
+    let plain_call = format!("{symbol_name}(");
+    if pattern.contains("\\b")
+        || pattern.contains("\\W")
+        || pattern.contains("[^")
+        || pattern.contains(&escaped_call)
+        || pattern.contains(&plain_call)
+    {
+        return "identifier_or_call".to_string();
+    }
+    if pattern.contains(symbol_name) {
+        return "substring_identifier".to_string();
+    }
+    "regex".to_string()
+}
+
 fn is_test_like_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains("/test/")
@@ -3361,6 +3391,16 @@ mod schema_bootstrap_tests {
         assert_eq!(status.local_ai.fastembed.dim, ai::FASTEMBED_EMBEDDING_DIM);
         assert!(!status.local_ai.fastembed.cache.is_empty());
         assert_eq!(status.local_ai.fastembed.build_feature_enabled, cfg!(feature = "fastembed"));
+        assert_eq!(status.local_ai.artifacts.total_chunks, 1);
+        assert_eq!(
+            status.local_ai.artifacts.eligible_chunks + status.local_ai.artifacts.skipped_chunks,
+            status.local_ai.artifacts.total_chunks
+        );
+        assert_eq!(
+            status.local_ai.fastembed.eligible_embeddings
+                + status.local_ai.fastembed.skipped_embeddings,
+            status.local_ai.artifacts.total_chunks
+        );
         assert_eq!(indexed_revision_count(&db), 1);
         assert_eq!(chunk_source_revision_count(&db), 1);
 
@@ -5121,6 +5161,12 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
 
         let rationale = db.rationale_search("risk", 10).unwrap();
         assert!(rationale.iter().any(|item| item.classification == "risk"));
+        let issue_ref_rationale = db.rationale_search("Fixes #42", 10).unwrap();
+        assert_eq!(issue_ref_rationale.first().map(|item| item.number), Some(42));
+        assert!(
+            issue_ref_rationale.iter().any(|item| item.number == 42),
+            "issue ref rationale should use structured GitHub refs: {issue_ref_rationale:?}"
+        );
 
         let chunk_id = first_chunk_id(&db);
         let papertrail = db.papertrail_for_chunk(chunk_id, 10).unwrap().unwrap();
@@ -5129,6 +5175,34 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         assert!(
             papertrail.github_evidence.iter().all(|item| item.evidence_kind == "historical_github")
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn papertrail_for_commit_prefers_commit_sourced_github_refs() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.name", "Rag Rat"]);
+        run_git(&root, &["config", "user.email", "rag@example.com"]);
+        fs::write(root.join("docs/search.md"), "# Decision\nalpha\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "Fix search rationale", "-m", "Fixes #42"]);
+
+        let config = markdown_config_for_root(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let commit = db
+            .storage
+            .connection()
+            .query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        let mock = MockGitHubClient;
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+
+        let papertrail = db.papertrail_for_commit(&commit[..7], 10).unwrap();
+        assert_eq!(papertrail.github_evidence.first().map(|item| item.number), Some(42));
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -357,7 +357,21 @@ pub fn rationale_search(
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<GitHubEvidence>> {
-    search_fts(conn, query, None, limit)
+    let mut evidence = Vec::new();
+    let default_repo = default_repo();
+    for reference in parse_refs(query, default_repo.as_deref()) {
+        evidence.extend(evidence_for_issue(
+            conn,
+            &reference.owner,
+            &reference.repo,
+            reference.number,
+            limit,
+        )?);
+    }
+    evidence.extend(search_fts(conn, query, None, limit)?);
+    dedupe_evidence(&mut evidence);
+    evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(evidence)
 }
 
 pub fn refs_for_path(conn: &Connection, path: &str, limit: u32) -> anyhow::Result<Vec<GitHubRef>> {
@@ -421,16 +435,18 @@ pub fn papertrail_for_commit(
     commit_hash: &str,
     limit: u32,
 ) -> anyhow::Result<Papertrail> {
+    let mut evidence = evidence_for_commit_refs(conn, commit_hash, limit)?;
     let mut stmt = conn.prepare(
-        "SELECT path FROM git_file_changes WHERE commit_hash = ?1 ORDER BY path LIMIT ?2",
+        "SELECT path FROM git_file_changes WHERE commit_hash LIKE ?1 ORDER BY path LIMIT ?2",
     )?;
+    let commit_like = format!("{commit_hash}%");
     let rows =
-        stmt.query_map(params![commit_hash, i64::from(limit)], |row| row.get::<_, String>(0))?;
-    let mut evidence = Vec::new();
+        stmt.query_map(params![commit_like, i64::from(limit)], |row| row.get::<_, String>(0))?;
     for row in rows {
         evidence.extend(evidence_for_path(conn, &row?, limit)?);
     }
     evidence.extend(rationale_search(conn, commit_hash, limit)?);
+    dedupe_evidence(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(Papertrail { current_source: None, github_evidence: evidence })
 }
@@ -1127,6 +1143,35 @@ fn evidence_for_issue(
     collect_rows(rows)
 }
 
+fn evidence_for_commit_refs(
+    conn: &Connection,
+    commit_hash: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<GitHubEvidence>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT owner, repo, number
+        FROM github_refs
+        WHERE source_kind = 'commit'
+          AND source_commit LIKE ?1
+        ORDER BY ref_kind = 'closing' DESC, id DESC
+        LIMIT ?2
+        ",
+    )?;
+    let commit_like = format!("{commit_hash}%");
+    let refs = stmt.query_map(params![commit_like, i64::from(limit)], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+    })?;
+    let mut evidence = Vec::new();
+    for reference in refs {
+        let (owner, repo, number) = reference?;
+        evidence.extend(evidence_for_issue(conn, &owner, &repo, number, limit)?);
+    }
+    dedupe_evidence(&mut evidence);
+    evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(evidence)
+}
+
 fn search_fts(
     conn: &Connection,
     query: &str,
@@ -1161,6 +1206,19 @@ fn search_fts(
 
 fn positive_rank_score(rank: usize) -> f64 {
     1.0 / ((rank + 1) as f64).sqrt()
+}
+
+fn dedupe_evidence(evidence: &mut Vec<GitHubEvidence>) {
+    let mut seen = BTreeSet::new();
+    evidence.retain(|item| {
+        seen.insert((
+            item.owner.clone(),
+            item.repo.clone(),
+            item.number,
+            item.item_kind.clone(),
+            item.item_id.clone(),
+        ))
+    });
 }
 
 fn evidence_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GitHubEvidence> {
