@@ -51,31 +51,34 @@ transaction per batch so the database is not held open while FastEmbed/ONNX is d
 
 ## Commands
 
+Commands read `rag-rat.toml` by default. Use `--config <path>` when running from another directory
+or with another repository profile.
+
 ```bash
-cargo run --bin rag-rat -- index --config rag-rat.toml
-cargo run --bin rag-rat -- index --changed --config rag-rat.toml
-cargo run --bin rag-rat -- index --discover --config rag-rat.toml
-cargo run --bin rag-rat -- index --full --config rag-rat.toml
-cargo run --bin rag-rat -- doctor --config rag-rat.toml
-cargo run --bin rag-rat -- migrate --check --config rag-rat.toml
-cargo run --bin rag-rat -- migrate --config rag-rat.toml
-cargo run --bin rag-rat -- github sync --from-refs --config rag-rat.toml
-cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42 --config rag-rat.toml
-cargo run --bin rag-rat -- github sync --from-refs --offline --config rag-rat.toml
-cargo run --bin rag-rat -- models list --config rag-rat.toml
-cargo run --bin rag-rat -- models install embedding-hash --config rag-rat.toml
-cargo run --features fastembed --bin rag-rat -- models install fastembed-all-minilm-l6-v2 --config rag-rat.toml
-cargo run --bin rag-rat -- reconcile --limit 100 --batch-size 32 --config rag-rat.toml
-cargo run --bin rag-rat -- reconcile --changed-first --max-seconds 60 --batch-size 64 --config rag-rat.toml
-cargo run --bin rag-rat -- reconcile --until-clean --batch-size 64 --config rag-rat.toml
-cargo run --bin rag-rat -- hooks install --config rag-rat.toml
-cargo run --bin rag-rat -- hooks status --config rag-rat.toml
-cargo run --bin rag-rat -- maintenance --trigger post-checkout --max-seconds 30 --config rag-rat.toml
-cargo run --bin rag-rat -- eval --config rag-rat.toml
-cargo run --bin rag-rat -- eval --json --config rag-rat.toml
-cargo run --bin rag-rat -- eval --update-baseline --config rag-rat.toml
-cargo run --bin rag-rat -- query --config rag-rat.toml "semantic recall"
-cargo run --bin rag-rat -- mcp --config rag-rat.toml
+cargo run --bin rag-rat -- index
+cargo run --bin rag-rat -- index --changed
+cargo run --bin rag-rat -- index --discover
+cargo run --bin rag-rat -- index --full
+cargo run --bin rag-rat -- doctor
+cargo run --bin rag-rat -- migrate --check
+cargo run --bin rag-rat -- migrate
+cargo run --bin rag-rat -- github sync --from-refs
+cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42
+cargo run --bin rag-rat -- github sync --from-refs --offline
+cargo run --bin rag-rat -- models list
+cargo run --bin rag-rat -- models install embedding-hash
+cargo run --features fastembed --bin rag-rat -- models install fastembed-all-minilm-l6-v2
+cargo run --bin rag-rat -- reconcile --limit 100 --batch-size 32
+cargo run --bin rag-rat -- reconcile --changed-first --max-seconds 60 --batch-size 64
+cargo run --bin rag-rat -- reconcile --until-clean --batch-size 64
+cargo run --bin rag-rat -- hooks install
+cargo run --bin rag-rat -- hooks status
+cargo run --bin rag-rat -- maintenance --trigger post-checkout --max-seconds 30
+cargo run --bin rag-rat -- eval
+cargo run --bin rag-rat -- eval --json
+cargo run --bin rag-rat -- eval --update-baseline
+cargo run --bin rag-rat -- query "semantic recall"
+cargo run --bin rag-rat -- mcp
 ```
 
 By default, rag-rat links against the system SQLite library through `rusqlite`.

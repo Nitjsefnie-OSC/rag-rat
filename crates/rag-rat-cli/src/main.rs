@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first().map(String::as_str) else {
         usage();
-        anyhow::bail!("missing command");
+        return Ok(());
     };
     let config_path = option_value(&args, "--config").unwrap_or_else(|| "rag-rat.toml".to_string());
     let config = Config::load(&config_path)?;
@@ -732,31 +732,32 @@ fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <index|doctor|migrate|query|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> --config <path> [query]\n\
+        "usage: rag-rat <index|doctor|migrate|query|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> [--config <path>] [query]\n\
+         default config: rag-rat.toml\n\
          examples:\n\
-         rag-rat index --config rag-rat.toml\n\
-         rag-rat index --changed --config rag-rat.toml\n\
-         rag-rat index --discover --config rag-rat.toml\n\
-         rag-rat index --full --config rag-rat.toml\n\
-         rag-rat index --watch --config rag-rat.toml\n\
-         rag-rat migrate --check --config rag-rat.toml\n\
-         rag-rat github sync --from-refs --config rag-rat.toml\n\
-         rag-rat hooks install --config rag-rat.toml\n\
-         rag-rat hooks status --config rag-rat.toml\n\
-         rag-rat maintenance --trigger post-checkout --max-seconds 30 --config rag-rat.toml\n\
-         rag-rat models list --config rag-rat.toml\n\
-         rag-rat models install embedding-hash --config rag-rat.toml\n\
-         rag-rat models install fastembed-all-minilm-l6-v2 --config rag-rat.toml\n\
-         rag-rat reconcile --plan --config rag-rat.toml\n\
-         rag-rat reconcile --limit 100 --batch-size 32 --config rag-rat.toml\n\
-         rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64 --config rag-rat.toml\n\
-         rag-rat reconcile --until-clean --batch-size 64 --config rag-rat.toml\n\
-         rag-rat reconcile --force --limit 100 --batch-size 32 --config rag-rat.toml\n\
-         rag-rat eval --config rag-rat.toml\n\
-         rag-rat eval --json --config rag-rat.toml\n\
-         rag-rat eval --update-baseline --config rag-rat.toml\n\
-         rag-rat query --config rag-rat.toml \"semantic recall\"\n\
-         rag-rat query --explain --config rag-rat.toml \"runtime shutdown\""
+         rag-rat index\n\
+         rag-rat index --changed\n\
+         rag-rat index --discover\n\
+         rag-rat index --full\n\
+         rag-rat index --watch\n\
+         rag-rat migrate --check\n\
+         rag-rat github sync --from-refs\n\
+         rag-rat hooks install\n\
+         rag-rat hooks status\n\
+         rag-rat maintenance --trigger post-checkout --max-seconds 30\n\
+         rag-rat models list\n\
+         rag-rat models install embedding-hash\n\
+         rag-rat models install fastembed-all-minilm-l6-v2\n\
+         rag-rat reconcile --plan\n\
+         rag-rat reconcile --limit 100 --batch-size 32\n\
+         rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64\n\
+         rag-rat reconcile --until-clean --batch-size 64\n\
+         rag-rat reconcile --force --limit 100 --batch-size 32\n\
+         rag-rat eval\n\
+         rag-rat eval --json\n\
+         rag-rat eval --update-baseline\n\
+         rag-rat query \"semantic recall\"\n\
+         rag-rat query --explain \"runtime shutdown\""
     );
 }
 
