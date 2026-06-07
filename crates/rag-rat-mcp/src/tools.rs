@@ -326,7 +326,28 @@ pub fn schema(name: &str) -> Value {
 }
 
 fn schema_for<T: schemars::JsonSchema>() -> Value {
-    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| json!({"type": "object"}))
+    let mut schema = serde_json::to_value(schemars::schema_for!(T))
+        .unwrap_or_else(|_| json!({"type": "object"}));
+    strip_schema_metadata(&mut schema);
+    schema
+}
+
+fn strip_schema_metadata(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("title");
+            for child in map.values_mut() {
+                strip_schema_metadata(child);
+            }
+        },
+        Value::Array(items) => {
+            for item in items {
+                strip_schema_metadata(item);
+            }
+        },
+        _ => {},
+    }
 }
 
 fn optional_language(language: Option<String>) -> anyhow::Result<Option<Language>> {

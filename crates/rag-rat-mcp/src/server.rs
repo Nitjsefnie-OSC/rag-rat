@@ -1,13 +1,17 @@
 use std::path::PathBuf;
 
 use rmcp::{
-    ErrorData, ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo, Tool,
+    },
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::tools::{
     BlameChunkArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs, PapertrailChunkArgs,
@@ -286,6 +290,24 @@ impl ServerHandler for RagRatService {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rag-rat", "0.1.0"))
             .with_instructions("Read-only-source repo intelligence. Index and auto-heal writes are confined to the configured SQLite database.")
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let tools = crate::tools::TOOL_NAMES
+            .iter()
+            .map(|name| {
+                let input_schema = match crate::tools::schema(name) {
+                    Value::Object(map) => map,
+                    _ => Map::new(),
+                };
+                Tool::new((*name).to_string(), crate::tools::description(name), input_schema)
+            })
+            .collect();
+        Ok(ListToolsResult { tools, meta: None, next_cursor: None })
     }
 }
 
