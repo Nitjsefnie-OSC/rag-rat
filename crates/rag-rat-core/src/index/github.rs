@@ -89,6 +89,8 @@ pub struct GitHubEvidence {
 pub struct Papertrail {
     pub current_source: Option<CurrentSourceEvidence>,
     pub github_evidence: Vec<GitHubEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fallback_github_evidence: Vec<GitHubEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -406,6 +408,7 @@ pub fn papertrail_for_chunk(
             symbol: chunk.symbol_path.clone(),
         }),
         github_evidence: evidence,
+        fallback_github_evidence: Vec::new(),
     })
 }
 
@@ -427,6 +430,7 @@ pub fn papertrail_for_symbol(
             symbol: Some(symbol.qualified_name.clone()),
         }),
         github_evidence: evidence,
+        fallback_github_evidence: Vec::new(),
     })
 }
 
@@ -436,6 +440,7 @@ pub fn papertrail_for_commit(
     limit: u32,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_commit_refs(conn, commit_hash, limit)?;
+    let mut fallback_evidence = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT path FROM git_file_changes WHERE commit_hash LIKE ?1 ORDER BY path LIMIT ?2",
     )?;
@@ -443,12 +448,18 @@ pub fn papertrail_for_commit(
     let rows =
         stmt.query_map(params![commit_like, i64::from(limit)], |row| row.get::<_, String>(0))?;
     for row in rows {
-        evidence.extend(evidence_for_path(conn, &row?, limit)?);
+        fallback_evidence.extend(evidence_for_path(conn, &row?, limit)?);
     }
-    evidence.extend(rationale_search(conn, commit_hash, limit)?);
+    fallback_evidence.extend(rationale_search(conn, commit_hash, limit)?);
     dedupe_evidence(&mut evidence);
+    dedupe_evidence(&mut fallback_evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    Ok(Papertrail { current_source: None, github_evidence: evidence })
+    fallback_evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(Papertrail {
+        current_source: None,
+        github_evidence: evidence,
+        fallback_github_evidence: fallback_evidence,
+    })
 }
 
 pub fn discover_and_store_refs(conn: &Connection, root: &Path) -> anyhow::Result<Vec<GitHubRef>> {
@@ -1140,7 +1151,12 @@ fn evidence_for_issue(
         ",
     )?;
     let rows = stmt.query_map(params![owner, repo, number, i64::from(limit)], evidence_row)?;
-    collect_rows(rows)
+    let mut evidence = collect_rows(rows)?;
+    for item in &mut evidence {
+        item.evidence_kind = "literal_github_ref";
+        item.score = 1.0;
+    }
+    Ok(evidence)
 }
 
 fn evidence_for_commit_refs(

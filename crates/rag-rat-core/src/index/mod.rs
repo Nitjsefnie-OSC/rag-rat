@@ -5163,6 +5163,11 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         assert!(rationale.iter().any(|item| item.classification == "risk"));
         let issue_ref_rationale = db.rationale_search("Fixes #42", 10).unwrap();
         assert_eq!(issue_ref_rationale.first().map(|item| item.number), Some(42));
+        assert_eq!(
+            issue_ref_rationale.first().map(|item| item.evidence_kind),
+            Some("literal_github_ref")
+        );
+        assert_eq!(issue_ref_rationale.first().map(|item| item.score), Some(1.0));
         assert!(
             issue_ref_rationale.iter().any(|item| item.number == 42),
             "issue ref rationale should use structured GitHub refs: {issue_ref_rationale:?}"
@@ -5172,9 +5177,9 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         let papertrail = db.papertrail_for_chunk(chunk_id, 10).unwrap().unwrap();
         assert!(papertrail.current_source.is_some());
         assert!(!papertrail.github_evidence.is_empty());
-        assert!(
-            papertrail.github_evidence.iter().all(|item| item.evidence_kind == "historical_github")
-        );
+        assert!(papertrail.github_evidence.iter().all(|item| {
+            matches!(item.evidence_kind, "historical_github" | "literal_github_ref")
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5203,6 +5208,13 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
 
         let papertrail = db.papertrail_for_commit(&commit[..7], 10).unwrap();
         assert_eq!(papertrail.github_evidence.first().map(|item| item.number), Some(42));
+        assert_eq!(
+            papertrail.github_evidence.first().map(|item| item.evidence_kind),
+            Some("literal_github_ref")
+        );
+        assert!(papertrail.fallback_github_evidence.iter().all(|item| {
+            item.evidence_kind == "historical_github" || item.evidence_kind == "literal_github_ref"
+        }));
 
         fs::remove_dir_all(root).unwrap();
     }

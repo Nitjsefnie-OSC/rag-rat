@@ -256,7 +256,15 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
                    files.language AS language,
                    files.kind AS kind,
                    COALESCE(symbols.qualified_name, chunks.symbol_path) AS symbol,
-                   'rust_uniffi_export' AS reason
+                   CASE
+                       WHEN symbols.kind = 'method'
+                         AND (
+                             chunks.text LIKE '%#[uniffi::export]%impl %'
+                          OR chunks.text LIKE '%#[::uniffi::export]%impl %'
+                         )
+                           THEN 'rust_uniffi_impl_member'
+                       ELSE 'rust_uniffi_export'
+                   END AS reason
             FROM chunks
             JOIN files ON files.id = chunks.file_id
             LEFT JOIN symbols
@@ -315,9 +323,18 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
             symbol: row.get(3)?,
             category: ImpactCategory::ProbableTextual.as_str().to_string(),
             reason: reason.clone(),
-            evidence: vec![format!("ffi_surface evidence class: {reason}")],
+            evidence: ffi_surface_evidence(&reason),
         })
     })?)
+}
+
+fn ffi_surface_evidence(reason: &str) -> Vec<String> {
+    let mut evidence = vec![format!("ffi_surface evidence class: {reason}")];
+    if reason == "rust_uniffi_impl_member" {
+        evidence
+            .push("member symbol is inside a chunk containing an exported UniFFI impl".to_string());
+    }
+    evidence
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
