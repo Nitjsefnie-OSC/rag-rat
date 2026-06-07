@@ -1115,12 +1115,13 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        let options = self.graph_options_with_logical_group(options)?;
         crate::query::graph::traverse_with_options(
             self.storage.connection(),
             symbol,
             true,
             limit,
-            options,
+            &options,
         )
     }
 
@@ -1138,12 +1139,13 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        let options = self.graph_options_with_logical_group(options)?;
         crate::query::graph::traverse_with_options(
             self.storage.connection(),
             symbol,
             false,
             limit,
-            options,
+            &options,
         )
     }
 
@@ -1155,19 +1157,20 @@ impl IndexDatabase {
         limit: u32,
         options: &crate::query::graph::GraphTraversalOptions,
     ) -> anyhow::Result<crate::query::graph::GraphTraversalReport> {
+        let options = self.graph_options_with_logical_group(options)?;
         let results = crate::query::graph::traverse_with_options(
             self.storage.connection(),
             &symbol.qualified_name,
             reverse,
             limit,
-            options,
+            &options,
         )?;
         let summary = crate::query::graph::traversal_summary(
             self.storage.connection(),
             &symbol.qualified_name,
             reverse,
             limit,
-            options,
+            &options,
             results.len(),
         )?;
         let (logical_symbol, variants) = self.graph_logical_symbol(options.logical_symbol_id)?;
@@ -1210,12 +1213,13 @@ impl IndexDatabase {
         include_tests: bool,
     ) -> anyhow::Result<crate::query::graph::CompareGraphTextReport> {
         let regex = Regex::new(pattern)?;
+        let options = self.graph_options_with_logical_group(options)?;
         let mut graph_edges = crate::query::graph::traverse_with_options(
             self.storage.connection(),
             &symbol.qualified_name,
             true,
             limit,
-            options,
+            &options,
         )?;
         if !include_tests {
             graph_edges.retain(|edge| {
@@ -1386,6 +1390,26 @@ impl IndexDatabase {
             }),
             variants,
         ))
+    }
+
+    fn graph_options_with_logical_group(
+        &self,
+        options: &crate::query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<crate::query::graph::GraphTraversalOptions> {
+        if options.logical_symbol_id.is_some() {
+            return Ok(options.clone());
+        }
+        let Some(symbol_id) = options.symbol_id else {
+            return Ok(options.clone());
+        };
+        let Some(logical) =
+            crate::query::symbol::logical_for_symbol_id(self.storage.connection(), symbol_id)?
+        else {
+            return Ok(options.clone());
+        };
+        let mut options = options.clone();
+        options.logical_symbol_id = Some(logical.logical_symbol_id);
+        Ok(options)
     }
 
     pub fn impact_surface(
@@ -3673,9 +3697,14 @@ pub fn caller() {
             )
             .unwrap();
         assert!(
-            exact_variant_callers.is_empty(),
-            "single variant exact should not imply the sibling cfg body: {exact_variant_callers:?}"
+            exact_variant_callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|symbol| symbol.ends_with("caller"))
+                    && edge.target.as_deref() == Some("spawn_blocking")
+                    && edge.verified_target_symbol
+            }),
+            "symbol_id exact should include its logical cfg group: {exact_variant_callers:?}"
         );
+        assert!(exact_variant_callers.iter().all(|edge| edge.verified_target_symbol));
 
         let exact_logical = db
             .graph_traversal_report(
@@ -3686,7 +3715,6 @@ pub fn caller() {
                 &crate::query::graph::GraphTraversalOptions {
                     resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
                     symbol_id: Some(lookup.candidates[0].symbol_id),
-                    logical_symbol_id: Some(logical_symbol_id),
                     ..Default::default()
                 },
             )
