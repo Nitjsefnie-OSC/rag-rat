@@ -46,6 +46,12 @@ Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `impo
 `Syntactic`, `NameOnly`, or `Ambiguous`. These are intentionally not compiler-grade resolved call
 graphs.
 
+`impact_surface` is graph-backed first. It layers exact symbol definitions, direct callers, direct
+callees, import/export dependents, same-file siblings, git commits touching those files, and cached
+GitHub papertrail. Text/path LIKE matching is used only as `Probable textual impact` fallback. Each
+item includes `category`, `reason`, and `evidence`; categories are `Direct structural impact`,
+`Probable textual impact`, and `Historical/papertrail evidence`.
+
 Git history tools return historical evidence. `commit_search` searches commit subjects and bodies;
 `git_history_for_path` returns commits touching a current path; `git_history_for_symbol` resolves
 the current symbol path/range first, then returns path history; `commits_touching_query` combines

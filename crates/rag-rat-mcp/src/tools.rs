@@ -226,7 +226,9 @@ pub fn description(name: &str) -> &'static str {
         "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin symbols.",
         "find_callers" => "Traverse tree-sitter-derived reverse graph edges for callers.",
         "trace_callees" => "Traverse tree-sitter-derived forward graph edges for callees.",
-        "impact_surface" => "Estimate affected source, test, generated binding, and docs surfaces.",
+        "impact_surface" => {
+            "Graph-backed coding preflight with structural, textual fallback, and papertrail evidence."
+        },
         "ffi_surface" => "Find UniFFI/export/generated-binding/call-site candidates.",
         "docs_for_symbol" => "Find docs chunks related to a symbol.",
         "read_chunk" => "Read current text for one selected chunk ID with anchor validation.",

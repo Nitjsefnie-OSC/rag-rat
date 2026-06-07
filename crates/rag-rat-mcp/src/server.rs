@@ -81,7 +81,7 @@ impl RagRatService {
 
     #[tool(
         name = "impact_surface",
-        description = "Estimate affected source, test, generated binding, and docs surfaces."
+        description = "Graph-backed coding preflight with structural, textual fallback, and papertrail evidence."
     )]
     fn impact_surface(
         &self,

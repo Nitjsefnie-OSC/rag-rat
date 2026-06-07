@@ -1600,6 +1600,14 @@ mod schema_bootstrap_tests {
         assert_eq!(symbol_history.len(), 1);
         assert_eq!(symbol_history[0].path, "src/lib.rs");
         assert_eq!(symbol_history[0].evidence_kind, "historical");
+        let impact = db.impact_surface("tracked_symbol", 10).unwrap();
+        assert!(impact.iter().any(|item| {
+            item.category == "Direct structural impact" && item.reason == "exact_symbol_definition"
+        }));
+        assert!(impact.iter().any(|item| {
+            item.category == "Historical/papertrail evidence"
+                && item.reason == "git_commit_touched_file"
+        }));
 
         let query_commits = db.commits_touching_query("beta", 10).unwrap();
         let beta_commit =
@@ -1747,7 +1755,12 @@ fun helper() {}
         assert_edge(&db, "MainBridge", "Syncable", "implements", "Syntactic");
         assert_edge(&db, "src/Main.kt", "ExternalThing", "imports", "NameOnly");
         let impact = db.impact_surface("helper", 10).unwrap();
-        assert!(impact.iter().any(|item| item.reason == "graph_edge_match"), "impact: {impact:?}");
+        assert!(
+            impact.iter().any(|item| {
+                item.category == "Direct structural impact" && item.reason == "direct_caller"
+            }),
+            "impact: {impact:?}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
