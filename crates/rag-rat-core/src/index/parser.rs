@@ -276,10 +276,10 @@ fn docs_before(text: &str, start_byte: usize) -> Option<String> {
     let mut docs = Vec::new();
     for line in before.lines().rev() {
         let trimmed = line.trim();
-        if trimmed.starts_with("///") {
-            docs.push(trimmed.trim_start_matches('/').trim().to_string());
-        } else if trimmed.starts_with("*") || trimmed.starts_with("/**") {
-            docs.push(trimmed.trim_start_matches('/').trim_start_matches('*').trim().to_string());
+        if matches!(trimmed, "/**" | "*/") {
+            continue;
+        } else if let Some(doc_line) = clean_doc_comment_line(trimmed) {
+            docs.push(doc_line);
         } else if trimmed.is_empty() {
             continue;
         } else {
@@ -288,4 +288,17 @@ fn docs_before(text: &str, start_byte: usize) -> Option<String> {
     }
     docs.reverse();
     (!docs.is_empty()).then(|| docs.join("\n"))
+}
+
+fn clean_doc_comment_line(trimmed: &str) -> Option<String> {
+    let line = if trimmed.starts_with("///") {
+        trimmed.trim_start_matches('/')
+    } else if trimmed.starts_with('*') || trimmed.starts_with("/**") {
+        trimmed.trim_start_matches('/').trim_start_matches('*').trim_end_matches('/')
+    } else {
+        return None;
+    }
+    .trim();
+
+    (!line.is_empty()).then(|| line.to_string())
 }

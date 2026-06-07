@@ -1082,7 +1082,7 @@ impl IndexDatabase {
             anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
         };
         let indexed_files = self.indexed_files()?;
-        let max_files = limit.map(usize::try_from).transpose()?.unwrap_or(usize::MAX);
+        let max_repairs = limit.map(usize::try_from).transpose()?.unwrap_or(usize::MAX);
         let mut report = HealIndexReport {
             checked_files: 0,
             healed_files: 0,
@@ -1092,11 +1092,18 @@ impl IndexDatabase {
             message: None,
         };
 
-        for file in indexed_files.into_iter().take(max_files) {
+        for file in indexed_files {
             report.checked_files += 1;
             let path = Path::new(&file.path);
             let full_path = root.join(path);
             let Ok(text) = fs::read_to_string(&full_path) else {
+                if usize::try_from(report.healed_files + report.removed_files).unwrap_or(usize::MAX)
+                    >= max_repairs
+                {
+                    report.message =
+                        Some("limit reached; rerun heal_index to continue".to_string());
+                    break;
+                }
                 self.mark_file_deleted(path)?;
                 report.removed_files += 1;
                 continue;
@@ -1105,6 +1112,12 @@ impl IndexDatabase {
             if sha256 == file.sha256 {
                 report.skipped_files += 1;
                 continue;
+            }
+            if usize::try_from(report.healed_files + report.removed_files).unwrap_or(usize::MAX)
+                >= max_repairs
+            {
+                report.message = Some("limit reached; rerun heal_index to continue".to_string());
+                break;
             }
             self.heal_file(path)?;
             report.healed_files += 1;
@@ -1116,11 +1129,6 @@ impl IndexDatabase {
             self.ensure_fts_fresh()?;
         }
         report.fts_fresh = !self.fts_dirty()?;
-        if usize::try_from(report.checked_files).unwrap_or(usize::MAX)
-            < self.indexed_file_count()?
-        {
-            report.message = Some("limit reached; rerun heal_index to continue".to_string());
-        }
         Ok(report)
     }
 
@@ -5211,6 +5219,27 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
 
         let err = db.search("common", 20, false).unwrap_err().to_string();
         assert!(err.contains("needs_reindex"), "{err}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn heal_index_limit_does_not_warn_when_only_fresh_files_are_skipped() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        let docs = root.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+        fs::write(docs.join("one.md"), "one fresh token\n").unwrap();
+        fs::write(docs.join("two.md"), "two fresh token\n").unwrap();
+        let config = markdown_config_for_root(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let report = db.heal_index(Some(1)).unwrap();
+
+        assert_eq!(report.healed_files, 0);
+        assert_eq!(report.removed_files, 0);
+        assert_eq!(report.skipped_files, 2);
+        assert_eq!(report.message, None);
 
         fs::remove_dir_all(root).unwrap();
     }

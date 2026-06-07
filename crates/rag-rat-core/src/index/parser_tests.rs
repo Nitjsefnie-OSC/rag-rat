@@ -70,6 +70,27 @@ fn extracts_kotlin_symbols() {
 }
 
 #[test]
+fn extracts_kotlin_kdoc_without_closing_delimiter_residue() {
+    let text = r#"
+/**
+ * Builds a proposal.
+ */
+class WatchProposalBuilder {
+    /**
+     * Builds the current proposal.
+     */
+    suspend fun build() {}
+}
+"#;
+    let symbols = parser::parse_symbols(Path::new("src/Main.kt"), Language::Kotlin, text).unwrap();
+    let class_docs =
+        symbols.iter().find(|symbol| symbol.name == "WatchProposalBuilder").unwrap().docs.as_ref();
+    assert_eq!(class_docs.map(String::as_str), Some("Builds a proposal."));
+    let function_docs = symbols.iter().find(|symbol| symbol.name == "build").unwrap().docs.as_ref();
+    assert_eq!(function_docs.map(String::as_str), Some("Builds the current proposal."));
+}
+
+#[test]
 fn markdown_uses_no_tree_sitter_symbols() {
     assert_eq!(
         parser::parser_kind(Path::new("docs/search.md"), Language::Markdown),
