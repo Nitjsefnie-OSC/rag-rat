@@ -1,7 +1,12 @@
 use std::{path::Path, str::FromStr};
 
 use rag_rat_core::{
-    IndexDatabase, language::Language, query::graph_meta::GraphMetaMode,
+    IndexDatabase,
+    language::Language,
+    query::{
+        graph::{GraphResolutionMode, GraphTraversalOptions},
+        graph_meta::GraphMetaMode,
+    },
     search::lexical::SearchOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -63,13 +68,19 @@ pub struct SymbolArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
     pub symbol: String,
+    pub symbol_id: Option<i64>,
+    pub resolution: Option<String>,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
+    #[serde(default)]
+    pub include_references: bool,
+    pub edge_kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ImpactArgs {
     pub query: String,
+    pub resolution: Option<String>,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
 }
@@ -172,15 +183,36 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
         },
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
-            json!(db.find_callers(&args.symbol, args.limit)?)
+            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            json!(db.find_callers_with_options(
+                &args.symbol,
+                args.limit,
+                &GraphTraversalOptions {
+                    include_references: args.include_references,
+                    edge_kinds: args.edge_kinds,
+                    resolution_mode,
+                    symbol_id: args.symbol_id,
+                }
+            )?)
         },
         "trace_callees" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
-            json!(db.trace_callees(&args.symbol, args.limit)?)
+            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            json!(db.trace_callees_with_options(
+                &args.symbol,
+                args.limit,
+                &GraphTraversalOptions {
+                    include_references: args.include_references,
+                    edge_kinds: args.edge_kinds,
+                    resolution_mode,
+                    symbol_id: args.symbol_id,
+                }
+            )?)
         },
         "impact_surface" => {
             let args: ImpactArgs = serde_json::from_value(arguments)?;
-            json!(db.impact_surface(&args.query, args.limit)?)
+            let resolution_mode = GraphResolutionMode::parse(args.resolution.as_deref())?;
+            json!(db.impact_surface_with_options(&args.query, args.limit, resolution_mode)?)
         },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;
@@ -442,6 +474,15 @@ mod tests {
         assert_schema_has_property(tools, "semantic_search", "include_git");
         assert_schema_has_property(tools, "semantic_search", "include_papertrail");
         assert_schema_has_property(tools, "semantic_search", "explain");
+        assert_schema_has_property(tools, "find_callers", "include_references");
+        assert_schema_has_property(tools, "find_callers", "edge_kinds");
+        assert_schema_has_property(tools, "find_callers", "resolution");
+        assert_schema_has_property(tools, "find_callers", "symbol_id");
+        assert_schema_has_property(tools, "trace_callees", "include_references");
+        assert_schema_has_property(tools, "trace_callees", "edge_kinds");
+        assert_schema_has_property(tools, "trace_callees", "resolution");
+        assert_schema_has_property(tools, "trace_callees", "symbol_id");
+        assert_schema_has_property(tools, "impact_surface", "resolution");
         assert_schema_requires(tools, "read_chunk", "chunk_id");
         assert_schema_has_property(tools, "read_chunk", "include_graph");
         assert_schema_has_property(tools, "read_chunk", "graph_limit");

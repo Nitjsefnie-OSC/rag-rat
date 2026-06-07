@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+use crate::query::graph::GraphResolutionMode;
+
 #[derive(Debug, Serialize)]
 pub struct ImpactItem {
     pub path: String,
@@ -18,6 +20,15 @@ pub fn impact_surface(
     conn: &Connection,
     query: &str,
     limit: u32,
+) -> anyhow::Result<Vec<ImpactItem>> {
+    impact_surface_with_options(conn, query, limit, GraphResolutionMode::Syntactic)
+}
+
+pub fn impact_surface_with_options(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let max_items = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut surface = ImpactSurface::default();
@@ -38,8 +49,8 @@ pub fn impact_surface(
         );
     }
 
-    graph_neighbors(conn, &targets, &target_names, true, &mut surface)?;
-    graph_neighbors(conn, &targets, &target_names, false, &mut surface)?;
+    graph_neighbors(conn, &targets, &target_names, true, resolution_mode, &mut surface)?;
+    graph_neighbors(conn, &targets, &target_names, false, resolution_mode, &mut surface)?;
     import_export_dependents(conn, &targets, &target_names, &mut surface)?;
     same_file_siblings(conn, &targets, &mut surface)?;
 
@@ -214,6 +225,10 @@ fn reason_rank(reason: &str) -> u8 {
 }
 
 fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Vec<SymbolTarget>> {
+    let candidates = symbol_query_candidates(query);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "
         SELECT symbols.id, symbols.file_id, files.path, files.language, files.kind,
@@ -224,23 +239,35 @@ fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Vec<SymbolTar
         ORDER BY files.kind, files.path, symbols.start_byte
         ",
     )?;
-    let rows = stmt.query_map([query], |row| {
-        Ok(SymbolTarget {
-            id: row.get(0)?,
-            file_id: row.get(1)?,
-            path: row.get(2)?,
-            language: row.get(3)?,
-            file_kind: row.get(4)?,
-            name: row.get(5)?,
-            qualified_name: row.get(6)?,
-        })
-    })?;
-    collect_rows(rows)
+    let mut targets = Vec::new();
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let rows = stmt.query_map([candidate], |row| {
+            Ok(SymbolTarget {
+                id: row.get(0)?,
+                file_id: row.get(1)?,
+                path: row.get(2)?,
+                language: row.get(3)?,
+                file_kind: row.get(4)?,
+                name: row.get(5)?,
+                qualified_name: row.get(6)?,
+            })
+        })?;
+        for row in collect_rows(rows)? {
+            if seen.insert(row.id) {
+                targets.push(row);
+            }
+        }
+    }
+    Ok(targets)
 }
 
 fn target_names(query: &str, targets: &[SymbolTarget]) -> Vec<String> {
     let mut names = BTreeSet::new();
-    names.insert(query.to_string());
+    for candidate in symbol_query_candidates(query) {
+        names.insert(candidate.to_string());
+        names.insert(short_symbol_name(candidate).to_string());
+    }
     for target in targets {
         names.insert(target.name.clone());
         names.insert(target.qualified_name.clone());
@@ -248,16 +275,62 @@ fn target_names(query: &str, targets: &[SymbolTarget]) -> Vec<String> {
     names.into_iter().collect()
 }
 
+fn symbol_query_candidates(query: &str) -> Vec<&str> {
+    query
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                !(ch.is_alphanumeric() || matches!(ch, '_' | ':' | '/' | '.' | '-'))
+            })
+        })
+        .filter(|token| !token.is_empty())
+        .filter(|token| token.contains("::") || is_non_stopword_identifier(token))
+        .collect()
+}
+
+fn is_non_stopword_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let is_identifier = (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric());
+    is_identifier
+        && !matches!(
+            value,
+            "of" | "in"
+                | "to"
+                | "from"
+                | "for"
+                | "and"
+                | "or"
+                | "the"
+                | "callers"
+                | "callee"
+                | "callees"
+                | "caller"
+                | "impact"
+                | "symbol"
+        )
+}
+
+fn short_symbol_name(value: &str) -> &str {
+    value.rsplit([':', '.', '#', '/']).find(|part| !part.is_empty()).unwrap_or(value)
+}
+
+fn is_qualified_symbol(value: &str) -> bool {
+    value.contains("::") || value.contains('/')
+}
+
 fn graph_neighbors(
     conn: &Connection,
     targets: &[SymbolTarget],
     target_names: &[String],
     reverse: bool,
+    resolution_mode: GraphResolutionMode,
     surface: &mut ImpactSurface,
 ) -> anyhow::Result<()> {
     let reason = if reverse { "direct_caller" } else { "direct_callee" };
-    let match_symbol_col = if reverse { "edges.to_symbol_id" } else { "edges.from_symbol_id" };
-    let match_name_col = if reverse { "edges.to_name" } else { "edges.from_name" };
     let source_path_col = if reverse {
         "COALESCE(source_files.path, from_files.path)"
     } else {
@@ -278,6 +351,7 @@ fn graph_neighbors(
     } else {
         "COALESCE(to_symbols.qualified_name, edges.to_name)"
     };
+    let predicate = impact_graph_predicate(reverse, resolution_mode);
     let sql = format!(
         "
         SELECT {source_path_col}, {source_language_col}, {source_kind_col},
@@ -289,7 +363,7 @@ fn graph_neighbors(
         LEFT JOIN files to_files ON to_files.id = to_symbols.file_id
         LEFT JOIN files source_files ON source_files.id = edges.source_file_id
         WHERE edges.edge_kind IN ('calls_name', 'references_type', 'implements')
-          AND ({match_symbol_col} = ?1 OR {match_name_col} = ?2)
+          AND ({predicate})
           AND {source_path_col} IS NOT NULL
         ORDER BY
             CASE edges.confidence
@@ -326,6 +400,9 @@ fn graph_neighbors(
         }
     }
     for name in target_names {
+        if resolution_mode != GraphResolutionMode::Fuzzy && !is_qualified_symbol(name) {
+            continue;
+        }
         let rows = stmt.query_map(params![Option::<i64>::None, name], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -347,6 +424,24 @@ fn graph_neighbors(
         }
     }
     Ok(())
+}
+
+fn impact_graph_predicate(reverse: bool, mode: GraphResolutionMode) -> &'static str {
+    match (reverse, mode) {
+        (true, GraphResolutionMode::Exact) => "edges.to_symbol_id = ?1",
+        (false, GraphResolutionMode::Exact) => {
+            "edges.from_symbol_id = ?1 AND edges.to_symbol_id IS NOT NULL"
+        },
+        (true, GraphResolutionMode::Syntactic) => {
+            "edges.to_symbol_id = ?1 OR edges.target_qualified_name = ?2"
+        },
+        (false, GraphResolutionMode::Syntactic) => {
+            "(edges.from_symbol_id = ?1 OR edges.from_name = ?2)
+             AND (edges.to_symbol_id IS NOT NULL OR edges.target_qualified_name IS NOT NULL)"
+        },
+        (true, GraphResolutionMode::Fuzzy) => "edges.to_symbol_id = ?1 OR edges.to_name = ?2",
+        (false, GraphResolutionMode::Fuzzy) => "edges.from_symbol_id = ?1 OR edges.from_name = ?2",
+    }
 }
 
 fn import_export_dependents(

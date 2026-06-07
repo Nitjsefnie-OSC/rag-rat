@@ -437,7 +437,7 @@ fn confidence_weight(confidence: &str) -> f64 {
     match confidence {
         "Exact" => 1.0,
         "Syntactic" => 0.70,
-        "NameOnly" => 0.25,
+        "NameOnly" => 0.15,
         "Ambiguous" => 0.0,
         _ => 0.0,
     }

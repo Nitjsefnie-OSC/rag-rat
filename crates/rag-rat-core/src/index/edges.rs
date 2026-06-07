@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::{collections::BTreeSet, path::Path};
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -12,11 +9,15 @@ use crate::{
     language::Language,
 };
 
+pub const MAX_GRAPH_PARSE_BYTES: usize = 512_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum EdgeKind {
     Imports,
     Exports,
     CallsName,
+    Constructs,
+    UsesMacro,
     ReferencesType,
     Implements,
     Contains,
@@ -28,6 +29,8 @@ impl EdgeKind {
             Self::Imports => "imports",
             Self::Exports => "exports",
             Self::CallsName => "calls_name",
+            Self::Constructs => "constructs",
+            Self::UsesMacro => "uses_macro",
             Self::ReferencesType => "references_type",
             Self::Implements => "implements",
             Self::Contains => "contains",
@@ -59,6 +62,9 @@ struct EdgeCandidate {
     from_symbol_id: Option<i64>,
     from_name: Option<String>,
     to_name: String,
+    target_qualified_name: Option<String>,
+    evidence: Option<String>,
+    receiver_hint: Option<String>,
     source_span: EdgeSpan,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
@@ -84,6 +90,12 @@ struct EdgeSpan {
     end_byte: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct EdgeContext {
+    target_qualified_name: Option<String>,
+    receiver_hint: Option<String>,
+}
+
 impl IndexedSymbol {
     fn span(&self) -> EdgeSpan {
         EdgeSpan {
@@ -106,9 +118,6 @@ pub fn index_file_edges(
         return Ok(());
     }
     let symbols = symbols_for_file(conn, file_id)?;
-    if symbols.is_empty() {
-        return Ok(());
-    }
     let mut candidates = contains_edges(&symbols);
     candidates.extend(syntactic_edges(path, language, text, &symbols)?);
     insert_candidates(conn, file_id, candidates)
@@ -116,27 +125,40 @@ pub fn index_file_edges(
 
 pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
-    let mut by_name: BTreeMap<String, Vec<&IndexedSymbol>> = BTreeMap::new();
-    let mut by_qualified: BTreeMap<String, &IndexedSymbol> = BTreeMap::new();
-    for symbol in &symbols {
-        by_name.entry(symbol.name.clone()).or_default().push(symbol);
-        by_qualified.insert(symbol.qualified_name.clone(), symbol);
-    }
-
-    let mut stmt =
-        conn.prepare("SELECT id, to_name, edge_kind, confidence FROM edges ORDER BY id")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, to_name, target_qualified_name, edge_kind, confidence, evidence, receiver_hint FROM edges ORDER BY id",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(2)?,
             row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
-    for (edge_id, to_name, edge_kind, current_confidence) in rows {
-        let resolution = resolve_symbol(&to_name, &edge_kind, &by_name, &by_qualified);
-        let Some((to_symbol_id, confidence)) = resolution else {
+    for (
+        edge_id,
+        to_name,
+        target_qualified_name,
+        edge_kind,
+        current_confidence,
+        evidence,
+        receiver_hint,
+    ) in rows
+    {
+        let resolution = resolve_symbol(
+            &to_name,
+            target_qualified_name.as_deref(),
+            &edge_kind,
+            evidence.as_deref(),
+            receiver_hint.as_deref(),
+            &symbols,
+        );
+        let Some((to_symbol_id, confidence, reason)) = resolution else {
             let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_str() {
                 EdgeConfidence::Ambiguous
             } else {
@@ -147,7 +169,8 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                  SET to_symbol_id = NULL,
                      target_start_line = NULL,
                      target_end_line = NULL,
-                     confidence = ?2
+                     confidence = ?2,
+                     resolution = 'unresolved'
                  WHERE id = ?1",
                 params![edge_id, confidence.as_str()],
             )?;
@@ -158,14 +181,16 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
              SET to_symbol_id = ?2,
                  confidence = ?3,
                  target_start_line = ?4,
-                 target_end_line = ?5
+                 target_end_line = ?5,
+                 resolution = ?6
              WHERE id = ?1",
             params![
                 edge_id,
                 to_symbol_id.id,
                 confidence.as_str(),
                 to_symbol_id.start_line,
-                to_symbol_id.end_line
+                to_symbol_id.end_line,
+                reason,
             ],
         )?;
     }
@@ -174,26 +199,136 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
 
 fn resolve_symbol<'a>(
     name: &str,
+    target_qualified_name: Option<&str>,
     edge_kind: &str,
-    by_name: &BTreeMap<String, Vec<&'a IndexedSymbol>>,
-    by_qualified: &BTreeMap<String, &'a IndexedSymbol>,
-) -> Option<(&'a IndexedSymbol, EdgeConfidence)> {
-    if let Some(symbol) = by_qualified.get(name) {
-        return Some((symbol, EdgeConfidence::Exact));
+    evidence: Option<&str>,
+    receiver_hint: Option<&str>,
+    symbols: &'a [IndexedSymbol],
+) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
+    let kind_matches = |symbol: &IndexedSymbol| {
+        edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
+    };
+    if let Some(qualified) = target_qualified_name.filter(|value| !value.is_empty()) {
+        if let Some(symbol) =
+            symbols.iter().find(|symbol| kind_matches(symbol) && symbol.qualified_name == qualified)
+        {
+            return Some((symbol, EdgeConfidence::Exact, "exact"));
+        }
+        let suffix = format!("::{qualified}");
+        let matches = symbols
+            .iter()
+            .filter(|symbol| kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [symbol] => return Some((*symbol, EdgeConfidence::Syntactic, "qualified_suffix")),
+            [symbol, ..] => return Some((*symbol, EdgeConfidence::Ambiguous, "qualified_suffix")),
+            [] => {},
+        }
+        if !allow_unqualified_fallback(edge_kind, qualified, name, evidence, receiver_hint) {
+            return None;
+        }
     }
     let short = short_name(name);
-    let matches = by_name.get(short)?;
-    let preferred = preferred_matches(edge_kind, matches);
+    let matches = symbols
+        .iter()
+        .filter(|symbol| kind_matches(symbol) && symbol.name == short)
+        .collect::<Vec<_>>();
+    let preferred = preferred_matches(edge_kind, &matches);
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
-        [symbol] => Some((symbol, EdgeConfidence::Syntactic)),
-        [symbol, ..] => Some((symbol, EdgeConfidence::Ambiguous)),
+        [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
+        [symbol, ..] => Some((*symbol, EdgeConfidence::Ambiguous, "target_name_fallback")),
         [] => None,
     }
 }
 
+fn allow_unqualified_fallback(
+    edge_kind: &str,
+    qualified: &str,
+    name: &str,
+    evidence: Option<&str>,
+    receiver_hint: Option<&str>,
+) -> bool {
+    if edge_kind == EdgeKind::UsesMacro.as_str() {
+        return false;
+    }
+    let target = short_name(name);
+    let qualifier = qualified
+        .rsplit_once("::")
+        .map(|(qualifier, _)| qualifier)
+        .unwrap_or(qualified)
+        .split("::")
+        .next()
+        .unwrap_or_default();
+    if matches!(qualifier, "crate" | "self" | "super") {
+        return true;
+    }
+    if receiver_hint.is_some_and(|receiver| !matches!(receiver, "self" | "Self"))
+        && evidence.is_some_and(|value| value.contains('.'))
+    {
+        return false;
+    }
+    if is_external_rust_root(qualifier) {
+        return false;
+    }
+    if looks_like_type_name(qualifier) && is_common_member_name(target) {
+        return false;
+    }
+    true
+}
+
+fn is_external_rust_root(value: &str) -> bool {
+    matches!(
+        value,
+        "std"
+            | "core"
+            | "alloc"
+            | "tokio"
+            | "serde"
+            | "serde_json"
+            | "anyhow"
+            | "thiserror"
+            | "rusqlite"
+            | "tree_sitter"
+            | "tracing"
+            | "log"
+            | "Vec"
+            | "String"
+            | "Option"
+            | "Result"
+            | "HashMap"
+            | "BTreeMap"
+            | "HashSet"
+            | "BTreeSet"
+    )
+}
+
+fn is_common_member_name(value: &str) -> bool {
+    matches!(
+        value,
+        "new"
+            | "default"
+            | "clone"
+            | "to_string"
+            | "into"
+            | "from"
+            | "as_ref"
+            | "as_mut"
+            | "iter"
+            | "map"
+            | "collect"
+            | "unwrap"
+            | "expect"
+            | "ok"
+            | "err"
+    )
+}
+
 fn preferred_matches<'a>(edge_kind: &str, matches: &[&'a IndexedSymbol]) -> Vec<&'a IndexedSymbol> {
     let preferred_kinds: &[&str] = match edge_kind {
+        "calls_name" => &["function", "method"],
+        "constructs" => &["struct", "class", "object"],
+        "uses_macro" => &["macro"],
         "implements" => &["trait", "interface"],
         "references_type" => &["struct", "enum", "trait", "type", "class", "interface", "object"],
         _ => &[],
@@ -224,6 +359,9 @@ fn contains_edges(symbols: &[IndexedSymbol]) -> Vec<EdgeCandidate> {
                 from_symbol_id: Some(parent.id),
                 from_name: Some(parent.qualified_name.clone()),
                 to_name: child.qualified_name.clone(),
+                target_qualified_name: Some(child.qualified_name.clone()),
+                evidence: Some(child.qualified_name.clone()),
+                receiver_hint: None,
                 source_span: child.span(),
                 edge_kind: EdgeKind::Contains,
                 confidence: EdgeConfidence::Exact,
@@ -251,9 +389,6 @@ fn syntactic_edges(
     let Some(tree) = parser.parse(text, None) else {
         return Ok(Vec::new());
     };
-    if tree.root_node().has_error() {
-        return Ok(Vec::new());
-    }
     let mut out = Vec::new();
     collect_edges(language, text, tree.root_node(), symbols, path, &mut out);
     Ok(out)
@@ -267,6 +402,9 @@ fn collect_edges(
     path: &Path,
     out: &mut Vec<EdgeCandidate>,
 ) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
     match language {
         Language::Rust => rust_edges(text, node, symbols, path, out),
         Language::TypeScript => typescript_edges(text, node, symbols, path, out),
@@ -296,6 +434,7 @@ fn rust_edges(
                     out.push(file_edge(
                         path,
                         node,
+                        text,
                         name,
                         EdgeKind::Imports,
                         EdgeConfidence::NameOnly,
@@ -308,6 +447,7 @@ fn rust_edges(
                         out.push(file_edge(
                             path,
                             node,
+                            text,
                             name,
                             EdgeKind::Exports,
                             EdgeConfidence::NameOnly,
@@ -318,17 +458,29 @@ fn rust_edges(
         },
         "mod_item" => {
             if let Some(name) = child_name_text(node, text) {
-                out.push(file_edge(path, node, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                out.push(file_edge(
+                    path,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::Imports,
+                    EdgeConfidence::NameOnly,
+                ));
             }
         },
         "call_expression" => {
             if let Some(name) = call_target_name(node, text) {
-                out.push(symbol_edge(
+                out.push(symbol_edge_with_context(
                     symbols,
                     node,
+                    text,
                     name,
                     EdgeKind::CallsName,
                     EdgeConfidence::NameOnly,
+                    EdgeContext {
+                        target_qualified_name: target_qualified_name(node, text),
+                        receiver_hint: scoped_receiver_name(node, text),
+                    },
                 ));
             }
             if let Some(receiver) = scoped_receiver_name(node, text) {
@@ -343,12 +495,14 @@ fn rust_edges(
         },
         "macro_invocation" => {
             if let Some(name) = first_identifier_text(node, text) {
-                out.push(symbol_edge(
+                out.push(symbol_edge_with_context(
                     symbols,
                     node,
+                    text,
                     name,
-                    EdgeKind::CallsName,
-                    EdgeConfidence::Ambiguous,
+                    EdgeKind::UsesMacro,
+                    EdgeConfidence::NameOnly,
+                    EdgeContext::default(),
                 ));
             }
         },
@@ -389,6 +543,9 @@ fn rust_impl_edges(
             from_symbol_id: containing_symbol(symbols, node.start_byte()).map(|symbol| symbol.id),
             from_name: Some(type_name),
             to_name: trait_name,
+            target_qualified_name: None,
+            evidence: Some(edge_evidence(node, text)),
+            receiver_hint: None,
             source_span: span_for_node(node),
             edge_kind: EdgeKind::Implements,
             confidence: EdgeConfidence::NameOnly,
@@ -414,12 +571,26 @@ fn typescript_edges(
     match node.kind() {
         "import_statement" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(path, node, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                out.push(file_edge(
+                    path,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::Imports,
+                    EdgeConfidence::NameOnly,
+                ));
             }
         },
         "export_statement" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(path, node, name, EdgeKind::Exports, EdgeConfidence::NameOnly));
+                out.push(file_edge(
+                    path,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::Exports,
+                    EdgeConfidence::NameOnly,
+                ));
             }
         },
         "call_expression" | "new_expression" => {
@@ -427,12 +598,25 @@ fn typescript_edges(
                 identifiers_under(node.child_by_field_name("function").unwrap_or(node), text);
             if let Some(name) = identifiers.last().cloned().or_else(|| call_target_name(node, text))
             {
-                out.push(symbol_edge(
+                let edge_kind = if node.kind() == "new_expression" {
+                    EdgeKind::Constructs
+                } else {
+                    EdgeKind::CallsName
+                };
+                out.push(symbol_edge_with_context(
                     symbols,
                     node,
+                    text,
                     name,
-                    EdgeKind::CallsName,
+                    edge_kind,
                     EdgeConfidence::NameOnly,
+                    EdgeContext {
+                        target_qualified_name: dotted_qualified_name(&identifiers),
+                        receiver_hint: identifiers
+                            .first()
+                            .filter(|_| identifiers.len() > 1)
+                            .cloned(),
+                    },
                 ));
             }
             if let Some(receiver) = identifiers.first().filter(|_| identifiers.len() > 1).cloned() {
@@ -481,7 +665,14 @@ fn kotlin_edges(
     match node.kind() {
         "import_header" | "import_directive" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(path, node, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+                out.push(file_edge(
+                    path,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::Imports,
+                    EdgeConfidence::NameOnly,
+                ));
             }
         },
         "call_expression" => {
@@ -512,9 +703,18 @@ fn kotlin_edges(
                 out.push(symbol_edge(
                     symbols,
                     node,
-                    constructor,
+                    constructor.clone(),
                     EdgeKind::ReferencesType,
                     EdgeConfidence::NameOnly,
+                ));
+                out.push(symbol_edge_with_context(
+                    symbols,
+                    node,
+                    text,
+                    constructor,
+                    EdgeKind::Constructs,
+                    EdgeConfidence::NameOnly,
+                    EdgeContext::default(),
                 ));
             }
         },
@@ -547,6 +747,7 @@ fn kotlin_edges(
 fn file_edge(
     path: &Path,
     node: Node<'_>,
+    text: &str,
     to_name: String,
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
@@ -555,6 +756,9 @@ fn file_edge(
         from_symbol_id: None,
         from_name: Some(path.to_string_lossy().replace('\\', "/")),
         to_name,
+        target_qualified_name: None,
+        evidence: Some(edge_evidence(node, text)),
+        receiver_hint: None,
         source_span: span_for_node(node),
         edge_kind,
         confidence,
@@ -568,16 +772,49 @@ fn symbol_edge(
     edge_kind: EdgeKind,
     confidence: EdgeConfidence,
 ) -> EdgeCandidate {
+    symbol_edge_with_context(
+        symbols,
+        node,
+        "",
+        to_name,
+        edge_kind,
+        confidence,
+        EdgeContext::default(),
+    )
+}
+
+fn symbol_edge_with_context(
+    symbols: &[IndexedSymbol],
+    node: Node<'_>,
+    text: &str,
+    to_name: String,
+    edge_kind: EdgeKind,
+    confidence: EdgeConfidence,
+    context: EdgeContext,
+) -> EdgeCandidate {
     let byte = node.start_byte();
     let source = containing_symbol(symbols, byte);
     EdgeCandidate {
         from_symbol_id: source.map(|symbol| symbol.id),
         from_name: source.map(|symbol| symbol.qualified_name.clone()),
         to_name,
+        target_qualified_name: context.target_qualified_name,
+        evidence: (!text.is_empty()).then(|| edge_evidence(node, text)),
+        receiver_hint: context.receiver_hint,
         source_span: span_for_node(node),
         edge_kind,
         confidence,
     }
+}
+
+fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String> {
+    let function = node.child_by_field_name("function").unwrap_or(node);
+    let value = node_text(function, text);
+    (value.contains("::") || value.contains('.')).then(|| value.replace('.', "::"))
+}
+
+fn dotted_qualified_name(identifiers: &[String]) -> Option<String> {
+    (identifiers.len() > 1).then(|| identifiers.join("::"))
 }
 
 fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedSymbol> {
@@ -604,6 +841,7 @@ fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedS
 fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
     node.child_by_field_name("function")
         .and_then(|child| last_identifier_text(child, text))
+        .map(|name| short_name(&name).to_string())
         .or_else(|| first_identifier_text(node, text))
 }
 
@@ -693,6 +931,16 @@ fn looks_like_type_name(value: &str) -> bool {
 
 fn node_text(node: Node<'_>, text: &str) -> String {
     node.utf8_text(text.as_bytes()).unwrap_or_default().to_string()
+}
+
+fn edge_evidence(node: Node<'_>, text: &str) -> String {
+    node_text(node, text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 fn short_name(name: &str) -> &str {
@@ -829,16 +1077,20 @@ fn insert_candidates(
             "
             INSERT INTO edges(
                 source_file_id, from_symbol_id, from_name, to_name,
+                target_qualified_name, evidence, receiver_hint,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 edge_kind, confidence
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ",
             params![
                 file_id,
                 candidate.from_symbol_id,
                 candidate.from_name,
                 to_name,
+                candidate.target_qualified_name,
+                candidate.evidence,
+                candidate.receiver_hint,
                 candidate.source_span.start_line,
                 candidate.source_span.end_line,
                 candidate.source_span.start_byte,

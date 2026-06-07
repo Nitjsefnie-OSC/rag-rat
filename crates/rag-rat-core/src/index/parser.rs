@@ -59,6 +59,23 @@ pub fn parse_symbols(
     }
 }
 
+pub fn parse_error(path: &Path, language: Language, text: &str) -> anyhow::Result<Option<String>> {
+    let grammar = match parser_kind(path, language) {
+        ParserKind::Rust => tree_sitter_rust::language(),
+        ParserKind::TypeScript => tree_sitter_typescript::language_typescript(),
+        ParserKind::Tsx => tree_sitter_typescript::language_tsx(),
+        ParserKind::Kotlin => tree_sitter_kotlin::language(),
+        ParserKind::Markdown => return Ok(None),
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar)?;
+    let tree =
+        parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
+    Ok(tree.root_node().has_error().then(|| {
+        "tree-sitter parse produced error nodes; partial structural index was retained".to_string()
+    }))
+}
+
 fn parse_tree_sitter(
     path: &Path,
     language: Language,
@@ -69,9 +86,6 @@ fn parse_tree_sitter(
     parser.set_language(&grammar)?;
     let tree =
         parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
-    if tree.root_node().has_error() {
-        anyhow::bail!("tree-sitter parse produced error nodes");
-    }
     let mut out = Vec::new();
     collect_symbols(path, language, text, tree.root_node(), &mut out);
     out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
@@ -84,9 +98,6 @@ fn parse_kotlin(path: &Path, text: &str) -> anyhow::Result<Vec<ParsedSymbol>> {
     parser.set_language(&tree_sitter_kotlin::language())?;
     let tree =
         parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
-    if tree.root_node().has_error() {
-        anyhow::bail!("tree-sitter parse produced error nodes");
-    }
     let mut out = Vec::new();
     collect_kotlin_symbols(path, text, tree.root_node(), &mut out);
     out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
@@ -101,6 +112,9 @@ fn collect_symbols(
     node: Node<'_>,
     out: &mut Vec<ParsedSymbol>,
 ) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
     if let Some((kind, name_node)) = symbol_node(language, node) {
         let name = node_text(name_node, text).unwrap_or_default();
         if !name.is_empty() {
@@ -119,6 +133,9 @@ fn collect_kotlin_symbols(
     node: tree_sitter::Node<'_>,
     out: &mut Vec<ParsedSymbol>,
 ) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
     if let Some((kind, name)) = kotlin_symbol_node(node, text) {
         out.push(make_symbol(path, text, kind, name, node.start_byte(), node.end_byte()));
     }

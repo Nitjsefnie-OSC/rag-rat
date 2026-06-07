@@ -149,6 +149,7 @@ pub struct DiscoveryStatus {
 }
 
 const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
+const GRAPH_INDEX_VERSION: &str = "5";
 
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -168,7 +169,9 @@ impl IndexDatabase {
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
-        Ok(Self { storage })
+        let db = Self { storage };
+        db.ensure_graph_index_current()?;
+        Ok(db)
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
@@ -223,6 +226,7 @@ impl IndexDatabase {
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
             db.index_git_history(&config.root)?;
             db.resolve_edges()?;
+            db.mark_graph_index_current()?;
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
@@ -291,6 +295,7 @@ impl IndexDatabase {
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
             db.resolve_edges()?;
+            db.mark_graph_index_current()?;
             if indexed > 0 {
                 db.sync_fts()?;
             }
@@ -975,6 +980,21 @@ impl IndexDatabase {
         crate::query::graph::traverse(self.storage.connection(), symbol, true, limit)
     }
 
+    pub fn find_callers_with_options(
+        &self,
+        symbol: &str,
+        limit: u32,
+        options: &crate::query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        crate::query::graph::traverse_with_options(
+            self.storage.connection(),
+            symbol,
+            true,
+            limit,
+            options,
+        )
+    }
+
     pub fn trace_callees(
         &self,
         symbol: &str,
@@ -983,12 +1003,41 @@ impl IndexDatabase {
         crate::query::graph::traverse(self.storage.connection(), symbol, false, limit)
     }
 
+    pub fn trace_callees_with_options(
+        &self,
+        symbol: &str,
+        limit: u32,
+        options: &crate::query::graph::GraphTraversalOptions,
+    ) -> anyhow::Result<Vec<crate::query::graph::GraphHop>> {
+        crate::query::graph::traverse_with_options(
+            self.storage.connection(),
+            symbol,
+            false,
+            limit,
+            options,
+        )
+    }
+
     pub fn impact_surface(
         &self,
         query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
         crate::query::impact::impact_surface(self.storage.connection(), query, limit)
+    }
+
+    pub fn impact_surface_with_options(
+        &self,
+        query: &str,
+        limit: u32,
+        resolution_mode: crate::query::graph::GraphResolutionMode,
+    ) -> anyhow::Result<Vec<crate::query::impact::ImpactItem>> {
+        crate::query::impact::impact_surface_with_options(
+            self.storage.connection(),
+            query,
+            limit,
+            resolution_mode,
+        )
     }
 
     pub fn rebuild_fts(&self) -> anyhow::Result<()> {
@@ -1043,8 +1092,10 @@ impl IndexDatabase {
             if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
                 // Large source files are intentionally coarse-indexed to keep full-repo indexing
                 // responsive. This is not a parser failure.
-            } else if let Err(err) = parser::parse_symbols(path, language, text) {
-                self.insert_parser_failure(path, language, &err.to_string())?;
+            } else if let Some(message) = parser::parse_error(path, language, text)
+                .unwrap_or_else(|err| Some(err.to_string()))
+            {
+                self.insert_parser_failure(path, language, &message)?;
             }
         }
         let sha256 = hex_sha256(text.as_bytes());
@@ -1077,7 +1128,7 @@ impl IndexDatabase {
             };
         self.insert_chunks(file_id, &sha256, &chunks, text)?;
         self.insert_symbols(file_id, language, &symbols)?;
-        if kind != TargetKind::Generated && text.len() <= chunker::MAX_STRUCTURAL_PARSE_BYTES {
+        if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
         }
         self.mark_fts_dirty()?;
@@ -1114,8 +1165,7 @@ impl IndexDatabase {
         )?;
         self.insert_chunks(file_id, &prepared.sha256, &prepared.chunks, &prepared.text)?;
         self.insert_symbols(file_id, file.language, &prepared.symbols)?;
-        if file.kind != TargetKind::Generated
-            && prepared.text.len() <= chunker::MAX_STRUCTURAL_PARSE_BYTES
+        if file.kind != TargetKind::Generated && prepared.text.len() <= edges::MAX_GRAPH_PARSE_BYTES
         {
             edges::index_file_edges(
                 self.storage.connection(),
@@ -1227,6 +1277,52 @@ impl IndexDatabase {
 
     fn resolve_edges(&self) -> anyhow::Result<()> {
         edges::resolve_all_edges(self.storage.connection())
+    }
+
+    fn ensure_graph_index_current(&self) -> anyhow::Result<()> {
+        if self.meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION) {
+            return Ok(());
+        }
+        let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
+            return Ok(());
+        };
+        self.storage.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> anyhow::Result<()> {
+            self.storage.connection().execute("DELETE FROM edges", [])?;
+            let files = self.graph_reindex_files()?;
+            for file in files {
+                if file.kind == TargetKind::Generated || file.language == Language::Markdown {
+                    continue;
+                }
+                let full_path = root.join(&file.path);
+                let Ok(text) = fs::read_to_string(full_path) else {
+                    continue;
+                };
+                if text.len() > edges::MAX_GRAPH_PARSE_BYTES {
+                    continue;
+                }
+                edges::index_file_edges(
+                    self.storage.connection(),
+                    file.id,
+                    Path::new(&file.path),
+                    file.language,
+                    &text,
+                )?;
+            }
+            self.resolve_edges()?;
+            self.mark_graph_index_current()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.storage.execute_batch("ROLLBACK");
+        }
+        result?;
+        self.storage.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    fn mark_graph_index_current(&self) -> anyhow::Result<()> {
+        self.set_meta("graph_index_version", GRAPH_INDEX_VERSION)
     }
 
     fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -1459,6 +1555,29 @@ impl IndexDatabase {
             })
     }
 
+    fn graph_reindex_files(&self) -> anyhow::Result<Vec<GraphReindexFile>> {
+        let mut stmt = self
+            .storage
+            .connection()
+            .prepare("SELECT id, path, language, kind FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |row| {
+            let language: String = row.get(2)?;
+            let kind: String = row.get(3)?;
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, language, kind))
+        })?;
+        let mut files = Vec::new();
+        for row in rows {
+            let (id, path, language, kind) = row?;
+            files.push(GraphReindexFile {
+                id,
+                path,
+                language: language.parse()?,
+                kind: kind.parse()?,
+            });
+        }
+        Ok(files)
+    }
+
     fn indexed_files(&self) -> anyhow::Result<Vec<IndexedFile>> {
         let mut stmt =
             self.storage.connection().prepare("SELECT path, sha256 FROM files ORDER BY path")?;
@@ -1491,6 +1610,14 @@ impl IndexDatabase {
 
 #[derive(Debug)]
 struct FileRow {
+    language: Language,
+    kind: TargetKind,
+}
+
+#[derive(Debug)]
+struct GraphReindexFile {
+    id: i64,
+    path: String,
     language: Language,
     kind: TargetKind,
 }
@@ -1601,9 +1728,8 @@ fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexConten
             if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
                 None
             } else {
-                parser::parse_symbols(&file.relative_path, file.language, &text)
-                    .err()
-                    .map(|err| err.to_string())
+                parser::parse_error(&file.relative_path, file.language, &text)
+                    .unwrap_or_else(|err| Some(err.to_string()))
             }
         } else {
             None
@@ -1897,7 +2023,11 @@ mod schema_bootstrap_tests {
         assert!(edge_columns.contains(&"source_end_byte".to_string()));
         assert!(edge_columns.contains(&"target_start_line".to_string()));
         assert!(edge_columns.contains(&"target_end_line".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 4);
+        assert!(edge_columns.contains(&"target_qualified_name".to_string()));
+        assert!(edge_columns.contains(&"evidence".to_string()));
+        assert!(edge_columns.contains(&"receiver_hint".to_string()));
+        assert!(edge_columns.contains(&"resolution".to_string()));
+        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 5);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2453,6 +2583,75 @@ fn caller() {
     }
 
     #[test]
+    fn graph_exact_mode_requires_verified_symbol_identity() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn helper() {}\n\npub fn caller() {\n    helper();\n}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let helper = db.symbols("helper", Some(Language::Rust), 10).unwrap().remove(0);
+        let caller = db.symbols("caller", Some(Language::Rust), 10).unwrap().remove(0);
+
+        let bare_exact = db
+            .find_callers_with_options(
+                "helper",
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(bare_exact.is_empty(), "bare exact lookup should not fall back: {bare_exact:?}");
+
+        let exact_callers = db
+            .find_callers_with_options(
+                "helper",
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    symbol_id: Some(helper.symbol_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            exact_callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("caller"))
+                    && edge.verified_target_symbol
+            }),
+            "exact callers: {exact_callers:?}"
+        );
+        assert!(exact_callers.iter().all(|edge| edge.verified_target_symbol));
+
+        let exact_callees = db
+            .trace_callees_with_options(
+                "caller",
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    symbol_id: Some(caller.symbol_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            exact_callees.iter().any(|edge| {
+                edge.target.as_deref() == Some("helper") && edge.verified_target_symbol
+            }),
+            "exact callees: {exact_callees:?}"
+        );
+        assert!(exact_callees.iter().all(|edge| edge.verified_target_symbol));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn indexes_real_world_rust_graph_patterns() {
         let root = fixture_temp_root("graph-realworld/rust");
         let config = source_config(root.clone(), Language::Rust);
@@ -2460,14 +2659,28 @@ fn caller() {
 
         assert_edge(&db, "src/lib.rs", "worker", "imports", "Syntactic");
         assert_edge(&db, "src/lib.rs", "Worker", "exports", "Syntactic");
-        assert_edge(&db, "entry", "new", "calls_name", "Ambiguous");
+        assert_edge(&db, "entry", "new", "calls_name", "NameOnly");
         assert_edge(&db, "entry", "Client", "references_type", "Syntactic");
-        assert_edge(&db, "drive", "serve", "calls_name", "Syntactic");
+        assert_edge(&db, "drive", "serve", "calls_name", "NameOnly");
         assert_edge(&db, "drive", "GenericRunner", "references_type", "Syntactic");
         assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
         assert_edge(&db, "generic_call", "T", "references_type", "NameOnly");
-        assert_edge(&db, "entry", "generated_call", "calls_name", "Ambiguous");
-        let callers = db.find_callers("serve", 10).unwrap();
+        assert_edge(&db, "entry", "generated_call", "uses_macro", "NameOnly");
+        let syntactic_callers = db.find_callers("serve", 10).unwrap();
+        assert!(
+            syntactic_callers.is_empty(),
+            "syntactic serve callers should avoid receiver/name fallback: {syntactic_callers:?}"
+        );
+        let callers = db
+            .find_callers_with_options(
+                "serve",
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Fuzzy,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             callers.iter().any(|edge| {
                 edge.edge_kind == "calls_name"
@@ -2535,11 +2748,21 @@ export const callRun = () => run();
         assert_edge(&db, "src/lib.tsx", "ReExportedWidget", "exports", "NameOnly");
         assert_edge(&db, "useWidget", "useMemo", "calls_name", "NameOnly");
         assert_edge(&db, "useWidget", "DefaultWidget", "calls_name", "Syntactic");
-        assert_edge(&db, "Shell", "renderWidget", "calls_name", "Syntactic");
+        assert_edge(&db, "Shell", "renderWidget", "calls_name", "NameOnly");
         assert_edge(&db, "Shell", "WidgetNS", "references_type", "NameOnly");
         assert_edge(&db, "Shell", "DefaultWidget", "references_type", "Syntactic");
         assert_edge(&db, "DefaultWidget", "WidgetProps", "references_type", "Syntactic");
-        let callees = db.trace_callees("Shell", 10).unwrap();
+        let callees = db
+            .trace_callees_with_options(
+                "Shell",
+                10,
+                &crate::query::graph::GraphTraversalOptions {
+                    include_references: true,
+                    edge_kinds: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert!(
             callees.iter().any(|edge| {
                 edge.edge_kind == "references_type"
@@ -2547,6 +2770,597 @@ export const callRun = () => run();
                     && edge.to_symbol.as_deref().is_some_and(|name| name.ends_with("DefaultWidget"))
             }),
             "Shell callees: {callees:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rust_macro_edges_do_not_resolve_to_same_named_modules() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+mod format;
+
+fn execute_one() {
+    let _value = format!("hello");
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/format.rs"), "pub fn helper() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let edge = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT edge_kind, to_name, to_symbol_id, confidence, resolution, evidence
+                FROM edges
+                WHERE edge_kind = 'uses_macro'
+                  AND to_name = 'format'
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(edge.0, "uses_macro");
+        assert_eq!(edge.1, "format");
+        assert_eq!(edge.2, None);
+        assert_eq!(edge.3, "NameOnly");
+        assert_eq!(edge.4, "unresolved");
+        assert!(edge.5.as_deref().is_some_and(|value| value.contains("format!")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_old_graph_policy_rebuilds_stale_macro_edges() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+mod format;
+
+fn execute_one() {
+    let _value = format!("hello");
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/format.rs"), "pub fn helper() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage
+            .connection()
+            .execute("UPDATE index_meta SET value = 'old' WHERE key = 'graph_index_version'", [])
+            .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "
+                UPDATE edges
+                SET edge_kind = 'calls_name',
+                    to_symbol_id = (SELECT id FROM symbols WHERE name = 'format' LIMIT 1),
+                    confidence = 'Syntactic',
+                    evidence = NULL,
+                    resolution = 'syntactic'
+                WHERE to_name = 'format'
+                ",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        let reopened = IndexDatabase::open(&config.database).unwrap();
+        let edge = reopened
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT edge_kind, to_symbol_id, confidence, resolution, evidence
+                FROM edges
+                WHERE to_name = 'format'
+                  AND edge_kind = 'uses_macro'
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(edge.0, "uses_macro");
+        assert_eq!(edge.1, None);
+        assert_eq!(edge.2, "NameOnly");
+        assert_eq!(edge.3, "unresolved");
+        assert!(edge.4.as_deref().is_some_and(|value| value.contains("format!")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qualified_common_member_calls_do_not_resolve_by_short_name() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub struct AlertsStore;
+
+impl AlertsStore {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+pub fn caller() {
+    let _items: Vec<String> = Vec::new();
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let edge = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT to_name, target_qualified_name, to_symbol_id, confidence, resolution
+                FROM edges
+                WHERE from_name LIKE '%caller'
+                  AND edge_kind = 'calls_name'
+                  AND to_name = 'new'
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(edge.0, "new");
+        assert_eq!(edge.1.as_deref(), Some("Vec::new"));
+        assert_eq!(edge.2, None);
+        assert_eq!(edge.3, "NameOnly");
+        assert_eq!(edge.4, "unresolved");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn macro_edges_do_not_resolve_to_same_named_typescript_symbols() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+fn rust_entry() {
+    let _payload = json!({"ok": true});
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/preferences.ts"), "export function json() { return {}; }\n")
+            .unwrap();
+        let mut config = source_config(root.clone(), Language::Rust);
+        config.targets.push(ResolvedTarget {
+            name: "typescript".to_string(),
+            language: Language::TypeScript,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.ts".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        });
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let edge = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT edge_kind, to_name, to_symbol_id, confidence, resolution, evidence
+                FROM edges
+                WHERE edge_kind = 'uses_macro'
+                  AND to_name = 'json'
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(edge.0, "uses_macro");
+        assert_eq!(edge.1, "json");
+        assert_eq!(edge.2, None);
+        assert_eq!(edge.3, "NameOnly");
+        assert_eq!(edge.4, "unresolved");
+        assert!(edge.5.as_deref().is_some_and(|value| value.contains("json!")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn qualified_crate_helper_callers_use_name_fallback() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub mod task_spawn {
+    pub fn spawn_blocking() {}
+}
+
+pub fn first() {
+    crate::task_spawn::spawn_blocking();
+}
+
+pub fn second() {
+    task_spawn::spawn_blocking();
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let callers = db.find_callers("spawn_blocking", 10).unwrap();
+        assert!(
+            callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("first"))
+                    && edge.edge_kind == "calls_name"
+                    && edge.resolution == "target_name_fallback"
+            }),
+            "spawn_blocking callers: {callers:?}"
+        );
+        assert!(
+            callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("second"))
+                    && edge.edge_kind == "calls_name"
+            }),
+            "spawn_blocking callers: {callers:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caller_lookup_does_not_match_related_names_or_chain_evidence() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub mod runtime {
+    pub mod task_spawn {
+        pub fn spawn() {}
+        pub fn spawn_blocking() -> JoinHandle {
+            JoinHandle
+        }
+        pub fn spawn_blocking_handle() {}
+        pub fn spawn_blocking_offload() -> JoinHandle {
+            JoinHandle
+        }
+    }
+}
+
+pub struct JoinHandle;
+
+impl JoinHandle {
+    pub fn map_err(self) {}
+}
+
+pub fn direct() {
+    crate::runtime::task_spawn::spawn_blocking();
+}
+
+pub fn related_handle() {
+    crate::runtime::task_spawn::spawn_blocking_handle();
+}
+
+pub fn related_offload_chain() {
+    crate::runtime::task_spawn::spawn_blocking_offload().map_err();
+}
+
+pub fn related_spawn_with_text() {
+    crate::runtime::task_spawn::spawn();
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let callers = db.find_callers("spawn_blocking", 20).unwrap();
+        assert!(
+            callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("direct"))
+                    && edge.target.as_deref() == Some("spawn_blocking")
+                    && edge.edge_kind == "calls_name"
+            }),
+            "spawn_blocking callers: {callers:?}"
+        );
+        assert!(
+            callers.iter().all(|edge| {
+                !edge.from_symbol.as_deref().is_some_and(|name| {
+                    name.ends_with("related_handle")
+                        || name.ends_with("related_offload_chain")
+                        || name.ends_with("related_spawn_with_text")
+                }) && !matches!(
+                    edge.target.as_deref(),
+                    Some("spawn_blocking_handle" | "spawn_blocking_offload" | "spawn" | "map_err")
+                )
+            }),
+            "caller lookup leaked related names or chain evidence: {callers:?}"
+        );
+
+        let qualified_callers = db.find_callers("src/lib.rs::spawn_blocking", 20).unwrap();
+        assert!(
+            qualified_callers.iter().any(|edge| {
+                edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("direct"))
+                    && edge.target.as_deref() == Some("spawn_blocking")
+                    && edge.edge_kind == "calls_name"
+            }),
+            "qualified spawn_blocking callers: {qualified_callers:?}"
+        );
+        assert!(
+            qualified_callers.iter().all(|edge| {
+                !edge.from_symbol.as_deref().is_some_and(|name| {
+                    name.ends_with("related_handle")
+                        || name.ends_with("related_offload_chain")
+                        || name.ends_with("related_spawn_with_text")
+                }) && !matches!(
+                    edge.target.as_deref(),
+                    Some("spawn_blocking_handle" | "spawn_blocking_offload" | "spawn" | "map_err")
+                )
+            }),
+            "qualified caller lookup leaked related names or chain evidence: {qualified_callers:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn files_past_the_old_structural_cap_still_contribute_symbols_and_edges() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let filler =
+            (0..700).map(|idx| format!("pub fn filler_{idx}() {{}}\n")).collect::<String>();
+        fs::write(
+            root.join("src/lib.rs"),
+            format!(
+                r#"
+pub mod task_spawn {{
+    pub fn spawn_blocking() {{}}
+}}
+
+{filler}
+
+pub fn caller() {{
+    crate::task_spawn::spawn_blocking();
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        assert!(fs::metadata(root.join("src/lib.rs")).unwrap().len() > 10_000);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let symbols = db.symbols("caller", Some(Language::Rust), 10).unwrap();
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "caller"),
+            "caller symbols: {symbols:?}"
+        );
+        let callers = db.find_callers("spawn_blocking", 10).unwrap();
+        assert!(
+            callers.iter().any(|edge| {
+                edge.edge_kind == "calls_name"
+                    && edge.target.as_deref() == Some("spawn_blocking")
+                    && edge.callsite.as_ref().is_some_and(|callsite| callsite.line > 700)
+            }),
+            "spawn_blocking callers: {callers:?}"
+        );
+        let impact =
+            db.impact_surface("callers of crate::task_spawn::spawn_blocking in src", 10).unwrap();
+        assert!(
+            impact.iter().any(|item| {
+                item.category == "Direct structural impact" && item.reason == "direct_caller"
+            }),
+            "impact: {impact:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_tree_sitter_trees_still_contribute_valid_symbols_and_edges() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn helper() {}
+
+pub fn caller() {
+    helper();
+}
+
+fn broken( {
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let symbols = db.symbols("caller", Some(Language::Rust), 10).unwrap();
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "caller"),
+            "caller symbols: {symbols:?}"
+        );
+        assert_edge(&db, "caller", "helper", "calls_name", "Syntactic");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receiver_method_calls_do_not_bind_to_same_named_free_functions() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub fn spawn_blocking() {}
+
+pub fn caller(joinset: JoinSet) {
+    joinset.spawn_blocking();
+}
+
+pub struct JoinSet;
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let edge = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT to_name, target_qualified_name, to_symbol_id, confidence, resolution, receiver_hint
+                FROM edges
+                WHERE from_name LIKE '%caller'
+                  AND edge_kind = 'calls_name'
+                  AND to_name = 'spawn_blocking'
+                ",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(edge.0, "spawn_blocking");
+        assert_eq!(edge.1.as_deref(), Some("joinset::spawn_blocking"));
+        assert_eq!(edge.2, None);
+        assert_eq!(edge.3, "NameOnly");
+        assert_eq!(edge.4, "unresolved");
+        assert_eq!(edge.5.as_deref(), Some("joinset"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trace_callees_excludes_type_references_by_default() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub struct JoinError;
+pub enum Result<T, E> { Ok(T), Err(E) }
+
+pub fn spawn_blocking<F, T>(f: F) -> Result<T, JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let default_callees = db.trace_callees("spawn_blocking", 20).unwrap();
+        assert!(
+            default_callees.iter().any(|edge| {
+                edge.edge_kind == "calls_name"
+                    && edge.target.as_deref() == Some("spawn_blocking")
+                    && edge
+                        .target_qualified_name
+                        .as_deref()
+                        .is_some_and(|target| target.ends_with("tokio::task::spawn_blocking"))
+            }),
+            "default callees: {default_callees:?}"
+        );
+        assert!(
+            default_callees.iter().all(|edge| edge.edge_kind != "references_type"),
+            "default callees leaked type refs: {default_callees:?}"
+        );
+        assert!(
+            default_callees.iter().all(|edge| !matches!(
+                edge.target.as_deref(),
+                Some("F" | "T" | "Send" | "Result" | "JoinError")
+            )),
+            "default callees leaked generic/type targets: {default_callees:?}"
+        );
+
+        let with_refs = db
+            .trace_callees_with_options(
+                "spawn_blocking",
+                20,
+                &crate::query::graph::GraphTraversalOptions {
+                    include_references: true,
+                    edge_kinds: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            with_refs.iter().any(|edge| edge.edge_kind == "references_type"),
+            "reference-enabled callees: {with_refs:?}"
         );
 
         fs::remove_dir_all(root).unwrap();

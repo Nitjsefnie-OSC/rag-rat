@@ -67,9 +67,9 @@ Development config without installing:
 
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`
 - `symbol_lookup`: `{ "symbol": string, "language"?: string, "limit"?: number }`
-- `find_callers`: `{ "symbol": string, "limit"?: number }`
-- `trace_callees`: `{ "symbol": string, "limit"?: number }`
-- `impact_surface`: `{ "query": string, "limit"?: number }`
+- `find_callers`: `{ "symbol": string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `trace_callees`: `{ "symbol": string, "symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "limit"?: number, "include_references"?: boolean, "edge_kinds"?: string[] }`
+- `impact_surface`: `{ "query": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "limit"?: number }`
 - `ffi_surface`: `{ "limit"?: number }`
 - `docs_for_symbol`: `{ "symbol": string, "limit"?: number }`
 - `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number }`
@@ -117,7 +117,7 @@ from an outdated FTS table.
   Default is `false`.
 
 Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `imports`, `exports`,
-`calls_name`, `references_type`, `implements`, and `contains`; confidence is reported as
+`calls_name`, `constructs`, `uses_macro`, `references_type`, `implements`, and `contains`; confidence is reported as
 `edge_confidence` (`confidence` is retained as the compatibility alias) with values `Exact`,
 `Syntactic`, `NameOnly`, or `Ambiguous`. Graph evidence is syntactic, confidence-labeled evidence,
 not compiler-grade name resolution or hard truth. Search results default to compact graph evidence
@@ -125,9 +125,34 @@ with bounded caller/callee lists; `read_chunk` defaults to full graph evidence. 
 entries include exact tree-sitter callsite spans: `callsite.path`, `callsite.line`, and
 `callsite.span` (`[start_line, end_line]`).
 
-`impact_surface` is graph-backed first. It layers exact symbol definitions, direct callers, direct
-callees, import/export dependents, same-file siblings, git commits touching those files, and cached
-GitHub papertrail. Text/path LIKE matching is used only as `Probable textual impact` fallback. Each
+Graph tools and `impact_surface` accept `resolution`:
+
+- `exact`: only verified target-symbol rows are returned. A row is allowed only when
+  `target_symbol_id` matches `symbol_id`, or the resolved fully-qualified symbol identity matches
+  `symbol`. Every returned row has `verified_target_symbol: true`.
+- `syntactic`: default. Exact matches plus qualified syntactic evidence are returned. Unresolved
+  qualified call targets may be shown, but broad bare-name ambiguous fallback is excluded.
+- `fuzzy`: compatibility/navigation mode. Suffix and bare-name fallback are allowed, including
+  ambiguous candidates. Treat these rows as possible evidence, not proof.
+
+Use `symbol_id` with `resolution: "exact"` when a previous `symbol_lookup` result selected one
+specific symbol. Bare names in `exact` mode intentionally return little or nothing unless
+`symbol_id` is provided.
+
+`trace_callees` is call-only by default: it returns `calls_name` and `constructs` edges. Type
+references, imports, exports, `contains`, `implements`, and macros are excluded unless
+`include_references` is true or `edge_kinds` is provided explicitly. `find_callers` uses exact
+target resolution first, then qualified-name and target-name fallbacks; fallback hits are labeled
+with `resolution`, `verified_target_symbol`, raw `evidence`, and optional `receiver_hint` so clients
+can treat name-only or ambiguous edges as possible evidence instead of compiler truth. Rust macro
+invocations are stored as `uses_macro` and are not resolved to same-named normal modules or
+functions.
+
+`impact_surface` is graph-backed first and defaults to `resolution: "syntactic"`. It layers exact
+symbol definitions, direct callers, direct callees, import/export dependents, same-file siblings,
+git commits touching those files, and cached GitHub papertrail. Pass `resolution: "fuzzy"` to include
+possible name-only graph evidence; those rows remain labeled by confidence and should be treated as
+possible impact. Text/path LIKE matching is used only as `Probable textual impact` fallback. Each
 item includes `category`, `reason`, and `evidence`; categories are `Direct structural impact`,
 `Probable textual impact`, and `Historical/papertrail evidence`.
 

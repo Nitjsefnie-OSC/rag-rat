@@ -5,10 +5,13 @@
 Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source where files are small enough for bounded parsing, markdown heading chunks for docs, and coarse chunks for generated or oversized files. Chunk anchors store content and context fingerprints so stale reads can be detected and repaired.
 
 Graph edges are populated from tree-sitter syntax, not compiler-grade name resolution. The indexer
-records pragmatic `imports`, `exports`, `calls_name`, `references_type`, `implements`, and
-`contains` edges with confidence labels: `Exact`, `Syntactic`, `NameOnly`, or `Ambiguous`.
-This makes `find_callers`, `trace_callees`, and impact routing useful while keeping approximate
-edges explicit.
+records pragmatic `imports`, `exports`, `calls_name`, `constructs`, `uses_macro`,
+`references_type`, `implements`, and `contains` edges with confidence labels: `Exact`,
+`Syntactic`, `NameOnly`, or `Ambiguous`. `trace_callees` is call-only by default
+(`calls_name`/`constructs`); references and macro edges are opt-in so type bounds and macro/module
+name collisions do not masquerade as normal callees. Raw edge evidence, receiver hints, call-site
+spans, and resolution reasons are stored with each edge. This makes `find_callers`,
+`trace_callees`, and impact routing useful while keeping approximate edges explicit.
 
 Tree-sitter grammars are exact-pinned in `Cargo.toml` so parser node coverage changes deliberately.
 

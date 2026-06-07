@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{index::parser, language::Language};
 
-pub const MAX_STRUCTURAL_PARSE_BYTES: usize = 10_000;
+pub const MAX_STRUCTURAL_PARSE_BYTES: usize = 512_000;
 
 #[derive(Debug, Clone)]
 pub struct Chunk {

@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 4;
+pub const LATEST_SCHEMA_VERSION: u32 = 5;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -18,6 +18,10 @@ const MIGRATION_004_ID: &str = "004_edge_source_target_spans";
 const MIGRATION_004_CHECKSUM: &str = "sha256:rag-rat-edge-source-target-spans-v4";
 const MIGRATION_004_DESCRIPTION: &str =
     "Add exact source call-site spans and resolved target line spans to graph edges";
+const MIGRATION_005_ID: &str = "005_edge_evidence_and_resolution";
+const MIGRATION_005_CHECKSUM: &str = "sha256:rag-rat-edge-evidence-resolution-v5";
+const MIGRATION_005_DESCRIPTION: &str =
+    "Add raw graph edge evidence, receiver hints, qualified targets, and resolution reasons";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +82,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_003_ID, MIGRATION_003_CHECKSUM, MIGRATION_003_DESCRIPTION)?;
     apply_edge_source_target_spans(conn)?;
     record_migration(conn, MIGRATION_004_ID, MIGRATION_004_CHECKSUM, MIGRATION_004_DESCRIPTION)?;
+    apply_edge_evidence_and_resolution(conn)?;
+    record_migration(conn, MIGRATION_005_ID, MIGRATION_005_CHECKSUM, MIGRATION_005_DESCRIPTION)?;
     Ok(())
 }
 
@@ -235,6 +241,10 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             source_end_byte INTEGER NOT NULL DEFAULT 0,
             target_start_line INTEGER,
             target_end_line INTEGER,
+            target_qualified_name TEXT,
+            evidence TEXT,
+            receiver_hint TEXT,
+            resolution TEXT NOT NULL DEFAULT 'unresolved',
             edge_kind TEXT NOT NULL,
             confidence TEXT NOT NULL,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
@@ -556,6 +566,7 @@ fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges", "from_name", "TEXT")?;
     add_column_if_missing(conn, "edges", "to_name", "TEXT NOT NULL DEFAULT ''")?;
     apply_edge_source_target_spans(conn)?;
+    apply_edge_evidence_and_resolution(conn)?;
     conn.execute(
         "
         UPDATE edges
@@ -588,6 +599,27 @@ fn apply_edge_source_target_spans(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges", "source_end_byte", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "edges", "target_start_line", "INTEGER")?;
     add_column_if_missing(conn, "edges", "target_end_line", "INTEGER")?;
+    Ok(())
+}
+
+fn apply_edge_evidence_and_resolution(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "target_qualified_name", "TEXT")?;
+    add_column_if_missing(conn, "edges", "evidence", "TEXT")?;
+    add_column_if_missing(conn, "edges", "receiver_hint", "TEXT")?;
+    add_column_if_missing(conn, "edges", "resolution", "TEXT NOT NULL DEFAULT 'unresolved'")?;
+    conn.execute(
+        "
+        UPDATE edges
+        SET resolution = CASE
+            WHEN to_symbol_id IS NOT NULL AND confidence = 'Exact' THEN 'exact'
+            WHEN to_symbol_id IS NOT NULL AND confidence = 'Syntactic' THEN 'syntactic'
+            WHEN to_symbol_id IS NOT NULL AND confidence = 'Ambiguous' THEN 'ambiguous'
+            WHEN to_symbol_id IS NOT NULL THEN 'name_fallback'
+            ELSE COALESCE(NULLIF(resolution, ''), 'unresolved')
+        END
+        ",
+        [],
+    )?;
     Ok(())
 }
 
@@ -694,6 +726,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_002_ID => Some(2),
             MIGRATION_003_ID => Some(3),
             MIGRATION_004_ID => Some(4),
+            MIGRATION_005_ID => Some(5),
             _ => None,
         })
         .max()
@@ -707,6 +740,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_002_ID
             | MIGRATION_003_ID
             | MIGRATION_004_ID
+            | MIGRATION_005_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -717,6 +751,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_002_ID => migration.checksum != MIGRATION_002_CHECKSUM,
         MIGRATION_003_ID => migration.checksum != MIGRATION_003_CHECKSUM,
         MIGRATION_004_ID => migration.checksum != MIGRATION_004_CHECKSUM,
+        MIGRATION_005_ID => migration.checksum != MIGRATION_005_CHECKSUM,
         _ => false,
     }
 }
