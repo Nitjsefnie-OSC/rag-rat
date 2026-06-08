@@ -14,6 +14,12 @@ It is built for agents that need more than `rg` but still need local, inspectabl
 - local embedding model bookkeeping and reconciliation
 - symbol/edge/path-bound repo memories that surface during future queries
 
+GPT-5.5's take:
+
+> Keep it in the default toolbox. Use `rag-rat` first for "where is this concept implemented?",
+> "why was this decision made?", "what historical PR/comment explains this?", and "what calls
+> this?". For final correctness, still verify with direct file reads and targeted tests.
+
 ## Supported Today
 
 ### Source Indexing
