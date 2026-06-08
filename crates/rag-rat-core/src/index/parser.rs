@@ -15,6 +15,13 @@ pub struct ParsedSymbol {
     pub end_line: usize,
     pub signature: Option<String>,
     pub docs: Option<String>,
+    pub facts: Vec<ParsedSymbolFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSymbolFact {
+    pub kind: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +125,16 @@ fn collect_symbols(
     if let Some((kind, name_node)) = symbol_node(language, node) {
         let name = node_text(name_node, text).unwrap_or_default();
         if !name.is_empty() {
-            out.push(make_symbol(path, text, kind, name, node.start_byte(), node.end_byte()));
+            out.push(make_symbol(
+                path,
+                language,
+                text,
+                node,
+                kind,
+                name,
+                node.start_byte(),
+                node.end_byte(),
+            ));
         }
     }
     let mut cursor = node.walk();
@@ -137,7 +153,16 @@ fn collect_kotlin_symbols(
         return;
     }
     if let Some((kind, name)) = kotlin_symbol_node(node, text) {
-        out.push(make_symbol(path, text, kind, name, node.start_byte(), node.end_byte()));
+        out.push(make_symbol(
+            path,
+            Language::Kotlin,
+            text,
+            node,
+            kind,
+            name,
+            node.start_byte(),
+            node.end_byte(),
+        ));
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -235,7 +260,9 @@ fn impl_name(node: Node<'_>) -> Option<Node<'_>> {
 
 fn make_symbol(
     path: &Path,
+    language: Language,
     text: &str,
+    node: Node<'_>,
     kind: &str,
     name: String,
     start_byte: usize,
@@ -253,7 +280,53 @@ fn make_symbol(
         end_line,
         signature: signature_for(text, start_byte, end_byte),
         docs: docs_before(text, start_byte),
+        facts: symbol_facts(language, text, node),
     }
+}
+
+fn symbol_facts(language: Language, text: &str, node: Node<'_>) -> Vec<ParsedSymbolFact> {
+    if language != Language::Rust {
+        return Vec::new();
+    }
+    let mut facts = Vec::new();
+    for attribute in rust_attribute_items(text, node) {
+        if rust_attribute_is_uniffi_export(&attribute) {
+            facts.push(ParsedSymbolFact {
+                kind: "rust_attr".to_string(),
+                value: "uniffi_export".to_string(),
+            });
+        }
+    }
+    facts.sort_by(|left, right| (&left.kind, &left.value).cmp(&(&right.kind, &right.value)));
+    facts.dedup();
+    facts
+}
+
+fn rust_attribute_items(text: &str, node: Node<'_>) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "attribute_item" {
+            attributes.push(node_text(child, text).unwrap_or_default());
+        }
+    }
+
+    let mut preceding = Vec::new();
+    let mut sibling = node.prev_named_sibling();
+    while let Some(previous) = sibling {
+        if previous.kind() != "attribute_item" {
+            break;
+        }
+        preceding.push(node_text(previous, text).unwrap_or_default());
+        sibling = previous.prev_named_sibling();
+    }
+    preceding.reverse();
+    preceding.extend(attributes);
+    preceding
+}
+
+fn rust_attribute_is_uniffi_export(attribute: &str) -> bool {
+    attribute.contains("uniffi::export") || attribute.contains("::uniffi::export")
 }
 
 fn node_text(node: Node<'_>, text: &str) -> Option<String> {

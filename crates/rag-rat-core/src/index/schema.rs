@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 9;
+pub const LATEST_SCHEMA_VERSION: u32 = 10;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -37,6 +37,10 @@ const MIGRATION_009_ID: &str = "009_github_ref_sync_state";
 const MIGRATION_009_CHECKSUM: &str = "sha256:rag-rat-github-ref-sync-state-v9";
 const MIGRATION_009_DESCRIPTION: &str =
     "Add per-GitHub-ref sync state for resumable papertrail cache updates";
+const MIGRATION_010_ID: &str = "010_symbol_facts";
+const MIGRATION_010_CHECKSUM: &str = "sha256:rag-rat-symbol-facts-v10";
+const MIGRATION_010_DESCRIPTION: &str =
+    "Add normalized symbol facts for parsed language metadata such as Rust attributes";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +111,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_008_ID, MIGRATION_008_CHECKSUM, MIGRATION_008_DESCRIPTION)?;
     apply_github_ref_sync(conn)?;
     record_migration(conn, MIGRATION_009_ID, MIGRATION_009_CHECKSUM, MIGRATION_009_DESCRIPTION)?;
+    apply_symbol_facts(conn)?;
+    record_migration(conn, MIGRATION_010_ID, MIGRATION_010_CHECKSUM, MIGRATION_010_DESCRIPTION)?;
     Ok(())
 }
 
@@ -276,6 +282,14 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             end_line INTEGER NOT NULL,
             PRIMARY KEY(logical_symbol_id, symbol_id),
             FOREIGN KEY(logical_symbol_id) REFERENCES logical_symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS symbol_facts(
+            symbol_id INTEGER NOT NULL,
+            fact_kind TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            PRIMARY KEY(symbol_id, fact_kind, fact_value),
             FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
         );
 
@@ -561,6 +575,8 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_symbol_facts_kind_value
+            ON symbol_facts(fact_kind, fact_value);
         CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
             ON logical_symbols(qualified_name);
         CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
@@ -826,6 +842,24 @@ fn apply_github_ref_sync(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_symbol_facts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS symbol_facts(
+            symbol_id INTEGER NOT NULL,
+            fact_kind TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            PRIMARY KEY(symbol_id, fact_kind, fact_value),
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_symbol_facts_kind_value
+            ON symbol_facts(fact_kind, fact_value);
+        ",
+    )?;
+    Ok(())
+}
+
 fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -897,6 +931,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_007_ID => Some(7),
             MIGRATION_008_ID => Some(8),
             MIGRATION_009_ID => Some(9),
+            MIGRATION_010_ID => Some(10),
             _ => None,
         })
         .max()
@@ -915,6 +950,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_007_ID
             | MIGRATION_008_ID
             | MIGRATION_009_ID
+            | MIGRATION_010_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -930,6 +966,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_007_ID => migration.checksum != MIGRATION_007_CHECKSUM,
         MIGRATION_008_ID => migration.checksum != MIGRATION_008_CHECKSUM,
         MIGRATION_009_ID => migration.checksum != MIGRATION_009_CHECKSUM,
+        MIGRATION_010_ID => migration.checksum != MIGRATION_010_CHECKSUM,
         _ => false,
     }
 }

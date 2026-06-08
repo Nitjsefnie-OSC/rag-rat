@@ -23,6 +23,28 @@ fn extracts_rust_symbols() {
 }
 
 #[test]
+fn extracts_rust_uniffi_export_symbol_facts() {
+    let text = r#"
+#[uniffi::export]
+pub fn exported_fn() {}
+
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(async_runtime = "tokio"))]
+impl Runtime {
+    pub fn route_search_query(&self) {}
+}
+
+pub struct Runtime;
+
+/// Not #[uniffi::export]: this is an internal helper.
+pub fn internal_helper() {}
+"#;
+    let symbols = parser::parse_symbols(Path::new("src/lib.rs"), Language::Rust, text).unwrap();
+    assert_symbol_fact(&symbols, "function", "exported_fn", "rust_attr", "uniffi_export");
+    assert_symbol_fact(&symbols, "impl", "Runtime", "rust_attr", "uniffi_export");
+    assert_no_symbol_fact(&symbols, "function", "internal_helper", "rust_attr", "uniffi_export");
+}
+
+#[test]
 fn extracts_typescript_symbols() {
     let text = include_str!("../../../../tests/fixtures/held-mini/src/index.ts");
     let symbols =
@@ -106,5 +128,41 @@ fn assert_symbol(symbols: &[parser::ParsedSymbol], kind: &str, name: &str) {
         symbols.iter().any(|symbol| symbol.kind == kind && symbol.name == name),
         "missing {kind} {name}; got {:?}",
         symbols.iter().map(|symbol| (&symbol.kind, &symbol.name)).collect::<Vec<_>>()
+    );
+}
+
+fn assert_symbol_fact(
+    symbols: &[parser::ParsedSymbol],
+    kind: &str,
+    name: &str,
+    fact_kind: &str,
+    fact_value: &str,
+) {
+    let symbol = symbols
+        .iter()
+        .find(|symbol| symbol.kind == kind && symbol.name == name)
+        .unwrap_or_else(|| panic!("missing {kind} {name}: {symbols:?}"));
+    assert!(
+        symbol.facts.iter().any(|fact| fact.kind == fact_kind && fact.value == fact_value),
+        "missing fact {fact_kind}={fact_value} on {kind} {name}; got {:?}",
+        symbol.facts
+    );
+}
+
+fn assert_no_symbol_fact(
+    symbols: &[parser::ParsedSymbol],
+    kind: &str,
+    name: &str,
+    fact_kind: &str,
+    fact_value: &str,
+) {
+    let symbol = symbols
+        .iter()
+        .find(|symbol| symbol.kind == kind && symbol.name == name)
+        .unwrap_or_else(|| panic!("missing {kind} {name}: {symbols:?}"));
+    assert!(
+        !symbol.facts.iter().any(|fact| fact.kind == fact_kind && fact.value == fact_value),
+        "unexpected fact {fact_kind}={fact_value} on {kind} {name}; got {:?}",
+        symbol.facts
     );
 }

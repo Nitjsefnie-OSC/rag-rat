@@ -1812,6 +1812,14 @@ impl IndexDatabase {
                     symbol.docs,
                 ],
             )?;
+            let symbol_id = self.storage.connection().last_insert_rowid();
+            for fact in &symbol.facts {
+                self.storage.connection().execute(
+                    "INSERT OR IGNORE INTO symbol_facts(symbol_id, fact_kind, fact_value)
+                     VALUES (?1, ?2, ?3)",
+                    params![symbol_id, fact.kind, fact.value],
+                )?;
+            }
         }
         Ok(())
     }
@@ -3141,7 +3149,13 @@ mod schema_bootstrap_tests {
         let github_ref_sync_columns = table_columns(&db, "github_ref_sync");
         assert!(github_ref_sync_columns.contains(&"status".to_string()));
         assert!(github_ref_sync_columns.contains(&"last_error".to_string()));
-        assert_eq!(db.status(&config.database).unwrap().schema.current_version, 9);
+        let symbol_fact_columns = table_columns(&db, "symbol_facts");
+        assert!(symbol_fact_columns.contains(&"fact_kind".to_string()));
+        assert!(symbol_fact_columns.contains(&"fact_value".to_string()));
+        assert_eq!(
+            db.status(&config.database).unwrap().schema.current_version,
+            schema::LATEST_SCHEMA_VERSION
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3826,20 +3840,23 @@ impl PhraseRepo {
     pub fn journal(&self) {}
 }
 
-#[uniffi::export]
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(async_runtime = "tokio"))]
+impl Runtime {
+    pub fn route_search_query(&self) {}
+}
+
+pub struct Runtime;
+
+/// Not #[uniffi::export]: this is an internal helper.
+pub fn internal_helper() {}
+
+#[cfg_attr(target_arch = "wasm32", ::uniffi::export)]
 pub fn exported_fn() {}
 "#,
         )
         .unwrap();
         let config = source_config(root.clone(), Language::Rust);
         let db = IndexDatabase::rebuild(&config).unwrap();
-        db.storage
-            .connection()
-            .execute(
-                "UPDATE chunks SET text = '#[uniffi::export]' || char(10) || text WHERE symbol_path IN ('src/lib.rs::PhraseRepo', 'src/lib.rs::exported_fn')",
-                [],
-            )
-            .unwrap();
 
         let surface = db.ffi_surface(20).unwrap();
         assert!(
@@ -3856,6 +3873,16 @@ pub fn exported_fn() {}
         assert!(
             surface.iter().any(|item| {
                 item.reason == "rust_uniffi_impl_member"
+                    && item
+                        .symbol
+                        .as_deref()
+                        .is_some_and(|symbol| symbol.ends_with("route_search_query"))
+            }),
+            "cfg_attr exported impl member should be labeled separately: {surface:?}"
+        );
+        assert!(
+            surface.iter().any(|item| {
+                item.reason == "rust_uniffi_impl_member"
                     && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("children"))
             }),
             "impl member should be labeled separately: {surface:?}"
@@ -3868,6 +3895,12 @@ pub fn exported_fn() {}
                     })
             }),
             "impl members must not be reported as direct exports: {surface:?}"
+        );
+        assert!(
+            !surface.iter().any(|item| {
+                item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("internal_helper"))
+            }),
+            "comment-only UniFFI mentions must not create FFI surface rows: {surface:?}"
         );
 
         fs::remove_dir_all(root).unwrap();

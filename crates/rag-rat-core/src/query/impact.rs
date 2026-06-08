@@ -255,36 +255,40 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
                    files.path AS path,
                    files.language AS language,
                    files.kind AS kind,
-                   COALESCE(symbols.qualified_name, chunks.symbol_path) AS symbol,
+                   symbols.qualified_name AS symbol,
                    CASE
-                       WHEN chunks.text LIKE '%#[uniffi::export]%impl %'
-                         OR chunks.text LIKE '%#[::uniffi::export]%impl %'
-                           THEN CASE
-                               WHEN symbols.kind IN ('function', 'method')
-                                 THEN 'rust_uniffi_impl_member'
-                               ELSE 'rust_uniffi_exported_impl'
-                           END
+                       WHEN symbols.kind = 'impl' THEN 'rust_uniffi_exported_impl'
                        ELSE 'rust_uniffi_export'
                    END AS reason
-            FROM chunks
-            JOIN files ON files.id = chunks.file_id
-            LEFT JOIN symbols
-              ON symbols.file_id = files.id
-             AND symbols.start_byte >= chunks.start_byte
-             AND symbols.end_byte <= chunks.end_byte
-             AND symbols.kind IN ('function', 'method', 'impl', 'struct', 'enum', 'trait', 'class')
+            FROM symbols
+            JOIN files ON files.id = symbols.file_id
+            JOIN symbol_facts
+              ON symbol_facts.symbol_id = symbols.id
+             AND symbol_facts.fact_kind = 'rust_attr'
+             AND symbol_facts.fact_value = 'uniffi_export'
             WHERE files.language = 'rust'
-              AND chunks.text LIKE '%uniffi::export%'
-              AND (
-                  chunks.text LIKE '%#[uniffi::export]%fn %'
-               OR chunks.text LIKE '%#[::uniffi::export]%fn %'
-               OR chunks.text LIKE '%#[uniffi::export]%impl %'
-               OR chunks.text LIKE '%#[::uniffi::export]%impl %'
-               OR chunks.text LIKE '%#[uniffi::export]%struct %'
-               OR chunks.text LIKE '%#[::uniffi::export]%struct %'
-               OR chunks.text LIKE '%#[uniffi::export]%enum %'
-               OR chunks.text LIKE '%#[::uniffi::export]%enum %'
-              )
+              AND symbols.kind IN ('function', 'method', 'impl', 'struct', 'enum', 'trait')
+        ),
+        rust_exported_impl_members AS (
+            SELECT DISTINCT
+                   files.path AS path,
+                   files.language AS language,
+                   files.kind AS kind,
+                   members.qualified_name AS symbol,
+                   'rust_uniffi_impl_member' AS reason
+            FROM symbols AS impls
+            JOIN files ON files.id = impls.file_id
+            JOIN symbol_facts
+              ON symbol_facts.symbol_id = impls.id
+             AND symbol_facts.fact_kind = 'rust_attr'
+             AND symbol_facts.fact_value = 'uniffi_export'
+            JOIN symbols AS members
+              ON members.file_id = impls.file_id
+             AND members.start_byte > impls.start_byte
+             AND members.end_byte < impls.end_byte
+             AND members.kind IN ('function', 'method')
+            WHERE files.language = 'rust'
+              AND impls.kind = 'impl'
         ),
         binding_refs AS (
             SELECT DISTINCT
@@ -309,6 +313,8 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
                OR files.path LIKE '%generated-manifest.json'
         )
         SELECT path, language, kind, symbol, reason FROM rust_exports
+        UNION
+        SELECT path, language, kind, symbol, reason FROM rust_exported_impl_members
         UNION
         SELECT path, language, kind, symbol, reason FROM binding_refs
         ORDER BY reason, kind DESC, path
