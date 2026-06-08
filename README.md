@@ -350,6 +350,10 @@ returning search or `read_chunk` results.
 
 GitHub sync is explicit and uses `gh api`; normal query tools read the local SQLite cache.
 
+## License
+
+`rag-rat` is licensed under the MIT License. See [LICENSE](LICENSE).
+
 ## Size Budget
 
 Storage dependency changes must keep the binary slim. See `docs/binary-size.md` for the manual size
