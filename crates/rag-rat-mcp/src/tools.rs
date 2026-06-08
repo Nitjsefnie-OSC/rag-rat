@@ -8,6 +8,7 @@ use rag_rat_core::{
         graph_meta::GraphMetaMode,
         impact::ImpactSurfaceOptions,
         memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryUpdate},
+        repo_brief::{RepoBriefMode, RepoBriefOptions},
         symbol::SymbolSelector,
     },
     search::lexical::SearchOptions,
@@ -126,6 +127,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "trace_callees",
     "compare_graph_to_text",
     "impact_surface",
+    "repo_brief",
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
@@ -173,6 +175,38 @@ pub struct SearchArgs {
     pub graph_limit: u32,
     #[serde(default)]
     pub include_fallback: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpRepoBriefMode {
+    Spine,
+    Churn,
+    GodModules,
+    RefactorCandidates,
+}
+
+impl McpRepoBriefMode {
+    fn core(self) -> RepoBriefMode {
+        match self {
+            Self::Spine => RepoBriefMode::Spine,
+            Self::Churn => RepoBriefMode::Churn,
+            Self::GodModules => RepoBriefMode::GodModules,
+            Self::RefactorCandidates => RepoBriefMode::RefactorCandidates,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RepoBriefArgs {
+    #[serde(default = "default_repo_brief_mode")]
+    pub mode: McpRepoBriefMode,
+    #[serde(default = "default_repo_brief_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub include_generated: bool,
+    #[serde(default = "default_true")]
+    pub include_memories: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -575,6 +609,15 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
             let args: ImpactArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
             impact_tool(db, args, resolution_mode)?
+        },
+        "repo_brief" => {
+            let args: RepoBriefArgs = serde_json::from_value(arguments)?;
+            json!(db.repo_brief(RepoBriefOptions {
+                mode: args.mode.core(),
+                limit: args.limit,
+                include_generated: args.include_generated,
+                include_memories: args.include_memories,
+            })?)
         },
         "ffi_surface" => {
             let args: LimitArgs = serde_json::from_value(arguments)?;
@@ -1103,6 +1146,9 @@ pub fn description(name: &str) -> &'static str {
         "impact_surface" => {
             "Graph-backed coding preflight with structural, textual fallback, and papertrail evidence."
         },
+        "repo_brief" => {
+            "Orientation-first repo brief with spine, churn, god-module, and refactor-candidate modes."
+        },
         "ffi_surface" => "Find UniFFI/export/generated-binding/call-site candidates.",
         "docs_for_symbol" => "Find docs chunks related to a symbol.",
         "read_chunk" => "Read current text for one selected chunk ID with anchor validation.",
@@ -1156,6 +1202,7 @@ pub fn schema(name: &str) -> Value {
         "find_callers" | "trace_callees" | "docs_for_symbol" => schema_for::<SymbolGraphArgs>(),
         "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
         "impact_surface" => schema_for::<ImpactArgs>(),
+        "repo_brief" => schema_for::<RepoBriefArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
         "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),
@@ -1222,6 +1269,14 @@ fn default_search_graph_limit() -> u32 {
     3
 }
 
+fn default_repo_brief_mode() -> McpRepoBriefMode {
+    McpRepoBriefMode::Spine
+}
+
+fn default_repo_brief_limit() -> u32 {
+    10
+}
+
 fn default_read_chunk_graph_mode() -> McpGraphMode {
     McpGraphMode::Full
 }
@@ -1271,6 +1326,7 @@ mod tests {
             "trace_callees",
             "compare_graph_to_text",
             "impact_surface",
+            "repo_brief",
             "ffi_surface",
             "docs_for_symbol",
             "read_chunk",
@@ -1374,6 +1430,15 @@ mod tests {
         assert_schema_has_property(tools, "impact_surface", "include_memories");
         assert_schema_has_property(tools, "impact_surface", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "impact_surface");
+        assert_schema_has_property(tools, "repo_brief", "mode");
+        assert_schema_property_enum(
+            tools,
+            "repo_brief",
+            "mode",
+            &["spine", "churn", "god_modules", "refactor_candidates"],
+        );
+        assert_schema_has_property(tools, "repo_brief", "limit");
+        assert_schema_has_property(tools, "repo_brief", "include_memories");
         assert_symbol_selector_schema(tools, "docs_for_symbol");
         assert_symbol_selector_schema(tools, "git_history_for_symbol");
         assert_symbol_selector_schema(tools, "papertrail_for_symbol");

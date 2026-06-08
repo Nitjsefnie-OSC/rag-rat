@@ -412,7 +412,7 @@ pub fn memories_for_symbol(
             memories.push(memory);
         }
     }
-    memories.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    memories.sort_by_key(|memory| std::cmp::Reverse(memory.updated_at_ms));
     Ok(memories)
 }
 
@@ -1052,16 +1052,16 @@ fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeAnchor> {
     let receiver_hint: Option<String> = row.get("receiver_hint")?;
     Ok(EdgeAnchor {
         edge_id: row.get("edge_id")?,
-        fingerprint: edge_fingerprint(
-            &path,
+        fingerprint: edge_fingerprint(EdgeFingerprintParts {
+            path: &path,
             start_line,
             end_line,
-            from_name.as_deref(),
-            to_name.as_deref(),
-            &edge_kind,
-            target_qualified_name.as_deref(),
-            receiver_hint.as_deref(),
-        ),
+            from_name: from_name.as_deref(),
+            to_name: to_name.as_deref(),
+            edge_kind: &edge_kind,
+            target_qualified_name: target_qualified_name.as_deref(),
+            receiver_hint: receiver_hint.as_deref(),
+        }),
         path,
         start_line,
         end_line,
@@ -1069,23 +1069,29 @@ fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeAnchor> {
     })
 }
 
-fn edge_fingerprint(
-    path: &str,
+struct EdgeFingerprintParts<'a> {
+    path: &'a str,
     start_line: i64,
     end_line: i64,
-    from_name: Option<&str>,
-    to_name: Option<&str>,
-    edge_kind: &str,
-    target_qualified_name: Option<&str>,
-    receiver_hint: Option<&str>,
-) -> String {
+    from_name: Option<&'a str>,
+    to_name: Option<&'a str>,
+    edge_kind: &'a str,
+    target_qualified_name: Option<&'a str>,
+    receiver_hint: Option<&'a str>,
+}
+
+fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
     hex_sha256(
         format!(
-            "{path}\n{start_line}\n{end_line}\n{}\n{}\n{edge_kind}\n{}\n{}",
-            from_name.unwrap_or(""),
-            to_name.unwrap_or(""),
-            target_qualified_name.unwrap_or(""),
-            receiver_hint.unwrap_or("")
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            parts.path,
+            parts.start_line,
+            parts.end_line,
+            parts.from_name.unwrap_or(""),
+            parts.to_name.unwrap_or(""),
+            parts.edge_kind,
+            parts.target_qualified_name.unwrap_or(""),
+            parts.receiver_hint.unwrap_or("")
         )
         .as_bytes(),
     )
@@ -1342,10 +1348,10 @@ fn validate_logical_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    if let Some(id) = binding.logical_symbol_id {
-        if crate::query::symbol::lookup_logical_by_id(conn, id)?.is_some() {
-            return validate_bound_chunk(conn, binding);
-        }
+    if let Some(id) = binding.logical_symbol_id
+        && crate::query::symbol::lookup_logical_by_id(conn, id)?.is_some()
+    {
+        return validate_bound_chunk(conn, binding);
     }
     let relocated = conn
         .query_row(
@@ -1377,10 +1383,10 @@ fn validate_symbol_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    if let Some(id) = binding.symbol_id {
-        if crate::query::symbol::lookup_by_id(conn, id)?.is_some() {
-            return validate_bound_chunk(conn, binding);
-        }
+    if let Some(id) = binding.symbol_id
+        && crate::query::symbol::lookup_by_id(conn, id)?.is_some()
+    {
+        return validate_bound_chunk(conn, binding);
     }
     let relocated = conn
         .query_row(
@@ -1420,15 +1426,15 @@ fn validate_edge_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    if let Some(edge_id) = binding.edge_id {
-        if let Some(edge) = edge_by_id(conn, edge_id)? {
-            binding.path = Some(edge.path);
-            binding.start_line = Some(edge.start_line);
-            binding.end_line = Some(edge.end_line);
-            binding.symbol_id = None;
-            binding.logical_symbol_id = None;
-            return validate_bound_edge_source_hash(conn, binding, &edge.source_hash);
-        }
+    if let Some(edge_id) = binding.edge_id
+        && let Some(edge) = edge_by_id(conn, edge_id)?
+    {
+        binding.path = Some(edge.path);
+        binding.start_line = Some(edge.start_line);
+        binding.end_line = Some(edge.end_line);
+        binding.symbol_id = None;
+        binding.logical_symbol_id = None;
+        return validate_bound_edge_source_hash(conn, binding, &edge.source_hash);
     }
     let Some(edge) = edge_by_fingerprint(conn, &binding.binding_id)? else {
         return Ok("gone".to_string());

@@ -16,7 +16,7 @@ use crate::tools::{
     BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
     MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs,
     MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs,
-    ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    ReadChunkArgs, RepoBriefArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -104,6 +104,17 @@ impl RagRatService {
         Parameters(args): Parameters<ImpactArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("impact_surface", json!(args))
+    }
+
+    #[tool(
+        name = "repo_brief",
+        description = "Orientation-first repo brief with spine, churn, god-module, and refactor-candidate modes."
+    )]
+    fn repo_brief(
+        &self,
+        Parameters(args): Parameters<RepoBriefArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("repo_brief", json!(args))
     }
 
     #[tool(
@@ -385,7 +396,7 @@ impl RagRatService {
 impl ServerHandler for RagRatService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("rag-rat", "0.1.0"))
+            .with_server_info(Implementation::new("rag-rat", "0.2.0"))
             .with_instructions("Read-only-source repo intelligence. Index and auto-heal writes are confined to the configured SQLite database.")
     }
 

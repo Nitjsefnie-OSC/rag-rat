@@ -110,7 +110,7 @@ impl Embedder for FastEmbedEmbedder {
         let documents = texts.iter().map(String::as_str).collect::<Vec<_>>();
         let mut model =
             self.model.lock().map_err(|_| anyhow::anyhow!("fastembed model lock poisoned"))?;
-        Ok(model.embed(documents, None)?)
+        model.embed(documents, None)
     }
 }
 

@@ -1752,6 +1752,13 @@ impl IndexDatabase {
         )
     }
 
+    pub fn repo_brief(
+        &self,
+        options: crate::query::repo_brief::RepoBriefOptions,
+    ) -> anyhow::Result<crate::query::repo_brief::RepoBrief> {
+        crate::query::repo_brief::repo_brief(self.storage.connection(), options)
+    }
+
     pub fn memory_create(
         &self,
         request: crate::query::memory::RepoMemoryCreate,
@@ -6734,6 +6741,87 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repo_brief_ranks_churn_and_god_module_candidates() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.name", "Rag Rat"]);
+        run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+        fs::write(root.join("src/stable.rs"), "pub fn stable() -> i32 { 1 }\n").unwrap();
+        fs::write(root.join("src/hot.rs"), hot_module_text(0)).unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "Add initial modules"]);
+
+        for revision in 1..=3 {
+            fs::write(root.join("src/hot.rs"), hot_module_text(revision)).unwrap();
+            run_git(&root, &["add", "src/hot.rs"]);
+            run_git(&root, &["commit", "-m", "Iterate hot module"]);
+        }
+
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+        };
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let churn = db
+            .repo_brief(crate::query::repo_brief::RepoBriefOptions {
+                mode: crate::query::repo_brief::RepoBriefMode::Churn,
+                limit: 1,
+                include_generated: false,
+                include_memories: true,
+            })
+            .unwrap();
+        assert_eq!(churn.candidates[0].path, "src/hot.rs");
+        assert_eq!(churn.candidates[0].category, "recent_churn_hotspot");
+        assert!(churn.candidates[0].score <= 1.0);
+        assert!(churn.candidates[0].metrics.commit_touch_count >= 4);
+        assert!(churn.candidates[0].why.iter().any(|reason| reason.contains("churn")));
+
+        let god_modules = db
+            .repo_brief(crate::query::repo_brief::RepoBriefOptions {
+                mode: crate::query::repo_brief::RepoBriefMode::GodModules,
+                limit: 1,
+                include_generated: false,
+                include_memories: true,
+            })
+            .unwrap();
+        assert_eq!(god_modules.candidates[0].path, "src/hot.rs");
+        assert!(god_modules.candidates[0].score <= 1.0);
+        assert!(god_modules.candidates[0].metrics.symbol_count >= 30);
+        assert!(!god_modules.candidates[0].split_hints.is_empty());
+        assert!(
+            god_modules.candidates[0].next_tools.iter().any(|tool| tool.tool == "impact_surface")
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn hot_module_text(revision: usize) -> String {
+        let mut text = String::new();
+        text.push_str("pub fn entry() -> i32 {\n");
+        for i in 0..32 {
+            text.push_str(&format!("    helper_{i}() +\n"));
+        }
+        text.push_str(&format!("    {revision}\n}}\n"));
+        for i in 0..32 {
+            text.push_str(&format!("pub fn helper_{i}() -> i32 {{ {i} }}\n"));
+        }
+        text
     }
 
     fn unique_temp_root() -> PathBuf {

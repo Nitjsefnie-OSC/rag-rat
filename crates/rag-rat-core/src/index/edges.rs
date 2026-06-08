@@ -155,13 +155,15 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     ) in rows
     {
         let resolution = resolve_symbol(
-            &to_name,
-            target_qualified_name.as_deref(),
-            &edge_kind,
-            evidence.as_deref(),
-            receiver_hint.as_deref(),
-            source_file_id,
-            source_language(&symbols, source_file_id),
+            ResolveSymbolRequest {
+                name: &to_name,
+                target_qualified_name: target_qualified_name.as_deref(),
+                edge_kind: &edge_kind,
+                evidence: evidence.as_deref(),
+                receiver_hint: receiver_hint.as_deref(),
+                source_file_id,
+                source_language: source_language(&symbols, source_file_id),
+            },
             &symbols,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
@@ -203,20 +205,24 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_symbol<'a>(
-    name: &str,
-    target_qualified_name: Option<&str>,
-    edge_kind: &str,
-    evidence: Option<&str>,
-    receiver_hint: Option<&str>,
+struct ResolveSymbolRequest<'a> {
+    name: &'a str,
+    target_qualified_name: Option<&'a str>,
+    edge_kind: &'a str,
+    evidence: Option<&'a str>,
+    receiver_hint: Option<&'a str>,
     source_file_id: i64,
-    source_language: Option<&str>,
+    source_language: Option<&'a str>,
+}
+
+fn resolve_symbol<'a>(
+    request: ResolveSymbolRequest<'_>,
     symbols: &'a [IndexedSymbol],
 ) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
     let kind_matches = |symbol: &IndexedSymbol| {
-        edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
+        request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
     };
-    if let Some(qualified) = target_qualified_name.filter(|value| !value.is_empty()) {
+    if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
         if let Some(symbol) =
             symbols.iter().find(|symbol| kind_matches(symbol) && symbol.qualified_name == qualified)
         {
@@ -236,22 +242,22 @@ fn resolve_symbol<'a>(
             [] => {},
         }
         if !allow_unqualified_fallback(
-            edge_kind,
+            request.edge_kind,
             qualified,
-            name,
-            evidence,
-            receiver_hint,
-            source_language,
+            request.name,
+            request.evidence,
+            request.receiver_hint,
+            request.source_language,
         ) {
             return None;
         }
     }
-    let short = short_name(name);
+    let short = short_name(request.name);
     let matches = symbols
         .iter()
         .filter(|symbol| kind_matches(symbol) && symbol.name == short)
         .collect::<Vec<_>>();
-    let preferred = preferred_matches(edge_kind, &matches);
+    let preferred = preferred_matches(request.edge_kind, &matches);
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
         [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
@@ -262,7 +268,7 @@ fn resolve_symbol<'a>(
             let same_file = matches
                 .iter()
                 .copied()
-                .filter(|symbol| symbol.file_id == source_file_id)
+                .filter(|symbol| symbol.file_id == request.source_file_id)
                 .collect::<Vec<_>>();
             match same_file.as_slice() {
                 [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "same_file_name")),
@@ -1032,10 +1038,10 @@ fn identifiers_under(node: Node<'_>, text: &str) -> Vec<String> {
 
 fn collect_identifiers(node: Node<'_>, text: &str, out: &mut Vec<String>) {
     if is_identifier_kind(node.kind()) {
-        if let Ok(value) = node.utf8_text(text.as_bytes()) {
-            if !value.is_empty() {
-                out.push(value.to_string());
-            }
+        if let Ok(value) = node.utf8_text(text.as_bytes())
+            && !value.is_empty()
+        {
+            out.push(value.to_string());
         }
         return;
     }

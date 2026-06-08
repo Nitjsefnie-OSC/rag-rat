@@ -2,6 +2,7 @@ pub mod graph;
 pub mod graph_meta;
 pub mod impact;
 pub mod memory;
+pub mod repo_brief;
 pub mod symbol;
 
 use rusqlite::{Connection, OptionalExtension};

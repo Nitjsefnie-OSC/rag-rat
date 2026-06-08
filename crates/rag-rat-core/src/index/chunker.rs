@@ -114,15 +114,15 @@ fn uncovered_code_chunks(path: &Path, text: &str, symbols: &[parser::ParsedSymbo
     for symbol in symbols {
         let start = symbol.start_line.max(1);
         let end = symbol.end_line.min(line_count);
-        for line in start..=end {
-            covered[line] = true;
+        for is_covered in covered.iter_mut().take(end + 1).skip(start) {
+            *is_covered = true;
         }
     }
 
     let mut chunks = Vec::new();
     let mut start_line = None;
-    for line in 1..=line_count {
-        if !covered[line] {
+    for (line, is_covered) in covered.iter().enumerate().take(line_count + 1).skip(1) {
+        if !*is_covered {
             start_line.get_or_insert(line);
             continue;
         }

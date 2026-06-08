@@ -60,6 +60,22 @@ fn main() -> anyhow::Result<()> {
                 print_json(&db.search(&query, 10, false)?)?;
             }
         },
+        "brief" => {
+            let db = IndexDatabase::open_config(&config)?;
+            let mode = rag_rat_core::query::repo_brief::RepoBriefMode::parse(
+                option_value(&args, "--mode").as_deref(),
+            )?;
+            let limit = option_value(&args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            print_json(&db.repo_brief(rag_rat_core::query::repo_brief::RepoBriefOptions {
+                mode,
+                limit,
+                include_generated: has_flag(&args, "--include-generated"),
+                include_memories: !has_flag(&args, "--no-memories"),
+            })?)?;
+        },
         "mcp" => {
             tokio::runtime::Runtime::new()?.block_on(rag_rat_mcp::server::run_stdio(config))?;
         },
@@ -801,7 +817,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <init|index|doctor|migrate|query|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> [--config <path>] [query]\n\
+        "usage: rag-rat <init|index|doctor|migrate|query|brief|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> [--config <path>] [query]\n\
          default config: rag-rat.toml\n\
          examples:\n\
          rag-rat init\n\
@@ -828,7 +844,10 @@ fn usage() {
          rag-rat eval --json\n\
          rag-rat eval --update-baseline\n\
          rag-rat query \"semantic recall\"\n\
-         rag-rat query --explain \"runtime shutdown\""
+         rag-rat query --explain \"runtime shutdown\"\n\
+         rag-rat brief --mode spine\n\
+         rag-rat brief --mode churn\n\
+         rag-rat brief --mode god_modules"
     );
 }
 

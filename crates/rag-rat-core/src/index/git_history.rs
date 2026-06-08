@@ -536,21 +536,22 @@ fn parse_blame(output: &str) -> Vec<BlameLine> {
     let mut current_commit = None::<String>;
     let mut current_time = None::<i64>;
     for line in output.lines() {
-        if let Some((hash, _rest)) = line.split_once(' ') {
-            if hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                current_commit = Some(hash.to_string());
-                current_time = None;
-                continue;
-            }
+        if let Some((hash, _rest)) = line.split_once(' ')
+            && hash.len() == 40
+            && hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            current_commit = Some(hash.to_string());
+            current_time = None;
+            continue;
         }
         if let Some(value) = line.strip_prefix("author-time ") {
             current_time = value.parse().ok();
             continue;
         }
-        if line.starts_with('\t') {
-            if let Some(commit) = current_commit.clone() {
-                lines.push(BlameLine { commit, author_time_s: current_time });
-            }
+        if line.starts_with('\t')
+            && let Some(commit) = current_commit.clone()
+        {
+            lines.push(BlameLine { commit, author_time_s: current_time });
         }
     }
     lines

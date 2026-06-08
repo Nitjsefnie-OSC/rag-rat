@@ -220,7 +220,7 @@ fn setup_model_and_reconcile(
     let model_index = if assume_yes {
         0
     } else {
-        Select::new().with_prompt("Select embedding model").items(&choices).default(0).interact()?
+        Select::new().with_prompt("Select embedding model").items(choices).default(0).interact()?
     };
     let model_id = choices[model_index];
     eprintln!("init: installing model {model_id}");

@@ -139,16 +139,7 @@ fn collect_symbols(
     if let Some((kind, name_node)) = symbol_node(language, node) {
         let name = node_text(name_node, text).unwrap_or_default();
         if !name.is_empty() {
-            out.push(make_symbol(
-                path,
-                language,
-                text,
-                node,
-                kind,
-                name,
-                node.start_byte(),
-                node.end_byte(),
-            ));
+            out.push(make_symbol(path, language, text, node, kind, name));
         }
     }
     let mut cursor = node.walk();
@@ -332,9 +323,9 @@ fn make_symbol(
     node: Node<'_>,
     kind: &str,
     name: String,
-    start_byte: usize,
-    end_byte: usize,
 ) -> ParsedSymbol {
+    let start_byte = node.start_byte();
+    let end_byte = node.end_byte();
     let start_line = byte_to_line(text, start_byte);
     let end_line = byte_to_line(text, end_byte);
     ParsedSymbol {

@@ -2563,7 +2563,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rag-rat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dialoguer",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fastembed",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "rag-rat-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rag-rat-core",
