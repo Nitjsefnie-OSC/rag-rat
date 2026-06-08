@@ -47,6 +47,184 @@ GPT-5.5's take:
 > "why was this decision made?", "what historical PR/comment explains this?", and "what calls
 > this?". For final correctness, still verify with direct file reads and targeted tests.
 
+## Install From Scratch
+
+The MCP server is a STDIO server, not an HTTP service. MCP clients start `rag-rat` as a child
+process and talk to it over stdin/stdout.
+
+### Install From crates.io
+
+Install the published CLI. This is the recommended path for most users and includes FastEmbed
+support by default:
+
+```bash
+cargo install rag-rat
+```
+
+### Install From Source
+
+For local development from a checkout, clone the repository and install the CLI package:
+
+```bash
+git clone https://github.com/cq27-dev/rag-rat.git
+cd rag-rat
+cargo install --path crates/rag-rat-cli --bin rag-rat
+```
+
+The source build also enables FastEmbed by default.
+
+For a smaller hash-only build without real embeddings, disable default features explicitly:
+
+```bash
+cargo install rag-rat --no-default-features
+cargo install --path crates/rag-rat-cli --bin rag-rat --no-default-features
+```
+
+### First-Run Setup
+
+Run the initializer from the repository you want to index:
+
+```bash
+cd /path/to/your/repo
+rag-rat init
+```
+
+`rag-rat init` scans the repository, prompts for languages and path bindings, writes
+`rag-rat.toml`, migrates the SQLite schema, indexes the repo, and offers to install/reconcile the
+local embedding model. At the end it can also register the MCP server for Claude Code or Codex and
+install the optional git maintenance hooks.
+
+The initializer is the recommended first-run path. It derives source-root candidates from the files
+present in the repo, keeps defaults conservative for broad projects, asks before installing the
+local embedding model, then runs migration, indexing, and local-AI reconciliation in the same setup
+flow. If a repo has unusual layout or generated-heavy paths, run the dry-run first and adjust the
+generated `rag-rat.toml` before indexing.
+
+Preview the generated config without writing anything:
+
+```bash
+rag-rat init --dry-run
+```
+
+Use `--yes` for the default non-interactive setup, or `--config <path>` when the config should live
+somewhere other than `rag-rat.toml`.
+
+Manual setup is still available when you need exact control:
+
+```toml
+[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+
+[local_ai.embedding.runtime]
+batch_size = 64
+ort_threads = 4
+omp_threads = 1
+max_embedding_chars = 4000
+
+[target_bindings]
+rust = ["src"]
+typescript = ["src"]
+kotlin = ["src"]
+c = ["src", "include"]
+cpp = ["src", "include"]
+
+[[target]]
+name = "rust-src"
+language = "rust"
+directories = ["src"]
+include = ["**/*.rs"]
+
+[[target]]
+name = "typescript-src"
+language = "typescript"
+directories = ["src"]
+include = ["**/*.ts", "**/*.tsx"]
+
+[[target]]
+name = "kotlin-src"
+language = "kotlin"
+directories = ["src"]
+include = ["**/*.kt"]
+
+[[target]]
+name = "c-src"
+language = "c"
+directories = ["src", "include"]
+include = ["**/*.c", "**/*.h"]
+
+[[target]]
+name = "cpp-src"
+language = "cpp"
+directories = ["src", "include"]
+include = ["**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.hpp", "**/*.hh", "**/*.hxx"]
+
+[[target]]
+name = "docs"
+language = "markdown"
+directories = ["."]
+include = ["**/*.md"]
+exclude = [".git/**", ".rag-rat/**", "target/**", "node_modules/**"]
+```
+
+Then run the pieces directly:
+
+```bash
+rag-rat migrate
+rag-rat index --discover
+rag-rat doctor
+```
+
+Install and reconcile the local embedding model:
+
+```bash
+rag-rat models install fastembed-all-minilm-l6-v2
+rag-rat reconcile --changed-first --limit 500 --batch-size 64
+```
+
+If installed with `--no-default-features`, use the hash baseline instead:
+
+```bash
+rag-rat models install embedding-hash
+```
+
+Add the installed binary to an MCP client config. Use an absolute `--config` path to the target
+repository's `rag-rat.toml`:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat": {
+      "command": "/home/you/.cargo/bin/rag-rat",
+      "args": ["mcp", "--config", "/path/to/your/repo/rag-rat.toml"]
+    }
+  }
+}
+```
+
+For development without installing the binary, point the MCP client at a local `rag-rat` checkout:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat-dev": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "/path/to/rag-rat/Cargo.toml",
+        "--bin",
+        "rag-rat",
+        "--",
+        "mcp",
+        "--config",
+        "/path/to/your/repo/rag-rat.toml"
+      ]
+    }
+  }
+}
+```
+
 ## Supported Today
 
 ### Source Indexing
@@ -273,175 +451,6 @@ rag-rat mcp
 ```
 
 By default, rag-rat links against the system SQLite library through `rusqlite`.
-
-## Install From Scratch
-
-The MCP server is a STDIO server, not an HTTP service. MCP clients start `rag-rat` as a child
-process and talk to it over stdin/stdout.
-
-Clone and install `rag-rat`:
-
-```bash
-cargo install rag-rat
-```
-
-For local development from a checkout:
-
-```bash
-git clone https://github.com/cq27-dev/rag-rat.git
-cd rag-rat
-cargo install --path crates/rag-rat-cli --bin rag-rat
-```
-
-FastEmbed is enabled by default. For a smaller hash-only build without real embeddings, disable
-default features and use the deterministic hash baseline:
-
-```bash
-cargo install rag-rat --no-default-features
-```
-
-Run the initializer from the repository you want to index:
-
-```bash
-cd /path/to/your/repo
-rag-rat init
-```
-
-`rag-rat init` scans the repository, prompts for languages and path bindings, writes
-`rag-rat.toml`, migrates the SQLite schema, indexes the repo, and offers to install/reconcile the
-local embedding model. At the end it can also register the MCP server for Claude Code or Codex and
-install the optional git maintenance hooks.
-
-The initializer is the recommended first-run path. It derives source-root candidates from the files
-present in the repo, keeps defaults conservative for broad projects, asks before installing the
-local embedding model, then runs migration, indexing, and local-AI reconciliation in the same setup
-flow. If a repo has unusual layout or generated-heavy paths, run the dry-run first and adjust the
-generated `rag-rat.toml` before indexing.
-
-Preview the generated config without writing anything:
-
-```bash
-rag-rat init --dry-run
-```
-
-Use `--yes` for the default non-interactive setup, or `--config <path>` when the config should live
-somewhere other than `rag-rat.toml`.
-
-Manual setup is still available when you need exact control:
-
-```toml
-[index]
-root = "."
-database = ".rag-rat/index.sqlite"
-
-[local_ai.embedding.runtime]
-batch_size = 64
-ort_threads = 4
-omp_threads = 1
-max_embedding_chars = 4000
-
-[target_bindings]
-rust = ["src"]
-typescript = ["src"]
-kotlin = ["src"]
-c = ["src", "include"]
-cpp = ["src", "include"]
-
-[[target]]
-name = "rust-src"
-language = "rust"
-directories = ["src"]
-include = ["**/*.rs"]
-
-[[target]]
-name = "typescript-src"
-language = "typescript"
-directories = ["src"]
-include = ["**/*.ts", "**/*.tsx"]
-
-[[target]]
-name = "kotlin-src"
-language = "kotlin"
-directories = ["src"]
-include = ["**/*.kt"]
-
-[[target]]
-name = "c-src"
-language = "c"
-directories = ["src", "include"]
-include = ["**/*.c", "**/*.h"]
-
-[[target]]
-name = "cpp-src"
-language = "cpp"
-directories = ["src", "include"]
-include = ["**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.hpp", "**/*.hh", "**/*.hxx"]
-
-[[target]]
-name = "docs"
-language = "markdown"
-directories = ["."]
-include = ["**/*.md"]
-exclude = [".git/**", ".rag-rat/**", "target/**", "node_modules/**"]
-```
-
-Then run the pieces directly:
-
-```bash
-rag-rat migrate
-rag-rat index --discover
-rag-rat doctor
-```
-
-Install and reconcile the local embedding model:
-
-```bash
-rag-rat models install fastembed-all-minilm-l6-v2
-rag-rat reconcile --changed-first --limit 500 --batch-size 64
-```
-
-If installed with `--no-default-features`, use the hash baseline instead:
-
-```bash
-rag-rat models install embedding-hash
-```
-
-Add the installed binary to an MCP client config. Use an absolute `--config` path to the target
-repository's `rag-rat.toml`:
-
-```json
-{
-  "mcpServers": {
-    "rag-rat": {
-      "command": "/home/you/.cargo/bin/rag-rat",
-      "args": ["mcp", "--config", "/path/to/your/repo/rag-rat.toml"]
-    }
-  }
-}
-```
-
-For development without installing the binary, point the MCP client at a local `rag-rat` checkout:
-
-```json
-{
-  "mcpServers": {
-    "rag-rat-dev": {
-      "command": "cargo",
-      "args": [
-        "run",
-        "--manifest-path",
-        "/path/to/rag-rat/Cargo.toml",
-        "--bin",
-        "rag-rat",
-        "--",
-        "mcp",
-        "--config",
-        "/path/to/your/repo/rag-rat.toml"
-      ]
-    }
-  }
-}
-```
 
 ## Configuration
 
