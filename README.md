@@ -7,7 +7,7 @@ git, GitHub papertrail, local-AI artifact status, and source-anchored repo memor
 It is built for agents that need more than `rg` but still need local, inspectable provenance:
 
 - current source chunks with stale-anchor validation
-- Rust, TypeScript/TSX, Kotlin, and Markdown structure
+- Rust, TypeScript/TSX, Kotlin, C/C++, and Markdown structure
 - tree-sitter-derived call/reference/import/export graph edges
 - git history, lazy chunk blame, and path-level commit evidence
 - cached GitHub issue/PR/review/comment rationale
@@ -26,7 +26,7 @@ GPT-5.5's take:
 
 `rag-rat` indexes configured repository targets into SQLite. It supports:
 
-- Rust, TypeScript, TSX, Kotlin, and Markdown
+- Rust, TypeScript, TSX, Kotlin, C, C++, and Markdown
 - generated/coarse targets for large or generated files
 - tree-sitter symbols and chunks for supported source languages
 - Markdown heading chunks for docs
@@ -67,7 +67,7 @@ The MCP surface includes:
 
 - `semantic_search`: indexed source/docs recall with SQLite BM25 lexical search and stale-hit
   validation
-- `symbol_lookup`: exact or fuzzy Rust/TypeScript/Kotlin symbol lookup
+- `symbol_lookup`: exact or fuzzy Rust/TypeScript/Kotlin/C/C++ symbol lookup
 - `find_callers` and `trace_callees`: reverse/forward graph traversal
 - `compare_graph_to_text`: graph caller edges compared against regex text hits
 - `impact_surface`: coding preflight that combines graph, optional text fallback, docs, git,
@@ -201,7 +201,7 @@ papertrail metrics. Current-source violations must stay at zero.
 ## Known Limits
 
 - Graph resolution is pragmatic tree-sitter analysis, not compiler/typechecker resolution.
-- Kotlin graph extraction is useful but less mature than Rust and TypeScript.
+- Kotlin and C/C++ graph extraction are useful but less mature than Rust and TypeScript.
 - `index --watch` is reserved and currently returns an explicit not-implemented error.
 - `semantic_search` is currently best understood as lexical BM25 recall plus freshness checks unless
   a real embedding model is installed and reconciled.
@@ -273,10 +273,10 @@ cd /path/to/your/repo
 rag-rat init
 ```
 
-`rag-rat init` scans the repository, shows a compact tree of candidate source roots, prompts for
-languages and path bindings, writes `rag-rat.toml`, migrates the SQLite schema, indexes the repo,
-and offers to install/reconcile the local embedding model. At the end it can also register the MCP
-server for Claude Code or Codex and install the optional git maintenance hooks.
+`rag-rat init` scans the repository, prompts for languages and path bindings, writes
+`rag-rat.toml`, migrates the SQLite schema, indexes the repo, and offers to install/reconcile the
+local embedding model. At the end it can also register the MCP server for Claude Code or Codex and
+install the optional git maintenance hooks.
 
 Preview the generated config without writing anything:
 
@@ -304,6 +304,8 @@ max_embedding_chars = 4000
 rust = ["src"]
 typescript = ["src"]
 kotlin = ["src"]
+c = ["src", "include"]
+cpp = ["src", "include"]
 
 [[target]]
 name = "rust-src"
@@ -322,6 +324,18 @@ name = "kotlin-src"
 language = "kotlin"
 directories = ["src"]
 include = ["**/*.kt"]
+
+[[target]]
+name = "c-src"
+language = "c"
+directories = ["src", "include"]
+include = ["**/*.c", "**/*.h"]
+
+[[target]]
+name = "cpp-src"
+language = "cpp"
+directories = ["src", "include"]
+include = ["**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.hpp", "**/*.hh", "**/*.hxx"]
 
 [[target]]
 name = "docs"

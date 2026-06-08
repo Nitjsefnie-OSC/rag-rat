@@ -24,12 +24,23 @@ pub struct ParsedSymbolFact {
     pub value: String,
 }
 
+const NAME_KINDS: &[&str] = &[
+    "identifier",
+    "type_identifier",
+    "property_identifier",
+    "field_identifier",
+    "simple_identifier",
+    "namespace_identifier",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserKind {
     Rust,
     TypeScript,
     Tsx,
     Kotlin,
+    C,
+    Cpp,
     Markdown,
 }
 
@@ -44,6 +55,8 @@ pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
             }
         },
         Language::Kotlin => ParserKind::Kotlin,
+        Language::C => ParserKind::C,
+        Language::Cpp => ParserKind::Cpp,
         Language::Markdown => ParserKind::Markdown,
     }
 }
@@ -54,24 +67,37 @@ pub fn parse_symbols(
     text: &str,
 ) -> anyhow::Result<Vec<ParsedSymbol>> {
     match parser_kind(path, language) {
-        ParserKind::Rust => parse_tree_sitter(path, language, text, tree_sitter_rust::language()),
-        ParserKind::TypeScript => {
-            parse_tree_sitter(path, language, text, tree_sitter_typescript::language_typescript())
+        ParserKind::Rust => {
+            parse_tree_sitter(path, language, text, tree_sitter_rust::LANGUAGE.into())
         },
+        ParserKind::TypeScript => parse_tree_sitter(
+            path,
+            language,
+            text,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
         ParserKind::Tsx => {
-            parse_tree_sitter(path, language, text, tree_sitter_typescript::language_tsx())
+            parse_tree_sitter(path, language, text, tree_sitter_typescript::LANGUAGE_TSX.into())
         },
-        ParserKind::Kotlin => parse_kotlin(path, text),
+        ParserKind::Kotlin => {
+            parse_tree_sitter(path, language, text, tree_sitter_kotlin::LANGUAGE.into())
+        },
+        ParserKind::C => parse_tree_sitter(path, language, text, tree_sitter_c::LANGUAGE.into()),
+        ParserKind::Cpp => {
+            parse_tree_sitter(path, language, text, tree_sitter_cpp::LANGUAGE.into())
+        },
         ParserKind::Markdown => Ok(Vec::new()),
     }
 }
 
 pub fn parse_error(path: &Path, language: Language, text: &str) -> anyhow::Result<Option<String>> {
     let grammar = match parser_kind(path, language) {
-        ParserKind::Rust => tree_sitter_rust::language(),
-        ParserKind::TypeScript => tree_sitter_typescript::language_typescript(),
-        ParserKind::Tsx => tree_sitter_typescript::language_tsx(),
-        ParserKind::Kotlin => tree_sitter_kotlin::language(),
+        ParserKind::Rust => tree_sitter_rust::LANGUAGE.into(),
+        ParserKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ParserKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        ParserKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
+        ParserKind::C => tree_sitter_c::LANGUAGE.into(),
+        ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         ParserKind::Markdown => return Ok(None),
     };
     let mut parser = tree_sitter::Parser::new();
@@ -95,18 +121,6 @@ fn parse_tree_sitter(
         parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
     let mut out = Vec::new();
     collect_symbols(path, language, text, tree.root_node(), &mut out);
-    out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
-    out.dedup_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.name.clone()));
-    Ok(out)
-}
-
-fn parse_kotlin(path: &Path, text: &str) -> anyhow::Result<Vec<ParsedSymbol>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&tree_sitter_kotlin::language())?;
-    let tree =
-        parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
-    let mut out = Vec::new();
-    collect_kotlin_symbols(path, text, tree.root_node(), &mut out);
     out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
     out.dedup_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.name.clone()));
     Ok(out)
@@ -143,33 +157,6 @@ fn collect_symbols(
     }
 }
 
-fn collect_kotlin_symbols(
-    path: &Path,
-    text: &str,
-    node: tree_sitter::Node<'_>,
-    out: &mut Vec<ParsedSymbol>,
-) {
-    if node.is_error() || node.is_missing() {
-        return;
-    }
-    if let Some((kind, name)) = kotlin_symbol_node(node, text) {
-        out.push(make_symbol(
-            path,
-            Language::Kotlin,
-            text,
-            node,
-            kind,
-            name,
-            node.start_byte(),
-            node.end_byte(),
-        ));
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_kotlin_symbols(path, text, child, out);
-    }
-}
-
 fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node<'_>)> {
     let kind = node.kind();
     match language {
@@ -193,62 +180,125 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             "class_declaration" => Some(("class", child_name(node)?)),
             "interface_declaration" => Some(("interface", child_name(node)?)),
             "type_alias_declaration" => Some(("type", child_name(node)?)),
-            "lexical_declaration" | "variable_declarator" | "public_field_definition" => {
-                Some(("const", child_name(node)?))
+            "variable_declarator" | "public_field_definition" => Some(("const", child_name(node)?)),
+            _ => None,
+        },
+        Language::Kotlin => match kind {
+            "class_declaration" => Some(("class", child_name(node)?)),
+            "object_declaration" => Some(("object", child_name(node)?)),
+            "function_declaration" => Some(("function", child_name(node)?)),
+            "property_declaration" => Some(("property", child_name(node)?)),
+            "companion_object" | "companion_object_declaration" => {
+                Some(("object", companion_name(node).unwrap_or(node)))
             },
             _ => None,
         },
-        Language::Kotlin | Language::Markdown => None,
+        Language::C => match kind {
+            "function_definition" => {
+                Some(("function", function_name(node).or_else(|| child_name(node))?))
+            },
+            "declaration" if has_descendant_kind(node, "function_declarator") => {
+                Some(("function", function_name(node).or_else(|| child_name(node))?))
+            },
+            "struct_specifier" => Some(("struct", child_name(node)?)),
+            "union_specifier" => Some(("union", child_name(node)?)),
+            "enum_specifier" => Some(("enum", child_name(node)?)),
+            "type_definition" => Some(("type", child_name(node)?)),
+            "preproc_function_def" => Some(("macro", child_name(node)?)),
+            _ => None,
+        },
+        Language::Cpp => match kind {
+            "function_definition" => {
+                Some(("function", function_name(node).or_else(|| child_name(node))?))
+            },
+            "declaration" if has_descendant_kind(node, "function_declarator") => {
+                Some(("function", function_name(node).or_else(|| child_name(node))?))
+            },
+            "class_specifier" => Some(("class", child_name(node)?)),
+            "struct_specifier" => Some(("struct", child_name(node)?)),
+            "union_specifier" => Some(("union", child_name(node)?)),
+            "enum_specifier" => Some(("enum", child_name(node)?)),
+            "type_definition" | "alias_declaration" => Some(("type", child_name(node)?)),
+            "namespace_definition" => Some(("namespace", child_name(node)?)),
+            "preproc_function_def" => Some(("macro", child_name(node)?)),
+            _ => None,
+        },
+        Language::Markdown => None,
     }
 }
 
-fn kotlin_symbol_node(node: tree_sitter::Node<'_>, text: &str) -> Option<(&'static str, String)> {
-    let kind = node.kind();
-    let symbol_kind = match kind {
-        "class_declaration" => "class",
-        "object_declaration" => "object",
-        "function_declaration" => "function",
-        "property_declaration" => "property",
-        "companion_object" | "companion_object_declaration" => "object",
-        _ => return None,
-    };
+fn child_name(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(name) = node.child_by_field_name("name") {
+        return Some(name);
+    }
+
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if matches!(child.kind(), "simple_identifier" | "type_identifier") {
-            return Some((symbol_kind, child.utf8_text(text.as_bytes()).ok()?.to_string()));
-        }
+    if let Some(name) =
+        node.named_children(&mut cursor).find(|child| NAME_KINDS.contains(&child.kind()))
+    {
+        return Some(name);
     }
-    if kind == "property_declaration" {
-        let name = first_descendant_text(node, text, &["simple_identifier"])?;
-        return Some((symbol_kind, name));
-    }
-    matches!(kind, "companion_object" | "companion_object_declaration")
-        .then(|| (symbol_kind, "companion".to_string()))
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| first_descendant_node(child, NAME_KINDS))
 }
 
-fn first_descendant_text(node: Node<'_>, text: &str, kinds: &[&str]) -> Option<String> {
+fn first_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if kinds.contains(&child.kind()) {
-            return child.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned);
+            return Some(child);
         }
-        if let Some(value) = first_descendant_text(child, text, kinds) {
+        if let Some(value) = first_descendant_node(child, kinds) {
             return Some(value);
         }
     }
     None
 }
 
-fn child_name(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("name").or_else(|| {
-        let mut cursor = node.walk();
-        node.named_children(&mut cursor).find(|child| {
-            matches!(
-                child.kind(),
-                "identifier" | "type_identifier" | "property_identifier" | "field_identifier"
-            )
-        })
-    })
+fn has_descendant_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == kind || has_descendant_kind(child, kind))
+}
+
+fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
+    for index in 0..node.child_count() {
+        let Some(index) = u32::try_from(index).ok() else {
+            continue;
+        };
+        if let Some(child) = node.child(index)
+            && child.kind() == "companion"
+        {
+            return Some(child);
+        }
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "simple_identifier" | "type_identifier"))
+}
+
+fn function_name(node: Node<'_>) -> Option<Node<'_>> {
+    let declarator = first_descendant_node(node, &["function_declarator"]).unwrap_or(node);
+    let name_root = declarator.child_by_field_name("declarator").unwrap_or(declarator);
+    if NAME_KINDS.contains(&name_root.kind()) {
+        return Some(name_root);
+    }
+    last_descendant_node(name_root, NAME_KINDS)
+}
+
+fn last_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    let mut last = None;
+    for child in node.named_children(&mut cursor) {
+        if kinds.contains(&child.kind()) {
+            last = Some(child);
+        }
+        if let Some(value) = last_descendant_node(child, kinds) {
+            last = Some(value);
+        }
+    }
+    last
 }
 
 fn impl_name(node: Node<'_>) -> Option<Node<'_>> {

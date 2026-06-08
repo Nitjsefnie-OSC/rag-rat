@@ -1094,7 +1094,7 @@ pub fn description(name: &str) -> &'static str {
         "semantic_search" => {
             "Search indexed source and docs with SQLite BM25 lexical recall; validates stale hits."
         },
-        "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin symbols.",
+        "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin, C, or C++ symbols.",
         "find_callers" => "Traverse tree-sitter-derived reverse graph edges for callers.",
         "trace_callees" => "Traverse tree-sitter-derived forward graph edges for callees.",
         "compare_graph_to_text" => {

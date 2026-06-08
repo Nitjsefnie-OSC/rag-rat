@@ -9,6 +9,8 @@ pub enum Language {
     Rust,
     TypeScript,
     Kotlin,
+    C,
+    Cpp,
     Markdown,
 }
 
@@ -18,6 +20,8 @@ impl Language {
             Self::Rust => "rust",
             Self::TypeScript => "typescript",
             Self::Kotlin => "kotlin",
+            Self::C => "c",
+            Self::Cpp => "cpp",
             Self::Markdown => "markdown",
         }
     }
@@ -27,13 +31,15 @@ impl Language {
             Self::Rust => &["rs"],
             Self::TypeScript => &["ts", "tsx"],
             Self::Kotlin => &["kt", "kts"],
+            Self::C => &["c", "h"],
+            Self::Cpp => &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
             Self::Markdown => &["md", "markdown"],
         }
     }
 
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?;
-        [Self::Rust, Self::TypeScript, Self::Kotlin, Self::Markdown]
+        [Self::Rust, Self::TypeScript, Self::Kotlin, Self::C, Self::Cpp, Self::Markdown]
             .into_iter()
             .find(|language| language.simple_extensions().contains(&ext))
     }
@@ -53,6 +59,8 @@ impl FromStr for Language {
             "rust" | "rs" => Ok(Self::Rust),
             "typescript" | "ts" | "tsx" => Ok(Self::TypeScript),
             "kotlin" | "kt" => Ok(Self::Kotlin),
+            "c" => Ok(Self::C),
+            "cpp" | "c++" | "cc" | "cxx" => Ok(Self::Cpp),
             "markdown" | "md" => Ok(Self::Markdown),
             other => Err(LanguageError::Unknown(other.to_string())),
         }

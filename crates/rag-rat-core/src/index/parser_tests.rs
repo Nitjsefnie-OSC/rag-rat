@@ -113,6 +113,68 @@ class WatchProposalBuilder {
 }
 
 #[test]
+fn extracts_c_symbols() {
+    let text = r#"
+#include <stdio.h>
+
+typedef struct Runtime Runtime;
+
+struct Runtime {
+    int state;
+};
+
+enum RuntimeState {
+    RuntimeOpen,
+};
+
+int runtime_open(Runtime *runtime) {
+    return runtime->state;
+}
+
+int runtime_close(Runtime *runtime);
+
+#define runtime_debug(value) value
+"#;
+    let symbols = parser::parse_symbols(Path::new("src/runtime.c"), Language::C, text).unwrap();
+    assert_eq!(parser::parser_kind(Path::new("src/runtime.c"), Language::C), ParserKind::C);
+    assert_symbol(&symbols, "struct", "Runtime");
+    assert_symbol(&symbols, "enum", "RuntimeState");
+    assert_symbol(&symbols, "function", "runtime_open");
+    assert_symbol(&symbols, "function", "runtime_close");
+    assert_symbol(&symbols, "macro", "runtime_debug");
+}
+
+#[test]
+fn extracts_cpp_symbols() {
+    let text = r#"
+#include <memory>
+
+namespace held {
+class Runtime {
+public:
+    Runtime();
+    void open();
+};
+
+struct RuntimeConfig {
+    int workers;
+};
+
+using RuntimePtr = std::shared_ptr<Runtime>;
+
+void Runtime::open() {}
+}
+"#;
+    let symbols = parser::parse_symbols(Path::new("src/runtime.cpp"), Language::Cpp, text).unwrap();
+    assert_eq!(parser::parser_kind(Path::new("src/runtime.cpp"), Language::Cpp), ParserKind::Cpp);
+    assert_symbol(&symbols, "namespace", "held");
+    assert_symbol(&symbols, "class", "Runtime");
+    assert_symbol(&symbols, "struct", "RuntimeConfig");
+    assert_symbol(&symbols, "type", "RuntimePtr");
+    assert_symbol(&symbols, "function", "open");
+}
+
+#[test]
 fn markdown_uses_no_tree_sitter_symbols() {
     assert_eq!(
         parser::parser_kind(Path::new("docs/search.md"), Language::Markdown),

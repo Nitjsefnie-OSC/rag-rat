@@ -53,7 +53,7 @@ impl RagRatService {
 
     #[tool(
         name = "symbol_lookup",
-        description = "Find exact or fuzzy Rust, TypeScript, Kotlin symbols."
+        description = "Find exact or fuzzy Rust, TypeScript, Kotlin, C, or C++ symbols."
     )]
     fn symbol_lookup(
         &self,

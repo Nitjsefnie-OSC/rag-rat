@@ -11,7 +11,6 @@ use rag_rat_core::{
     index::ai::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, ReconcileOptions},
     language::Language,
 };
-use termtree::Tree;
 
 use crate::{
     apply_embedding_runtime_env, git_paths, render_index_progress, render_reconcile_progress,
@@ -51,11 +50,7 @@ struct InitPlan {
 struct RepoScan {
     language_counts: BTreeMap<Language, usize>,
     dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
-}
-
-#[derive(Debug, Default)]
-struct TreeNode {
-    children: BTreeMap<String, TreeNode>,
+    direct_dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
 }
 
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -117,8 +112,8 @@ impl InitOptions {
 fn prompt_plan(root: PathBuf, root_value: String, scan: &RepoScan) -> anyhow::Result<InitPlan> {
     println!("Repository root: {}", root.display());
     println!();
-    println!("Detected source tree:");
-    print_language_tree(scan)?;
+    println!("Detected languages:");
+    print_language_summary(scan);
     println!();
 
     let language_items = supported_languages()
@@ -152,7 +147,6 @@ fn prompt_plan(root: PathBuf, root_value: String, scan: &RepoScan) -> anyhow::Re
         }
         println!();
         println!("Candidate paths for {}:", language.as_str());
-        print_candidate_tree(&candidates)?;
         let items = candidates
             .iter()
             .map(|candidate| {
@@ -397,6 +391,12 @@ fn add_file_to_dir_counts(
 ) -> anyhow::Result<()> {
     let parent = path.parent().unwrap_or(root);
     let relative_parent = parent.strip_prefix(root).unwrap_or(parent);
+    *scan
+        .direct_dir_counts
+        .entry(language)
+        .or_default()
+        .entry(relative_parent.to_path_buf())
+        .or_default() += 1;
     *scan.dir_counts.entry(language).or_default().entry(PathBuf::from(".")).or_default() += 1;
     let mut current = PathBuf::new();
     for component in relative_parent.components() {
@@ -427,7 +427,7 @@ fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCandidate> {
         .map(|(path, count)| DirCandidate {
             path: path.clone(),
             count: *count,
-            default: default_dir(language, path),
+            default: default_dir(scan, language, path),
         })
         .collect::<Vec<_>>();
     if !candidates.iter().any(|candidate| candidate.default)
@@ -446,7 +446,7 @@ fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCandidate> {
     candidates
 }
 
-fn default_dir(language: Language, path: &Path) -> bool {
+fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> bool {
     let text = display_rel(path);
     match language {
         Language::Rust => text == "src" || text.ends_with("/src"),
@@ -457,48 +457,39 @@ fn default_dir(language: Language, path: &Path) -> bool {
                 || text.ends_with("/src/main/java")
                 || text.ends_with("/src/main/kotlin")
         },
+        Language::C | Language::Cpp => {
+            text == "src"
+                || text.ends_with("/src")
+                || text == "include"
+                || text.ends_with("/include")
+                || directly_contains_source(scan, language, path)
+        },
         Language::Markdown => text == "docs" || text == ".",
     }
+}
+
+fn directly_contains_source(scan: &RepoScan, language: Language, path: &Path) -> bool {
+    path != Path::new(".")
+        && scan
+            .direct_dir_counts
+            .get(&language)
+            .and_then(|counts| counts.get(path))
+            .copied()
+            .unwrap_or_default()
+            > 0
 }
 
 fn path_depth(path: &Path) -> usize {
     if path == Path::new(".") { 0 } else { path.components().count() }
 }
 
-fn print_language_tree(scan: &RepoScan) -> anyhow::Result<()> {
-    let candidates = supported_languages()
-        .into_iter()
-        .flat_map(|language| candidate_dirs(scan, language))
-        .collect::<Vec<_>>();
-    print_candidate_tree(&candidates)
-}
-
-fn print_candidate_tree(candidates: &[DirCandidate]) -> anyhow::Result<()> {
-    let mut root = TreeNode::default();
-    for candidate in candidates {
-        insert_tree_path(&mut root, &candidate.path);
+fn print_language_summary(scan: &RepoScan) {
+    for language in supported_languages() {
+        let count = scan.language_counts.get(&language).copied().unwrap_or_default();
+        if count > 0 {
+            println!("  {}: {count} files", language.as_str());
+        }
     }
-    print!("{}", build_tree(".".to_string(), &root));
-    Ok(())
-}
-
-fn insert_tree_path(root: &mut TreeNode, path: &Path) {
-    if path == Path::new(".") {
-        return;
-    }
-    let mut node = root;
-    for component in path.components() {
-        let name = component.as_os_str().to_string_lossy().to_string();
-        node = node.children.entry(name).or_default();
-    }
-}
-
-fn build_tree(name: String, node: &TreeNode) -> Tree<String> {
-    let mut tree = Tree::new(name);
-    for (name, child) in &node.children {
-        tree.push(build_tree(name.clone(), child));
-    }
-    tree
 }
 
 fn render_config(plan: &InitPlan) -> String {
@@ -564,7 +555,14 @@ fn display_rel(path: &Path) -> String {
 }
 
 fn supported_languages() -> Vec<Language> {
-    vec![Language::Rust, Language::TypeScript, Language::Kotlin, Language::Markdown]
+    vec![
+        Language::Rust,
+        Language::TypeScript,
+        Language::Kotlin,
+        Language::C,
+        Language::Cpp,
+        Language::Markdown,
+    ]
 }
 
 fn option_value(args: &[String], name: &str) -> Option<String> {
@@ -612,6 +610,7 @@ mod tests {
                     BTreeMap::from([(PathBuf::from("."), 1), (PathBuf::from("docs"), 1)]),
                 ),
             ]),
+            direct_dir_counts: BTreeMap::new(),
         };
 
         let plan = default_plan(".".to_string(), &scan);
@@ -622,6 +621,42 @@ mod tests {
             plan.bindings[&Language::Markdown],
             vec![PathBuf::from("."), PathBuf::from("docs")]
         );
+    }
+
+    #[test]
+    fn c_defaults_include_direct_source_feature_dirs() {
+        let scan = RepoScan {
+            language_counts: BTreeMap::from([(Language::C, 10)]),
+            dir_counts: BTreeMap::from([(
+                Language::C,
+                BTreeMap::from([
+                    (PathBuf::from("."), 10),
+                    (PathBuf::from("drivers"), 1),
+                    (PathBuf::from("drivers/entropy"), 1),
+                    (PathBuf::from("samples"), 9),
+                    (PathBuf::from("samples/simple_txrx"), 9),
+                    (PathBuf::from("samples/simple_txrx/src"), 9),
+                ]),
+            )]),
+            direct_dir_counts: BTreeMap::from([(
+                Language::C,
+                BTreeMap::from([
+                    (PathBuf::from("drivers/entropy"), 1),
+                    (PathBuf::from("samples/simple_txrx/src"), 1),
+                ]),
+            )]),
+        };
+
+        let defaults = candidate_dirs(&scan, Language::C)
+            .into_iter()
+            .filter(|candidate| candidate.default)
+            .map(|candidate| candidate.path)
+            .collect::<Vec<_>>();
+
+        assert!(defaults.contains(&PathBuf::from("drivers/entropy")));
+        assert!(defaults.contains(&PathBuf::from("samples/simple_txrx/src")));
+        assert!(!defaults.contains(&PathBuf::from("drivers")));
+        assert!(!defaults.contains(&PathBuf::from(".")));
     }
 
     #[test]

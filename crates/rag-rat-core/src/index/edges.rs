@@ -439,10 +439,12 @@ fn syntactic_edges(
     symbols: &[IndexedSymbol],
 ) -> anyhow::Result<Vec<EdgeCandidate>> {
     let grammar = match parser::parser_kind(path, language) {
-        ParserKind::Rust => tree_sitter_rust::language(),
-        ParserKind::TypeScript => tree_sitter_typescript::language_typescript(),
-        ParserKind::Tsx => tree_sitter_typescript::language_tsx(),
-        ParserKind::Kotlin => tree_sitter_kotlin::language(),
+        ParserKind::Rust => tree_sitter_rust::LANGUAGE.into(),
+        ParserKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ParserKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        ParserKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
+        ParserKind::C => tree_sitter_c::LANGUAGE.into(),
+        ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         ParserKind::Markdown => return Ok(Vec::new()),
     };
     let mut parser = tree_sitter::Parser::new();
@@ -470,6 +472,7 @@ fn collect_edges(
         Language::Rust => rust_edges(text, node, symbols, path, out),
         Language::TypeScript => typescript_edges(text, node, symbols, path, out),
         Language::Kotlin => kotlin_edges(text, node, symbols, path, out),
+        Language::C | Language::Cpp => c_like_edges(text, node, symbols, path, out),
         Language::Markdown => {},
     }
 
@@ -813,6 +816,69 @@ fn kotlin_edges(
     }
 }
 
+fn c_like_edges(
+    text: &str,
+    node: Node<'_>,
+    symbols: &[IndexedSymbol],
+    path: &Path,
+    out: &mut Vec<EdgeCandidate>,
+) {
+    match node.kind() {
+        "preproc_include" => {
+            let include = node_text(node, text)
+                .trim()
+                .trim_start_matches("#include")
+                .trim()
+                .trim_matches(['<', '>', '"'])
+                .to_string();
+            if !include.is_empty() {
+                out.push(file_edge(
+                    path,
+                    node,
+                    text,
+                    include,
+                    EdgeKind::Imports,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+        },
+        "call_expression" => {
+            let identifiers =
+                identifiers_under(node.child_by_field_name("function").unwrap_or(node), text);
+            if let Some(name) = identifiers.last().cloned().or_else(|| call_target_name(node, text))
+            {
+                out.push(symbol_edge_with_context(
+                    symbols,
+                    node,
+                    text,
+                    name,
+                    EdgeKind::CallsName,
+                    EdgeConfidence::NameOnly,
+                    EdgeContext {
+                        target_qualified_name: c_like_qualified_name(&identifiers),
+                        receiver_hint: identifiers
+                            .first()
+                            .filter(|_| identifiers.len() > 1)
+                            .cloned(),
+                    },
+                ));
+            }
+        },
+        "type_identifier" | "qualified_identifier" | "namespace_identifier" => {
+            if let Some(name) = last_identifier_text(node, text) {
+                out.push(symbol_edge(
+                    symbols,
+                    node,
+                    name,
+                    EdgeKind::ReferencesType,
+                    EdgeConfidence::NameOnly,
+                ));
+            }
+        },
+        _ => {},
+    }
+}
+
 fn file_edge(
     path: &Path,
     node: Node<'_>,
@@ -883,6 +949,10 @@ fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String> {
 }
 
 fn dotted_qualified_name(identifiers: &[String]) -> Option<String> {
+    (identifiers.len() > 1).then(|| identifiers.join("::"))
+}
+
+fn c_like_qualified_name(identifiers: &[String]) -> Option<String> {
     (identifiers.len() > 1).then(|| identifiers.join("::"))
 }
 
@@ -987,6 +1057,7 @@ fn is_identifier_kind(kind: &str) -> bool {
             | "shorthand_property_identifier"
             | "simple_identifier"
             | "package_identifier"
+            | "namespace_identifier"
     )
 }
 

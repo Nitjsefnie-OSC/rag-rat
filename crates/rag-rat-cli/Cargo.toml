@@ -17,5 +17,4 @@ rag-rat-core = { path = "../rag-rat-core" }
 rag-rat-mcp = { path = "../rag-rat-mcp" }
 serde.workspace = true
 serde_json.workspace = true
-termtree = "1.0.0"
 tokio.workspace = true
