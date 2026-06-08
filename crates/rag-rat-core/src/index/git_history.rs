@@ -114,8 +114,28 @@ struct FileChange {
     change_kind: String,
 }
 
-pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
+#[derive(Debug)]
+pub(crate) struct PreparedGitHistory {
+    repo: Option<GitRepo>,
+    commits: Vec<CommitRecord>,
+    changes: Vec<FileChange>,
+}
+
+pub(crate) fn prepare(root: &Path) -> anyhow::Result<PreparedGitHistory> {
     let Some(repo) = git_repo(root) else {
+        return Ok(PreparedGitHistory { repo: None, commits: Vec::new(), changes: Vec::new() });
+    };
+    let commits = read_commits(root)?;
+    let changes = read_file_changes(root, &repo.worktree_root)?;
+    Ok(PreparedGitHistory { repo: Some(repo), commits, changes })
+}
+
+pub(crate) fn apply_prepared(
+    conn: &Connection,
+    root: &Path,
+    prepared: PreparedGitHistory,
+) -> anyhow::Result<GitHistoryIndexStatus> {
+    let Some(repo) = prepared.repo else {
         clear(conn)?;
         return status(conn, root);
     };
@@ -129,8 +149,7 @@ pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexSt
         ",
     )?;
 
-    let commits = read_commits(root)?;
-    for commit in &commits {
+    for commit in &prepared.commits {
         conn.execute(
             "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, committed_at_s, subject, body, changed_file_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
@@ -146,9 +165,8 @@ pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexSt
         )?;
     }
 
-    let changes = read_file_changes(root, &repo.worktree_root)?;
     let mut changed_counts = BTreeMap::<String, i64>::new();
-    for change in changes {
+    for change in prepared.changes {
         *changed_counts.entry(change.commit_hash.clone()).or_default() += 1;
         conn.execute(
             "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind)
@@ -177,6 +195,11 @@ pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexSt
     )?;
     set_meta(conn, "git_history_indexed_head", &repo.head)?;
     status(conn, root)
+}
+
+pub fn index(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
+    let prepared = prepare(root)?;
+    apply_prepared(conn, root, prepared)
 }
 
 pub fn status(conn: &Connection, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {

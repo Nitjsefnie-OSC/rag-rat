@@ -24,6 +24,7 @@ use std::{
         mpsc,
     },
     thread,
+    thread::JoinHandle,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -309,6 +310,8 @@ impl IndexDatabase {
         let mut db = Self::create_or_migrate(&config.database)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        progress(IndexProgress::IndexingGitHistory);
+        let mut git_history = Some(spawn_git_history_prepare(&config.root));
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.clear_full_rebuild_tables()?;
@@ -316,8 +319,12 @@ impl IndexDatabase {
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
-            progress(IndexProgress::IndexingGitHistory);
-            db.index_git_history(&config.root)?;
+            db.apply_prepared_git_history(
+                &config.root,
+                git_history
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
+            )?;
             progress(IndexProgress::RebuildingLogicalSymbols);
             db.rebuild_logical_symbols()?;
             progress(IndexProgress::ResolvingGraph);
@@ -331,6 +338,9 @@ impl IndexDatabase {
             Ok(())
         })();
         if result.is_err() {
+            if let Some(handle) = git_history.take() {
+                let _ = join_git_history_prepare(handle);
+            }
             let _ = db.storage.execute_batch("ROLLBACK");
         }
         result?;
@@ -484,18 +494,24 @@ impl IndexDatabase {
             return Self::rebuild_with_progress(config, progress);
         }
         progress(IndexProgress::Started { database: config.database.clone(), mode });
+        progress(IndexProgress::IndexingGitHistory);
+        let mut git_history = Some(spawn_git_history_prepare(&config.root));
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
-            progress(IndexProgress::IndexingGitHistory);
-            db.index_git_history(&config.root)?;
             let indexed = match mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
+            db.apply_prepared_git_history(
+                &config.root,
+                git_history
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
+            )?;
             if indexed > 0 {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
@@ -511,6 +527,9 @@ impl IndexDatabase {
             Ok(())
         })();
         if result.is_err() {
+            if let Some(handle) = git_history.take() {
+                let _ = join_git_history_prepare(handle);
+            }
             let _ = db.storage.execute_batch("ROLLBACK");
         }
         result?;
@@ -2083,8 +2102,13 @@ impl IndexDatabase {
         Ok(())
     }
 
-    fn index_git_history(&self, root: &Path) -> anyhow::Result<GitHistoryIndexStatus> {
-        git_history::index(self.storage.connection(), root)
+    fn apply_prepared_git_history(
+        &self,
+        root: &Path,
+        handle: JoinHandle<anyhow::Result<git_history::PreparedGitHistory>>,
+    ) -> anyhow::Result<GitHistoryIndexStatus> {
+        let prepared = join_git_history_prepare(handle)?;
+        git_history::apply_prepared(self.storage.connection(), root, prepared)
     }
 
     fn git_history_status(&self) -> anyhow::Result<GitHistoryIndexStatus> {
