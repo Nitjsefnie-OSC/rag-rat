@@ -1604,11 +1604,10 @@ fn now_ms() -> i64 {
 }
 
 fn fts_query(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|term| term.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
+    let terms = query
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
         .filter(|term| !term.is_empty())
-        .map(|term| format!("{term}*"))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    terms.join(" OR ")
 }

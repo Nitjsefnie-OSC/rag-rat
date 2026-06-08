@@ -1626,6 +1626,10 @@ mod tests {
             call_tool(&config.database, "memory_search", json!({"query": "logical helper"}))
                 .unwrap();
         assert_eq!(search.as_array().unwrap()[0]["memory_id"], memory_id);
+        let path_like_search =
+            call_tool(&config.database, "memory_search", json!({"query": "follow-up/src/lib.rs"}))
+                .unwrap();
+        assert!(path_like_search.is_array());
 
         let chunk_id =
             memory["memory"]["bindings"].as_array().unwrap()[0]["chunk_id"].as_i64().unwrap();
