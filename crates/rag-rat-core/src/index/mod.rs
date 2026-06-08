@@ -340,24 +340,101 @@ impl IndexDatabase {
     fn clear_full_rebuild_tables(&self) -> anyhow::Result<()> {
         self.storage.execute_batch(
             "
-            DELETE FROM main.chunk_fts;
-            DELETE FROM main.commit_fts;
-            DELETE FROM main.reconcile_attempts;
-            DELETE FROM main.reconcile_meta;
-            DELETE FROM main.chunk_summaries;
-            DELETE FROM main.chunk_embeddings;
-            DELETE FROM main.git_chunk_blame;
-            DELETE FROM main.git_file_changes;
-            DELETE FROM main.git_commits;
-            DELETE FROM main.symbol_facts;
-            DELETE FROM main.logical_symbol_members;
-            DELETE FROM main.logical_symbols;
-            DELETE FROM main.edges;
-            DELETE FROM main.docs;
-            DELETE FROM main.parser_failures;
-            DELETE FROM main.symbols;
-            DELETE FROM main.chunks;
-            DELETE FROM main.files;
+            CREATE TEMP TABLE IF NOT EXISTS full_rebuild_file_ids(id INTEGER PRIMARY KEY);
+            DELETE FROM temp.full_rebuild_file_ids;
+            INSERT OR IGNORE INTO temp.full_rebuild_file_ids(id)
+            SELECT id
+            FROM main.files
+            WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = 'worktree_id')
+              AND worktree_id != '';
+            INSERT OR IGNORE INTO temp.full_rebuild_file_ids(id)
+            SELECT id
+            FROM main.files
+            WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
+              AND commit_sha != ''
+              AND path NOT IN (
+                  SELECT path FROM main.files
+                  WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = 'worktree_id')
+                    AND worktree_id != ''
+              );
+
+            UPDATE main.edges
+            SET to_symbol_id = NULL,
+                target_start_line = NULL,
+                target_end_line = NULL,
+                resolution = 'unresolved'
+            WHERE to_symbol_id IN (
+                SELECT symbols.id
+                FROM main.symbols
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+            );
+            DELETE FROM main.edges
+            WHERE source_file_id IN (SELECT id FROM temp.full_rebuild_file_ids)
+               OR from_symbol_id IN (
+                    SELECT symbols.id
+                    FROM main.symbols
+                    JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+               );
+
+            DELETE FROM main.logical_symbol_members
+            WHERE symbol_id IN (
+                SELECT symbols.id
+                FROM main.symbols
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+            );
+            DELETE FROM main.logical_symbols
+            WHERE id NOT IN (
+                SELECT logical_symbol_id FROM main.logical_symbol_members
+            );
+            DELETE FROM main.symbol_facts
+            WHERE symbol_id IN (
+                SELECT symbols.id
+                FROM main.symbols
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+            );
+            DELETE FROM main.chunk_fts
+            WHERE rowid IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+            );
+            DELETE FROM main.chunk_summaries
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+            );
+            DELETE FROM main.chunk_embeddings
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+            );
+            DELETE FROM main.git_chunk_blame
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+            );
+            DELETE FROM main.docs
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+            );
+            DELETE FROM main.parser_failures
+            WHERE path IN (
+                SELECT path
+                FROM main.files
+                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = files.id
+            );
+            DELETE FROM main.symbols
+            WHERE file_id IN (SELECT id FROM temp.full_rebuild_file_ids);
+            DELETE FROM main.chunks
+            WHERE file_id IN (SELECT id FROM temp.full_rebuild_file_ids);
+            DELETE FROM main.files
+            WHERE id IN (SELECT id FROM temp.full_rebuild_file_ids);
+            DELETE FROM temp.full_rebuild_file_ids;
             ",
         )?;
         Ok(())
@@ -1923,8 +2000,26 @@ impl IndexDatabase {
     }
 
     fn rebuild_logical_symbols(&self) -> anyhow::Result<()> {
-        self.storage.connection().execute("DELETE FROM logical_symbol_members", [])?;
-        self.storage.connection().execute("DELETE FROM logical_symbols", [])?;
+        self.storage.connection().execute_batch(
+            "
+            CREATE TEMP TABLE IF NOT EXISTS logical_symbols_to_rebuild(id INTEGER PRIMARY KEY);
+            DELETE FROM temp.logical_symbols_to_rebuild;
+            INSERT OR IGNORE INTO temp.logical_symbols_to_rebuild(id)
+            SELECT logical_symbol_members.logical_symbol_id
+            FROM main.logical_symbol_members
+            JOIN main.symbols ON symbols.id = logical_symbol_members.symbol_id
+            JOIN files ON files.id = symbols.file_id;
+            DELETE FROM main.logical_symbol_members
+            WHERE logical_symbol_id IN (
+                SELECT id FROM temp.logical_symbols_to_rebuild
+            );
+            DELETE FROM main.logical_symbols
+            WHERE id IN (
+                SELECT id FROM temp.logical_symbols_to_rebuild
+            );
+            DELETE FROM temp.logical_symbols_to_rebuild;
+            ",
+        )?;
 
         let mut stmt = self.storage.connection().prepare(
             "
@@ -3487,6 +3582,120 @@ mod schema_bootstrap_tests {
         assert_eq!(after.embedding.model_id, ai::HASH_MODEL_ID);
         assert!(after.embedding.installed);
         assert_eq!(after.embedding.state, "Ready");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_rebuild_preserves_other_worktree_contexts() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn current_context() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let other_file_id = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                INSERT INTO main.files(
+                    path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+                    indexed_revision, commit_sha, worktree_id
+                )
+                VALUES ('src/other.rs', 'rust', 'source', 'other-sha', 0, 0, 1, 'other-sha', '', 'other-worktree')
+                RETURNING id
+                ",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let other_chunk_id = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                INSERT INTO main.chunks(
+                    file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line,
+                    text, text_hash, source_revision, anchor_version, normalized_hash,
+                    start_boundary_hash, end_boundary_hash, start_context_hash, end_context_hash,
+                    context_radius, embedding_policy, embedding_priority
+                )
+                VALUES (?1, 'symbol', 'other_context', 0, 12, 1, 1, 'other context', 'other-text',
+                    'other-sha', 1, '', '', '', '', '', 2, 'Embed', 1)
+                RETURNING id
+                ",
+                [other_file_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "
+                INSERT INTO main.symbols(
+                    file_id, language, name, qualified_name, kind, start_byte, end_byte, signature, docs
+                )
+                VALUES (?1, 'rust', 'other_context', 'other_context', 'function', 0, 12, NULL, NULL)
+                ",
+                [other_file_id],
+            )
+            .unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO main.chunk_fts(rowid, text) VALUES (?1, 'other context')",
+                [other_chunk_id],
+            )
+            .unwrap();
+        drop(db);
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_eq!(
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.files WHERE worktree_id = 'other-worktree'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.chunks WHERE file_id = ?1",
+                    [other_file_id],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.symbols WHERE file_id = ?1",
+                    [other_file_id],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.storage
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM main.chunk_fts WHERE rowid = ?1",
+                    [other_chunk_id],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
