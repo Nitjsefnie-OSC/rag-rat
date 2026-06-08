@@ -257,12 +257,13 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
                    files.kind AS kind,
                    COALESCE(symbols.qualified_name, chunks.symbol_path) AS symbol,
                    CASE
-                       WHEN symbols.kind = 'method'
-                         AND (
-                             chunks.text LIKE '%#[uniffi::export]%impl %'
-                          OR chunks.text LIKE '%#[::uniffi::export]%impl %'
-                         )
-                           THEN 'rust_uniffi_impl_member'
+                       WHEN chunks.text LIKE '%#[uniffi::export]%impl %'
+                         OR chunks.text LIKE '%#[::uniffi::export]%impl %'
+                           THEN CASE
+                               WHEN symbols.kind IN ('function', 'method')
+                                 THEN 'rust_uniffi_impl_member'
+                               ELSE 'rust_uniffi_exported_impl'
+                           END
                        ELSE 'rust_uniffi_export'
                    END AS reason
             FROM chunks
@@ -271,7 +272,7 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
               ON symbols.file_id = files.id
              AND symbols.start_byte >= chunks.start_byte
              AND symbols.end_byte <= chunks.end_byte
-             AND symbols.kind IN ('function', 'method', 'struct', 'enum', 'trait', 'class')
+             AND symbols.kind IN ('function', 'method', 'impl', 'struct', 'enum', 'trait', 'class')
             WHERE files.language = 'rust'
               AND chunks.text LIKE '%uniffi::export%'
               AND (
@@ -330,9 +331,23 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
 
 fn ffi_surface_evidence(reason: &str) -> Vec<String> {
     let mut evidence = vec![format!("ffi_surface evidence class: {reason}")];
-    if reason == "rust_uniffi_impl_member" {
-        evidence
-            .push("member symbol is inside a chunk containing an exported UniFFI impl".to_string());
+    match reason {
+        "rust_uniffi_impl_member" => {
+            evidence.push(
+                "member symbol is inside a chunk containing an exported UniFFI impl".to_string(),
+            );
+            evidence.push(
+                "this row is not claiming the member itself has a #[uniffi::export] attribute"
+                    .to_string(),
+            );
+        },
+        "rust_uniffi_exported_impl" => {
+            evidence.push(
+                "exported impl/type surface; member rows are reported separately when symbols are available"
+                    .to_string(),
+            );
+        },
+        _ => {},
     }
     evidence
 }

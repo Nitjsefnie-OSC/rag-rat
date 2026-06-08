@@ -3811,6 +3811,69 @@ fn caller() {
     }
 
     #[test]
+    fn ffi_surface_labels_exported_impl_members_separately() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub struct PhraseRepo;
+
+#[uniffi::export]
+impl PhraseRepo {
+    pub fn children(&self) {}
+    pub fn journal(&self) {}
+}
+
+#[uniffi::export]
+pub fn exported_fn() {}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE chunks SET text = '#[uniffi::export]' || char(10) || text WHERE symbol_path IN ('src/lib.rs::PhraseRepo', 'src/lib.rs::exported_fn')",
+                [],
+            )
+            .unwrap();
+
+        let surface = db.ffi_surface(20).unwrap();
+        assert!(
+            surface.iter().any(|item| {
+                item.reason == "rust_uniffi_export"
+                    && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("exported_fn"))
+            }),
+            "direct export should remain direct: {surface:?}"
+        );
+        assert!(
+            surface.iter().any(|item| item.reason == "rust_uniffi_exported_impl"),
+            "exported impl/type surface should be explicit: {surface:?}"
+        );
+        assert!(
+            surface.iter().any(|item| {
+                item.reason == "rust_uniffi_impl_member"
+                    && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("children"))
+            }),
+            "impl member should be labeled separately: {surface:?}"
+        );
+        assert!(
+            !surface.iter().any(|item| {
+                item.reason == "rust_uniffi_export"
+                    && item.symbol.as_deref().is_some_and(|symbol| {
+                        symbol.ends_with("children") || symbol.ends_with("journal")
+                    })
+            }),
+            "impl members must not be reported as direct exports: {surface:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn search_and_read_chunk_attach_bounded_graph_evidence() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);

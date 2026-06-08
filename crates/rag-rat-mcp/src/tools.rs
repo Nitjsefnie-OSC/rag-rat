@@ -606,15 +606,32 @@ fn compact_graph_coverage(value: &mut Value, include_coverage: bool) {
     if include_coverage {
         return;
     }
-    let Some(coverage) = value.get_mut("coverage").and_then(Value::as_object_mut) else {
+    let Some(report) = value.as_object_mut() else {
+        return;
+    };
+    let Some(coverage) = report.remove("coverage").and_then(|value| value.as_object().cloned())
+    else {
         return;
     };
     let parser_failures =
         coverage.get("parser_failures").and_then(Value::as_u64).unwrap_or_default();
     let stale_files = coverage.get("stale_files").and_then(Value::as_u64).unwrap_or_default();
     let known_gaps = coverage.get("known_index_gaps").and_then(Value::as_array).map_or(0, Vec::len);
-    if parser_failures == 0 && stale_files == 0 && known_gaps == 0 {
-        coverage.remove("parser_coverage_for_paths");
+    let mut warnings = Vec::new();
+    if parser_failures > 0 {
+        warnings.push(Value::String(format!(
+            "{parser_failures} parser failures may affect graph coverage"
+        )));
+    }
+    if stale_files > 0 {
+        warnings
+            .push(Value::String(format!("{stale_files} stale files may affect graph coverage")));
+    }
+    if known_gaps > 0 {
+        warnings.push(Value::String(format!("{known_gaps} known graph index gaps")));
+    }
+    if !warnings.is_empty() {
+        report.insert("coverage_warnings".to_string(), Value::Array(warnings));
     }
 }
 
@@ -1162,8 +1179,8 @@ mod tests {
         assert_eq!(exact["summary"]["exact_verified"], 1);
         assert_eq!(exact["summary"]["false_positive_risk"], "low");
         assert_eq!(exact["summary"]["completeness_risk"], "low");
-        assert_eq!(exact["coverage"]["stale_files"], 0);
-        assert!(exact["coverage"].get("parser_coverage_for_paths").is_none());
+        assert!(exact.get("coverage").is_none());
+        assert!(exact.get("coverage_warnings").is_none());
         let exact_with_coverage = call_tool(
             &config.database,
             "find_callers",
