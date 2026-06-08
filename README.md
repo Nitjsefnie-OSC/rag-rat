@@ -4,6 +4,78 @@
 files read-only, writes only its configured SQLite database, and exposes current source, graph,
 git, GitHub papertrail, local-AI artifact status, and source-anchored repo memories as evidence.
 
+```mermaid
+flowchart LR
+    subgraph Col1["**Repository evidence**"]
+        direction TB
+        A1["**Current source**<br/>*files, chunks, symbols*<br/>from configured targets"]
+        A2["**Git history**<br/>*commits, paths, blame*<br/>local repository context"]
+        A3["**GitHub papertrail**<br/>*issues, PRs, comments*<br/>cached rationale evidence"]
+        A4["**Repo memories**<br/>*Invariant, Risk, Decision*<br/>agent or human findings / bound to source anchors"]
+    end
+
+    subgraph Col2["**rag-rat evidence engine**"]
+        direction TB
+        B1["**Index current source**<br/>targets → files → chunks<br/>parser → symbols"]
+        B2["**Build code graph**<br/>`logical_symbol_id`<br/>`edge_id`, caller → callee"]
+        B3["**Reconcile retrieval artifacts**<br/>FTS, vectors, freshness<br/>*derived from current chunks*"]
+        B4["**Bind and validate memories**<br/>`logical_symbol_id` → symbol_id<br/>`chunk_id` + text_hash, edge_id<br/>current | relocated | stale | gone"]
+    end
+
+    subgraph Col3["**MCP tools**"]
+        direction TB
+        C1["**Search and read**<br/>`semantic_search`, `read_chunk`"]
+        C2["**Symbols and graph**<br/>`symbol_lookup`, `find_callers`, `trace_callees`"]
+        C3["**Impact and rationale**<br/>`impact_surface`, `papertrail_for_*`, `rationale_search`"]
+        C4["**Memory tools**<br/>`memory_create`/`update`<br/>`memory_for_symbol`, `memory_for_path`<br/>`memory_for_call_path`"]
+    end
+
+    subgraph Col4["**Agent output**"]
+        direction TB
+        D1["**Local evidence**<br/>*current source text*<br/>plus provenance"]
+        D2["**Known context**<br/>*call paths, history,*<br/>papertrail, memories"]
+    end
+
+    %% Repository → Engine
+    A1 --> B1
+    A2 --> B2
+    A3 --> B3
+    A4 --> B4
+
+    %% Internal Engine flow
+    B1 --> B2
+    B2 --> B3
+    B3 --> B4
+
+    %% Engine → MCP Tools
+    B1 -.-> C1
+    B2 -.-> C2
+    B3 -.-> C3
+    B4 -.-> C4
+
+    %% MCP Tools → Agent Output
+    C1 & C2 --> D1
+    C3 & C4 --> D2
+
+    %% Feedback loop
+    D2 -.->|"agent-authored findings<br/>become source-anchored<br/>repo memories"| B4
+
+    classDef repo fill:#f0f4f8,stroke:#2c5f8c,stroke-width:2px,color:#1e3a5f,rx:8,ry:8
+    classDef engine fill:#f8f4eb,stroke:#8c5f2c,stroke-width:2px,color:#5f3a1e,rx:8,ry:8
+    classDef tools fill:#f0f8f0,stroke:#2c8c5f,stroke-width:2px,color:#1e5f3a,rx:8,ry:8
+    classDef output fill:#f8f0f8,stroke:#8c2c5f,stroke-width:2px,color:#5f1e3a,rx:8,ry:8
+
+    class A1,A2,A3,A4 repo
+    class B1,B2,B3,B4 engine
+    class C1,C2,C3,C4 tools
+    class D1,D2 output
+
+    style Col1 fill:none,stroke:none
+    style Col2 fill:none,stroke:none
+    style Col3 fill:none,stroke:none
+    style Col4 fill:none,stroke:none
+```
+
 It is built for agents that need more than `rg` but still need local, inspectable provenance:
 
 - current source chunks with stale-anchor validation
