@@ -214,17 +214,30 @@ impl IndexDatabase {
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
+        Self::migrate_with_fastembed_cache(path, None)
+    }
+
+    fn migrate_with_fastembed_cache(
+        path: &Path,
+        fastembed_cache_dir: Option<&Path>,
+    ) -> anyhow::Result<schema::SchemaStatus> {
         let storage = IndexConnection::open(path)?;
         let status = schema::status(storage.connection())?;
         match status.state {
-            schema::SchemaState::Compatible => return Ok(status),
             schema::SchemaState::Newer | schema::SchemaState::Dirty => {
                 anyhow::bail!("{}", status.message);
             },
-            schema::SchemaState::Missing | schema::SchemaState::Older => {},
+            schema::SchemaState::Compatible => {},
+            schema::SchemaState::Missing | schema::SchemaState::Older => {
+                schema::apply(storage.connection())?;
+            },
         }
-        schema::apply(storage.connection())?;
         ai::ensure_model_manifest(storage.connection())?;
+        if let Some(fastembed_cache_dir) = fastembed_cache_dir {
+            ai::recover_cached_fastembed_model_from(storage.connection(), fastembed_cache_dir)?;
+        } else {
+            ai::recover_cached_fastembed_model(storage.connection())?;
+        }
         schema::status(storage.connection())
     }
 
@@ -3666,6 +3679,63 @@ mod schema_bootstrap_tests {
         assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 1);
         let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
         assert_eq!(stale_embedding_hits.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn cached_fastembed_model_recovers_ready_state() {
+        let (root, config) = markdown_config("alpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let cache_dir = root.join("models");
+        let revision = "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079";
+        let repo = cache_dir.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::create_dir_all(repo.join("snapshots").join(revision)).unwrap();
+        fs::write(repo.join("refs").join("main"), revision).unwrap();
+
+        ai::recover_cached_fastembed_model_at(db.storage.connection(), &cache_dir).unwrap();
+
+        let models = db.list_models().unwrap();
+        let fastembed =
+            models.iter().find(|model| model.model_id == ai::FASTEMBED_MODEL_ID).unwrap();
+        assert!(fastembed.installed);
+        assert_eq!(fastembed.status, "Ready");
+        let status = db.local_ai_status().unwrap();
+        assert_eq!(status.fastembed.status, "Ready");
+        assert!(status.fastembed.active);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn compatible_migrate_recovers_cached_fastembed_model() {
+        let (root, config) = markdown_config("alpha token\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let cache_dir = root.join("models");
+        let revision = "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079";
+        let repo = cache_dir.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::create_dir_all(repo.join("snapshots").join(revision)).unwrap();
+        fs::write(repo.join("refs").join("main"), revision).unwrap();
+        db.storage
+            .connection()
+            .execute(
+                "UPDATE ai_models
+                 SET installed = 0, status = 'MissingModel', installed_at_ms = NULL
+                 WHERE model_id = ?1",
+                [ai::FASTEMBED_MODEL_ID],
+            )
+            .unwrap();
+
+        IndexDatabase::migrate_with_fastembed_cache(&config.database, Some(&cache_dir)).unwrap();
+
+        let db = IndexDatabase::open(&config.database).unwrap();
+        let status = db.local_ai_status().unwrap();
+        assert_eq!(status.fastembed.status, "Ready");
+        assert!(status.fastembed.active);
 
         fs::remove_dir_all(root).unwrap();
     }

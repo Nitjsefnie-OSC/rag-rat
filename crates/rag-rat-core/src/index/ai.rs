@@ -25,6 +25,8 @@ pub const DEFAULT_MAX_EMBEDDING_CHARS: usize = 4_000;
 const MIN_EMBEDDING_CHARS: usize = 80;
 pub const EMBEDDING_TEXT_VERSION: &str = "embedding-text-v2";
 const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
+#[cfg(feature = "fastembed")]
+const FASTEMBED_HF_CACHE_REPO_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 
 pub trait Embedder {
     fn model_id(&self) -> &str;
@@ -389,6 +391,84 @@ fn normalize_embedding_model_versions(conn: &Connection) -> anyhow::Result<()> {
         [],
     )?;
     Ok(())
+}
+
+pub(super) fn recover_cached_fastembed_model(conn: &Connection) -> anyhow::Result<()> {
+    recover_cached_fastembed_model_from(conn, &fastembed_cache_dir())
+}
+
+pub(super) fn recover_cached_fastembed_model_from(
+    conn: &Connection,
+    cache_dir: &Path,
+) -> anyhow::Result<()> {
+    #[cfg(feature = "fastembed")]
+    {
+        recover_cached_fastembed_model_at(conn, cache_dir)?;
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        let _ = (conn, cache_dir);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fastembed")]
+pub(super) fn recover_cached_fastembed_model_at(
+    conn: &Connection,
+    cache_dir: &Path,
+) -> anyhow::Result<()> {
+    if !fastembed_cache_ready(cache_dir) {
+        return Ok(());
+    }
+    let fastembed = model(conn, FASTEMBED_MODEL_ID)?;
+    if !fastembed.installed || fastembed.status != "Ready" {
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
+                 embedding_dim = ?3, runtime = 'fastembed', last_error = NULL
+             WHERE model_id = ?1",
+            params![
+                FASTEMBED_MODEL_ID,
+                now_ms(),
+                i64::try_from(FASTEMBED_EMBEDDING_DIM).unwrap_or(i64::MAX)
+            ],
+        )?;
+    }
+    if active_embedding_model_is_missing(conn)? {
+        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fastembed")]
+fn active_embedding_model_is_missing(conn: &Connection) -> anyhow::Result<bool> {
+    let Some(active_model_id) = meta(conn, ACTIVE_EMBEDDING_MODEL_META)? else {
+        return Ok(true);
+    };
+    let active = conn
+        .query_row(
+            "
+            SELECT model_id, capability, embedding_dim, runtime, installed, disabled, status, installed_at_ms, last_error
+            FROM ai_models WHERE model_id = ?1
+            ",
+            [active_model_id],
+            model_row,
+        )
+        .optional()?;
+    Ok(match active {
+        Some(active) => validate_ready_model(&active).is_err(),
+        None => true,
+    })
+}
+
+#[cfg(feature = "fastembed")]
+fn fastembed_cache_ready(cache_dir: &Path) -> bool {
+    let repo = cache_dir.join(FASTEMBED_HF_CACHE_REPO_DIR);
+    let Ok(revision) = std::fs::read_to_string(repo.join("refs").join("main")) else {
+        return false;
+    };
+    let revision = revision.trim();
+    !revision.is_empty() && repo.join("snapshots").join(revision).is_dir()
 }
 
 pub fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result<ModelInfo> {
