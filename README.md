@@ -246,71 +246,33 @@ cargo run --bin rag-rat -- mcp
 
 By default, rag-rat links against the system SQLite library through `rusqlite`.
 
-## MCP Server Install
+## Install From Scratch
 
 The MCP server is a STDIO server, not an HTTP service. MCP clients start `rag-rat` as a child
 process and talk to it over stdin/stdout.
 
-For a reusable local install from this repo:
+Clone and install `rag-rat`:
 
 ```bash
-cargo install --path tools/rag-rat --bin rag-rat --features fastembed
-rag-rat migrate --config /home/kk/src/held/rag-rat.toml
-rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
-rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
-rag-rat reconcile --changed-first --limit 500 --batch-size 64 --config /home/kk/src/held/rag-rat.toml
-rag-rat doctor --config /home/kk/src/held/rag-rat.toml
+git clone https://github.com/cq27-dev/rag-rat.git
+cd rag-rat
+cargo install --path crates/rag-rat-cli --bin rag-rat --features rag-rat-core/fastembed
 ```
 
-Without real embeddings, omit `--features fastembed` and install `embedding-hash` instead:
+Without real embeddings, omit the feature and use the deterministic hash baseline:
 
 ```bash
-cargo install --path tools/rag-rat --bin rag-rat
-rag-rat models install embedding-hash --config /home/kk/src/held/rag-rat.toml
+cargo install --path crates/rag-rat-cli --bin rag-rat
 ```
 
-Add the installed binary to an MCP client config:
+Create a `rag-rat.toml` in the repository you want to index:
 
-```json
-{
-  "mcpServers": {
-    "rag-rat": {
-      "command": "/home/kk/.cargo/bin/rag-rat",
-      "args": ["mcp", "--config", "/home/kk/src/held/rag-rat.toml"]
-    }
-  }
-}
+```bash
+cd /path/to/your/repo
+$EDITOR rag-rat.toml
 ```
 
-For development without installing the binary, point the MCP client at Cargo:
-
-```json
-{
-  "mcpServers": {
-    "rag-rat-dev": {
-      "command": "cargo",
-      "args": [
-        "run",
-        "--manifest-path",
-        "/home/kk/src/held/tools/rag-rat/Cargo.toml",
-        "--features",
-        "fastembed",
-        "--bin",
-        "rag-rat",
-        "--",
-        "mcp",
-        "--config",
-        "/home/kk/src/held/rag-rat.toml"
-      ]
-    }
-  }
-}
-```
-
-## Configuration
-
-The host repo owns `rag-rat.toml`. This keeps monorepo-specific target bindings out of the reusable
-tool.
+Minimal config:
 
 ```toml
 [index]
@@ -324,15 +286,134 @@ omp_threads = 1
 max_embedding_chars = 4000
 
 [target_bindings]
-rust = ["core/held-core/src"]
-typescript = ["apps/mobile/src", "apps/web/src"]
+rust = ["src"]
+typescript = ["src"]
+kotlin = ["src"]
 
 [[target]]
-name = "generated-ts"
+name = "rust-src"
+language = "rust"
+directories = ["src"]
+include = ["**/*.rs"]
+
+[[target]]
+name = "typescript-src"
 language = "typescript"
-directories = ["packages/held-core/src/generated"]
-kind = "generated"
-include = ["**/*.ts"]
+directories = ["src"]
+include = ["**/*.ts", "**/*.tsx"]
+
+[[target]]
+name = "kotlin-src"
+language = "kotlin"
+directories = ["src"]
+include = ["**/*.kt"]
+
+[[target]]
+name = "docs"
+language = "markdown"
+directories = ["."]
+include = ["**/*.md"]
+exclude = [".git/**", ".rag-rat/**", "target/**", "node_modules/**"]
+```
+
+Initialize the database and index the repo:
+
+```bash
+rag-rat migrate
+rag-rat index --discover
+rag-rat doctor
+```
+
+If installed with FastEmbed support, install and reconcile the local embedding model:
+
+```bash
+rag-rat models install fastembed-all-minilm-l6-v2
+rag-rat reconcile --changed-first --limit 500 --batch-size 64
+```
+
+If installed without FastEmbed support, use the hash baseline instead:
+
+```bash
+rag-rat models install embedding-hash
+```
+
+Add the installed binary to an MCP client config. Use an absolute `--config` path to the target
+repository's `rag-rat.toml`:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat": {
+      "command": "/home/you/.cargo/bin/rag-rat",
+      "args": ["mcp", "--config", "/path/to/your/repo/rag-rat.toml"]
+    }
+  }
+}
+```
+
+For development without installing the binary, point the MCP client at a local `rag-rat` checkout:
+
+```json
+{
+  "mcpServers": {
+    "rag-rat-dev": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "/path/to/rag-rat/Cargo.toml",
+        "--features",
+        "fastembed",
+        "--bin",
+        "rag-rat",
+        "--",
+        "mcp",
+        "--config",
+        "/path/to/your/repo/rag-rat.toml"
+      ]
+    }
+  }
+}
+```
+
+## Configuration
+
+The indexed repository owns `rag-rat.toml`. This keeps project-specific target bindings out of the
+reusable tool.
+
+```toml
+[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+
+[local_ai.embedding.runtime]
+batch_size = 64
+ort_threads = 4
+omp_threads = 1
+max_embedding_chars = 4000
+
+[target_bindings]
+rust = ["crates/app/src"]
+typescript = ["web/src"]
+kotlin = ["android/src/main/java"]
+
+[[target]]
+name = "app-rust"
+language = "rust"
+directories = ["crates/app/src"]
+include = ["**/*.rs"]
+
+[[target]]
+name = "web-typescript"
+language = "typescript"
+directories = ["web/src"]
+include = ["**/*.ts", "**/*.tsx"]
+
+[[target]]
+name = "android-kotlin"
+language = "kotlin"
+directories = ["android/src/main/java"]
+include = ["**/*.kt"]
 ```
 
 ## Git Hooks
