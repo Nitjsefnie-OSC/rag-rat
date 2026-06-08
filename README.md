@@ -245,31 +245,31 @@ Commands read `rag-rat.toml` by default. Use `--config <path>` when running from
 or with another repository profile.
 
 ```bash
-cargo run --bin rag-rat -- index
-cargo run --bin rag-rat -- index --changed
-cargo run --bin rag-rat -- index --discover
-cargo run --bin rag-rat -- index --full
-cargo run --bin rag-rat -- init
-cargo run --bin rag-rat -- doctor
-cargo run --bin rag-rat -- migrate --check
-cargo run --bin rag-rat -- migrate
-cargo run --bin rag-rat -- github sync --from-refs
-cargo run --bin rag-rat -- github sync --issue cq27-dev/rag-rat#42
-cargo run --bin rag-rat -- github sync --from-refs --offline
-cargo run --bin rag-rat -- models list
-cargo run --bin rag-rat -- models install embedding-hash
-cargo run --features fastembed --bin rag-rat -- models install fastembed-all-minilm-l6-v2
-cargo run --bin rag-rat -- reconcile --limit 100 --batch-size 32
-cargo run --bin rag-rat -- reconcile --changed-first --max-seconds 60 --batch-size 64
-cargo run --bin rag-rat -- reconcile --until-clean --batch-size 64
-cargo run --bin rag-rat -- hooks install
-cargo run --bin rag-rat -- hooks status
-cargo run --bin rag-rat -- maintenance --trigger post-checkout --max-seconds 30
-cargo run --bin rag-rat -- eval
-cargo run --bin rag-rat -- eval --json
-cargo run --bin rag-rat -- eval --update-baseline
-cargo run --bin rag-rat -- query "semantic recall"
-cargo run --bin rag-rat -- mcp
+rag-rat index
+rag-rat index --changed
+rag-rat index --discover
+rag-rat index --full
+rag-rat init
+rag-rat doctor
+rag-rat migrate --check
+rag-rat migrate
+rag-rat github sync --from-refs
+rag-rat github sync --issue cq27-dev/rag-rat#42
+rag-rat github sync --from-refs --offline
+rag-rat models list
+rag-rat models install embedding-hash
+rag-rat models install fastembed-all-minilm-l6-v2
+rag-rat reconcile --limit 100 --batch-size 32
+rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64
+rag-rat reconcile --until-clean --batch-size 64
+rag-rat hooks install
+rag-rat hooks status
+rag-rat maintenance --trigger post-checkout --max-seconds 30
+rag-rat eval
+rag-rat eval --json
+rag-rat eval --update-baseline
+rag-rat query "semantic recall"
+rag-rat mcp
 ```
 
 By default, rag-rat links against the system SQLite library through `rusqlite`.
