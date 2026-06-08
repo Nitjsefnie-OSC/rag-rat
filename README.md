@@ -278,6 +278,12 @@ rag-rat init
 local embedding model. At the end it can also register the MCP server for Claude Code or Codex and
 install the optional git maintenance hooks.
 
+The initializer is the recommended first-run path. It derives source-root candidates from the files
+present in the repo, keeps defaults conservative for broad projects, asks before installing the
+local embedding model, then runs migration, indexing, and local-AI reconciliation in the same setup
+flow. If a repo has unusual layout or generated-heavy paths, run the dry-run first and adjust the
+generated `rag-rat.toml` before indexing.
+
 Preview the generated config without writing anything:
 
 ```bash
