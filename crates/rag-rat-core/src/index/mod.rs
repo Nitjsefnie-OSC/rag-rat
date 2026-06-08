@@ -1439,6 +1439,7 @@ impl IndexDatabase {
             .collect::<BTreeSet<_>>();
         let mut matched_hits = Vec::new();
         let mut text_only_hits = Vec::new();
+        let mut likely_parser_gaps = Vec::new();
         for hit in &text_hits {
             if let Some(edge) = graph_by_location.get(&(hit.path.clone(), hit.line)) {
                 matched_hits.push(crate::query::graph::MatchedGraphTextHit {
@@ -1451,18 +1452,24 @@ impl IndexDatabase {
                     resolution: edge.resolution.clone(),
                 });
             } else {
-                text_only_hits.push(crate::query::graph::TextOnlyHit {
+                let gap_kind = classify_text_only_hit(&hit.path, &hit.text, &parser_failure_paths);
+                let text_only_hit = crate::query::graph::TextOnlyHit {
                     path: hit.path.clone(),
                     line: hit.line,
                     text: hit.text.clone(),
-                    reason: "no graph edge extracted".to_string(),
-                    likely_gap: if parser_failure_paths.contains(&hit.path) {
-                        "parser_failure"
+                    reason: if gap_kind == "parser_call_extraction" || gap_kind == "parser_failure"
+                    {
+                        "no graph edge extracted"
                     } else {
-                        "parser_call_extraction"
+                        "text mention outside graph-call evidence"
                     }
                     .to_string(),
-                });
+                    likely_gap: gap_kind.to_string(),
+                };
+                if is_likely_parser_gap_kind(gap_kind) {
+                    likely_parser_gaps.push(text_only_hit.clone());
+                }
+                text_only_hits.push(text_only_hit);
             }
         }
 
@@ -1492,7 +1499,6 @@ impl IndexDatabase {
             }
             graph_only_edges.push(graph_only);
         }
-        let likely_parser_gaps = text_only_hits.clone();
         let complete = likely_parser_gaps.is_empty() && likely_false_positives.is_empty();
         let recommended_fallback =
             recommended_graph_text_fallback(&likely_parser_gaps, &graph_only_edges);
@@ -1523,10 +1529,12 @@ impl IndexDatabase {
                 matched: u64::try_from(matched_hits.len()).unwrap_or(u64::MAX),
                 graph_only: u64::try_from(graph_only_edges.len()).unwrap_or(u64::MAX),
                 text_only: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+                text_mentions: u64::try_from(text_only_hits.len() - likely_parser_gaps.len())
+                    .unwrap_or(u64::MAX),
                 likely_parser_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
                 likely_false_positives: u64::try_from(likely_false_positives.len())
                     .unwrap_or(u64::MAX),
-                likely_index_gaps: u64::try_from(text_only_hits.len()).unwrap_or(u64::MAX),
+                likely_index_gaps: u64::try_from(likely_parser_gaps.len()).unwrap_or(u64::MAX),
                 complete,
                 recommended_fallback,
                 pattern_match_mode,
@@ -2810,6 +2818,69 @@ fn is_likely_false_positive_graph_only(
         || edge.confidence == "NameOnly"
         || edge.confidence == "Ambiguous"
         || !edge.verified_target_symbol
+}
+
+fn classify_text_only_hit(
+    path: &str,
+    text: &str,
+    parser_failure_paths: &BTreeSet<String>,
+) -> &'static str {
+    if parser_failure_paths.contains(path) {
+        return "parser_failure";
+    }
+    if is_generated_path(path) {
+        return "generated_text_mention";
+    }
+    let trimmed = text.trim_start();
+    if is_comment_like_text(trimmed) {
+        return "comment_text_mention";
+    }
+    if is_import_or_declaration_text(trimmed) {
+        return "declaration_text_mention";
+    }
+    if is_test_like_path(path) && is_test_scaffolding_text(trimmed) {
+        return "test_scaffolding_text_mention";
+    }
+    "parser_call_extraction"
+}
+
+fn is_likely_parser_gap_kind(kind: &str) -> bool {
+    matches!(kind, "parser_call_extraction" | "parser_failure")
+}
+
+fn is_generated_path(path: &str) -> bool {
+    path.contains("/generated/")
+        || path.contains("/generated-web/")
+        || path.ends_with(".d.ts")
+        || path.ends_with("_bg.wasm.d.ts")
+}
+
+fn is_comment_like_text(text: &str) -> bool {
+    text.starts_with("//")
+        || text.starts_with("/*")
+        || text.starts_with('*')
+        || text.starts_with("*/")
+        || text.starts_with("#")
+}
+
+fn is_import_or_declaration_text(text: &str) -> bool {
+    text.starts_with("import ")
+        || text.starts_with("export type ")
+        || text.starts_with("export interface ")
+        || text.starts_with("type ")
+        || text.starts_with("interface ")
+        || text.starts_with("declare ")
+}
+
+fn is_test_scaffolding_text(text: &str) -> bool {
+    text.contains(".mock")
+        || text.contains("jest.")
+        || text.contains("jest<")
+        || text.contains("expect(")
+        || text.contains("toHaveBeen")
+        || text.contains("describe(")
+        || text.contains("it(")
+        || text.contains("test(")
 }
 
 fn recommended_graph_text_fallback(
@@ -5824,12 +5895,42 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
             papertrail.github_evidence.first().map(|item| item.evidence_kind),
             Some("literal_github_ref")
         );
-        assert!(papertrail.fallback_github_evidence.iter().all(|item| {
-            matches!(
-                item.evidence_kind,
-                "fallback_historical_github" | "fallback_literal_github_ref"
-            ) && item.score <= 0.25
-        }));
+        assert!(
+            papertrail.fallback_github_evidence.is_empty(),
+            "structured commit refs should suppress noisy fallback evidence: {papertrail:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "// First rationale (#42)\n// Second rationale (#42)\npub fn tracked_symbol() {}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let mock = MockGitHubClient;
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        let papertrail = db
+            .papertrail_for_symbol("tracked_symbol", Some(Language::Rust), 10)
+            .unwrap()
+            .expect("tracked symbol papertrail");
+
+        assert_eq!(
+            papertrail
+                .github_evidence
+                .iter()
+                .filter(|item| item.number == 42 && item.item_kind == "issue")
+                .count(),
+            1,
+            "duplicate #42 refs in one file should collapse to one issue evidence row: {papertrail:?}"
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

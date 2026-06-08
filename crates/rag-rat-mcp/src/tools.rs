@@ -1130,7 +1130,7 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub mod one;\npub mod two;\n").unwrap();
         fs::write(
             root.join("src/one.rs"),
-            "pub fn shared() {}\npub fn caller_one() {\n    shared();\n}\n",
+            "pub fn shared() {}\n//     shared(\npub fn caller_one() {\n    shared();\n}\n",
         )
         .unwrap();
         fs::write(
@@ -1217,17 +1217,27 @@ mod tests {
         assert_eq!(comparison["query"]["symbol_id"], one["symbol_id"]);
         assert_eq!(comparison["summary"]["graph_edges"], 1);
         assert_eq!(comparison["summary"]["graph_hits"], 1);
-        assert_eq!(comparison["summary"]["text_hits"], 2);
+        assert_eq!(comparison["summary"]["text_hits"], 3);
         assert_eq!(comparison["summary"]["matched"], 1);
-        assert_eq!(comparison["summary"]["text_only"], 1);
+        assert_eq!(comparison["summary"]["text_only"], 2);
+        assert_eq!(comparison["summary"]["text_mentions"], 1);
         assert_eq!(comparison["summary"]["likely_parser_gaps"], 1);
+        assert_eq!(comparison["summary"]["likely_index_gaps"], 1);
         assert_eq!(comparison["summary"]["graph_only"], 0);
         assert_eq!(comparison["summary"]["complete"], false);
         assert_eq!(comparison["summary"]["recommended_fallback"], "text");
         assert_eq!(comparison["summary"]["pattern_match_mode"], "identifier_or_call");
         assert!(comparison["summary"]["warnings"].as_array().unwrap().is_empty());
         assert_eq!(comparison["matched_hits"].as_array().unwrap().len(), 1);
-        assert_eq!(comparison["text_only_hits"].as_array().unwrap().len(), 1);
+        assert_eq!(comparison["text_only_hits"].as_array().unwrap().len(), 2);
+        assert_eq!(comparison["likely_parser_gaps"].as_array().unwrap().len(), 1);
+        assert!(
+            comparison["text_only_hits"].as_array().unwrap().iter().any(|hit| {
+                hit["likely_gap"].as_str() == Some("comment_text_mention")
+                    && hit["reason"].as_str() == Some("text mention outside graph-call evidence")
+            }),
+            "comment text hits should not be promoted to parser gaps: {comparison:?}"
+        );
 
         let substring_comparison = call_tool(
             &config.database,

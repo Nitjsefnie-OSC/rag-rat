@@ -419,6 +419,7 @@ pub fn papertrail_for_symbol(
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_path(conn, &symbol.path, limit)?;
     evidence.extend(rationale_search(conn, &symbol.qualified_name, limit)?);
+    dedupe_evidence(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     let (start_line, end_line, chunk_id) = current_symbol_span(conn, symbol)?;
     Ok(Papertrail {
@@ -441,17 +442,19 @@ pub fn papertrail_for_commit(
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_commit_refs(conn, commit_hash, limit)?;
     let mut fallback_evidence = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT path FROM git_file_changes WHERE commit_hash LIKE ?1 ORDER BY path LIMIT ?2",
-    )?;
-    let commit_like = format!("{commit_hash}%");
-    let rows =
-        stmt.query_map(params![commit_like, i64::from(limit)], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        fallback_evidence.extend(evidence_for_path(conn, &row?, limit)?);
+    if evidence.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT path FROM git_file_changes WHERE commit_hash LIKE ?1 ORDER BY path LIMIT ?2",
+        )?;
+        let commit_like = format!("{commit_hash}%");
+        let rows =
+            stmt.query_map(params![commit_like, i64::from(limit)], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            fallback_evidence.extend(evidence_for_path(conn, &row?, limit)?);
+        }
+        fallback_evidence.extend(rationale_search(conn, commit_hash, limit)?);
+        mark_fallback_evidence(&mut fallback_evidence);
     }
-    fallback_evidence.extend(rationale_search(conn, commit_hash, limit)?);
-    mark_fallback_evidence(&mut fallback_evidence);
     dedupe_evidence(&mut evidence);
     dedupe_evidence(&mut fallback_evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));

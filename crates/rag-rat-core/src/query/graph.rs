@@ -185,6 +185,7 @@ pub struct CompareGraphTextSummary {
     pub matched: u64,
     pub graph_only: u64,
     pub text_only: u64,
+    pub text_mentions: u64,
     pub likely_parser_gaps: u64,
     pub likely_false_positives: u64,
     pub likely_index_gaps: u64,
