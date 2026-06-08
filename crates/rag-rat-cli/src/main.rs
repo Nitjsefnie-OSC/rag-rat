@@ -773,6 +773,18 @@ fn render_index_progress(progress: IndexProgress) {
                 path.display()
             );
         },
+        IndexProgress::IndexingGitHistory => {
+            eprintln!("index: indexing git history");
+        },
+        IndexProgress::RebuildingLogicalSymbols => {
+            eprintln!("index: rebuilding logical symbols");
+        },
+        IndexProgress::ResolvingGraph => {
+            eprintln!("index: resolving graph edges");
+        },
+        IndexProgress::SyncingFts => {
+            eprintln!("index: syncing SQLite FTS");
+        },
         IndexProgress::RebuildingFts => {
             eprintln!("index: rebuilding SQLite FTS");
         },

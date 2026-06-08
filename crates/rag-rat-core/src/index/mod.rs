@@ -89,6 +89,10 @@ pub enum IndexProgress {
         language: Language,
         kind: TargetKind,
     },
+    IndexingGitHistory,
+    RebuildingLogicalSymbols,
+    ResolvingGraph,
+    SyncingFts,
     RebuildingFts,
     Finished {
         files: usize,
@@ -299,8 +303,11 @@ impl IndexDatabase {
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
+            progress(IndexProgress::IndexingGitHistory);
             db.index_git_history(&config.root)?;
+            progress(IndexProgress::RebuildingLogicalSymbols);
             db.rebuild_logical_symbols()?;
+            progress(IndexProgress::ResolvingGraph);
             db.resolve_edges()?;
             db.mark_graph_index_current()?;
             progress(IndexProgress::RebuildingFts);
@@ -366,6 +373,7 @@ impl IndexDatabase {
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
+            progress(IndexProgress::IndexingGitHistory);
             db.index_git_history(&config.root)?;
             let indexed = match mode {
                 IndexMode::Changed => db.index_changed_files_with_progress(config, progress)?,
@@ -373,9 +381,12 @@ impl IndexDatabase {
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
             if indexed > 0 {
+                progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;
+                progress(IndexProgress::ResolvingGraph);
                 db.resolve_edges()?;
                 db.mark_graph_index_current()?;
+                progress(IndexProgress::SyncingFts);
                 db.sync_fts()?;
             }
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
@@ -411,13 +422,16 @@ impl IndexDatabase {
 
         let prepared = prepare_files_with_progress(&files, progress)?;
         for (index, prepared_file) in prepared.iter().enumerate() {
-            progress(IndexProgress::IndexingFile {
-                current: index + 1,
-                total: files.len(),
-                path: prepared_file.file.relative_path.clone(),
-                language: prepared_file.file.language,
-                kind: prepared_file.file.kind,
-            });
+            let current = index + 1;
+            if should_report_file_progress(current, files.len()) {
+                progress(IndexProgress::IndexingFile {
+                    current,
+                    total: files.len(),
+                    path: prepared_file.file.relative_path.clone(),
+                    language: prepared_file.file.language,
+                    kind: prepared_file.file.kind,
+                });
+            }
             self.insert_prepared_file(prepared_file)?;
         }
 
@@ -493,13 +507,16 @@ impl IndexDatabase {
 
         let prepared = prepare_files_with_progress(&files, progress)?;
         for (index, prepared_file) in prepared.iter().enumerate() {
-            progress(IndexProgress::IndexingFile {
-                current: index + 1,
-                total: files.len(),
-                path: prepared_file.file.relative_path.clone(),
-                language: prepared_file.file.language,
-                kind: prepared_file.file.kind,
-            });
+            let current = index + 1;
+            if should_report_file_progress(current, files.len()) {
+                progress(IndexProgress::IndexingFile {
+                    current,
+                    total: files.len(),
+                    path: prepared_file.file.relative_path.clone(),
+                    language: prepared_file.file.language,
+                    kind: prepared_file.file.kind,
+                });
+            }
             self.remove_file_in_scope(
                 &prepared_file.file.relative_path,
                 &prepared_file.file.commit_sha,
@@ -2856,13 +2873,15 @@ where
                 .map(|file| {
                     let prepared = prepare_index_file(file);
                     let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    let _ = tx.send(PreparedProgress {
-                        current,
-                        total,
-                        path: file.relative_path.clone(),
-                        language: file.language,
-                        kind: file.kind,
-                    });
+                    if should_report_file_progress(current, total) {
+                        let _ = tx.send(PreparedProgress {
+                            current,
+                            total,
+                            path: file.relative_path.clone(),
+                            language: file.language,
+                            kind: file.kind,
+                        });
+                    }
                     prepared
                 })
                 .collect::<Vec<_>>()
@@ -2881,6 +2900,16 @@ where
         handle.join().map_err(|_| anyhow::anyhow!("parallel file preparation panicked"))
     })?;
     Ok(prepared)
+}
+
+fn should_report_file_progress(current: usize, total: usize) -> bool {
+    if total == 0 {
+        return false;
+    }
+    current == 1
+        || current == total
+        || current.saturating_mul(10) / total
+            != current.saturating_sub(1).saturating_mul(10) / total
 }
 
 fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexContent> {
@@ -3246,6 +3275,14 @@ mod schema_bootstrap_tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_progress_reports_first_final_and_decile_boundaries() {
+        let reported = (1..=100)
+            .filter(|current| should_report_file_progress(*current, 100))
+            .collect::<Vec<_>>();
+        assert_eq!(reported, vec![1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
     }
 
     #[test]
