@@ -15,7 +15,7 @@ pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
 pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 pub const HASH_EMBEDDING_DIM: usize = 384;
 pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
-pub const FASTEMBED_MISSING_FEATURE_MESSAGE: &str = "FastEmbed backend requested, but this binary was built without `--features fastembed`.\nRebuild with:\n  cargo install rag-rat --features fastembed";
+pub const FASTEMBED_MISSING_FEATURE_MESSAGE: &str = "FastEmbed backend requested, but this binary was built without default FastEmbed support.\nRebuild with default features enabled:\n  cargo install rag-rat";
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
 const LAST_EMBEDDING_RECONCILE_STARTED_META: &str = "last_embedding_reconcile_started_at_ms";
@@ -1109,7 +1109,7 @@ fn fastembed_operational_status(
 
 fn fastembed_next_command(plan: &EmbeddingReconcilePlan) -> Option<String> {
     if !fastembed_build_feature_enabled() {
-        return Some("cargo install rag-rat --features fastembed".to_string());
+        return Some("cargo install rag-rat".to_string());
     }
     if !plan.available {
         return Some(format!("rag-rat models install {}", FASTEMBED_MODEL_ID));
@@ -1664,7 +1664,13 @@ fn embedding_input_hash(model_id: &str, model_version: &str, input: &str) -> Str
     hasher.update(EMBEDDING_TEXT_VERSION.as_bytes());
     hasher.update(b"\0");
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let hash = hasher.finalize();
+    let mut out = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn write_current_embedding_batch(

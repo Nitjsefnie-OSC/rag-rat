@@ -4120,10 +4120,7 @@ mod schema_bootstrap_tests {
             status.fastembed.message.as_deref(),
             Some(ai::FASTEMBED_MISSING_FEATURE_MESSAGE)
         );
-        assert_eq!(
-            status.fastembed.next.as_deref(),
-            Some("cargo install rag-rat --features fastembed")
-        );
+        assert_eq!(status.fastembed.next.as_deref(), Some("cargo install rag-rat"));
 
         fs::remove_dir_all(root).unwrap();
     }

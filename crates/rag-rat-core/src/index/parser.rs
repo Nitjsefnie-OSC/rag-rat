@@ -187,7 +187,7 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             "class_declaration" => Some(("class", child_name(node)?)),
             "object_declaration" => Some(("object", child_name(node)?)),
             "function_declaration" => Some(("function", child_name(node)?)),
-            "property_declaration" => Some(("property", child_name(node)?)),
+            "property_declaration" => Some(("property", kotlin_property_name(node)?)),
             "companion_object" | "companion_object_declaration" => {
                 Some(("object", companion_name(node).unwrap_or(node)))
             },
@@ -276,6 +276,23 @@ fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "simple_identifier" | "type_identifier"))
+}
+
+fn kotlin_property_name(node: Node<'_>) -> Option<Node<'_>> {
+    child_name(kotlin_variable_declaration(node).unwrap_or(node))
+}
+
+fn kotlin_variable_declaration(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find_map(|child| {
+        if child.kind() == "variable_declaration" {
+            Some(child)
+        } else if matches!(child.kind(), "modifiers" | "type_parameters" | "type_constraints") {
+            None
+        } else {
+            kotlin_variable_declaration(child)
+        }
+    })
 }
 
 fn function_name(node: Node<'_>) -> Option<Node<'_>> {

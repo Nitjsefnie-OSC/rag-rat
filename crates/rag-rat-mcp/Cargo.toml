@@ -1,16 +1,25 @@
 [package]
 name = "rag-rat-mcp"
 version = "0.1.0"
+description = "MCP server tools for rag-rat repository search, symbol graph traversal, rationale lookup, and source-bound memories."
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-rag-rat-core = { path = "../rag-rat-core" }
+rag-rat-core = { version = "0.1.0", path = "../rag-rat-core", default-features = false }
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[features]
+default = ["fastembed"]
+fastembed = ["rag-rat-core/fastembed"]

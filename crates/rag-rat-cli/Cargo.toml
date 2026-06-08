@@ -1,10 +1,15 @@
 [package]
-name = "rag-rat-cli"
+name = "rag-rat"
 version = "0.1.0"
+description = "CLI and MCP entrypoint for indexing repositories into local source, graph, history, and memory evidence."
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "rag-rat"
@@ -14,8 +19,12 @@ path = "src/main.rs"
 anyhow.workspace = true
 dialoguer = "0.12"
 libc.workspace = true
-rag-rat-core = { path = "../rag-rat-core" }
-rag-rat-mcp = { path = "../rag-rat-mcp" }
+rag-rat-core = { version = "0.1.0", path = "../rag-rat-core", default-features = false }
+rag-rat-mcp = { version = "0.1.0", path = "../rag-rat-mcp", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[features]
+default = ["fastembed"]
+fastembed = ["rag-rat-core/fastembed", "rag-rat-mcp/fastembed"]

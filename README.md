@@ -151,7 +151,7 @@ This is a discovery/preflight tool, not a proof of ABI compatibility.
 Local AI state is explicit and inspectable:
 
 - `embedding-hash`: deterministic baseline embedder
-- `fastembed-all-minilm-l6-v2`: local FastEmbed backend when built with the `fastembed` feature
+- `fastembed-all-minilm-l6-v2`: local FastEmbed backend, included in the default build
 - `models list/install`: model registry and install state
 - `local_ai_status`: active/installed/missing status plus chunk/vector counters
 - `reconcile`: derived-artifact queue for embedding current eligible chunks
@@ -282,15 +282,22 @@ process and talk to it over stdin/stdout.
 Clone and install `rag-rat`:
 
 ```bash
-git clone https://github.com/cq27-dev/rag-rat.git
-cd rag-rat
-cargo install --path crates/rag-rat-cli --bin rag-rat --features rag-rat-core/fastembed
+cargo install rag-rat
 ```
 
-Without real embeddings, omit the feature and use the deterministic hash baseline:
+For local development from a checkout:
 
 ```bash
+git clone https://github.com/cq27-dev/rag-rat.git
+cd rag-rat
 cargo install --path crates/rag-rat-cli --bin rag-rat
+```
+
+FastEmbed is enabled by default. For a smaller hash-only build without real embeddings, disable
+default features and use the deterministic hash baseline:
+
+```bash
+cargo install rag-rat --no-default-features
 ```
 
 Run the initializer from the repository you want to index:
@@ -386,14 +393,14 @@ rag-rat index --discover
 rag-rat doctor
 ```
 
-If installed with FastEmbed support, install and reconcile the local embedding model:
+Install and reconcile the local embedding model:
 
 ```bash
 rag-rat models install fastembed-all-minilm-l6-v2
 rag-rat reconcile --changed-first --limit 500 --batch-size 64
 ```
 
-If installed without FastEmbed support, use the hash baseline instead:
+If installed with `--no-default-features`, use the hash baseline instead:
 
 ```bash
 rag-rat models install embedding-hash
@@ -424,8 +431,6 @@ For development without installing the binary, point the MCP client at a local `
         "run",
         "--manifest-path",
         "/path/to/rag-rat/Cargo.toml",
-        "--features",
-        "fastembed",
         "--bin",
         "rag-rat",
         "--",

@@ -7,10 +7,14 @@ members = [
 resolver = "3"
 
 [workspace.package]
+authors = ["Kristaps Karlsons"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/cq27-dev/rag-rat"
+readme = "README.md"
+keywords = ["rag", "mcp", "code-search", "tree-sitter", "embeddings"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -18,20 +22,20 @@ fastembed = { version = "5.1.0", default-features = false, features = ["hf-hub-r
 gix = { version = "0.84.0", default-features = false, features = ["status", "parallel", "sha1"] }
 libc = "0.2"
 rmcp = { version = "1.7.0", features = ["transport-io"] }
-rusqlite = "0.39"
+rusqlite = "0.40"
 rayon = "1.11"
 regex = "1.11"
 schemars = { version = "1.2.1", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-std"] }
-toml = "0.9"
+toml = "1.1"
 # Grammar crates are exact-pinned so parser node coverage changes deliberately.
 tree-sitter = "=0.26.9"
 tree-sitter-c = "=0.24.2"
 tree-sitter-cpp = "=0.23.4"
-tree-sitter-kotlin = { git = "https://github.com/cq27-dev/tree-sitter-kotlin.git", branch = "rag-rat/tree-sitter-0.26" }
+tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1.0" }
 tree-sitter-rust = "=0.24.2"
 tree-sitter-typescript = "=0.23.2"

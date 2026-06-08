@@ -1,10 +1,15 @@
 [package]
 name = "rag-rat-core"
 version = "0.1.0"
+description = "Repository evidence engine for source chunks, symbols, graph edges, Git history, GitHub rationale, and source-bound memories."
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -26,5 +31,5 @@ tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 
 [features]
-default = []
+default = ["fastembed"]
 fastembed = ["dep:fastembed"]

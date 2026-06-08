@@ -727,7 +727,7 @@ fn kotlin_edges(
     out: &mut Vec<EdgeCandidate>,
 ) {
     match node.kind() {
-        "import_header" | "import_directive" => {
+        "import" | "import_header" | "import_directive" => {
             for name in identifiers_under(node, text) {
                 out.push(file_edge(
                     path,
