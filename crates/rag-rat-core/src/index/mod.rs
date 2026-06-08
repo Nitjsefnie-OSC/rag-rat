@@ -306,12 +306,12 @@ impl IndexDatabase {
             database: config.database.clone(),
             mode: IndexMode::Full,
         });
-        remove_database_files(&config.database)?;
         let mut db = Self::create_or_migrate(&config.database)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
+            db.clear_full_rebuild_tables()?;
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
@@ -335,6 +335,32 @@ impl IndexDatabase {
         }
         result?;
         Ok(db)
+    }
+
+    fn clear_full_rebuild_tables(&self) -> anyhow::Result<()> {
+        self.storage.execute_batch(
+            "
+            DELETE FROM main.chunk_fts;
+            DELETE FROM main.commit_fts;
+            DELETE FROM main.reconcile_attempts;
+            DELETE FROM main.reconcile_meta;
+            DELETE FROM main.chunk_summaries;
+            DELETE FROM main.chunk_embeddings;
+            DELETE FROM main.git_chunk_blame;
+            DELETE FROM main.git_file_changes;
+            DELETE FROM main.git_commits;
+            DELETE FROM main.symbol_facts;
+            DELETE FROM main.logical_symbol_members;
+            DELETE FROM main.logical_symbols;
+            DELETE FROM main.edges;
+            DELETE FROM main.docs;
+            DELETE FROM main.parser_failures;
+            DELETE FROM main.symbols;
+            DELETE FROM main.chunks;
+            DELETE FROM main.files;
+            ",
+        )?;
+        Ok(())
     }
 
     pub fn index_changed(config: &Config) -> anyhow::Result<Self> {
@@ -3157,20 +3183,6 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn remove_database_files(path: &Path) -> anyhow::Result<()> {
-    for candidate in [
-        path.to_path_buf(),
-        PathBuf::from(format!("{}-shm", path.display())),
-        PathBuf::from(format!("{}-wal", path.display())),
-        PathBuf::from(format!("{}.tmp", path.display())),
-    ] {
-        if candidate.exists() {
-            fs::remove_file(candidate)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod schema_bootstrap_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3390,6 +3402,91 @@ mod schema_bootstrap_tests {
         assert!(columns.contains(&"target_end_line".to_string()));
         assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
         assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrate_preserves_github_papertrail_cache() {
+        let (root, config) =
+            markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        github::sync_from_refs(db.storage.connection(), &root, Some(&MockGitHubClient), false)
+            .unwrap();
+        assert_eq!(row_count(&db, "github_refs"), 1);
+        assert_eq!(row_count(&db, "github_issues"), 1);
+        assert_eq!(row_count(&db, "github_comments"), 1);
+        assert_eq!(row_count(&db, "github_pull_requests"), 1);
+        assert_eq!(row_count(&db, "github_reviews"), 1);
+        assert_eq!(row_count(&db, "github_review_comments"), 1);
+        assert_eq!(row_count(&db, "github_fts"), 5);
+        db.storage
+            .connection()
+            .execute("DELETE FROM schema_version WHERE id = ?1", ["010_symbol_facts"])
+            .unwrap();
+        drop(db);
+
+        let migrated = IndexDatabase::migrate(&config.database).unwrap();
+        assert_eq!(migrated.state, schema::SchemaState::Compatible);
+        let db = IndexDatabase::open(&config.database).unwrap();
+        assert_eq!(row_count(&db, "github_refs"), 1);
+        assert_eq!(row_count(&db, "github_issues"), 1);
+        assert_eq!(row_count(&db, "github_comments"), 1);
+        assert_eq!(row_count(&db, "github_pull_requests"), 1);
+        assert_eq!(row_count(&db, "github_reviews"), 1);
+        assert_eq!(row_count(&db, "github_review_comments"), 1);
+        assert_eq!(row_count(&db, "github_fts"), 5);
+        let hits = db.github_issue_search("sqlite", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].number, 42);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_rebuild_preserves_github_papertrail_cache() {
+        let (root, config) =
+            markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        github::sync_from_refs(db.storage.connection(), &root, Some(&MockGitHubClient), false)
+            .unwrap();
+        assert_eq!(row_count(&db, "github_issues"), 1);
+        assert_eq!(row_count(&db, "github_fts"), 5);
+        drop(db);
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_eq!(row_count(&db, "github_refs"), 1);
+        assert_eq!(row_count(&db, "github_issues"), 1);
+        assert_eq!(row_count(&db, "github_comments"), 1);
+        assert_eq!(row_count(&db, "github_pull_requests"), 1);
+        assert_eq!(row_count(&db, "github_reviews"), 1);
+        assert_eq!(row_count(&db, "github_review_comments"), 1);
+        assert_eq!(row_count(&db, "github_ref_sync"), 1);
+        assert_eq!(row_count(&db, "github_fts"), 5);
+        let hits = db.github_issue_search("sqlite", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].number, 42);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn full_rebuild_preserves_installed_model_manifest() {
+        let (root, config) = markdown_config("alpha token with enough detail for embeddings\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+        let before = db.local_ai_status().unwrap();
+        assert_eq!(before.embedding.model_id, ai::HASH_MODEL_ID);
+        assert!(before.embedding.installed);
+        drop(db);
+
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let after = db.local_ai_status().unwrap();
+        assert_eq!(after.embedding.model_id, ai::HASH_MODEL_ID);
+        assert!(after.embedding.installed);
+        assert_eq!(after.embedding.state, "Ready");
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5841,6 +5938,13 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [table], |row| {
                 row.get(0)
             })
+            .unwrap()
+    }
+
+    fn row_count(db: &IndexDatabase, table: &str) -> i64 {
+        db.storage
+            .connection()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
             .unwrap()
     }
 
