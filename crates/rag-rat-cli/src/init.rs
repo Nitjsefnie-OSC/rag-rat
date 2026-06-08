@@ -555,14 +555,7 @@ fn display_rel(path: &Path) -> String {
 }
 
 fn supported_languages() -> Vec<Language> {
-    vec![
-        Language::Rust,
-        Language::TypeScript,
-        Language::Kotlin,
-        Language::C,
-        Language::Cpp,
-        Language::Markdown,
-    ]
+    Language::all().to_vec()
 }
 
 fn option_value(args: &[String], name: &str) -> Option<String> {

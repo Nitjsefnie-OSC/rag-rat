@@ -4291,6 +4291,43 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn reconcile_treats_c_chunks_as_embedding_eligible() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/main.c"),
+            r#"
+static int read_sensor_value(int baseline)
+{
+    int adjusted = baseline + 42;
+    return adjusted;
+}
+
+int main(void)
+{
+    int sample = read_sensor_value(7);
+    return sample == 49 ? 0 : 1;
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::C);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+        let plan = db.reconcile_plan().unwrap();
+
+        assert_eq!(plan.embeddings.skipped_by_policy.get("SkipLanguageUnsupported"), None);
+        assert!(plan.embeddings.missing > 0, "plan: {:?}", plan.embeddings);
+
+        let report = db.reconcile(None, Some(8)).unwrap();
+        assert!(report.embeddings_written > 0, "report: {report:?}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reconcile_policy_skips_tiny_chunks_before_embedding() {
         let (root, config) = markdown_config("tiny\n");
         let db = IndexDatabase::rebuild(&config).unwrap();

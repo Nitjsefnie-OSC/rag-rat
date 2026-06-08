@@ -15,6 +15,13 @@ pub enum Language {
 }
 
 impl Language {
+    pub const ALL: [Self; 6] =
+        [Self::Rust, Self::TypeScript, Self::Kotlin, Self::C, Self::Cpp, Self::Markdown];
+
+    pub fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
@@ -37,11 +44,16 @@ impl Language {
         }
     }
 
+    pub fn supports_embeddings(self) -> bool {
+        matches!(
+            self,
+            Self::Rust | Self::TypeScript | Self::Kotlin | Self::C | Self::Cpp | Self::Markdown
+        )
+    }
+
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?;
-        [Self::Rust, Self::TypeScript, Self::Kotlin, Self::C, Self::Cpp, Self::Markdown]
-            .into_iter()
-            .find(|language| language.simple_extensions().contains(&ext))
+        Self::all().iter().copied().find(|language| language.simple_extensions().contains(&ext))
     }
 }
 

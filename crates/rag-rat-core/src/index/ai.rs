@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::index::now_ms;
+use crate::{index::now_ms, language::Language};
 
 pub const HASH_MODEL_ID: &str = "embedding-hash";
 pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
@@ -1493,7 +1493,10 @@ pub fn embedding_policy_for_chunk(
     if is_test_fixture_path(&path_text) {
         return policy("SkipTestFixture", 9, false);
     }
-    if !matches!(language, "rust" | "typescript" | "kotlin" | "markdown") {
+    let Ok(language_kind) = language.parse::<Language>() else {
+        return policy("SkipLanguageUnsupported", 9, false);
+    };
+    if !language_kind.supports_embeddings() {
         return policy("SkipLanguageUnsupported", 9, false);
     }
     if trimmed.chars().count() < MIN_EMBEDDING_CHARS {
