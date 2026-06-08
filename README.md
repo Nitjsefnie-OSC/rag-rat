@@ -1,53 +1,210 @@
 # rag-rat
 
-`rag-rat` is a local, read-only-source Rust repo-intelligence tool. It builds a SQLite FTS5 index over configured language roots and exposes CLI plus `rmcp` STDIO MCP access for LLM-assisted code search and propagation tracing.
+`rag-rat` is a local repo-intelligence index and MCP server for coding agents. It keeps source
+files read-only, writes only its configured SQLite database, and exposes current source, graph,
+git, GitHub papertrail, local-AI artifact status, and source-anchored repo memories as evidence.
 
-Indexing uses tree-sitter structure for Rust, TypeScript/TSX, and Kotlin source where files are small enough for bounded parsing, markdown heading chunks for docs, and coarse chunks for generated or oversized files. Chunk anchors store content and context fingerprints so stale reads can be detected and repaired.
+It is built for agents that need more than `rg` but still need local, inspectable provenance:
 
-Graph edges are populated from tree-sitter syntax, not compiler-grade name resolution. The indexer
-records pragmatic `imports`, `exports`, `calls_name`, `constructs`, `uses_macro`,
-`references_type`, `implements`, and `contains` edges with confidence labels: `Exact`,
-`Syntactic`, `NameOnly`, or `Ambiguous`. `trace_callees` is call-only by default
-(`calls_name`/`constructs`); references and macro edges are opt-in so type bounds and macro/module
-name collisions do not masquerade as normal callees. Raw edge evidence, receiver hints, call-site
-spans, and resolution reasons are stored with each edge. This makes `find_callers`,
-`trace_callees`, and impact routing useful while keeping approximate edges explicit.
-Duplicate Rust definitions that represent one cfg-gated API are grouped as logical symbols, so
-`logical_symbol_id` plus exact graph resolution can ask for callers of the logical API without
-weakening exactness to bare-name fallback.
+- current source chunks with stale-anchor validation
+- Rust, TypeScript/TSX, Kotlin, and Markdown structure
+- tree-sitter-derived call/reference/import/export graph edges
+- git history, lazy chunk blame, and path-level commit evidence
+- cached GitHub issue/PR/review/comment rationale
+- local embedding model bookkeeping and reconciliation
+- symbol/edge/path-bound repo memories that surface during future queries
 
-Tree-sitter grammars are exact-pinned in `Cargo.toml` so parser node coverage changes deliberately.
+## Supported Today
 
-Chunk anchors include normalized text hashes, boundary hashes, nearby context hashes, and an anchor
-version. `read_chunk` and search validate anchors against current source, relocate small line drift,
-and cap automatic stale-file reindexing per call.
+### Source Indexing
 
-Git history is indexed into SQLite when the target root is a git worktree. Commit subjects/bodies
-and path-level changes are historical evidence, separate from current source search. Chunk blame is
-computed lazily for current chunk text and cached against the current source text hash.
+`rag-rat` indexes configured repository targets into SQLite. It supports:
 
-GitHub papertrail data is fetched only by explicit `github sync` commands through `gh api`; normal
-search, papertrail, and rationale tools read the local SQLite cache only. Cached issues, PRs,
-comments, reviews, and review comments are indexed as historical GitHub evidence.
+- Rust, TypeScript, TSX, Kotlin, and Markdown
+- generated/coarse targets for large or generated files
+- tree-sitter symbols and chunks for supported source languages
+- Markdown heading chunks for docs
+- parser failure tracking, file counts, and index freshness reporting
+- changed-file, discovery, and full-rebuild index modes
 
-Local AI artifacts are explicit. `embedding-hash` is the deterministic baseline embedder.
-`fastembed-all-minilm-l6-v2` is the first real local embedding backend and requires building with
-`--features fastembed`. `models install` selects the active embedding model and is the intended
-FastEmbed cache-population step. `doctor` reports whether this binary has FastEmbed compiled in, the
-model cache path, model name, dimension, current/stale/missing/failed embedding counts, last
-reconcile throughput, and the next command to run. `reconcile` treats SQLite as the derived-artifact
-queue: it embeds only eligible current chunks whose bounded embedding input is missing, stale by
+Index rows are context-aware for git worktrees. Clean files are stored by `commit_sha`; dirty or
+untracked files are stored under a worktree overlay. Queries prefer the active worktree overlay and
+fall back to the active commit, so a single database can reuse rows across branch switches while
+still reflecting uncommitted local edits.
+
+### Current-Source Safety
+
+Chunks store text hashes, boundary hashes, context hashes, and an anchor version. `read_chunk` and
+search validate indexed hits against current source before returning them. Small line drift can be
+relocated; larger rewrites are reported as stale or gone. SQLite FTS is refreshed when the stored
+content revision says it is dirty.
+
+### Graph Intelligence
+
+The graph is tree-sitter-derived, not compiler-grade. Edges are stored with explicit confidence and
+provenance:
+
+- edge kinds: `calls_name`, `constructs`, `uses_macro`, `references_type`, `imports`, `exports`,
+  `contains`, `implements`
+- confidence labels: `Exact`, `Syntactic`, `NameOnly`, `Ambiguous`
+- callsite path/span, raw evidence snippets, receiver hints, target names, resolved symbol ids, and
+  resolution reasons
+
+`trace_callees` defaults to call-like edges (`calls_name` and `constructs`) so type references and
+macro/module collisions do not look like normal callees unless requested. Duplicate cfg-gated Rust
+definitions are grouped as logical symbols, so agents can ask for one logical API without falling
+back to unsafe bare-name matching.
+
+### Search And Impact
+
+The MCP surface includes:
+
+- `semantic_search`: indexed source/docs recall with SQLite BM25 lexical search and stale-hit
+  validation
+- `symbol_lookup`: exact or fuzzy Rust/TypeScript/Kotlin symbol lookup
+- `find_callers` and `trace_callees`: reverse/forward graph traversal
+- `compare_graph_to_text`: graph caller edges compared against regex text hits
+- `impact_surface`: coding preflight that combines graph, optional text fallback, docs, git,
+  GitHub papertrail, tests, and repo memories
+- `docs_for_symbol`: documentation chunks related to a symbol
+- `read_chunk`: current text for a selected chunk with anchor validation
+
+The name `semantic_search` is historical: the current supported MCP behavior is lexical BM25 recall
+plus freshness checks. Local embedding infrastructure exists, but vector recall should be treated as
+model/artifact-dependent rather than guaranteed.
+
+### Git And GitHub Evidence
+
+When the target root is a git worktree, `rag-rat` indexes commit subjects, bodies, and touched
+paths. It also computes chunk blame lazily and caches blame against the current chunk text hash.
+
+Supported MCP tools:
+
+- `commit_search`
+- `git_history_for_path`
+- `git_history_for_symbol`
+- `commits_touching_query`
+- `git_blame_chunk`
+
+GitHub papertrail is cache-first. `github sync` uses `gh api` explicitly; normal MCP tools read only
+the SQLite cache. Cached issues, PRs, issue comments, PR reviews, and review comments are indexed as
+historical rationale.
+
+Supported MCP tools:
+
+- `papertrail_for_chunk`
+- `papertrail_for_symbol`
+- `papertrail_for_commit`
+- `github_issue_search`
+- `github_refs_for_path`
+- `rationale_search`
+- `github_sync_status`
+
+Reference discovery supports common issue forms such as `Fixes #123`, `GH-123`,
+`owner/repo#123`, and full GitHub issue/PR URLs.
+
+### FFI Discovery
+
+`ffi_surface` finds likely FFI-relevant rows with evidence classes:
+
+- Rust UniFFI/exported items
+- native binding references
+- generated binding artifacts
+
+This is a discovery/preflight tool, not a proof of ABI compatibility.
+
+### Local AI Artifacts
+
+Local AI state is explicit and inspectable:
+
+- `embedding-hash`: deterministic baseline embedder
+- `fastembed-all-minilm-l6-v2`: local FastEmbed backend when built with the `fastembed` feature
+- `models list/install`: model registry and install state
+- `local_ai_status`: active/installed/missing status plus chunk/vector counters
+- `reconcile`: derived-artifact queue for embedding current eligible chunks
+
+`reconcile` embeds only eligible current chunks whose bounded embedding input is missing, stale by
 input hash, stale by model/version/dimension, or retryable after failure. Low-signal chunks are
-skipped with visible policy reasons such as `SkipGenerated`, `SkipTooSmall`, `SkipTooLarge`,
-`SkipLowSignal`, `SkipLanguageUnsupported`, and `SkipTestFixture`. `semantic_search` uses embeddings
-only when the model is installed, the stored dimension matches active model metadata, the artifact is
-`Current`, and both source text hash and embedding input hash match the current chunk. Stale AI
-artifacts are treated as absent.
+skipped with explicit policy reasons such as `SkipGenerated`, `SkipTooSmall`, `SkipTooLarge`,
+`SkipLowSignal`, `SkipLanguageUnsupported`, and `SkipTestFixture`.
 
-CPU-heavy index work uses the Rayon worker pool. File reads, source hashing, tree-sitter preparation,
-and git-log parsing run in parallel across available cores. Reconcile batches embedding inputs,
-runs model inference outside SQLite transactions, then writes vectors through one short serialized
-transaction per batch so the database is not held open while FastEmbed/ONNX is doing CPU work.
+### Repo Memories
+
+Repo memories are first-class local evidence, not chat memory. They are typed, source-anchored notes
+bound to code or repository evidence.
+
+Supported memory kinds:
+
+- `Invariant`
+- `Decision`
+- `RejectedAlternative`
+- `Risk`
+- `BugPattern`
+- `TestExpectation`
+- `PerformanceNote`
+- `SecurityNote`
+- `FFIBoundary`
+- `PlatformQuirk`
+- `FollowUp`
+- `OpenQuestion`
+- `Obsolete`
+
+Supported bindings:
+
+- `logical_symbol_id`
+- `symbol_id`
+- `chunk_id`
+- path plus optional line span
+- graph `edge_id`
+- call-path edge sequence hash
+- commit hash
+- GitHub issue/PR reference
+
+Memories track `current`, `relocated`, `stale`, `gone`, or `unverified` anchor state. They surface
+through `memory_*` tools and through integrated tools such as `read_chunk`, `symbol_lookup`,
+`find_callers`, `trace_callees`, and `impact_surface`. Edge-bound memories appear under
+`repo_memories.path_crossed` when an impact query crosses that graph edge.
+
+Supported MCP tools:
+
+- `memory_create`
+- `memory_update`
+- `memory_search`
+- `memory_for_symbol`
+- `memory_for_path`
+- `memory_for_call_path`
+- `memory_validate`
+- `memory_mark_obsolete`
+
+### Maintenance And Evaluation
+
+Supported operational commands:
+
+- `migrate` / `migrate --check`
+- `doctor`
+- `index_status`
+- `heal_index`
+- `hooks install/status/uninstall`
+- `maintenance --trigger <hook> --max-seconds <n>`
+- `eval`, `eval --json`, `eval --update-baseline`
+- `dump-config`
+
+`eval` runs fixture-driven ranking and freshness checks and reports search, graph, impact, git, and
+papertrail metrics. Current-source violations must stay at zero.
+
+## Known Limits
+
+- Graph resolution is pragmatic tree-sitter analysis, not compiler/typechecker resolution.
+- Kotlin graph extraction is useful but less mature than Rust and TypeScript.
+- `index --watch` is reserved and currently returns an explicit not-implemented error.
+- `semantic_search` is currently best understood as lexical BM25 recall plus freshness checks unless
+  a real embedding model is installed and reconciled.
+- `impact_surface` can return large JSON payloads; compact evidence views are still needed.
+- FFI surface detection is heuristic.
+- Call-path hash memories can be looked up, but authoritative edge-sequence hashes are not yet
+  generated by traversal tools.
+- Repo memories do not yet have review/approval workflow, multi-bind editing, or low-confidence
+  filtering in integrated tools.
 
 ## Commands
 
@@ -144,64 +301,10 @@ For development without installing the binary, point the MCP client at Cargo:
 }
 ```
 
-## Schema Migrations
-
-The SQLite index has an explicit `schema_version` table. Each migration records an id,
-`applied_at_ms`, checksum, and description. Runtime opens are check-only: compatible schemas open,
-older schemas report `rag-rat migrate` or `rag-rat index --full`, newer schemas are refused, and
-dirty or partial migrations are refused with a rebuild instruction.
-
-Use `migrate --check` for CI/preflight and `migrate` to apply the current index schema baseline.
-Because the index is derived, hard migration failures should be resolved with `index --full`.
-
-`index` defaults to `--changed`: it uses git status to index changed/new paths and remove deleted
-indexed paths. `index --discover` walks configured targets, detects new files, changed indexed
-files, and removed indexed files, then updates only that delta. Use `index --full` to rebuild every
-file and rebuild the SQLite FTS5 table from stored chunks. `index --watch` is reserved for a later
-file-watcher mode and currently exits with an explicit not-implemented error.
-
-When the target root is a git worktree, indexed rows are scoped by context. Clean files are stored
-under the current `commit_sha`; dirty or untracked files are stored under a transient `worktree_id`
-overlay. Queries read the active worktree overlay first and then fall back to rows for the active
-commit, so branch switches can reuse previously indexed commit rows while uncommitted files shadow
-their committed versions. Non-git roots are treated as worktree overlays.
-
-`doctor` reports discovery drift. If configured source files are not indexed, it returns a warning
-such as `3 unindexed source files detected. Run rag-rat index --full or rag-rat index --discover.`
-
-Search never runs silently against stale FTS state. The index records a content revision for the
-current `files`/`chunks` rows, tracks whether FTS is dirty after writes, and synchronizes FTS before
-search when `fts_source_revision` no longer matches `content_revision`.
-
-`reconcile --plan` reports the embedding backlog by validity reason, priority class, and skip
-policy. Eligible chunks are prioritized before tests and low-signal material; generated/coarse,
-too-small, too-large, unsupported-language, fixture, import-only, and export-barrel chunks are
-skipped intentionally rather than embedded just to reach 100 percent vector coverage. Embedding input
-is bounded by `--max-embedding-chars` and hashed with the active model id, model version, and
-embedding text builder version, so indexing metadata churn does not recompute unchanged embedding
-inputs. Use `--changed-first --max-seconds 60 --batch-size 64` for daily catch-up, and
-`--until-clean --batch-size 64` for a full backlog pass. Reconcile JSON reports `chunks_per_sec`,
-`chars_per_sec`, average input size, truncated input count, and `skipped_by_policy`.
-
-`eval` runs the fixture-driven ranking and freshness harness from `evals/queries.toml` plus
-`evals/expected_hits.toml`. It reports MRR@10, Recall@10, path hit rate, symbol hit rate,
-graph evidence hit rate, impact hit rate, git evidence hit rate, papertrail evidence hit rate,
-stale-hit rate, current-source violation count, papertrail precision sample, and latency p50/p95.
-`stale_current_source_violations` must remain zero. Papertrail cases can be marked
-`requires_papertrail_cache = true`; they are skipped until local GitHub evidence has been synced.
-Use `eval --json` for machine-readable output and `eval --update-baseline` to rewrite
-`expected_hits.toml` from observed top-10 evidence.
-
-Non-git target roots still index source and docs; git history status reports unavailable with zero
-commit/path rows.
-
-GitHub sync discovers references from commits, branch names, indexed files, and docs. It supports
-`Fixes`/`Closes`/`Refs`/`See`, `GH-123`, `owner/repo#123`, and full GitHub issue/PR URLs. `--offline`
-updates discovered references and reports cache status without network access.
-
 ## Configuration
 
-The host repo owns `rag-rat.toml`. This keeps monorepo-specific target bindings out of the reusable tool.
+The host repo owns `rag-rat.toml`. This keeps monorepo-specific target bindings out of the reusable
+tool.
 
 ```toml
 [index]
@@ -228,25 +331,26 @@ include = ["**/*.ts"]
 
 ## Git Hooks
 
-`rag-rat hooks install` installs generated `post-checkout`, `post-merge`, and `post-rewrite`
-hooks for the current worktree. The hooks run in the background and call one bounded command:
-`rag-rat maintenance --trigger <hook> --max-seconds 30`. `post-checkout` forwards Git's checkout
-arguments as `--old-head`, `--new-head`, and `--branch-checkout`, and file-only checkouts are
-skipped.
+`rag-rat hooks install` installs generated `post-checkout`, `post-merge`, and `post-rewrite` hooks
+for the current worktree. The hooks run in the background and call one bounded command:
+`rag-rat maintenance --trigger <hook> --max-seconds 30`. Existing unmanaged hook files are never
+overwritten.
 
 `rag-rat maintenance` operates on the current worktree only. For branch switches, merges, and
 rewrites it runs discover indexing for new/changed/deleted files, refreshes SQLite FTS through the
 index path when needed, then reconciles embeddings with `changed_first` until the remaining time
-budget is spent. It reports the remaining embedding backlog at the end.
-
-Use `rag-rat hooks status` to inspect generated hooks and `rag-rat hooks uninstall` to remove only
-hooks managed by rag-rat. Existing unmanaged hook files are never overwritten.
+budget is spent.
 
 ## Security
 
-The MCP server exposes read-only source tools only. It does not execute shell commands or write configured target files. It may write the configured SQLite index during `index` and during automatic stale-index healing before returning search or `read_chunk` results.
+The MCP server exposes read-only source tools only. It does not execute shell commands or write
+configured target files. It may write the configured SQLite index during indexing, migration,
+maintenance, model reconciliation, repo-memory operations, and automatic stale-index healing before
+returning search or `read_chunk` results.
+
+GitHub sync is explicit and uses `gh api`; normal query tools read the local SQLite cache.
 
 ## Size Budget
 
-Storage dependency changes must keep the binary slim. See `docs/binary-size.md` for the
-manual size check and heavyweight dependency policy.
+Storage dependency changes must keep the binary slim. See `docs/binary-size.md` for the manual size
+check and heavyweight dependency policy.
