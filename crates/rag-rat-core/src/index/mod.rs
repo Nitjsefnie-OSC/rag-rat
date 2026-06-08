@@ -3171,6 +3171,19 @@ fn collect_changed_index_files(
     Ok(files)
 }
 
+fn spawn_git_history_prepare(
+    root: &Path,
+) -> JoinHandle<anyhow::Result<git_history::PreparedGitHistory>> {
+    let root = root.to_path_buf();
+    thread::spawn(move || git_history::prepare(&root))
+}
+
+fn join_git_history_prepare(
+    handle: JoinHandle<anyhow::Result<git_history::PreparedGitHistory>>,
+) -> anyhow::Result<git_history::PreparedGitHistory> {
+    handle.join().map_err(|_| anyhow::anyhow!("git history preparation panicked"))?
+}
+
 fn prepare_index_file(file: &IndexFile) -> PreparedIndexFile {
     PreparedIndexFile { file: file.clone(), prepared: prepare_index_content(file) }
 }
@@ -4957,6 +4970,120 @@ export const callRun = () => run();
             }),
             "callRun callees: {callees:?}"
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_c_graph_edges_from_tree_sitter() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/runtime.c"),
+            r#"
+typedef struct Runtime Runtime;
+
+struct Runtime {
+  int state;
+};
+
+int helper(Runtime *runtime) {
+  return runtime->state;
+}
+
+int runtime_open(Runtime *runtime) {
+  return helper(runtime);
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::C);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "runtime_open", "helper", "calls_name", "Syntactic");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_c_file_scope_macro_regions_for_search() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("drivers/entropy")).unwrap();
+        fs::write(
+            root.join("drivers/entropy/entropy.c"),
+            r#"
+static int entropy_init(const struct device *dev)
+{
+    ARG_UNUSED(dev);
+    return 0;
+}
+
+/* Entropy driver APIs structure */
+static DEVICE_API(entropy, entropy_cryptoacc_trng_api) = {
+    .get_entropy = entropy_cryptoacc_trng_get_entropy,
+};
+
+DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
+                      PRE_KERNEL_1, CONFIG_ENTROPY_INIT_PRIORITY,
+                      &entropy_cryptoacc_trng_api);
+"#,
+        )
+        .unwrap();
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "c".to_string(),
+                language: Language::C,
+                directories: vec![PathBuf::from("drivers/entropy")],
+                include: vec!["**/*.c".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+        };
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let hits = db.search("DEVICE_API", 5, false).unwrap();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.path == "drivers/entropy/entropy.c" && hit.summary.contains("DEVICE_API")
+            }),
+            "DEVICE_API hits: {hits:?}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexes_cpp_graph_edges_from_tree_sitter() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/runtime.cpp"),
+            r#"
+namespace held {
+class Runtime {
+public:
+  void open();
+};
+
+void helper() {}
+
+void Runtime::open() {
+  helper();
+}
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Cpp);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_edge(&db, "open", "helper", "calls_name", "Syntactic");
 
         fs::remove_dir_all(root).unwrap();
     }

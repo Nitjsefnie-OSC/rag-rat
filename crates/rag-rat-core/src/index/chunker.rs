@@ -76,7 +76,7 @@ fn markdown_chunks(text: &str) -> Vec<Chunk> {
 fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Vec<Chunk>> {
     let symbols = parser::parse_symbols(path, language, text)?;
     let mut chunks = Vec::new();
-    for symbol in symbols {
+    for symbol in &symbols {
         let Some(symbol_span) = line_span(text, symbol.start_line, symbol.end_line) else {
             continue;
         };
@@ -103,7 +103,78 @@ fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Ve
             ));
         }
     }
+    chunks.extend(uncovered_code_chunks(path, text, &symbols));
+    chunks.sort_by_key(|chunk| (chunk.start_byte, chunk.end_byte));
     if chunks.is_empty() { Ok(whole_file_chunk(path, text)) } else { Ok(chunks) }
+}
+
+fn uncovered_code_chunks(path: &Path, text: &str, symbols: &[parser::ParsedSymbol]) -> Vec<Chunk> {
+    let line_count = text.lines().count().max(1);
+    let mut covered = vec![false; line_count + 1];
+    for symbol in symbols {
+        let start = symbol.start_line.max(1);
+        let end = symbol.end_line.min(line_count);
+        for line in start..=end {
+            covered[line] = true;
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut start_line = None;
+    for line in 1..=line_count {
+        if !covered[line] {
+            start_line.get_or_insert(line);
+            continue;
+        }
+        if let Some(start) = start_line.take() {
+            push_uncovered_chunk(
+                path,
+                text,
+                start,
+                line.saturating_sub(1),
+                chunks.len(),
+                &mut chunks,
+            );
+        }
+    }
+    if let Some(start) = start_line {
+        push_uncovered_chunk(path, text, start, line_count, chunks.len(), &mut chunks);
+    }
+    chunks
+}
+
+fn push_uncovered_chunk(
+    path: &Path,
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+    context_index: usize,
+    chunks: &mut Vec<Chunk>,
+) {
+    let Some(span) = line_span(text, start_line, end_line) else {
+        return;
+    };
+    if span.text.trim().is_empty() {
+        return;
+    }
+    for (part_idx, part) in
+        split_symbol(&span.text, span.start_byte, start_line, 80).into_iter().enumerate()
+    {
+        chunks.push(make_chunk(
+            "code",
+            Some(format!(
+                "{}::#context-{}{}",
+                path.to_string_lossy().replace('\\', "/"),
+                context_index + 1,
+                if part_idx == 0 { String::new() } else { format!("-{part_idx}") }
+            )),
+            part.start_byte,
+            part.end_byte,
+            part.start_line,
+            part.end_line,
+            part.text,
+        ));
+    }
 }
 
 struct LineSpan {
