@@ -451,6 +451,7 @@ pub fn papertrail_for_commit(
         fallback_evidence.extend(evidence_for_path(conn, &row?, limit)?);
     }
     fallback_evidence.extend(rationale_search(conn, commit_hash, limit)?);
+    mark_fallback_evidence(&mut fallback_evidence);
     dedupe_evidence(&mut evidence);
     dedupe_evidence(&mut fallback_evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
@@ -460,6 +461,17 @@ pub fn papertrail_for_commit(
         github_evidence: evidence,
         fallback_github_evidence: fallback_evidence,
     })
+}
+
+fn mark_fallback_evidence(evidence: &mut [GitHubEvidence]) {
+    for item in evidence {
+        item.evidence_kind = match item.evidence_kind {
+            "literal_github_ref" => "fallback_literal_github_ref",
+            "historical_github" => "fallback_historical_github",
+            _ => "fallback_github_evidence",
+        };
+        item.score = item.score.min(0.25);
+    }
 }
 
 pub fn discover_and_store_refs(conn: &Connection, root: &Path) -> anyhow::Result<Vec<GitHubRef>> {

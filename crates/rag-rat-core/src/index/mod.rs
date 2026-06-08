@@ -5276,7 +5276,10 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
             Some("literal_github_ref")
         );
         assert!(papertrail.fallback_github_evidence.iter().all(|item| {
-            item.evidence_kind == "historical_github" || item.evidence_kind == "literal_github_ref"
+            matches!(
+                item.evidence_kind,
+                "fallback_historical_github" | "fallback_literal_github_ref"
+            ) && item.score <= 0.25
         }));
 
         fs::remove_dir_all(root).unwrap();
