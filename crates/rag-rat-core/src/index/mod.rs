@@ -372,10 +372,10 @@ impl IndexDatabase {
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
-            db.rebuild_logical_symbols()?;
-            db.resolve_edges()?;
-            db.mark_graph_index_current()?;
             if indexed > 0 {
+                db.rebuild_logical_symbols()?;
+                db.resolve_edges()?;
+                db.mark_graph_index_current()?;
                 db.sync_fts()?;
             }
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
@@ -3413,6 +3413,21 @@ mod schema_bootstrap_tests {
         assert!(fresh.warning.is_none());
         assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
         assert!(db.symbols("old_symbol", Some(Language::Rust), 10).unwrap().is_empty());
+
+        let mut events = Vec::new();
+        let db = IndexDatabase::index_discover_with_progress(&config, |progress| {
+            events.push(progress);
+        })
+        .unwrap();
+        assert!(matches!(events.last(), Some(IndexProgress::Finished { files: 0 })));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                IndexProgress::PreparingFile { .. } | IndexProgress::IndexingFile { .. }
+            )),
+            "no-op discover should not prepare or index files: {events:?}"
+        );
+        assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
 
         fs::remove_dir_all(root).unwrap();
     }
