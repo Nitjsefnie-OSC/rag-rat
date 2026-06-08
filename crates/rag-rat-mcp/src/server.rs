@@ -14,9 +14,9 @@ use serde_json::{Map, Value, json};
 
 use crate::tools::{
     BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
-    MemoryCreateArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs, MemorySearchArgs,
-    MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs,
-    SearchArgs, SymbolArgs, SymbolGraphArgs,
+    MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs,
+    MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs,
+    ReadChunkArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -345,6 +345,17 @@ impl RagRatService {
         Parameters(args): Parameters<MemoryForPathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("memory_for_path", json!(args))
+    }
+
+    #[tool(
+        name = "memory_for_call_path",
+        description = "Return repo memories bound to one call-path edge sequence hash."
+    )]
+    fn memory_for_call_path(
+        &self,
+        Parameters(args): Parameters<MemoryForCallPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_for_call_path", json!(args))
     }
 
     #[tool(

@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 11;
+pub const LATEST_SCHEMA_VERSION: u32 = 12;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -45,6 +45,10 @@ const MIGRATION_011_ID: &str = "011_repo_memories";
 const MIGRATION_011_CHECKSUM: &str = "sha256:rag-rat-repo-memories-v11";
 const MIGRATION_011_DESCRIPTION: &str =
     "Add source-anchored repo memories bound to symbols, chunks, paths, and papertrail refs";
+const MIGRATION_012_ID: &str = "012_repo_memory_call_paths";
+const MIGRATION_012_CHECKSUM: &str = "sha256:rag-rat-repo-memory-call-paths-v12";
+const MIGRATION_012_DESCRIPTION: &str =
+    "Add edge and call-path memory bindings for graph traversal surfacing";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +123,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_010_ID, MIGRATION_010_CHECKSUM, MIGRATION_010_DESCRIPTION)?;
     apply_repo_memories(conn)?;
     record_migration(conn, MIGRATION_011_ID, MIGRATION_011_CHECKSUM, MIGRATION_011_DESCRIPTION)?;
+    apply_repo_memory_call_paths(conn)?;
+    record_migration(conn, MIGRATION_012_ID, MIGRATION_012_CHECKSUM, MIGRATION_012_DESCRIPTION)?;
     Ok(())
 }
 
@@ -593,6 +599,17 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS repo_memory_call_paths(
+            memory_id TEXT NOT NULL,
+            start_logical_symbol_id INTEGER,
+            end_logical_symbol_id INTEGER,
+            edge_sequence_hash TEXT NOT NULL,
+            path_summary TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, edge_sequence_hash),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
             text,
             content='chunks',
@@ -655,8 +672,14 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
             ON repo_memory_bindings(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_chunk
             ON repo_memory_bindings(chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_edge
+            ON repo_memory_bindings(edge_id);
         CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_path
             ON repo_memory_bindings(path);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_start
+            ON repo_memory_call_paths(start_logical_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_end
+            ON repo_memory_call_paths(end_logical_symbol_id);
         ",
     )?;
     migrate_files(conn)?;
@@ -676,6 +699,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_github_ref_sync(conn)?;
     apply_symbol_facts(conn)?;
     apply_repo_memories(conn)?;
+    apply_repo_memory_call_paths(conn)?;
     Ok(())
 }
 
@@ -976,6 +1000,17 @@ fn apply_repo_memories(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS repo_memory_call_paths(
+            memory_id TEXT NOT NULL,
+            start_logical_symbol_id INTEGER,
+            end_logical_symbol_id INTEGER,
+            edge_sequence_hash TEXT NOT NULL,
+            path_summary TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, edge_sequence_hash),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
         CREATE VIRTUAL TABLE IF NOT EXISTS repo_memory_fts USING fts5(
             memory_id UNINDEXED,
             title,
@@ -991,8 +1026,39 @@ fn apply_repo_memories(conn: &Connection) -> rusqlite::Result<()> {
             ON repo_memory_bindings(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_chunk
             ON repo_memory_bindings(chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_edge
+            ON repo_memory_bindings(edge_id);
         CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_path
             ON repo_memory_bindings(path);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_start
+            ON repo_memory_call_paths(start_logical_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_end
+            ON repo_memory_call_paths(end_logical_symbol_id);
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS repo_memory_call_paths(
+            memory_id TEXT NOT NULL,
+            start_logical_symbol_id INTEGER,
+            end_logical_symbol_id INTEGER,
+            edge_sequence_hash TEXT NOT NULL,
+            path_summary TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, edge_sequence_hash),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_edge
+            ON repo_memory_bindings(edge_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_start
+            ON repo_memory_call_paths(start_logical_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_end
+            ON repo_memory_call_paths(end_logical_symbol_id);
         ",
     )?;
     Ok(())
@@ -1071,6 +1137,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_009_ID => Some(9),
             MIGRATION_010_ID => Some(10),
             MIGRATION_011_ID => Some(11),
+            MIGRATION_012_ID => Some(12),
             _ => None,
         })
         .max()
@@ -1091,6 +1158,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_009_ID
             | MIGRATION_010_ID
             | MIGRATION_011_ID
+            | MIGRATION_012_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1108,6 +1176,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_009_ID => migration.checksum != MIGRATION_009_CHECKSUM,
         MIGRATION_010_ID => migration.checksum != MIGRATION_010_CHECKSUM,
         MIGRATION_011_ID => migration.checksum != MIGRATION_011_CHECKSUM,
+        MIGRATION_012_ID => migration.checksum != MIGRATION_012_CHECKSUM,
         _ => false,
     }
 }

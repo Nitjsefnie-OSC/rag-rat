@@ -149,6 +149,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_search",
     "memory_for_symbol",
     "memory_for_path",
+    "memory_for_call_path",
     "memory_validate",
     "memory_mark_obsolete",
 ];
@@ -383,6 +384,7 @@ pub struct MemoryBindArgs {
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub chunk_id: Option<i64>,
+    pub edge_id: Option<i64>,
     pub path: Option<String>,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
@@ -390,6 +392,10 @@ pub struct MemoryBindArgs {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
+    pub start_logical_symbol_id: Option<i64>,
+    pub end_logical_symbol_id: Option<i64>,
+    pub edge_sequence_hash: Option<String>,
+    pub path_summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -438,6 +444,13 @@ pub struct MemoryForSymbolArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryForPathArgs {
     pub path: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryForCallPathArgs {
+    pub edge_sequence_hash: String,
     #[serde(default = "default_search_limit")]
     pub limit: u32,
 }
@@ -659,6 +672,10 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
             let args: MemoryForPathArgs = serde_json::from_value(arguments)?;
             json!(db.memory_for_path(&args.path, args.limit)?)
         },
+        "memory_for_call_path" => {
+            let args: MemoryForCallPathArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_for_call_path_hash(&args.edge_sequence_hash, args.limit)?)
+        },
         "memory_validate" => json!(db.memory_validate()?),
         "memory_mark_obsolete" => {
             let args: MemoryIdArgs = serde_json::from_value(arguments)?;
@@ -742,7 +759,14 @@ fn graph_tool(
             )?);
             compact_graph_coverage(&mut value, args.include_coverage);
             if include_memories {
-                value["repo_memories"] = json!(db.memory_for_symbol(&symbol, 10)?);
+                let edge_ids = value["results"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|hop| hop.get("edge_id").and_then(Value::as_i64))
+                    .collect::<Vec<_>>();
+                value["repo_memories"] =
+                    json!(db.memory_evidence_for_symbol_and_edges(&symbol, &edge_ids, 10)?);
             }
             Ok(value)
         },
@@ -1015,6 +1039,7 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             logical_symbol_id: args.logical_symbol_id,
             symbol_id: args.symbol_id,
             chunk_id: args.chunk_id,
+            edge_id: args.edge_id,
             path: args.path,
             start_line: args.start_line,
             end_line: args.end_line,
@@ -1022,6 +1047,10 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             github_owner: args.github_owner,
             github_repo: args.github_repo,
             github_number: args.github_number,
+            start_logical_symbol_id: args.start_logical_symbol_id,
+            end_logical_symbol_id: args.end_logical_symbol_id,
+            edge_sequence_hash: args.edge_sequence_hash,
+            path_summary: args.path_summary,
         }
     }
 }
@@ -1105,6 +1134,7 @@ pub fn description(name: &str) -> &'static str {
         "memory_search" => "Search active or stale repo memories with deterministic FTS recall.",
         "memory_for_symbol" => "Return repo memories bound to a selected symbol or logical symbol.",
         "memory_for_path" => "Return repo memories bound to one current repository path.",
+        "memory_for_call_path" => "Return repo memories bound to one call-path edge sequence hash.",
         "memory_validate" => {
             "Validate repo-memory anchors and mark current, relocated, stale, or gone."
         },
@@ -1138,6 +1168,7 @@ pub fn schema(name: &str) -> Value {
         "memory_search" => schema_for::<MemorySearchArgs>(),
         "memory_for_symbol" => schema_for::<MemoryForSymbolArgs>(),
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
+        "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),
         "memory_mark_obsolete" => schema_for::<MemoryIdArgs>(),
         "local_ai_status" | "github_sync_status" | "index_status" | "memory_validate" => {
             schema_for::<EmptyArgs>()
@@ -1263,6 +1294,7 @@ mod tests {
             "memory_search",
             "memory_for_symbol",
             "memory_for_path",
+            "memory_for_call_path",
             "memory_validate",
             "memory_mark_obsolete",
         ] {
@@ -1362,10 +1394,14 @@ mod tests {
         assert_schema_requires(tools, "memory_create", "kind");
         assert_schema_requires(tools, "memory_create", "bind");
         assert_schema_has_property(tools, "memory_create", "confidence");
+        assert_schema_nested_property(tools, "memory_create", "bind", "edge_id");
+        assert_schema_nested_property(tools, "memory_create", "bind", "edge_sequence_hash");
+        assert_schema_nested_property(tools, "memory_create", "bind", "path_summary");
         assert_schema_requires(tools, "memory_update", "memory_id");
         assert_schema_requires(tools, "memory_search", "query");
         assert_schema_has_property(tools, "memory_for_symbol", "logical_symbol_id");
         assert_schema_requires(tools, "memory_for_path", "path");
+        assert_schema_requires(tools, "memory_for_call_path", "edge_sequence_hash");
         assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
         assert_eq!(tool_schema(tools, "memory_validate")["type"], "object");
         assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
@@ -1731,6 +1767,16 @@ mod tests {
     fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
         let schema = tool_schema(tools, name);
         assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
+    }
+
+    fn assert_schema_nested_property(tools: &[Value], name: &str, parent: &str, field: &str) {
+        let schema = tool_schema(tools, name);
+        let property = schema["properties"].get(parent).expect("schema property");
+        let resolved = resolve_schema_ref(schema, property);
+        assert!(
+            resolved["properties"].get(field).is_some(),
+            "{name}.{parent} should define {field}"
+        );
     }
 
     fn assert_schema_property_enum(tools: &[Value], name: &str, field: &str, expected: &[&str]) {

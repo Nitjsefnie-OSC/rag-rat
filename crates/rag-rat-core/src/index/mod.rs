@@ -1778,6 +1778,40 @@ impl IndexDatabase {
         crate::query::memory::memories_for_path(self.storage.connection(), path, limit)
     }
 
+    pub fn memory_for_edges(
+        &self,
+        edge_ids: &[i64],
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
+        crate::query::memory::memories_for_edges(self.storage.connection(), edge_ids, limit)
+    }
+
+    pub fn memory_evidence_for_symbol_and_edges(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        edge_ids: &[i64],
+        limit: u32,
+    ) -> anyhow::Result<crate::query::memory::RepoMemoryEvidence> {
+        crate::query::memory::memory_evidence_for_symbol_and_edges(
+            self.storage.connection(),
+            symbol,
+            edge_ids,
+            limit,
+        )
+    }
+
+    pub fn memory_for_call_path_hash(
+        &self,
+        edge_sequence_hash: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
+        crate::query::memory::memories_for_call_path_hash(
+            self.storage.connection(),
+            edge_sequence_hash,
+            limit,
+        )
+    }
+
     pub fn memory_validate(
         &self,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryValidationReport> {
@@ -6256,6 +6290,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                     logical_symbol_id: Some(logical_symbol_id),
                     symbol_id: None,
                     chunk_id: None,
+                    edge_id: None,
                     path: None,
                     start_line: None,
                     end_line: None,
@@ -6263,6 +6298,10 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                     github_owner: None,
                     github_repo: None,
                     github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
                 },
             })
             .unwrap();
@@ -6341,6 +6380,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                     logical_symbol_id: None,
                     symbol_id: None,
                     chunk_id: Some(chunk_id),
+                    edge_id: None,
                     path: None,
                     start_line: None,
                     end_line: None,
@@ -6348,6 +6388,10 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                     github_owner: None,
                     github_repo: None,
                     github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
                 },
             })
             .unwrap();
@@ -6367,6 +6411,125 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         assert_eq!(report.gone, 1);
         let gone = db.memory_for_symbol(&symbol, 10).unwrap();
         assert_eq!(gone[0].bindings[0].anchor_status, "gone");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn target_edge() {}\npub fn caller_edge() {\n    target_edge();\n}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let target = db
+            .select_symbol(&crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("target_edge".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: false,
+                limit: 10,
+            })
+            .unwrap()
+            .unwrap()
+            .expect("selected target");
+        let graph_options = crate::query::graph::GraphTraversalOptions {
+            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(target.symbol_id),
+            logical_symbol_id: target.logical_symbol_id,
+            ..Default::default()
+        };
+        let callers =
+            db.graph_traversal_report("find_callers", &target, true, 10, &graph_options).unwrap();
+        let edge_id = callers.results[0].edge_id;
+
+        let edge_memory = db
+            .memory_create(crate::query::memory::RepoMemoryCreate {
+                kind: "Risk".to_string(),
+                title: "caller_edge to target_edge must stay synchronous".to_string(),
+                body: "This specific call path is used to prove edge-bound memories surface when impact crosses the edge."
+                    .to_string(),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: vec!["edge".to_string()],
+                bind: crate::query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: None,
+                    symbol_id: None,
+                    chunk_id: None,
+                    edge_id: Some(edge_id),
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
+                },
+            })
+            .unwrap();
+        assert_eq!(edge_memory.memory.bindings[0].binding_kind, "edge");
+        assert_eq!(edge_memory.memory.bindings[0].edge_id, Some(edge_id));
+
+        let impact = db
+            .impact_surface_report_for_selected_symbol(
+                &target,
+                10,
+                &crate::query::impact::ImpactSurfaceOptions {
+                    resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(impact.repo_memories.direct.is_empty());
+        assert_eq!(impact.repo_memories.path_crossed.len(), 1);
+        assert_eq!(impact.repo_memories.path_crossed[0].memory_id, edge_memory.memory.memory_id);
+        assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
+
+        let call_path_memory = db
+            .memory_create(crate::query::memory::RepoMemoryCreate {
+                kind: "TestExpectation".to_string(),
+                title: "caller_edge path hash recall".to_string(),
+                body: "Call-path memories are addressable by a deterministic edge sequence hash."
+                    .to_string(),
+                confidence: "medium".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: vec!["call-path".to_string()],
+                bind: crate::query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: None,
+                    symbol_id: None,
+                    chunk_id: None,
+                    edge_id: None,
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: target.logical_symbol_id,
+                    end_logical_symbol_id: target.logical_symbol_id,
+                    edge_sequence_hash: Some("edge-sequence-test-hash".to_string()),
+                    path_summary: Some("caller_edge -> target_edge".to_string()),
+                },
+            })
+            .unwrap();
+        let call_path = db.memory_for_call_path_hash("edge-sequence-test-hash", 10).unwrap();
+        assert_eq!(call_path.len(), 1);
+        assert_eq!(call_path[0].memory_id, call_path_memory.memory.memory_id);
+        assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
 
         fs::remove_dir_all(root).unwrap();
     }

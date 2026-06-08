@@ -230,6 +230,7 @@ pub struct GraphOnlyEdge {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphHop {
+    pub edge_id: i64,
     pub from_symbol: Option<String>,
     pub to_symbol: Option<String>,
     pub edge_kind: String,
@@ -283,27 +284,28 @@ pub fn traverse_with_options(
         let tier = reverse_tier(mode);
         format!(
             "
-            SELECT COALESCE(from_symbols.qualified_name, edges.from_name),
-                   COALESCE(to_symbols.qualified_name, edges.to_name),
-                   edges.edge_kind,
-                   edges.confidence,
-                   edges.to_name,
-                   edges.target_qualified_name,
-                   edges.evidence,
-                   edges.receiver_hint,
-                   edges.resolution,
-                   edges.to_symbol_id IS NOT NULL,
-                   source_files.path,
-                   COALESCE(NULLIF(edges.source_start_line, 0), 1),
-                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1),
-                   {tier}
+            SELECT COALESCE(from_symbols.qualified_name, edges.from_name) AS from_symbol,
+                   COALESCE(to_symbols.qualified_name, edges.to_name) AS to_symbol,
+                   edges.id AS edge_id,
+                   edges.edge_kind AS edge_kind,
+                   edges.confidence AS confidence,
+                   edges.to_name AS target,
+                   edges.target_qualified_name AS target_qualified_name,
+                   edges.evidence AS evidence,
+                   edges.receiver_hint AS receiver_hint,
+                   edges.resolution AS edge_resolution,
+                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
+                   source_files.path AS callsite_path,
+                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
+                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1) AS callsite_end_line,
+                   {tier} AS match_tier
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
             LEFT JOIN symbols to_symbols ON to_symbols.id = edges.to_symbol_id
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
-            ORDER BY 14,
+            ORDER BY match_tier,
                 CASE edges.confidence
                     WHEN 'Exact' THEN 0
                     WHEN 'Syntactic' THEN 1
@@ -321,20 +323,21 @@ pub fn traverse_with_options(
         let visibility_filter = forward_visibility_filter(options);
         format!(
             "
-            SELECT COALESCE(from_symbols.qualified_name, edges.from_name),
-                   COALESCE(to_symbols.qualified_name, edges.to_name),
-                   edges.edge_kind,
-                   edges.confidence,
-                   edges.to_name,
-                   edges.target_qualified_name,
-                   edges.evidence,
-                   edges.receiver_hint,
-                   edges.resolution,
-                   edges.to_symbol_id IS NOT NULL,
-                   source_files.path,
-                   COALESCE(NULLIF(edges.source_start_line, 0), 1),
-                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1),
-                   0
+            SELECT COALESCE(from_symbols.qualified_name, edges.from_name) AS from_symbol,
+                   COALESCE(to_symbols.qualified_name, edges.to_name) AS to_symbol,
+                   edges.id AS edge_id,
+                   edges.edge_kind AS edge_kind,
+                   edges.confidence AS confidence,
+                   edges.to_name AS target,
+                   edges.target_qualified_name AS target_qualified_name,
+                   edges.evidence AS evidence,
+                   edges.receiver_hint AS receiver_hint,
+                   edges.resolution AS edge_resolution,
+                   edges.to_symbol_id IS NOT NULL AS verified_target_symbol,
+                   source_files.path AS callsite_path,
+                   COALESCE(NULLIF(edges.source_start_line, 0), 1) AS callsite_start_line,
+                   COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1) AS callsite_end_line,
+                   0 AS match_tier
             FROM edges
             JOIN files source_files ON source_files.id = edges.source_file_id
             LEFT JOIN symbols from_symbols ON from_symbols.id = edges.from_symbol_id
@@ -367,24 +370,29 @@ pub fn traverse_with_options(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |row| {
-        let edge_kind: String = row.get(2)?;
-        let confidence: String = row.get(3)?;
-        let verified_target_symbol = row.get(9)?;
-        let resolution =
-            resolution_label(mode, row.get::<_, String>(8)?, row.get(13)?, verified_target_symbol);
-        let callsite_path: String = row.get(10)?;
-        let callsite_start = row.get(11)?;
-        let callsite_end = row.get(12)?;
+        let edge_kind: String = row.get("edge_kind")?;
+        let confidence: String = row.get("confidence")?;
+        let verified_target_symbol = row.get("verified_target_symbol")?;
+        let resolution = resolution_label(
+            mode,
+            row.get::<_, String>("edge_resolution")?,
+            row.get("match_tier")?,
+            verified_target_symbol,
+        );
+        let callsite_path: String = row.get("callsite_path")?;
+        let callsite_start = row.get("callsite_start_line")?;
+        let callsite_end = row.get("callsite_end_line")?;
         Ok(GraphHop {
-            from_symbol: row.get(0)?,
-            to_symbol: row.get(1)?,
+            edge_id: row.get("edge_id")?,
+            from_symbol: row.get("from_symbol")?,
+            to_symbol: row.get("to_symbol")?,
             edge_kind: edge_kind.clone(),
             confidence: confidence.clone(),
             edge_confidence: confidence,
-            target: row.get(4)?,
-            target_qualified_name: row.get(5)?,
-            evidence: row.get(6)?,
-            receiver_hint: row.get(7)?,
+            target: row.get("target")?,
+            target_qualified_name: row.get("target_qualified_name")?,
+            evidence: row.get("evidence")?,
+            receiver_hint: row.get("receiver_hint")?,
             resolution,
             verified_target_symbol,
             shown_by_default: CALL_EDGE_KINDS.contains(&edge_kind.as_str()),
@@ -410,6 +418,7 @@ fn dedupe_hops(hops: &mut Vec<GraphHop>) {
         seen.insert((
             hop.from_symbol.clone(),
             hop.to_symbol.clone(),
+            hop.edge_id,
             hop.edge_kind.clone(),
             hop.target.clone(),
             hop.target_qualified_name.clone(),
@@ -921,8 +930,11 @@ fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'static str {
 }
 
 fn unique_symbol_name(conn: &Connection, name: &str) -> anyhow::Result<bool> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM symbols WHERE name = ?1", [name], |row| row.get(0))?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) AS symbol_count FROM symbols WHERE name = ?1",
+        [name],
+        |row| row.get("symbol_count"),
+    )?;
     Ok(count == 1)
 }
 

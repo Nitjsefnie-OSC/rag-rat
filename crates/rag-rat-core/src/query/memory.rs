@@ -20,6 +20,7 @@ pub struct RepoMemory {
     pub input_hash: Option<String>,
     pub memory_version: String,
     pub bindings: Vec<RepoMemoryBinding>,
+    pub call_paths: Vec<RepoMemoryCallPath>,
     pub tags: Vec<String>,
 }
 
@@ -40,6 +41,16 @@ pub struct RepoMemoryBinding {
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
     pub anchor_status: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoMemoryCallPath {
+    pub memory_id: String,
+    pub start_logical_symbol_id: Option<i64>,
+    pub end_logical_symbol_id: Option<i64>,
+    pub edge_sequence_hash: String,
+    pub path_summary: String,
     pub created_at_ms: i64,
 }
 
@@ -67,6 +78,7 @@ pub struct RepoMemoryBindTarget {
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,
     pub chunk_id: Option<i64>,
+    pub edge_id: Option<i64>,
     pub path: Option<String>,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
@@ -74,6 +86,10 @@ pub struct RepoMemoryBindTarget {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
+    pub start_logical_symbol_id: Option<i64>,
+    pub end_logical_symbol_id: Option<i64>,
+    pub edge_sequence_hash: Option<String>,
+    pub path_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +116,7 @@ pub struct RepoMemoryValidationReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoMemoryEvidence {
     pub direct: Vec<RepoMemory>,
+    pub path_crossed: Vec<RepoMemory>,
     pub stale: Vec<RepoMemory>,
 }
 
@@ -113,12 +130,22 @@ struct ResolvedBinding {
     logical_symbol_id: Option<i64>,
     symbol_id: Option<i64>,
     chunk_id: Option<i64>,
+    edge_id: Option<i64>,
     commit_hash: Option<String>,
     github_owner: Option<String>,
     github_repo: Option<String>,
     github_number: Option<i64>,
+    call_path: Option<ResolvedCallPath>,
     source_text_hash: Option<String>,
     anchor_status: String,
+}
+
+#[derive(Debug)]
+struct ResolvedCallPath {
+    start_logical_symbol_id: Option<i64>,
+    end_logical_symbol_id: Option<i64>,
+    edge_sequence_hash: String,
+    path_summary: String,
 }
 
 pub fn create_memory(
@@ -238,8 +265,19 @@ pub fn memory_by_id(conn: &Connection, memory_id: &str) -> anyhow::Result<Option
     let Some(mut memory) = conn
         .query_row(
             "
-            SELECT id, kind, title, body, confidence, status, created_by, created_at_ms,
-                   updated_at_ms, source, source_text_hash, input_hash, memory_version
+            SELECT id AS memory_id,
+                   kind AS kind,
+                   title AS title,
+                   body AS body,
+                   confidence AS confidence,
+                   status AS status,
+                   created_by AS created_by,
+                   created_at_ms AS created_at_ms,
+                   updated_at_ms AS updated_at_ms,
+                   source AS source,
+                   source_text_hash AS source_text_hash,
+                   input_hash AS input_hash,
+                   memory_version AS memory_version
             FROM repo_memories
             WHERE id = ?1
             ",
@@ -261,7 +299,7 @@ pub fn memories_for_chunk(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let mut stmt = conn.prepare(
         "
-        SELECT DISTINCT repo_memories.id
+        SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
         LEFT JOIN chunks ON chunks.id = ?1
@@ -277,7 +315,9 @@ pub fn memories_for_chunk(
     )?;
     ids_to_memories(
         conn,
-        stmt.query_map(params![chunk_id, i64::from(limit)], |row| row.get::<_, String>(0))?,
+        stmt.query_map(params![chunk_id, i64::from(limit)], |row| {
+            row.get::<_, String>("memory_id")
+        })?,
     )
 }
 
@@ -288,7 +328,7 @@ pub fn memories_for_path(
 ) -> anyhow::Result<Vec<RepoMemory>> {
     let mut stmt = conn.prepare(
         "
-        SELECT DISTINCT repo_memories.id
+        SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
         WHERE repo_memories.status IN ('active', 'stale')
@@ -297,7 +337,10 @@ pub fn memories_for_path(
         LIMIT ?2
         ",
     )?;
-    ids_to_memories(conn, stmt.query_map(params![path, i64::from(limit)], |row| row.get(0))?)
+    ids_to_memories(
+        conn,
+        stmt.query_map(params![path, i64::from(limit)], |row| row.get("memory_id"))?,
+    )
 }
 
 pub fn memories_for_symbol(
@@ -309,7 +352,7 @@ pub fn memories_for_symbol(
     let mut candidate_ids = BTreeSet::new();
     let mut stmt = conn.prepare(
         "
-        SELECT DISTINCT repo_memories.id
+        SELECT DISTINCT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
         WHERE repo_memories.status IN ('active', 'stale')
@@ -317,7 +360,10 @@ pub fn memories_for_symbol(
               repo_memory_bindings.logical_symbol_id = ?1
               OR repo_memory_bindings.symbol_id = ?2
               OR repo_memory_bindings.binding_id = ?3
-              OR repo_memory_bindings.path = ?4
+              OR (
+                  repo_memory_bindings.binding_kind = 'path'
+                  AND repo_memory_bindings.path = ?4
+              )
           )
         ORDER BY repo_memories.updated_at_ms DESC
         LIMIT ?5
@@ -331,7 +377,7 @@ pub fn memories_for_symbol(
             symbol.path,
             i64::from(limit)
         ],
-        |row| row.get::<_, String>(0),
+        |row| row.get::<_, String>("memory_id"),
     )?;
     for row in rows {
         candidate_ids.insert(row?);
@@ -340,7 +386,7 @@ pub fn memories_for_symbol(
         let placeholders = std::iter::repeat_n("?", chunk_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
             "
-            SELECT DISTINCT repo_memories.id
+            SELECT DISTINCT repo_memories.id AS memory_id
             FROM repo_memories
             JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
             WHERE repo_memories.status IN ('active', 'stale')
@@ -353,8 +399,9 @@ pub fn memories_for_symbol(
         let mut values =
             chunk_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect::<Vec<_>>();
         values.push(rusqlite::types::Value::Integer(i64::from(limit)));
-        let rows =
-            stmt.query_map(rusqlite::params_from_iter(values), |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            row.get::<_, String>("memory_id")
+        })?;
         for row in rows {
             candidate_ids.insert(row?);
         }
@@ -374,7 +421,77 @@ pub fn memory_evidence_for_symbol(
     symbol: &crate::query::symbol::SymbolHit,
     limit: u32,
 ) -> anyhow::Result<RepoMemoryEvidence> {
-    split_active_stale(memories_for_symbol(conn, symbol, limit)?)
+    let (direct, stale) = split_active_stale(memories_for_symbol(conn, symbol, limit)?);
+    Ok(RepoMemoryEvidence { direct, path_crossed: Vec::new(), stale })
+}
+
+pub fn memory_evidence_for_symbol_and_edges(
+    conn: &Connection,
+    symbol: &crate::query::symbol::SymbolHit,
+    edge_ids: &[i64],
+    limit: u32,
+) -> anyhow::Result<RepoMemoryEvidence> {
+    let (direct, mut stale) = split_active_stale(memories_for_symbol(conn, symbol, limit)?);
+    let (path_crossed, crossed_stale) =
+        split_active_stale(memories_for_edges(conn, edge_ids, limit)?);
+    stale.extend(crossed_stale);
+    Ok(RepoMemoryEvidence { direct, path_crossed, stale })
+}
+
+pub fn memories_for_edges(
+    conn: &Connection,
+    edge_ids: &[i64],
+    limit: u32,
+) -> anyhow::Result<Vec<RepoMemory>> {
+    if edge_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut unique_edge_ids = edge_ids.to_vec();
+    unique_edge_ids.sort_unstable();
+    unique_edge_ids.dedup();
+    let placeholders =
+        std::iter::repeat_n("?", unique_edge_ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "
+        SELECT DISTINCT repo_memories.id AS memory_id
+        FROM repo_memories
+        JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
+        WHERE repo_memories.status IN ('active', 'stale')
+          AND repo_memory_bindings.edge_id IN ({placeholders})
+        ORDER BY repo_memories.updated_at_ms DESC
+        LIMIT ?
+        "
+    );
+    let mut values =
+        unique_edge_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect::<Vec<_>>();
+    values.push(rusqlite::types::Value::Integer(i64::from(limit)));
+    let mut stmt = conn.prepare(&sql)?;
+    ids_to_memories(
+        conn,
+        stmt.query_map(rusqlite::params_from_iter(values), |row| row.get("memory_id"))?,
+    )
+}
+
+pub fn memories_for_call_path_hash(
+    conn: &Connection,
+    edge_sequence_hash: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<RepoMemory>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT DISTINCT repo_memories.id AS memory_id
+        FROM repo_memories
+        JOIN repo_memory_call_paths ON repo_memory_call_paths.memory_id = repo_memories.id
+        WHERE repo_memories.status IN ('active', 'stale')
+          AND repo_memory_call_paths.edge_sequence_hash = ?1
+        ORDER BY repo_memories.updated_at_ms DESC
+        LIMIT ?2
+        ",
+    )?;
+    ids_to_memories(
+        conn,
+        stmt.query_map(params![edge_sequence_hash, i64::from(limit)], |row| row.get("memory_id"))?,
+    )
 }
 
 pub fn memory_search(
@@ -397,7 +514,10 @@ pub fn memory_search(
         LIMIT ?2
         ",
     )?;
-    ids_to_memories(conn, stmt.query_map(params![query, i64::from(limit)], |row| row.get(0))?)
+    ids_to_memories(
+        conn,
+        stmt.query_map(params![query, i64::from(limit)], |row| row.get("memory_id"))?,
+    )
 }
 
 pub fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidationReport> {
@@ -429,10 +549,11 @@ pub fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidati
                 logical_symbol_id = ?4,
                 symbol_id = ?5,
                 chunk_id = ?6,
-                path = ?7,
-                start_line = ?8,
-                end_line = ?9
-            WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?10
+                edge_id = ?7,
+                path = ?8,
+                start_line = ?9,
+                end_line = ?10
+            WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?11
             ",
             params![
                 binding.memory_id,
@@ -441,6 +562,7 @@ pub fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidati
                 binding.logical_symbol_id,
                 binding.symbol_id,
                 binding.chunk_id,
+                binding.edge_id,
                 binding.path,
                 binding.start_line,
                 binding.end_line,
@@ -471,6 +593,12 @@ fn resolve_binding(
     if let Some(chunk_id) = bind.chunk_id {
         return resolve_chunk_binding(conn, chunk_id);
     }
+    if let Some(edge_id) = bind.edge_id {
+        return resolve_edge_binding(conn, edge_id);
+    }
+    if let Some(edge_sequence_hash) = bind.edge_sequence_hash.as_deref() {
+        return resolve_call_path_binding(conn, bind, edge_sequence_hash);
+    }
     if let Some(path) = bind.path.as_deref() {
         return resolve_path_binding(conn, path, bind.start_line, bind.end_line);
     }
@@ -484,10 +612,12 @@ fn resolve_binding(
             logical_symbol_id: None,
             symbol_id: None,
             chunk_id: None,
+            edge_id: None,
             commit_hash: Some(commit_hash.to_string()),
             github_owner: None,
             github_repo: None,
             github_number: None,
+            call_path: None,
             source_text_hash: None,
             anchor_status: "unverified".to_string(),
         });
@@ -504,16 +634,18 @@ fn resolve_binding(
             logical_symbol_id: None,
             symbol_id: None,
             chunk_id: None,
+            edge_id: None,
             commit_hash: None,
             github_owner: Some(owner.to_string()),
             github_repo: Some(repo.to_string()),
             github_number: Some(number),
+            call_path: None,
             source_text_hash: None,
             anchor_status: "unverified".to_string(),
         });
     }
     anyhow::bail!(
-        "memory_create requires logical_symbol_id, symbol_id, chunk_id, path/span, commit_hash, or github ref binding"
+        "memory_create requires logical_symbol_id, symbol_id, chunk_id, edge_id, call path, path/span, commit_hash, or github ref binding"
     )
 }
 
@@ -533,10 +665,12 @@ fn resolve_logical_symbol_binding(
         logical_symbol_id: Some(logical_symbol_id),
         symbol_id: chunk.as_ref().and_then(|chunk| chunk.symbol_id),
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
+        edge_id: None,
         commit_hash: None,
         github_owner: None,
         github_repo: None,
         github_number: None,
+        call_path: None,
         source_text_hash: chunk.map(|chunk| chunk.text_hash),
         anchor_status: "current".to_string(),
     })
@@ -555,10 +689,12 @@ fn resolve_symbol_binding(conn: &Connection, symbol_id: i64) -> anyhow::Result<R
         logical_symbol_id: symbol.logical_symbol_id,
         symbol_id: Some(symbol_id),
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
+        edge_id: None,
         commit_hash: None,
         github_owner: None,
         github_repo: None,
         github_number: None,
+        call_path: None,
         source_text_hash: chunk.map(|chunk| chunk.text_hash),
         anchor_status: "current".to_string(),
     })
@@ -578,12 +714,81 @@ fn resolve_chunk_binding(conn: &Connection, chunk_id: i64) -> anyhow::Result<Res
             .and_then(|id| logical_symbol_id_for_symbol(conn, id).ok().flatten()),
         symbol_id,
         chunk_id: Some(chunk_id),
+        edge_id: None,
         commit_hash: None,
         github_owner: None,
         github_repo: None,
         github_number: None,
+        call_path: None,
         source_text_hash: Some(chunk.text_hash),
         anchor_status: "current".to_string(),
+    })
+}
+
+fn resolve_edge_binding(conn: &Connection, edge_id: i64) -> anyhow::Result<ResolvedBinding> {
+    let edge =
+        edge_by_id(conn, edge_id)?.ok_or_else(|| anyhow::anyhow!("edge_id {edge_id} not found"))?;
+    Ok(ResolvedBinding {
+        binding_kind: "edge".to_string(),
+        binding_id: edge.fingerprint,
+        path: Some(edge.path),
+        start_line: Some(edge.start_line),
+        end_line: Some(edge.end_line),
+        logical_symbol_id: None,
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: Some(edge_id),
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        call_path: None,
+        source_text_hash: Some(edge.source_hash),
+        anchor_status: "current".to_string(),
+    })
+}
+
+fn resolve_call_path_binding(
+    conn: &Connection,
+    bind: &RepoMemoryBindTarget,
+    edge_sequence_hash: &str,
+) -> anyhow::Result<ResolvedBinding> {
+    validate_len("edge_sequence_hash", edge_sequence_hash, 128)?;
+    let path_summary = bind
+        .path_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("call-path memory requires path_summary"))?;
+    validate_len("path_summary", path_summary, 500)?;
+    if let Some(start_id) = bind.start_logical_symbol_id {
+        ensure_logical_symbol_exists(conn, start_id)?;
+    }
+    if let Some(end_id) = bind.end_logical_symbol_id {
+        ensure_logical_symbol_exists(conn, end_id)?;
+    }
+    Ok(ResolvedBinding {
+        binding_kind: "call_path".to_string(),
+        binding_id: edge_sequence_hash.to_string(),
+        path: None,
+        start_line: None,
+        end_line: None,
+        logical_symbol_id: bind.start_logical_symbol_id.or(bind.end_logical_symbol_id),
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        call_path: Some(ResolvedCallPath {
+            start_logical_symbol_id: bind.start_logical_symbol_id,
+            end_logical_symbol_id: bind.end_logical_symbol_id,
+            edge_sequence_hash: edge_sequence_hash.to_string(),
+            path_summary: path_summary.to_string(),
+        }),
+        source_text_hash: None,
+        anchor_status: "unverified".to_string(),
     })
 }
 
@@ -612,10 +817,12 @@ fn resolve_path_binding(
         logical_symbol_id: None,
         symbol_id: None,
         chunk_id: None,
+        edge_id: None,
         commit_hash: None,
         github_owner: None,
         github_repo: None,
         github_number: None,
+        call_path: None,
         source_text_hash: file_hash,
         anchor_status: "current".to_string(),
     })
@@ -632,11 +839,26 @@ struct ChunkAnchor {
     symbol_id: Option<i64>,
 }
 
+#[derive(Debug)]
+struct EdgeAnchor {
+    edge_id: i64,
+    fingerprint: String,
+    path: String,
+    start_line: i64,
+    end_line: i64,
+    source_hash: String,
+}
+
 fn chunk_by_id(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ChunkAnchor>> {
     conn.query_row(
         "
-        SELECT chunks.id, files.path, chunks.start_line, chunks.end_line, chunks.symbol_path,
-               chunks.text_hash, NULL
+        SELECT chunks.id AS chunk_id,
+               files.path AS path,
+               chunks.start_line AS start_line,
+               chunks.end_line AS end_line,
+               chunks.symbol_path AS symbol_path,
+               chunks.text_hash AS text_hash,
+               NULL AS symbol_id
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         WHERE chunks.id = ?1
@@ -655,8 +877,13 @@ fn chunk_for_symbol(
 ) -> anyhow::Result<Option<ChunkAnchor>> {
     conn.query_row(
         "
-        SELECT chunks.id, files.path, chunks.start_line, chunks.end_line, chunks.symbol_path,
-               chunks.text_hash, symbols.id
+        SELECT chunks.id AS chunk_id,
+               files.path AS path,
+               chunks.start_line AS start_line,
+               chunks.end_line AS end_line,
+               chunks.symbol_path AS symbol_path,
+               chunks.text_hash AS text_hash,
+               symbols.id AS symbol_id
         FROM symbols
         JOIN files ON files.id = symbols.file_id
         LEFT JOIN chunks ON chunks.file_id = files.id
@@ -679,8 +906,13 @@ fn chunk_for_logical_symbol(
 ) -> anyhow::Result<Option<ChunkAnchor>> {
     conn.query_row(
         "
-        SELECT chunks.id, files.path, chunks.start_line, chunks.end_line, chunks.symbol_path,
-               chunks.text_hash, symbols.id
+        SELECT chunks.id AS chunk_id,
+               files.path AS path,
+               chunks.start_line AS start_line,
+               chunks.end_line AS end_line,
+               chunks.symbol_path AS symbol_path,
+               chunks.text_hash AS text_hash,
+               symbols.id AS symbol_id
         FROM logical_symbol_members
         JOIN symbols ON symbols.id = logical_symbol_members.symbol_id
         JOIN files ON files.id = symbols.file_id
@@ -703,7 +935,7 @@ fn chunk_ids_for_symbol(
 ) -> anyhow::Result<Vec<i64>> {
     let mut stmt = conn.prepare(
         "
-        SELECT chunks.id
+        SELECT chunks.id AS chunk_id
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         WHERE files.path = ?1
@@ -712,7 +944,7 @@ fn chunk_ids_for_symbol(
     )?;
     let rows = stmt
         .query_map(params![symbol.path, symbol.qualified_name, symbol.symbol_path], |row| {
-            row.get::<_, i64>(0)
+            row.get::<_, i64>("chunk_id")
         })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -723,14 +955,14 @@ fn symbol_id_for_chunk(conn: &Connection, chunk: &ChunkAnchor) -> anyhow::Result
     };
     conn.query_row(
         "
-        SELECT symbols.id
+        SELECT symbols.id AS symbol_id
         FROM symbols
         JOIN files ON files.id = symbols.file_id
         WHERE files.path = ?1 AND symbols.qualified_name = ?2
         LIMIT 1
         ",
         params![chunk.path, symbol_path],
-        |row| row.get(0),
+        |row| row.get("symbol_id"),
     )
     .optional()
     .map_err(Into::into)
@@ -738,9 +970,9 @@ fn symbol_id_for_chunk(conn: &Connection, chunk: &ChunkAnchor) -> anyhow::Result
 
 fn logical_symbol_id_for_symbol(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<i64>> {
     conn.query_row(
-        "SELECT logical_symbol_id FROM logical_symbol_members WHERE symbol_id = ?1 LIMIT 1",
+        "SELECT logical_symbol_id AS logical_symbol_id FROM logical_symbol_members WHERE symbol_id = ?1 LIMIT 1",
         [symbol_id],
-        |row| row.get(0),
+        |row| row.get("logical_symbol_id"),
     )
     .optional()
     .map_err(Into::into)
@@ -748,14 +980,122 @@ fn logical_symbol_id_for_symbol(conn: &Connection, symbol_id: i64) -> anyhow::Re
 
 fn chunk_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkAnchor> {
     Ok(ChunkAnchor {
-        chunk_id: row.get(0)?,
-        path: row.get(1)?,
-        start_line: row.get(2)?,
-        end_line: row.get(3)?,
-        symbol_path: row.get(4)?,
-        text_hash: row.get(5)?,
-        symbol_id: row.get(6)?,
+        chunk_id: row.get("chunk_id")?,
+        path: row.get("path")?,
+        start_line: row.get("start_line")?,
+        end_line: row.get("end_line")?,
+        symbol_path: row.get("symbol_path")?,
+        text_hash: row.get("text_hash")?,
+        symbol_id: row.get("symbol_id")?,
     })
+}
+
+fn edge_by_id(conn: &Connection, edge_id: i64) -> anyhow::Result<Option<EdgeAnchor>> {
+    conn.query_row(
+        "
+        SELECT edges.id AS edge_id,
+               files.path AS path,
+               COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1) AS end_line,
+               files.sha256 AS source_hash,
+               edges.from_name AS from_name,
+               edges.to_name AS to_name,
+               edges.edge_kind AS edge_kind,
+               edges.target_qualified_name AS target_qualified_name,
+               edges.receiver_hint AS receiver_hint
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.id = ?1
+        ",
+        [edge_id],
+        edge_anchor_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn edge_by_fingerprint(conn: &Connection, fingerprint: &str) -> anyhow::Result<Option<EdgeAnchor>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT edges.id AS edge_id,
+               files.path AS path,
+               COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1) AS end_line,
+               files.sha256 AS source_hash,
+               edges.from_name AS from_name,
+               edges.to_name AS to_name,
+               edges.edge_kind AS edge_kind,
+               edges.target_qualified_name AS target_qualified_name,
+               edges.receiver_hint AS receiver_hint
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        ",
+    )?;
+    let rows = stmt.query_map([], edge_anchor_row)?;
+    for row in rows {
+        let edge = row?;
+        if edge.fingerprint == fingerprint {
+            return Ok(Some(edge));
+        }
+    }
+    Ok(None)
+}
+
+fn edge_anchor_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeAnchor> {
+    let path: String = row.get("path")?;
+    let start_line = row.get("start_line")?;
+    let end_line = row.get("end_line")?;
+    let from_name: Option<String> = row.get("from_name")?;
+    let to_name: Option<String> = row.get("to_name")?;
+    let edge_kind: String = row.get("edge_kind")?;
+    let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
+    let receiver_hint: Option<String> = row.get("receiver_hint")?;
+    Ok(EdgeAnchor {
+        edge_id: row.get("edge_id")?,
+        fingerprint: edge_fingerprint(
+            &path,
+            start_line,
+            end_line,
+            from_name.as_deref(),
+            to_name.as_deref(),
+            &edge_kind,
+            target_qualified_name.as_deref(),
+            receiver_hint.as_deref(),
+        ),
+        path,
+        start_line,
+        end_line,
+        source_hash: row.get("source_hash")?,
+    })
+}
+
+fn edge_fingerprint(
+    path: &str,
+    start_line: i64,
+    end_line: i64,
+    from_name: Option<&str>,
+    to_name: Option<&str>,
+    edge_kind: &str,
+    target_qualified_name: Option<&str>,
+    receiver_hint: Option<&str>,
+) -> String {
+    hex_sha256(
+        format!(
+            "{path}\n{start_line}\n{end_line}\n{}\n{}\n{edge_kind}\n{}\n{}",
+            from_name.unwrap_or(""),
+            to_name.unwrap_or(""),
+            target_qualified_name.unwrap_or(""),
+            receiver_hint.unwrap_or("")
+        )
+        .as_bytes(),
+    )
+}
+
+fn ensure_logical_symbol_exists(conn: &Connection, logical_symbol_id: i64) -> anyhow::Result<()> {
+    if crate::query::symbol::lookup_logical_by_id(conn, logical_symbol_id)?.is_some() {
+        return Ok(());
+    }
+    anyhow::bail!("logical_symbol_id {logical_symbol_id} not found")
 }
 
 fn insert_binding(
@@ -771,7 +1111,7 @@ fn insert_binding(
             symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo, github_number,
             anchor_status, created_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?13, ?14, ?15)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ",
         params![
             memory_id,
@@ -783,6 +1123,7 @@ fn insert_binding(
             binding.logical_symbol_id,
             binding.symbol_id,
             binding.chunk_id,
+            binding.edge_id,
             binding.commit_hash,
             binding.github_owner,
             binding.github_repo,
@@ -791,6 +1132,25 @@ fn insert_binding(
             now
         ],
     )?;
+    if let Some(call_path) = &binding.call_path {
+        conn.execute(
+            "
+            INSERT INTO repo_memory_call_paths(
+                memory_id, start_logical_symbol_id, end_logical_symbol_id, edge_sequence_hash,
+                path_summary, created_at_ms
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                memory_id,
+                call_path.start_logical_symbol_id,
+                call_path.end_logical_symbol_id,
+                call_path.edge_sequence_hash,
+                call_path.path_summary,
+                now
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -802,7 +1162,7 @@ fn duplicate_memory_id(
 ) -> anyhow::Result<Option<String>> {
     conn.query_row(
         "
-        SELECT repo_memories.id
+        SELECT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
         WHERE lower(repo_memories.title) = lower(?1)
@@ -813,7 +1173,7 @@ fn duplicate_memory_id(
         LIMIT 1
         ",
         params![title.trim(), body.trim(), binding.binding_kind, binding.binding_id],
-        |row| row.get(0),
+        |row| row.get("memory_id"),
     )
     .optional()
     .map_err(Into::into)
@@ -848,42 +1208,43 @@ fn upsert_memory_fts(conn: &Connection, memory_id: &str) -> anyhow::Result<()> {
 
 fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory> {
     Ok(RepoMemory {
-        memory_id: row.get(0)?,
-        kind: row.get(1)?,
-        title: row.get(2)?,
-        body: row.get(3)?,
-        confidence: row.get(4)?,
-        status: row.get(5)?,
-        created_by: row.get(6)?,
-        created_at_ms: row.get(7)?,
-        updated_at_ms: row.get(8)?,
-        source: row.get(9)?,
-        source_text_hash: row.get(10)?,
-        input_hash: row.get(11)?,
-        memory_version: row.get(12)?,
+        memory_id: row.get("memory_id")?,
+        kind: row.get("kind")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        confidence: row.get("confidence")?,
+        status: row.get("status")?,
+        created_by: row.get("created_by")?,
+        created_at_ms: row.get("created_at_ms")?,
+        updated_at_ms: row.get("updated_at_ms")?,
+        source: row.get("source")?,
+        source_text_hash: row.get("source_text_hash")?,
+        input_hash: row.get("input_hash")?,
+        memory_version: row.get("memory_version")?,
         bindings: Vec::new(),
+        call_paths: Vec::new(),
         tags: Vec::new(),
     })
 }
 
 fn binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemoryBinding> {
     Ok(RepoMemoryBinding {
-        memory_id: row.get(0)?,
-        binding_kind: row.get(1)?,
-        binding_id: row.get(2)?,
-        path: row.get(3)?,
-        start_line: row.get(4)?,
-        end_line: row.get(5)?,
-        logical_symbol_id: row.get(6)?,
-        symbol_id: row.get(7)?,
-        chunk_id: row.get(8)?,
-        edge_id: row.get(9)?,
-        commit_hash: row.get(10)?,
-        github_owner: row.get(11)?,
-        github_repo: row.get(12)?,
-        github_number: row.get(13)?,
-        anchor_status: row.get(14)?,
-        created_at_ms: row.get(15)?,
+        memory_id: row.get("memory_id")?,
+        binding_kind: row.get("binding_kind")?,
+        binding_id: row.get("binding_id")?,
+        path: row.get("path")?,
+        start_line: row.get("start_line")?,
+        end_line: row.get("end_line")?,
+        logical_symbol_id: row.get("logical_symbol_id")?,
+        symbol_id: row.get("symbol_id")?,
+        chunk_id: row.get("chunk_id")?,
+        edge_id: row.get("edge_id")?,
+        commit_hash: row.get("commit_hash")?,
+        github_owner: row.get("github_owner")?,
+        github_repo: row.get("github_repo")?,
+        github_number: row.get("github_number")?,
+        anchor_status: row.get("anchor_status")?,
+        created_at_ms: row.get("created_at_ms")?,
     })
 }
 
@@ -900,8 +1261,30 @@ fn attach_memory_children(conn: &Connection, memory: &mut RepoMemory) -> anyhow:
     )?;
     memory.bindings =
         stmt.query_map([&memory.memory_id], binding_row)?.collect::<Result<Vec<_>, _>>()?;
+    let mut stmt = conn.prepare(
+        "
+        SELECT memory_id, start_logical_symbol_id, end_logical_symbol_id, edge_sequence_hash,
+               path_summary, created_at_ms
+        FROM repo_memory_call_paths
+        WHERE memory_id = ?1
+        ORDER BY created_at_ms, edge_sequence_hash
+        ",
+    )?;
+    memory.call_paths =
+        stmt.query_map([&memory.memory_id], call_path_row)?.collect::<Result<Vec<_>, _>>()?;
     memory.tags = tags_for_memory(conn, &memory.memory_id)?;
     Ok(())
+}
+
+fn call_path_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemoryCallPath> {
+    Ok(RepoMemoryCallPath {
+        memory_id: row.get("memory_id")?,
+        start_logical_symbol_id: row.get("start_logical_symbol_id")?,
+        end_logical_symbol_id: row.get("end_logical_symbol_id")?,
+        edge_sequence_hash: row.get("edge_sequence_hash")?,
+        path_summary: row.get("path_summary")?,
+        created_at_ms: row.get("created_at_ms")?,
+    })
 }
 
 fn tags_for_memory(conn: &Connection, memory_id: &str) -> anyhow::Result<Vec<String>> {
@@ -925,7 +1308,7 @@ fn ids_to_memories(
     Ok(memories)
 }
 
-fn split_active_stale(memories: Vec<RepoMemory>) -> anyhow::Result<RepoMemoryEvidence> {
+fn split_active_stale(memories: Vec<RepoMemory>) -> (Vec<RepoMemory>, Vec<RepoMemory>) {
     let mut direct = Vec::new();
     let mut stale = Vec::new();
     for memory in memories {
@@ -939,7 +1322,7 @@ fn split_active_stale(memories: Vec<RepoMemory>) -> anyhow::Result<RepoMemoryEvi
             direct.push(memory);
         }
     }
-    Ok(RepoMemoryEvidence { direct, stale })
+    (direct, stale)
 }
 
 fn validate_binding(conn: &Connection, binding: &mut RepoMemoryBinding) -> anyhow::Result<String> {
@@ -947,6 +1330,8 @@ fn validate_binding(conn: &Connection, binding: &mut RepoMemoryBinding) -> anyho
         "logical_symbol" => validate_logical_symbol_binding(conn, binding),
         "symbol" => validate_symbol_binding(conn, binding),
         "chunk" => validate_chunk_binding(conn, binding),
+        "edge" => validate_edge_binding(conn, binding),
+        "call_path" => validate_call_path_binding(conn, binding),
         "path" => validate_path_binding(conn, binding),
         "commit" | "github" => Ok("unverified".to_string()),
         _ => Ok("unverified".to_string()),
@@ -1029,6 +1414,59 @@ fn validate_chunk_binding(
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
     validate_bound_chunk(conn, binding)
+}
+
+fn validate_edge_binding(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+) -> anyhow::Result<String> {
+    if let Some(edge_id) = binding.edge_id {
+        if let Some(edge) = edge_by_id(conn, edge_id)? {
+            binding.path = Some(edge.path);
+            binding.start_line = Some(edge.start_line);
+            binding.end_line = Some(edge.end_line);
+            binding.symbol_id = None;
+            binding.logical_symbol_id = None;
+            return validate_bound_edge_source_hash(conn, binding, &edge.source_hash);
+        }
+    }
+    let Some(edge) = edge_by_fingerprint(conn, &binding.binding_id)? else {
+        return Ok("gone".to_string());
+    };
+    binding.edge_id = Some(edge.edge_id);
+    binding.path = Some(edge.path);
+    binding.start_line = Some(edge.start_line);
+    binding.end_line = Some(edge.end_line);
+    binding.symbol_id = None;
+    binding.logical_symbol_id = None;
+    Ok("relocated".to_string())
+}
+
+fn validate_call_path_binding(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+) -> anyhow::Result<String> {
+    let exists = conn.query_row(
+        "
+        SELECT COUNT(*)
+        FROM repo_memory_call_paths
+        WHERE memory_id = ?1 AND edge_sequence_hash = ?2
+        ",
+        params![binding.memory_id, binding.binding_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(if exists > 0 { "unverified" } else { "gone" }.to_string())
+}
+
+fn validate_bound_edge_source_hash(
+    conn: &Connection,
+    binding: &RepoMemoryBinding,
+    current_source_hash: &str,
+) -> anyhow::Result<String> {
+    match source_hash_for_memory(conn, &binding.memory_id)? {
+        Some(expected) if expected != current_source_hash => Ok("stale".to_string()),
+        _ => Ok("current".to_string()),
+    }
 }
 
 fn validate_bound_chunk(
