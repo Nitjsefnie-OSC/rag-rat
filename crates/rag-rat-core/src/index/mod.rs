@@ -19,6 +19,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -69,6 +74,13 @@ pub enum IndexProgress {
     Discovering,
     Discovered {
         files: usize,
+    },
+    PreparingFile {
+        current: usize,
+        total: usize,
+        path: PathBuf,
+        language: Language,
+        kind: TargetKind,
     },
     IndexingFile {
         current: usize,
@@ -397,7 +409,7 @@ impl IndexDatabase {
         let files = self.assign_file_scopes(files, &changes);
         progress(IndexProgress::Discovered { files: files.len() });
 
-        let prepared = files.par_iter().map(prepare_index_file).collect::<Vec<_>>();
+        let prepared = prepare_files_with_progress(&files, progress)?;
         for (index, prepared_file) in prepared.iter().enumerate() {
             progress(IndexProgress::IndexingFile {
                 current: index + 1,
@@ -479,7 +491,7 @@ impl IndexDatabase {
             self.mark_file_deleted(&path)?;
         }
 
-        let prepared = files.par_iter().map(prepare_index_file).collect::<Vec<_>>();
+        let prepared = prepare_files_with_progress(&files, progress)?;
         for (index, prepared_file) in prepared.iter().enumerate() {
             progress(IndexProgress::IndexingFile {
                 current: index + 1,
@@ -2818,6 +2830,59 @@ fn prepare_index_file(file: &IndexFile) -> PreparedIndexFile {
     PreparedIndexFile { file: file.clone(), prepared: prepare_index_content(file) }
 }
 
+fn prepare_files_with_progress<F>(
+    files: &[IndexFile],
+    progress: &mut F,
+) -> anyhow::Result<Vec<PreparedIndexFile>>
+where
+    F: FnMut(IndexProgress),
+{
+    #[derive(Debug)]
+    struct PreparedProgress {
+        current: usize,
+        total: usize,
+        path: PathBuf,
+        language: Language,
+        kind: TargetKind,
+    }
+
+    let total = files.len();
+    let prepared = thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        let completed = AtomicUsize::new(0);
+        let handle = scope.spawn(move || {
+            files
+                .par_iter()
+                .map(|file| {
+                    let prepared = prepare_index_file(file);
+                    let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(PreparedProgress {
+                        current,
+                        total,
+                        path: file.relative_path.clone(),
+                        language: file.language,
+                        kind: file.kind,
+                    });
+                    prepared
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for event in rx {
+            progress(IndexProgress::PreparingFile {
+                current: event.current,
+                total: event.total,
+                path: event.path,
+                language: event.language,
+                kind: event.kind,
+            });
+        }
+
+        handle.join().map_err(|_| anyhow::anyhow!("parallel file preparation panicked"))
+    })?;
+    Ok(prepared)
+}
+
 fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexContent> {
     let text = fs::read_to_string(&file.full_path)?;
     let modified_at_ms = file_metadata_ms(&file.full_path)?;
@@ -3155,6 +3220,29 @@ mod schema_bootstrap_tests {
         assert_eq!(
             db.status(&config.database).unwrap().schema.current_version,
             schema::LATEST_SCHEMA_VERSION
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebuild_reports_file_preparation_progress() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn exported() {}\n").unwrap();
+
+        let config = source_config(root.clone(), Language::Rust);
+        let mut events = Vec::new();
+        IndexDatabase::rebuild_with_progress(&config, |progress| events.push(progress)).unwrap();
+
+        assert!(
+            events.iter().any(|event| matches!(event, IndexProgress::PreparingFile { .. })),
+            "missing preparing progress event: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, IndexProgress::IndexingFile { .. })),
+            "missing indexing progress event: {events:?}"
         );
 
         fs::remove_dir_all(root).unwrap();

@@ -749,6 +749,18 @@ fn render_index_progress(progress: IndexProgress) {
         IndexProgress::Discovered { files } => {
             eprintln!("index: discovered {files} files");
         },
+        IndexProgress::PreparingFile { current, total, path, language, kind } => {
+            let percent = progress_percent(
+                u64::try_from(current).unwrap_or(u64::MAX),
+                u64::try_from(total).unwrap_or(u64::MAX),
+            );
+            eprintln!(
+                "index: preparing {current}/{total} ({percent:>3}%) [{}:{}] {}",
+                kind.as_str(),
+                language.as_str(),
+                path.display()
+            );
+        },
         IndexProgress::IndexingFile { current, total, path, language, kind } => {
             let percent = progress_percent(
                 u64::try_from(current).unwrap_or(u64::MAX),
