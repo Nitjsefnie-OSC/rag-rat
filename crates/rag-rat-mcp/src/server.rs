@@ -14,8 +14,9 @@ use serde_json::{Map, Value, json};
 
 use crate::tools::{
     BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
-    PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs, SearchArgs,
-    SymbolArgs, SymbolGraphArgs,
+    MemoryCreateArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs, MemorySearchArgs,
+    MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs, ReadChunkArgs,
+    SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -292,6 +293,80 @@ impl RagRatService {
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("index_status", json!({}))
+    }
+
+    #[tool(
+        name = "memory_create",
+        description = "Create a source-anchored repo memory bound to a symbol, chunk, path, commit, or GitHub ref."
+    )]
+    fn memory_create(
+        &self,
+        Parameters(args): Parameters<MemoryCreateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_create", json!(args))
+    }
+
+    #[tool(
+        name = "memory_update",
+        description = "Update typed repo-memory text, status, confidence, kind, or tags."
+    )]
+    fn memory_update(
+        &self,
+        Parameters(args): Parameters<MemoryUpdateArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_update", json!(args))
+    }
+
+    #[tool(
+        name = "memory_search",
+        description = "Search active or stale repo memories with deterministic FTS recall."
+    )]
+    fn memory_search(
+        &self,
+        Parameters(args): Parameters<MemorySearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_search", json!(args))
+    }
+
+    #[tool(
+        name = "memory_for_symbol",
+        description = "Return repo memories bound to a selected symbol or logical symbol."
+    )]
+    fn memory_for_symbol(
+        &self,
+        Parameters(args): Parameters<MemoryForSymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_for_symbol", json!(args))
+    }
+
+    #[tool(name = "memory_for_path", description = "Return repo memories bound to one path.")]
+    fn memory_for_path(
+        &self,
+        Parameters(args): Parameters<MemoryForPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_for_path", json!(args))
+    }
+
+    #[tool(
+        name = "memory_validate",
+        description = "Validate repo-memory anchors and mark current, relocated, stale, or gone."
+    )]
+    fn memory_validate(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_validate", json!({}))
+    }
+
+    #[tool(
+        name = "memory_mark_obsolete",
+        description = "Mark a repo memory obsolete without deleting its audit trail."
+    )]
+    fn memory_mark_obsolete(
+        &self,
+        Parameters(args): Parameters<MemoryIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("memory_mark_obsolete", json!(args))
     }
 }
 

@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::query::graph::{self, GraphHop, GraphResolutionMode, GraphTraversalOptions};
+use crate::query::memory::{self, RepoMemoryEvidence};
 use crate::query::symbol::SymbolHit;
 
 #[derive(Debug, Serialize)]
@@ -25,6 +26,7 @@ pub struct ImpactSurfaceOptions {
     pub include_git: bool,
     pub include_papertrail: bool,
     pub include_text_fallback: bool,
+    pub include_memories: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,6 +40,7 @@ pub struct ImpactSurfaceReport {
     pub text_fallback_hits: Vec<ImpactItem>,
     pub recent_commits_touching_symbol_path: Vec<ImpactItem>,
     pub github_rationale_issues_prs: Vec<ImpactItem>,
+    pub repo_memories: RepoMemoryEvidence,
     pub completeness_and_caveats: ImpactCompleteness,
 }
 
@@ -52,6 +55,7 @@ pub struct ImpactSurfaceQuery {
     pub include_git: bool,
     pub include_papertrail: bool,
     pub include_text_fallback: bool,
+    pub include_memories: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -61,7 +65,14 @@ pub struct ImpactCompleteness {
     pub text_fallback_hits: u64,
     pub parser_failures: u64,
     pub stale_files: u64,
+    pub memory_status: ImpactMemoryStatus,
     pub caveats: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ImpactMemoryStatus {
+    pub active: u64,
+    pub stale: u64,
 }
 
 impl Default for ImpactSurfaceOptions {
@@ -73,6 +84,7 @@ impl Default for ImpactSurfaceOptions {
             include_git: true,
             include_papertrail: true,
             include_text_fallback: true,
+            include_memories: true,
         }
     }
 }
@@ -126,6 +138,11 @@ pub fn impact_surface_report_for_symbol(
     } else {
         Vec::new()
     };
+    let repo_memories = if options.include_memories {
+        memory::memory_evidence_for_symbol(conn, symbol, limit)?
+    } else {
+        RepoMemoryEvidence { direct: Vec::new(), stale: Vec::new() }
+    };
     let mut caveats = vec![
         "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.".to_string(),
     ];
@@ -149,6 +166,7 @@ pub fn impact_surface_report_for_symbol(
             include_git: options.include_git,
             include_papertrail: options.include_papertrail,
             include_text_fallback: options.include_text_fallback,
+            include_memories: options.include_memories,
         },
         completeness_and_caveats: ImpactCompleteness {
             exact_graph_callers: u64::try_from(direct_semantic_callers.len()).unwrap_or(u64::MAX),
@@ -156,6 +174,10 @@ pub fn impact_surface_report_for_symbol(
             text_fallback_hits: u64::try_from(text_fallback_hits.len()).unwrap_or(u64::MAX),
             parser_failures: parser_failure_count(conn)?,
             stale_files: 0,
+            memory_status: ImpactMemoryStatus {
+                active: u64::try_from(repo_memories.direct.len()).unwrap_or(u64::MAX),
+                stale: u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX),
+            },
             caveats,
         },
         direct_semantic_callers,
@@ -166,6 +188,7 @@ pub fn impact_surface_report_for_symbol(
         text_fallback_hits,
         recent_commits_touching_symbol_path,
         github_rationale_issues_prs,
+        repo_memories,
     })
 }
 

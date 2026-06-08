@@ -1,6 +1,7 @@
 pub mod graph;
 pub mod graph_meta;
 pub mod impact;
+pub mod memory;
 pub mod symbol;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -18,6 +19,8 @@ pub struct ReadChunk {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<graph_meta::GraphEvidence>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<memory::RepoMemory>,
 }
 
 pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ReadChunk>> {
@@ -42,6 +45,7 @@ pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Rea
                     symbol_path: row.get(6)?,
                     text: row.get(7)?,
                     graph: None,
+                    memories: Vec::new(),
                 })
             },
         )

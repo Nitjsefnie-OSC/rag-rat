@@ -840,7 +840,7 @@ impl IndexDatabase {
     }
 
     pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
-        self.read_chunk_with_graph(chunk_id, GraphMetaMode::Full, 20)
+        self.read_chunk_with_graph_and_memories(chunk_id, GraphMetaMode::Full, 20, true)
     }
 
     pub fn read_chunk_with_graph(
@@ -848,6 +848,16 @@ impl IndexDatabase {
         chunk_id: i64,
         graph_mode: GraphMetaMode,
         graph_limit: u32,
+    ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
+        self.read_chunk_with_graph_and_memories(chunk_id, graph_mode, graph_limit, false)
+    }
+
+    pub fn read_chunk_with_graph_and_memories(
+        &self,
+        chunk_id: i64,
+        graph_mode: GraphMetaMode,
+        graph_limit: u32,
+        include_memories: bool,
     ) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         let Some(mut chunk) = self.read_chunk_current(chunk_id)? else {
             return Ok(None);
@@ -858,6 +868,10 @@ impl IndexDatabase {
             graph_mode,
             graph_limit,
         )?;
+        if include_memories {
+            chunk.memories =
+                crate::query::memory::memories_for_chunk(self.storage.connection(), chunk_id, 20)?;
+        }
         Ok(Some(chunk))
     }
 
@@ -1717,6 +1731,57 @@ impl IndexDatabase {
             limit,
             options,
         )
+    }
+
+    pub fn memory_create(
+        &self,
+        request: crate::query::memory::RepoMemoryCreate,
+    ) -> anyhow::Result<crate::query::memory::RepoMemoryCreateResult> {
+        crate::query::memory::create_memory(self.storage.connection(), request)
+    }
+
+    pub fn memory_update(
+        &self,
+        update: crate::query::memory::RepoMemoryUpdate,
+    ) -> anyhow::Result<crate::query::memory::RepoMemory> {
+        crate::query::memory::update_memory(self.storage.connection(), update)
+    }
+
+    pub fn memory_mark_obsolete(
+        &self,
+        memory_id: &str,
+    ) -> anyhow::Result<crate::query::memory::RepoMemory> {
+        crate::query::memory::mark_obsolete(self.storage.connection(), memory_id)
+    }
+
+    pub fn memory_search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
+        crate::query::memory::memory_search(self.storage.connection(), query, limit)
+    }
+
+    pub fn memory_for_symbol(
+        &self,
+        symbol: &crate::query::symbol::SymbolHit,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
+        crate::query::memory::memories_for_symbol(self.storage.connection(), symbol, limit)
+    }
+
+    pub fn memory_for_path(
+        &self,
+        path: &str,
+        limit: u32,
+    ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
+        crate::query::memory::memories_for_path(self.storage.connection(), path, limit)
+    }
+
+    pub fn memory_validate(
+        &self,
+    ) -> anyhow::Result<crate::query::memory::RepoMemoryValidationReport> {
+        crate::query::memory::validate_memories(self.storage.connection())
     }
 
     pub fn rebuild_fts(&self) -> anyhow::Result<()> {
@@ -6146,6 +6211,162 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         let status = db.status(&config.database).unwrap();
         assert_eq!(status.parser_failures, 1);
         assert_eq!(status.parser_failure_paths[0].path, "src/broken.rs");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(unix)]\npub fn cfg_helper() {}\n#[cfg(windows)]\npub fn cfg_helper() {}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let symbol = db
+            .select_symbol(&crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("cfg_helper".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: true,
+                limit: 10,
+            })
+            .unwrap()
+            .unwrap()
+            .expect("selected symbol");
+        let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
+
+        let created = db
+            .memory_create(crate::query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: "Treat cfg helper variants as one logical helper".to_string(),
+                body: "Caller and impact analysis should use the logical symbol, not one cfg body variant."
+                    .to_string(),
+                confidence: "high".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: vec!["cfg".to_string(), "graph".to_string()],
+                bind: crate::query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: Some(logical_symbol_id),
+                    symbol_id: None,
+                    chunk_id: None,
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                },
+            })
+            .unwrap();
+        assert!(!created.duplicate);
+        assert_eq!(created.memory.bindings[0].binding_kind, "logical_symbol");
+
+        let memories = db.memory_for_symbol(&symbol, 10).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].kind, "Invariant");
+        let chunk_id = memories[0].bindings[0].chunk_id.expect("bound chunk");
+        let chunk = db.read_chunk(chunk_id).unwrap().expect("memory chunk");
+        assert_eq!(chunk.memories.len(), 1);
+        assert_eq!(chunk.memories[0].memory_id, created.memory.memory_id);
+
+        let impact = db
+            .impact_surface_report_for_selected_symbol(
+                &symbol,
+                10,
+                &crate::query::impact::ImpactSurfaceOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(impact.repo_memories.direct.len(), 1);
+        assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
+        assert_eq!(impact.completeness_and_caveats.memory_status.stale, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn anchored_memory() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let symbol = db
+            .select_symbol(&crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("anchored_memory".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: false,
+                limit: 10,
+            })
+            .unwrap()
+            .unwrap()
+            .expect("selected symbol");
+        let chunk_id = db
+            .storage
+            .connection()
+            .query_row(
+                "
+                SELECT chunks.id
+                FROM chunks
+                JOIN files ON files.id = chunks.file_id
+                WHERE files.path = ?1 AND chunks.symbol_path = ?2
+                LIMIT 1
+                ",
+                params![symbol.path, symbol.qualified_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let created = db
+            .memory_create(crate::query::memory::RepoMemoryCreate {
+                kind: "Risk".to_string(),
+                title: "Anchor must become stale when source hash changes".to_string(),
+                body: "Validation should separate stale memories from current repo evidence."
+                    .to_string(),
+                confidence: "medium".to_string(),
+                created_by: Some("test-agent".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                bind: crate::query::memory::RepoMemoryBindTarget {
+                    logical_symbol_id: None,
+                    symbol_id: None,
+                    chunk_id: Some(chunk_id),
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                },
+            })
+            .unwrap();
+
+        db.storage
+            .connection()
+            .execute("UPDATE chunks SET text_hash = 'changed' WHERE id = ?1", [chunk_id])
+            .unwrap();
+        let report = db.memory_validate().unwrap();
+        assert_eq!(report.stale, 1);
+        let stale = db.memory_for_symbol(&symbol, 10).unwrap();
+        assert_eq!(stale[0].memory_id, created.memory.memory_id);
+        assert_eq!(stale[0].bindings[0].anchor_status, "stale");
+
+        db.storage.connection().execute("DELETE FROM chunks WHERE id = ?1", [chunk_id]).unwrap();
+        let report = db.memory_validate().unwrap();
+        assert_eq!(report.gone, 1);
+        let gone = db.memory_for_symbol(&symbol, 10).unwrap();
+        assert_eq!(gone[0].bindings[0].anchor_status, "gone");
 
         fs::remove_dir_all(root).unwrap();
     }

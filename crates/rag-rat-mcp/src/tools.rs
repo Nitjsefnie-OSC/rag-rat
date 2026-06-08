@@ -7,6 +7,7 @@ use rag_rat_core::{
         graph::{GraphResolutionMode, GraphTraversalOptions},
         graph_meta::GraphMetaMode,
         impact::ImpactSurfaceOptions,
+        memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryUpdate},
         symbol::SymbolSelector,
     },
     search::lexical::SearchOptions,
@@ -143,6 +144,13 @@ pub const TOOL_NAMES: &[&str] = &[
     "heal_index",
     "github_sync_status",
     "index_status",
+    "memory_create",
+    "memory_update",
+    "memory_search",
+    "memory_for_symbol",
+    "memory_for_path",
+    "memory_validate",
+    "memory_mark_obsolete",
 ];
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -177,6 +185,8 @@ pub struct SymbolArgs {
     pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
+    #[serde(default = "default_true")]
+    pub include_memories: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -200,6 +210,8 @@ pub struct SymbolGraphArgs {
     pub include_common_methods: bool,
     #[serde(default)]
     pub include_coverage: bool,
+    #[serde(default = "default_true")]
+    pub include_memories: bool,
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -250,6 +262,8 @@ pub struct ImpactArgs {
     pub include_papertrail: bool,
     #[serde(default = "default_true")]
     pub include_text_fallback: bool,
+    #[serde(default = "default_true")]
+    pub include_memories: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -265,6 +279,172 @@ pub struct ReadChunkArgs {
     pub include_graph: McpGraphMode,
     #[serde(default = "default_read_chunk_graph_limit")]
     pub graph_limit: u32,
+    #[serde(default = "default_true")]
+    pub include_memories: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+pub enum McpMemoryKind {
+    Invariant,
+    Decision,
+    RejectedAlternative,
+    Risk,
+    BugPattern,
+    TestExpectation,
+    PerformanceNote,
+    SecurityNote,
+    FFIBoundary,
+    PlatformQuirk,
+    FollowUp,
+    OpenQuestion,
+    Obsolete,
+}
+
+impl McpMemoryKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invariant => "Invariant",
+            Self::Decision => "Decision",
+            Self::RejectedAlternative => "RejectedAlternative",
+            Self::Risk => "Risk",
+            Self::BugPattern => "BugPattern",
+            Self::TestExpectation => "TestExpectation",
+            Self::PerformanceNote => "PerformanceNote",
+            Self::SecurityNote => "SecurityNote",
+            Self::FFIBoundary => "FFIBoundary",
+            Self::PlatformQuirk => "PlatformQuirk",
+            Self::FollowUp => "FollowUp",
+            Self::OpenQuestion => "OpenQuestion",
+            Self::Obsolete => "Obsolete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpMemoryConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl McpMemoryConfidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpMemoryStatus {
+    Active,
+    Stale,
+    Obsolete,
+    Rejected,
+}
+
+impl McpMemoryStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Stale => "stale",
+            Self::Obsolete => "obsolete",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpMemorySource {
+    Agent,
+    Human,
+    Imported,
+    Generated,
+}
+
+impl McpMemorySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Human => "human",
+            Self::Imported => "imported",
+            Self::Generated => "generated",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryBindArgs {
+    pub logical_symbol_id: Option<i64>,
+    pub symbol_id: Option<i64>,
+    pub chunk_id: Option<i64>,
+    pub path: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+    pub commit_hash: Option<String>,
+    pub github_owner: Option<String>,
+    pub github_repo: Option<String>,
+    pub github_number: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryCreateArgs {
+    pub kind: McpMemoryKind,
+    pub title: String,
+    pub body: String,
+    pub confidence: McpMemoryConfidence,
+    pub created_by: Option<String>,
+    pub source: Option<McpMemorySource>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub bind: MemoryBindArgs,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryUpdateArgs {
+    pub memory_id: String,
+    pub kind: Option<McpMemoryKind>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub confidence: Option<McpMemoryConfidence>,
+    pub status: Option<McpMemoryStatus>,
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemorySearchArgs {
+    pub query: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryForSymbolArgs {
+    pub symbol: Option<String>,
+    pub symbol_path: Option<String>,
+    pub logical_symbol_id: Option<i64>,
+    pub symbol_id: Option<i64>,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryForPathArgs {
+    pub path: String,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryIdArgs {
+    pub memory_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -361,7 +541,7 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
         },
         "symbol_lookup" => {
             let args: SymbolArgs = serde_json::from_value(arguments)?;
-            json!(db.symbol_candidates(&symbol_selector(args)?)?)
+            symbol_lookup_tool(db, args)?
         },
         "find_callers" => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
@@ -393,10 +573,11 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
         },
         "read_chunk" => {
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
-            json!(db.read_chunk_with_graph(
+            json!(db.read_chunk_with_graph_and_memories(
                 args.chunk_id,
                 GraphMetaMode::parse(args.include_graph.as_str())?,
-                args.graph_limit
+                args.graph_limit,
+                args.include_memories
             )?)
         },
         "commit_search" => {
@@ -458,9 +639,70 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
         },
         "github_sync_status" => json!(db.github_sync_status()?),
         "index_status" => json!(db.status(db.database_path())?),
+        "memory_create" => {
+            let args: MemoryCreateArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_create(args.core())?)
+        },
+        "memory_update" => {
+            let args: MemoryUpdateArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_update(args.core())?)
+        },
+        "memory_search" => {
+            let args: MemorySearchArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_search(&args.query, args.limit)?)
+        },
+        "memory_for_symbol" => {
+            let args: MemoryForSymbolArgs = serde_json::from_value(arguments)?;
+            memory_for_symbol_tool(db, args)?
+        },
+        "memory_for_path" => {
+            let args: MemoryForPathArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_for_path(&args.path, args.limit)?)
+        },
+        "memory_validate" => json!(db.memory_validate()?),
+        "memory_mark_obsolete" => {
+            let args: MemoryIdArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_mark_obsolete(&args.memory_id)?)
+        },
         other => anyhow::bail!("unknown tool `{other}`"),
     };
     Ok(result)
+}
+
+fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
+    let include_memories = args.include_memories;
+    let lookup = db.symbol_candidates(&symbol_selector(args)?)?;
+    let mut value = json!(lookup);
+    if !include_memories {
+        return Ok(value);
+    }
+    let Some(candidates) = value.get_mut("candidates").and_then(Value::as_array_mut) else {
+        return Ok(value);
+    };
+    let selector = SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: None,
+        language: None,
+        allow_ambiguous: true,
+        limit: 1,
+    };
+    for candidate in candidates {
+        let Some(symbol_id) = candidate.get("symbol_id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let mut selector = selector.clone();
+        selector.symbol_id = Some(symbol_id);
+        let Ok(Ok(Some(symbol))) = db.select_symbol(&selector) else {
+            continue;
+        };
+        let memories = db.memory_for_symbol(&symbol, 10)?;
+        if !memories.is_empty() {
+            candidate["memories"] = json!(memories);
+        }
+    }
+    Ok(value)
 }
 
 fn graph_tool(
@@ -474,6 +716,7 @@ fn graph_tool(
     let include_unresolved = args.include_unresolved;
     let include_macros = args.include_macros;
     let include_common_methods = args.include_common_methods;
+    let include_memories = args.include_memories;
     let edge_kinds = graph_edge_kinds(args.edge_kinds.as_deref());
     let allow_ambiguous = args.allow_ambiguous;
     let selector = graph_symbol_selector(&args)?;
@@ -498,6 +741,9 @@ fn graph_tool(
                 &options
             )?);
             compact_graph_coverage(&mut value, args.include_coverage);
+            if include_memories {
+                value["repo_memories"] = json!(db.memory_for_symbol(&symbol, 10)?);
+            }
             Ok(value)
         },
         Ok(None) if allow_ambiguous => {
@@ -681,6 +927,7 @@ fn impact_tool(
         include_git: args.include_git,
         include_papertrail: args.include_papertrail,
         include_text_fallback: args.include_text_fallback,
+        include_memories: args.include_memories,
     };
     if args.logical_symbol_id.is_some()
         || args.symbol_id.is_some()
@@ -714,6 +961,69 @@ fn impact_tool(
         anyhow::bail!("impact_surface requires query, symbol_id, symbol_path, or symbol");
     };
     Ok(json!(db.impact_surface_with_options(query, args.limit, resolution_mode)?))
+}
+
+fn memory_for_symbol_tool(db: &IndexDatabase, args: MemoryForSymbolArgs) -> anyhow::Result<Value> {
+    let selector = SymbolSelector {
+        logical_symbol_id: args.logical_symbol_id,
+        symbol_id: args.symbol_id,
+        symbol_path: args.symbol_path,
+        symbol: args.symbol,
+        language: None,
+        allow_ambiguous: args.allow_ambiguous,
+        limit: args.limit,
+    };
+    match db.select_symbol(&selector)? {
+        Ok(Some(symbol)) => Ok(json!(db.memory_for_symbol(&symbol, args.limit)?)),
+        Ok(None) => Ok(Value::Null),
+        Err(disambiguation) => Ok(json!(disambiguation)),
+    }
+}
+
+impl MemoryCreateArgs {
+    fn core(self) -> RepoMemoryCreate {
+        RepoMemoryCreate {
+            kind: self.kind.as_str().to_string(),
+            title: self.title,
+            body: self.body,
+            confidence: self.confidence.as_str().to_string(),
+            created_by: self.created_by,
+            source: self.source.map(|source| source.as_str().to_string()),
+            tags: self.tags,
+            bind: self.bind.into(),
+        }
+    }
+}
+
+impl MemoryUpdateArgs {
+    fn core(self) -> RepoMemoryUpdate {
+        RepoMemoryUpdate {
+            memory_id: self.memory_id,
+            kind: self.kind.map(|kind| kind.as_str().to_string()),
+            title: self.title,
+            body: self.body,
+            confidence: self.confidence.map(|confidence| confidence.as_str().to_string()),
+            status: self.status.map(|status| status.as_str().to_string()),
+            tags: self.tags,
+        }
+    }
+}
+
+impl From<MemoryBindArgs> for RepoMemoryBindTarget {
+    fn from(args: MemoryBindArgs) -> Self {
+        Self {
+            logical_symbol_id: args.logical_symbol_id,
+            symbol_id: args.symbol_id,
+            chunk_id: args.chunk_id,
+            path: args.path,
+            start_line: args.start_line,
+            end_line: args.end_line,
+            commit_hash: args.commit_hash,
+            github_owner: args.github_owner,
+            github_repo: args.github_repo,
+            github_number: args.github_number,
+        }
+    }
 }
 
 fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
@@ -788,6 +1098,17 @@ pub fn description(name: &str) -> &'static str {
         "index_status" => {
             "Report SQLite index freshness, git metadata, parser failures, and file counts."
         },
+        "memory_create" => {
+            "Create a source-anchored repo memory bound to a symbol, chunk, path, commit, or GitHub ref."
+        },
+        "memory_update" => "Update typed repo-memory text, status, confidence, kind, or tags.",
+        "memory_search" => "Search active or stale repo memories with deterministic FTS recall.",
+        "memory_for_symbol" => "Return repo memories bound to a selected symbol or logical symbol.",
+        "memory_for_path" => "Return repo memories bound to one current repository path.",
+        "memory_validate" => {
+            "Validate repo-memory anchors and mark current, relocated, stale, or gone."
+        },
+        "memory_mark_obsolete" => "Mark a repo memory obsolete without deleting its audit trail.",
         _ => "Unknown tool.",
     }
 }
@@ -812,7 +1133,15 @@ pub fn schema(name: &str) -> Value {
         "papertrail_for_chunk" => schema_for::<PapertrailChunkArgs>(),
         "papertrail_for_commit" => schema_for::<PapertrailCommitArgs>(),
         "heal_index" => schema_for::<HealIndexArgs>(),
-        "local_ai_status" | "github_sync_status" | "index_status" => schema_for::<EmptyArgs>(),
+        "memory_create" => schema_for::<MemoryCreateArgs>(),
+        "memory_update" => schema_for::<MemoryUpdateArgs>(),
+        "memory_search" => schema_for::<MemorySearchArgs>(),
+        "memory_for_symbol" => schema_for::<MemoryForSymbolArgs>(),
+        "memory_for_path" => schema_for::<MemoryForPathArgs>(),
+        "memory_mark_obsolete" => schema_for::<MemoryIdArgs>(),
+        "local_ai_status" | "github_sync_status" | "index_status" | "memory_validate" => {
+            schema_for::<EmptyArgs>()
+        },
         _ => json!({"type": "object"}),
     }
 }
@@ -929,6 +1258,13 @@ mod tests {
             "local_ai_status",
             "heal_index",
             "github_sync_status",
+            "memory_create",
+            "memory_update",
+            "memory_search",
+            "memory_for_symbol",
+            "memory_for_path",
+            "memory_validate",
+            "memory_mark_obsolete",
         ] {
             assert!(names.contains(&expected), "missing MCP tool {expected}");
         }
@@ -952,6 +1288,7 @@ mod tests {
         assert_schema_has_property(tools, "find_callers", "include_macros");
         assert_schema_has_property(tools, "find_callers", "include_common_methods");
         assert_schema_has_property(tools, "find_callers", "include_coverage");
+        assert_schema_has_property(tools, "find_callers", "include_memories");
         assert_schema_has_property(tools, "find_callers", "edge_kinds");
         assert_schema_has_property(tools, "find_callers", "resolution");
         assert_schema_property_enum(
@@ -982,6 +1319,7 @@ mod tests {
         assert_schema_has_property(tools, "trace_callees", "include_macros");
         assert_schema_has_property(tools, "trace_callees", "include_common_methods");
         assert_schema_has_property(tools, "trace_callees", "include_coverage");
+        assert_schema_has_property(tools, "trace_callees", "include_memories");
         assert_schema_has_property(tools, "trace_callees", "edge_kinds");
         assert_schema_has_property(tools, "trace_callees", "resolution");
         assert_schema_has_property(tools, "trace_callees", "logical_symbol_id");
@@ -1001,6 +1339,7 @@ mod tests {
         assert_schema_has_property(tools, "impact_surface", "include_git");
         assert_schema_has_property(tools, "impact_surface", "include_papertrail");
         assert_schema_has_property(tools, "impact_surface", "include_text_fallback");
+        assert_schema_has_property(tools, "impact_surface", "include_memories");
         assert_schema_has_property(tools, "impact_surface", "logical_symbol_id");
         assert_symbol_selector_schema(tools, "impact_surface");
         assert_symbol_selector_schema(tools, "docs_for_symbol");
@@ -1015,10 +1354,20 @@ mod tests {
             &["none", "compact", "full"],
         );
         assert_schema_has_property(tools, "read_chunk", "graph_limit");
+        assert_schema_has_property(tools, "read_chunk", "include_memories");
         assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
         assert_schema_has_property(tools, "papertrail_for_commit", "include_fallback");
         assert_schema_has_property(tools, "rationale_search", "include_fallback");
         assert_schema_has_property(tools, "heal_index", "limit");
+        assert_schema_requires(tools, "memory_create", "kind");
+        assert_schema_requires(tools, "memory_create", "bind");
+        assert_schema_has_property(tools, "memory_create", "confidence");
+        assert_schema_requires(tools, "memory_update", "memory_id");
+        assert_schema_requires(tools, "memory_search", "query");
+        assert_schema_has_property(tools, "memory_for_symbol", "logical_symbol_id");
+        assert_schema_requires(tools, "memory_for_path", "path");
+        assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
+        assert_eq!(tool_schema(tools, "memory_validate")["type"], "object");
         assert_eq!(tool_schema(tools, "local_ai_status")["type"], "object");
     }
 
@@ -1088,6 +1437,88 @@ mod tests {
 
         let local_ai = call_tool(&config.database, "local_ai_status", json!({})).unwrap();
         assert_eq!(local_ai["embedding"]["state"], "MissingModel");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
+        let root = unique_temp_root();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[cfg(unix)]\npub fn cfg_helper() {}\n#[cfg(windows)]\npub fn cfg_helper() {}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        drop(db);
+
+        let lookup = call_tool(
+            &config.database,
+            "symbol_lookup",
+            json!({"symbol": "cfg_helper", "allow_ambiguous": true}),
+        )
+        .unwrap();
+        let logical_symbol_id =
+            lookup["candidates"].as_array().unwrap()[0]["logical_symbol_id"].as_i64().unwrap();
+        let memory = call_tool(
+            &config.database,
+            "memory_create",
+            json!({
+                "kind": "Invariant",
+                "title": "Treat cfg helper variants as one logical helper",
+                "body": "Caller and impact analysis should use the logical symbol, not one cfg body variant.",
+                "confidence": "high",
+                "created_by": "mcp-test",
+                "tags": ["cfg", "graph"],
+                "bind": {"logical_symbol_id": logical_symbol_id}
+            }),
+        )
+        .unwrap();
+        assert_eq!(memory["duplicate"], false);
+        let memory_id = memory["memory"]["memory_id"].as_str().unwrap();
+
+        let for_symbol = call_tool(
+            &config.database,
+            "memory_for_symbol",
+            json!({"logical_symbol_id": logical_symbol_id}),
+        )
+        .unwrap();
+        assert_eq!(for_symbol.as_array().unwrap()[0]["memory_id"], memory_id);
+        let search =
+            call_tool(&config.database, "memory_search", json!({"query": "logical helper"}))
+                .unwrap();
+        assert_eq!(search.as_array().unwrap()[0]["memory_id"], memory_id);
+
+        let chunk_id =
+            memory["memory"]["bindings"].as_array().unwrap()[0]["chunk_id"].as_i64().unwrap();
+        let chunk = call_tool(
+            &config.database,
+            "read_chunk",
+            json!({"chunk_id": chunk_id, "include_memories": true}),
+        )
+        .unwrap();
+        assert_eq!(chunk["memories"].as_array().unwrap()[0]["memory_id"], memory_id);
+
+        let impact = call_tool(
+            &config.database,
+            "impact_surface",
+            json!({"logical_symbol_id": logical_symbol_id, "include_memories": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            impact["repo_memories"]["direct"].as_array().unwrap()[0]["memory_id"],
+            memory_id
+        );
+        assert_eq!(impact["completeness_and_caveats"]["memory_status"]["active"], 1);
+
+        let validation = call_tool(&config.database, "memory_validate", json!({})).unwrap();
+        assert_eq!(validation["current"], 1);
+        let obsolete =
+            call_tool(&config.database, "memory_mark_obsolete", json!({"memory_id": memory_id}))
+                .unwrap();
+        assert_eq!(obsolete["status"], "obsolete");
 
         fs::remove_dir_all(root).unwrap();
     }
