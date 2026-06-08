@@ -23,14 +23,18 @@ fn walk_dir(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
         if should_skip_name(&file_name) {
             continue;
         }
-        if path.is_dir() {
+        if file_type.is_dir() {
             walk_dir(root, &path, target, files)?;
-        } else if is_target_file(root, &path, target) {
+        } else if file_type.is_file() && is_target_file(root, &path, target) {
             files.insert(path);
         }
     }

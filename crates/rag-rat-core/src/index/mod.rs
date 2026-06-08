@@ -3958,6 +3958,23 @@ mod schema_bootstrap_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn indexing_skips_symlink_loops() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn loop_safe_symbol() {}\n").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("src/loop")).unwrap();
+
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        assert_eq!(db.symbols("loop_safe_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn dirty_git_files_are_indexed_as_worktree_overlay() {
         let root = unique_temp_root();
