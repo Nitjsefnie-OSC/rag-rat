@@ -1,0 +1,13 @@
+[index]
+root = "."
+database = ".rag-rat/index.sqlite"
+
+[local_ai.embedding.runtime]
+batch_size = 64
+ort_threads = 4
+omp_threads = 1
+max_embedding_chars = 4000
+
+[target_bindings]
+rust = ["crates"]
+markdown = ["docs"]
