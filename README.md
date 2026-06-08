@@ -222,6 +222,7 @@ cargo run --bin rag-rat -- index
 cargo run --bin rag-rat -- index --changed
 cargo run --bin rag-rat -- index --discover
 cargo run --bin rag-rat -- index --full
+cargo run --bin rag-rat -- init
 cargo run --bin rag-rat -- doctor
 cargo run --bin rag-rat -- migrate --check
 cargo run --bin rag-rat -- migrate
@@ -265,14 +266,28 @@ Without real embeddings, omit the feature and use the deterministic hash baselin
 cargo install --path crates/rag-rat-cli --bin rag-rat
 ```
 
-Create a `rag-rat.toml` in the repository you want to index:
+Run the initializer from the repository you want to index:
 
 ```bash
 cd /path/to/your/repo
-$EDITOR rag-rat.toml
+rag-rat init
 ```
 
-Minimal config:
+`rag-rat init` scans the repository, shows a compact tree of candidate source roots, prompts for
+languages and path bindings, writes `rag-rat.toml`, migrates the SQLite schema, indexes the repo,
+and offers to install/reconcile the local embedding model. At the end it can also register the MCP
+server for Claude Code or Codex and install the optional git maintenance hooks.
+
+Preview the generated config without writing anything:
+
+```bash
+rag-rat init --dry-run
+```
+
+Use `--yes` for the default non-interactive setup, or `--config <path>` when the config should live
+somewhere other than `rag-rat.toml`.
+
+Manual setup is still available when you need exact control:
 
 ```toml
 [index]
@@ -316,7 +331,7 @@ include = ["**/*.md"]
 exclude = [".git/**", ".rag-rat/**", "target/**", "node_modules/**"]
 ```
 
-Initialize the database and index the repo:
+Then run the pieces directly:
 
 ```bash
 rag-rat migrate
