@@ -2513,6 +2513,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dialoguer",
+ "libc",
  "rag-rat-core",
  "rag-rat-mcp",
  "serde",

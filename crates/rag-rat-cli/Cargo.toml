@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 dialoguer = "0.12"
+libc.workspace = true
 rag-rat-core = { path = "../rag-rat-core" }
 rag-rat-mcp = { path = "../rag-rat-mcp" }
 serde.workspace = true
