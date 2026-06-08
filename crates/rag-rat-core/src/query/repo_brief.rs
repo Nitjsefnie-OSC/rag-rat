@@ -130,24 +130,24 @@ pub struct RepoBriefNextTool {
     pub args: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug)]
-struct FileBriefRow {
-    path: String,
-    language: String,
-    kind: String,
-    generated: bool,
-    line_count: u64,
-    chunk_count: u64,
-    symbol_count: u64,
-    fan_in: u64,
-    fan_out: u64,
-    commit_touch_count: u64,
-    recent_touch_count: u64,
-    additions: u64,
-    deletions: u64,
-    github_ref_count: u64,
-    symbol_kinds: BTreeMap<String, u64>,
-    memories: RepoBriefMemoryCounts,
+#[derive(Debug, Clone)]
+pub(crate) struct FileBriefRow {
+    pub(crate) path: String,
+    pub(crate) language: String,
+    pub(crate) kind: String,
+    pub(crate) generated: bool,
+    pub(crate) line_count: u64,
+    pub(crate) chunk_count: u64,
+    pub(crate) symbol_count: u64,
+    pub(crate) fan_in: u64,
+    pub(crate) fan_out: u64,
+    pub(crate) commit_touch_count: u64,
+    pub(crate) recent_touch_count: u64,
+    pub(crate) additions: u64,
+    pub(crate) deletions: u64,
+    pub(crate) github_ref_count: u64,
+    pub(crate) symbol_kinds: BTreeMap<String, u64>,
+    pub(crate) memories: RepoBriefMemoryCounts,
 }
 
 pub fn repo_brief(conn: &Connection, options: RepoBriefOptions) -> anyhow::Result<RepoBrief> {
@@ -515,16 +515,16 @@ fn scoring_note(mode: RepoBriefMode) -> &'static str {
 }
 
 #[derive(Debug)]
-struct SummaryCounts {
-    total_files: u64,
-    generated_files: u64,
-    graph_edges: u64,
-    git_commits: u64,
-    git_file_changes: u64,
-    memories: RepoBriefMemoryCounts,
+pub(crate) struct SummaryCounts {
+    pub(crate) total_files: u64,
+    pub(crate) generated_files: u64,
+    pub(crate) graph_edges: u64,
+    pub(crate) git_commits: u64,
+    pub(crate) git_file_changes: u64,
+    pub(crate) memories: RepoBriefMemoryCounts,
 }
 
-fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts> {
+pub(crate) fn summary_counts(conn: &Connection) -> anyhow::Result<SummaryCounts> {
     let (total_files, generated_files) =
         conn.query_row("SELECT COUNT(*), COALESCE(SUM(generated), 0) FROM files", [], |row| {
             Ok((row_u64(row, 0)?, row_u64(row, 1)?))
@@ -548,7 +548,10 @@ fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
     Ok(conn.query_row(&sql, [], |row| row_u64(row, 0))?)
 }
 
-fn file_rows(conn: &Connection, include_generated: bool) -> anyhow::Result<Vec<FileBriefRow>> {
+pub(crate) fn file_rows(
+    conn: &Connection,
+    include_generated: bool,
+) -> anyhow::Result<Vec<FileBriefRow>> {
     let newest_commit = newest_commit_time(conn)?;
     let recent_floor = newest_commit.saturating_sub(90 * 24 * 60 * 60);
     let mut stmt = conn.prepare(
@@ -644,7 +647,10 @@ fn file_rows(conn: &Connection, include_generated: bool) -> anyhow::Result<Vec<F
     Ok(out)
 }
 
-fn enrich_symbol_kinds(conn: &Connection, rows: &mut [FileBriefRow]) -> anyhow::Result<()> {
+pub(crate) fn enrich_symbol_kinds(
+    conn: &Connection,
+    rows: &mut [FileBriefRow],
+) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -657,7 +663,10 @@ fn enrich_symbol_kinds(conn: &Connection, rows: &mut [FileBriefRow]) -> anyhow::
     Ok(())
 }
 
-fn enrich_memory_counts(conn: &Connection, rows: &mut [FileBriefRow]) -> anyhow::Result<()> {
+pub(crate) fn enrich_memory_counts(
+    conn: &Connection,
+    rows: &mut [FileBriefRow],
+) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }

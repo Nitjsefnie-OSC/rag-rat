@@ -16,7 +16,7 @@ use crate::tools::{
     BlameChunkArgs, CompareGraphTextArgs, EmptyArgs, HealIndexArgs, ImpactArgs, LimitArgs,
     MemoryCreateArgs, MemoryForCallPathArgs, MemoryForPathArgs, MemoryForSymbolArgs, MemoryIdArgs,
     MemorySearchArgs, MemoryUpdateArgs, PapertrailChunkArgs, PapertrailCommitArgs, PathHistoryArgs,
-    ReadChunkArgs, RepoBriefArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
+    ReadChunkArgs, RepoBriefArgs, RepoClustersArgs, SearchArgs, SymbolArgs, SymbolGraphArgs,
 };
 
 #[derive(Clone)]
@@ -115,6 +115,17 @@ impl RagRatService {
         Parameters(args): Parameters<RepoBriefArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.call("repo_brief", json!(args))
+    }
+
+    #[tool(
+        name = "repo_clusters",
+        description = "Cheap file-level ownership clusters using path proximity, graph edges, and git co-touches."
+    )]
+    fn repo_clusters(
+        &self,
+        Parameters(args): Parameters<RepoClustersArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.call("repo_clusters", json!(args))
     }
 
     #[tool(

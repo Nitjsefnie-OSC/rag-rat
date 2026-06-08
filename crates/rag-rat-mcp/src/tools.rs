@@ -4,6 +4,7 @@ use rag_rat_core::{
     Config, IndexDatabase,
     language::Language,
     query::{
+        clusters::RepoClustersOptions,
         graph::{GraphResolutionMode, GraphTraversalOptions},
         graph_meta::GraphMetaMode,
         impact::ImpactSurfaceOptions,
@@ -128,6 +129,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "compare_graph_to_text",
     "impact_surface",
     "repo_brief",
+    "repo_clusters",
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
@@ -207,6 +209,18 @@ pub struct RepoBriefArgs {
     pub include_generated: bool,
     #[serde(default = "default_true")]
     pub include_memories: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RepoClustersArgs {
+    #[serde(default = "default_repo_brief_limit")]
+    pub limit: u32,
+    #[serde(default)]
+    pub include_generated: bool,
+    #[serde(default = "default_true")]
+    pub include_memories: bool,
+    #[serde(default = "default_min_cluster_size")]
+    pub min_cluster_size: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -617,6 +631,15 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
                 limit: args.limit,
                 include_generated: args.include_generated,
                 include_memories: args.include_memories,
+            })?)
+        },
+        "repo_clusters" => {
+            let args: RepoClustersArgs = serde_json::from_value(arguments)?;
+            json!(db.repo_clusters(RepoClustersOptions {
+                limit: args.limit,
+                include_generated: args.include_generated,
+                include_memories: args.include_memories,
+                min_cluster_size: args.min_cluster_size,
             })?)
         },
         "ffi_surface" => {
@@ -1149,6 +1172,9 @@ pub fn description(name: &str) -> &'static str {
         "repo_brief" => {
             "Orientation-first repo brief with spine, churn, god-module, and refactor-candidate modes."
         },
+        "repo_clusters" => {
+            "Cheap file-level ownership clusters using path proximity, graph edges, and git co-touches."
+        },
         "ffi_surface" => "Find UniFFI/export/generated-binding/call-site candidates.",
         "docs_for_symbol" => "Find docs chunks related to a symbol.",
         "read_chunk" => "Read current text for one selected chunk ID with anchor validation.",
@@ -1203,6 +1229,7 @@ pub fn schema(name: &str) -> Value {
         "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
         "impact_surface" => schema_for::<ImpactArgs>(),
         "repo_brief" => schema_for::<RepoBriefArgs>(),
+        "repo_clusters" => schema_for::<RepoClustersArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
         "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),
@@ -1277,6 +1304,10 @@ fn default_repo_brief_limit() -> u32 {
     10
 }
 
+fn default_min_cluster_size() -> u32 {
+    2
+}
+
 fn default_read_chunk_graph_mode() -> McpGraphMode {
     McpGraphMode::Full
 }
@@ -1327,6 +1358,7 @@ mod tests {
             "compare_graph_to_text",
             "impact_surface",
             "repo_brief",
+            "repo_clusters",
             "ffi_surface",
             "docs_for_symbol",
             "read_chunk",
@@ -1439,6 +1471,9 @@ mod tests {
         );
         assert_schema_has_property(tools, "repo_brief", "limit");
         assert_schema_has_property(tools, "repo_brief", "include_memories");
+        assert_schema_has_property(tools, "repo_clusters", "limit");
+        assert_schema_has_property(tools, "repo_clusters", "include_memories");
+        assert_schema_has_property(tools, "repo_clusters", "min_cluster_size");
         assert_symbol_selector_schema(tools, "docs_for_symbol");
         assert_symbol_selector_schema(tools, "git_history_for_symbol");
         assert_symbol_selector_schema(tools, "papertrail_for_symbol");

@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 12;
+pub const LATEST_SCHEMA_VERSION: u32 = 13;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -49,6 +49,10 @@ const MIGRATION_012_ID: &str = "012_repo_memory_call_paths";
 const MIGRATION_012_CHECKSUM: &str = "sha256:rag-rat-repo-memory-call-paths-v12";
 const MIGRATION_012_DESCRIPTION: &str =
     "Add edge and call-path memory bindings for graph traversal surfacing";
+const MIGRATION_013_ID: &str = "013_graph_file_lookup_indexes";
+const MIGRATION_013_CHECKSUM: &str = "sha256:rag-rat-graph-file-lookup-indexes-v13";
+const MIGRATION_013_DESCRIPTION: &str =
+    "Add graph file lookup indexes for ownership clustering and file-level graph summaries";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -125,6 +129,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_011_ID, MIGRATION_011_CHECKSUM, MIGRATION_011_DESCRIPTION)?;
     apply_repo_memory_call_paths(conn)?;
     record_migration(conn, MIGRATION_012_ID, MIGRATION_012_CHECKSUM, MIGRATION_012_DESCRIPTION)?;
+    apply_graph_file_lookup_indexes(conn)?;
+    record_migration(conn, MIGRATION_013_ID, MIGRATION_013_CHECKSUM, MIGRATION_013_DESCRIPTION)?;
     Ok(())
 }
 
@@ -651,6 +657,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_qualified_name ON symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbol_facts_kind_value
             ON symbol_facts(fact_kind, fact_value);
         CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
@@ -700,6 +707,7 @@ fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_symbol_facts(conn)?;
     apply_repo_memories(conn)?;
     apply_repo_memory_call_paths(conn)?;
+    apply_graph_file_lookup_indexes(conn)?;
     Ok(())
 }
 
@@ -1064,6 +1072,17 @@ fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn apply_graph_file_lookup_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "source_file_id", "INTEGER")?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges(source_file_id);
+        ",
+    )?;
+    Ok(())
+}
+
 fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
@@ -1138,6 +1157,7 @@ fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_010_ID => Some(10),
             MIGRATION_011_ID => Some(11),
             MIGRATION_012_ID => Some(12),
+            MIGRATION_013_ID => Some(13),
             _ => None,
         })
         .max()
@@ -1159,6 +1179,7 @@ fn known_migration(id: &str) -> bool {
             | MIGRATION_010_ID
             | MIGRATION_011_ID
             | MIGRATION_012_ID
+            | MIGRATION_013_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1177,6 +1198,7 @@ fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
         MIGRATION_010_ID => migration.checksum != MIGRATION_010_CHECKSUM,
         MIGRATION_011_ID => migration.checksum != MIGRATION_011_CHECKSUM,
         MIGRATION_012_ID => migration.checksum != MIGRATION_012_CHECKSUM,
+        MIGRATION_013_ID => migration.checksum != MIGRATION_013_CHECKSUM,
         _ => false,
     }
 }

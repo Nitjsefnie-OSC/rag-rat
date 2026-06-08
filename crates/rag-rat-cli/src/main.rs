@@ -76,6 +76,23 @@ fn main() -> anyhow::Result<()> {
                 include_memories: !has_flag(&args, "--no-memories"),
             })?)?;
         },
+        "clusters" => {
+            let db = IndexDatabase::open_config(&config)?;
+            let limit = option_value(&args, "--limit")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(10);
+            let min_cluster_size = option_value(&args, "--min-cluster-size")
+                .map(|value| value.parse::<u32>())
+                .transpose()?
+                .unwrap_or(2);
+            print_json(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
+                limit,
+                include_generated: has_flag(&args, "--include-generated"),
+                include_memories: !has_flag(&args, "--no-memories"),
+                min_cluster_size,
+            })?)?;
+        },
         "mcp" => {
             tokio::runtime::Runtime::new()?.block_on(rag_rat_mcp::server::run_stdio(config))?;
         },
@@ -817,7 +834,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <init|index|doctor|migrate|query|brief|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> [--config <path>] [query]\n\
+        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> [--config <path>] [query]\n\
          default config: rag-rat.toml\n\
          examples:\n\
          rag-rat init\n\
@@ -847,7 +864,8 @@ fn usage() {
          rag-rat query --explain \"runtime shutdown\"\n\
          rag-rat brief --mode spine\n\
          rag-rat brief --mode churn\n\
-         rag-rat brief --mode god_modules"
+         rag-rat brief --mode god_modules\n\
+         rag-rat clusters --limit 10"
     );
 }
 

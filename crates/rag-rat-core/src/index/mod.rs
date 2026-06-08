@@ -1759,6 +1759,13 @@ impl IndexDatabase {
         crate::query::repo_brief::repo_brief(self.storage.connection(), options)
     }
 
+    pub fn repo_clusters(
+        &self,
+        options: crate::query::clusters::RepoClustersOptions,
+    ) -> anyhow::Result<crate::query::clusters::RepoClustersReport> {
+        crate::query::clusters::repo_clusters(self.storage.connection(), options)
+    }
+
     pub fn memory_create(
         &self,
         request: crate::query::memory::RepoMemoryCreate,
@@ -6807,6 +6814,73 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
         assert!(
             god_modules.candidates[0].next_tools.iter().any(|tool| tool.tool == "impact_surface")
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repo_clusters_groups_cotouched_files() {
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src/sync")).unwrap();
+        fs::create_dir_all(root.join("src/ui")).unwrap();
+        run_git(&root, &["init"]);
+        run_git(&root, &["config", "user.name", "Rag Rat"]);
+        run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+        fs::write(root.join("src/sync/actor.rs"), "pub fn sync_actor() -> i32 { 1 }\n").unwrap();
+        fs::write(root.join("src/sync/msg.rs"), "pub fn sync_msg() -> i32 { 2 }\n").unwrap();
+        fs::write(root.join("src/ui/app.rs"), "pub fn ui_app() -> i32 { 3 }\n").unwrap();
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "Add modules"]);
+
+        for revision in 1..=2 {
+            fs::write(
+                root.join("src/sync/actor.rs"),
+                format!("pub fn sync_actor() -> i32 {{ {revision} }}\n"),
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/sync/msg.rs"),
+                format!("pub fn sync_msg() -> i32 {{ {} }}\n", revision + 10),
+            )
+            .unwrap();
+            run_git(&root, &["add", "src/sync/actor.rs", "src/sync/msg.rs"]);
+            run_git(&root, &["commit", "-m", "Iterate sync modules"]);
+        }
+
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+        };
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let clusters = db
+            .repo_clusters(crate::query::clusters::RepoClustersOptions {
+                limit: 5,
+                include_generated: false,
+                include_memories: true,
+                min_cluster_size: 2,
+            })
+            .unwrap();
+
+        let sync_cluster = clusters
+            .clusters
+            .iter()
+            .find(|cluster| cluster.name == "src/sync")
+            .expect("sync cluster");
+        assert!(sync_cluster.representative_paths.contains(&"src/sync/actor.rs".to_string()));
+        assert!(sync_cluster.representative_paths.contains(&"src/sync/msg.rs".to_string()));
+        assert!(sync_cluster.metrics.co_touch_edges >= 2);
 
         fs::remove_dir_all(root).unwrap();
     }
