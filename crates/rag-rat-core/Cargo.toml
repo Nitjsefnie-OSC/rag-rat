@@ -31,6 +31,9 @@ tree-sitter-kotlin.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [features]
 default = ["fastembed"]
 fastembed = ["dep:fastembed"]

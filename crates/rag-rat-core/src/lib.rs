@@ -1,5 +1,6 @@
 pub mod config;
 pub mod eval;
+pub mod fleet;
 pub mod index;
 pub mod language;
 pub mod locks;

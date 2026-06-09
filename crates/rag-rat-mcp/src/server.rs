@@ -1,4 +1,6 @@
 use rag_rat_core::Config;
+#[cfg(not(unix))]
+use rmcp::transport::stdio;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -8,7 +10,6 @@ use rmcp::{
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
-    transport::stdio,
 };
 use serde_json::{Map, Value, json};
 
@@ -22,14 +23,32 @@ use crate::tools::{
 #[derive(Clone)]
 pub struct RagRatService {
     config: Config,
+    /// In-flight tool-call counter, observed by the hot-upgrade teardown so it drains at a request
+    /// boundary before `exec`. Present only on Unix, where hot-upgrade is supported.
+    #[cfg(unix)]
+    inflight: std::sync::Arc<crate::upgrade::Inflight>,
 }
 
 impl RagRatService {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(unix)]
+            inflight: crate::upgrade::Inflight::new(),
+        }
+    }
+
+    /// Shared in-flight counter, so the hot-upgrade signal task can wait for tool calls to drain.
+    #[cfg(unix)]
+    pub fn inflight(&self) -> std::sync::Arc<crate::upgrade::Inflight> {
+        std::sync::Arc::clone(&self.inflight)
     }
 
     fn call(&self, name: &str, value: Value) -> Result<CallToolResult, ErrorData> {
+        // All ~34 tools funnel through here; the guard makes every tool call observable to the
+        // hot-upgrade drain via one chokepoint instead of 34 handlers.
+        #[cfg(unix)]
+        let _inflight = self.inflight.guard();
         let value = crate::tools::call_tool_for_config(&self.config, name, value)
             .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
         let text = serde_json::to_string_pretty(&value)
@@ -431,11 +450,92 @@ impl ServerHandler for RagRatService {
 }
 
 pub async fn run_stdio(config: Config) -> anyhow::Result<()> {
-    // Keep the index fresh while a session is connected. The guard lives until `waiting()` returns
-    // (the rmcp stdio transport completes on stdin EOF — our shutdown signal); dropping it then
-    // stops the watcher and runs a final timeout-skip pass.
-    let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
-    let service = RagRatService::new(config).serve(stdio()).await?;
-    service.waiting().await?;
+    #[cfg(unix)]
+    {
+        run_stdio_unix(config).await
+    }
+    #[cfg(not(unix))]
+    {
+        // Keep the index fresh while a session is connected; dropping the watcher on shutdown
+        // runs a final timeout-skip pass. (Hot-upgrade is Unix-only.)
+        let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
+        let service = RagRatService::new(config).serve(stdio()).await?;
+        service.waiting().await?;
+        Ok(())
+    }
+}
+
+/// Unix `run_stdio`: serves over a [`crate::upgrade::GatedStdin`] so a `SIGUSR1` can hot-`exec`
+/// the newly installed binary in place, and resumes (skipping `initialize`) when handed off to.
+#[cfg(unix)]
+async fn run_stdio_unix(config: Config) -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    use rmcp::service::serve_directly;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    use crate::upgrade::{self, GatedStdin, Upgrade, UpgradeGate};
+
+    let gate = UpgradeGate::new();
+    let service = RagRatService::new(config.clone());
+    let inflight = service.inflight();
+
+    let transport = (GatedStdin::new(tokio::io::stdin(), Arc::clone(&gate)), tokio::io::stdout());
+
+    // Resume (skip `initialize`) iff a predecessor handed off a session we can still honor.
+    let running = match upgrade::take_handoff() {
+        Some(handoff) if upgrade::protocol_supported(&handoff.negotiated_protocol_version) => {
+            serve_directly(service, transport, Some(handoff.peer_info))
+        },
+        Some(handoff) => {
+            // The new binary can't honor the negotiated protocol — exit cleanly so the client
+            // reconnects and renegotiates rather than resuming on a mismatch.
+            eprintln!(
+                "hot-upgrade: protocol {} unsupported by this binary; exiting for clean reconnect",
+                handoff.negotiated_protocol_version
+            );
+            return Ok(());
+        },
+        None => service.serve(transport).await?,
+    };
+
+    // Keep the index fresh while connected. Its lock fds are CLOEXEC, so a hot-`exec` releases
+    // them automatically; on normal EOF the drop runs a final timeout-skip pass. When hot-upgrade
+    // is armed, the elected watcher also watches the binary dir to drive the fleet trigger.
+    let install_path = upgrade::install_path();
+    let _watcher =
+        rag_rat_core::watch::Watcher::spawn_with_fleet(config.clone(), install_path.clone());
+
+    // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
+    if let Some(install_path) = install_path {
+        let peer_info = running.peer().peer_info().cloned().unwrap_or_default();
+        let negotiated_protocol_version = peer_info.protocol_version.as_str().to_string();
+        let handoff_dir = config
+            .database
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let upgrade = Upgrade {
+            gate: Arc::clone(&gate),
+            inflight,
+            install_path,
+            handoff_dir,
+            peer_info,
+            negotiated_protocol_version,
+        };
+        tokio::spawn(async move {
+            let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) else {
+                eprintln!("hot-upgrade: could not install SIGUSR1 handler; disabled");
+                return;
+            };
+            // On success `run()` never returns (it `exec`s or exits); on a drain-timeout abort it
+            // returns and we wait for the next signal.
+            while sigusr1.recv().await.is_some() {
+                upgrade.run().await;
+            }
+        });
+    }
+
+    running.waiting().await?;
     Ok(())
 }

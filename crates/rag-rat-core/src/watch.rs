@@ -10,7 +10,7 @@
 //!   memory_validate. Discover handles additions/edits/deletions; the pass is idempotent.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,6 +24,7 @@ use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 
 use crate::{
     config::Config,
+    fleet,
     index::{IndexDatabase, ai::ReconcileOptions, target_for_path},
     locks::{self, FileLock},
 };
@@ -35,6 +36,11 @@ const GC_EVERY_PASSES: u64 = 20;
 const PASS_RECONCILE_MAX_SECONDS: u64 = 60;
 /// Shutdown / interactive lock acquisition: skip rather than block forever.
 const SKIP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Quiet window after a change to the installed binary before signaling the fleet to hot-upgrade.
+/// `cargo install` writes a temp file then renames; the debounce lets the rename settle.
+const FLEET_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Max-latency cap for the fleet-trigger debounce (sustained binary churn still fires).
+const FLEET_MAX_LATENCY: Duration = Duration::from_millis(2000);
 
 /// Debounce state with a hard max-latency cap. Pure (clock injected) so it is unit-testable without
 /// real filesystem events.
@@ -130,6 +136,16 @@ fn event_is_relevant(config: &Config, event: &Event) -> bool {
     })
 }
 
+/// Whether `event` touches the installed binary path — the fleet hot-upgrade trigger. Matches by
+/// full path (`cargo install` renames its temp file to exactly this path) so unrelated churn in
+/// the same directory is ignored.
+fn event_targets_binary(fleet_bin: Option<&Path>, event: &Event) -> bool {
+    let Some(bin) = fleet_bin else {
+        return false;
+    };
+    event.paths.iter().any(|path| path == bin)
+}
+
 /// A running watcher. Dropping it signals the thread to stop and joins it.
 #[derive(Debug)]
 pub struct Watcher {
@@ -141,6 +157,14 @@ impl Watcher {
     /// Start the watcher unless disabled by config or `RAG_RAT_NO_WATCH`. The returned watcher must
     /// be kept alive; dropping it stops the thread. Returns `None` when watching is disabled.
     pub fn spawn(config: Config) -> Option<Watcher> {
+        Self::spawn_with_fleet(config, None)
+    }
+
+    /// Like [`Watcher::spawn`], but when `fleet_bin` is the installed-binary path, the elected
+    /// watcher also watches that file's directory and signals the hot-upgrade fleet (see
+    /// [`crate::fleet`]) when a new binary lands. Only the MCP server — which has a `SIGUSR1`
+    /// handler — passes `Some`.
+    pub fn spawn_with_fleet(config: Config, fleet_bin: Option<PathBuf>) -> Option<Watcher> {
         if !config.watch.enabled || std::env::var_os("RAG_RAT_NO_WATCH").is_some() {
             return None;
         }
@@ -149,7 +173,7 @@ impl Watcher {
             .name("rag-rat-watch".to_string())
             .spawn({
                 let stop = Arc::clone(&stop);
-                move || watcher_main(config, &stop)
+                move || watcher_main(config, fleet_bin, &stop)
             })
             .ok()?;
         Some(Watcher { stop, handle: Some(handle) })
@@ -177,7 +201,7 @@ fn sleep_checking_stop(total: Duration, stop: &AtomicBool) {
     }
 }
 
-fn watcher_main(config: Config, stop: &AtomicBool) {
+fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     let base_dir =
         config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
     let election_path = locks::election_lock_path(&base_dir, &config.root);
@@ -207,11 +231,19 @@ fn watcher_main(config: Config, stop: &AtomicBool) {
             let _ = notify_watcher.watch(&config.root.join(dir), RecursiveMode::Recursive);
         }
     }
+    // Fleet hot-upgrade: also watch the installed binary's directory so a new `cargo install`
+    // rename triggers a fleet-wide upgrade. Watch the directory (not the file) so the atomic
+    // rename — which replaces the inode — is still observed.
+    let fleet_dir = fleet_bin.as_ref().and_then(|bin| bin.parent());
+    if let Some(dir) = fleet_dir {
+        let _ = notify_watcher.watch(dir, RecursiveMode::NonRecursive);
+    }
 
     let mut debounce = Debounce::new(
         Duration::from_millis(config.watch.debounce_ms),
         Duration::from_millis(config.watch.max_latency_ms),
     );
+    let mut fleet_debounce = Debounce::new(FLEET_DEBOUNCE, FLEET_MAX_LATENCY);
     // Periodic backstop (covers event-blind filesystems + missed events). `None` disables it.
     let periodic = (config.watch.periodic_sweep_secs > 0)
         .then(|| Duration::from_secs(config.watch.periodic_sweep_secs));
@@ -223,14 +255,20 @@ fn watcher_main(config: Config, stop: &AtomicBool) {
         }
         let now = Instant::now();
         let periodic_wait = periodic.map(|p| (last_pass + p).saturating_duration_since(now));
-        let wait = [debounce.due_in(now), periodic_wait]
+        let wait = [debounce.due_in(now), fleet_debounce.due_in(now), periodic_wait]
             .into_iter()
             .flatten()
             .min()
             .unwrap_or(Duration::from_millis(500));
         match rx.recv_timeout(wait) {
-            Ok(Ok(event)) if event_is_relevant(&config, &event) => {
-                debounce.on_event(Instant::now())
+            Ok(Ok(event)) => {
+                let now = Instant::now();
+                if event_is_relevant(&config, &event) {
+                    debounce.on_event(now);
+                }
+                if event_targets_binary(fleet_bin.as_deref(), &event) {
+                    fleet_debounce.on_event(now);
+                }
             },
             Ok(_) => {},
             Err(RecvTimeoutError::Timeout) => {},
@@ -243,6 +281,13 @@ fn watcher_main(config: Config, stop: &AtomicBool) {
             let _ = maintenance_pass(&config, passes.is_multiple_of(GC_EVERY_PASSES));
             debounce.reset();
             last_pass = Instant::now();
+        }
+        if fleet_debounce.should_fire(now)
+            && let Some(bin) = fleet_bin.as_deref()
+        {
+            // Signal the fleet (this process last) to hot-upgrade to the freshly installed binary.
+            fleet::trigger(bin);
+            fleet_debounce.reset();
         }
     }
 
