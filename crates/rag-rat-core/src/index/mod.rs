@@ -322,6 +322,19 @@ impl IndexDatabase {
         db.set_context(&commit_sha, &worktree_id)?;
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
+        // RAM-first bulk build: a full rebuild is one big atomic write, so trade per-write
+        // durability for speed — keep the rollback journal in memory (so ROLLBACK still works and
+        // an interrupted rebuild can't corrupt the index), skip fsyncs, and avoid the WAL
+        // double-write (pages → -wal → checkpoint) by writing pages once. Restored to WAL/NORMAL
+        // after the rebuild closes its transaction. Only `rebuild` uses this; incremental indexing
+        // and the watcher stay on durable WAL.
+        // NB: do NOT touch `temp_store` here — changing it drops all existing temp tables, which
+        // would wipe the `connection_context` overlay table created by `set_context` above.
+        db.storage.execute_batch(
+            "PRAGMA synchronous = OFF;
+             PRAGMA journal_mode = MEMORY;
+             PRAGMA cache_size = -262144;",
+        )?;
         let result = (|| -> anyhow::Result<()> {
             db.storage.execute_batch("BEGIN TRANSACTION")?;
             db.clear_full_rebuild_tables()?;
@@ -353,6 +366,11 @@ impl IndexDatabase {
             }
             let _ = db.storage.execute_batch("ROLLBACK");
         }
+        // Restore durable settings now that the rebuild transaction has closed (journal_mode can
+        // only change outside a transaction). cache_size is left bumped — harmless for the short
+        // remaining lifetime of this connection (e.g. the reconcile that follows `init`).
+        let _ =
+            db.storage.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
         result?;
         Ok(db)
     }
@@ -7631,6 +7649,35 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
             )
             .unwrap();
         assert!(count > 0, "missing edge {from} -[{edge_kind}/{confidence}]-> {to}");
+    }
+
+    #[test]
+    fn rebuild_restores_durable_wal_after_bulk_build() {
+        // The bulk rebuild drops to journal_mode=MEMORY + synchronous=OFF for speed; it MUST
+        // restore durable WAL/NORMAL afterward so later writes (reconcile, the watcher) are safe.
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let journal_mode: String = db
+            .storage
+            .connection()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal", "rebuild must restore WAL durability");
+        let synchronous: i64 = db
+            .storage
+            .connection()
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be restored to NORMAL (=1)");
+        // The index is intact and queryable after the bulk build.
+        assert!(!db.symbols("alpha", Some(Language::Rust), 10).unwrap().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn table_count(db: &IndexDatabase, table: &str) -> i64 {
