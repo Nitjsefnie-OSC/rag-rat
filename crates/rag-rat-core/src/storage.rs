@@ -68,6 +68,10 @@ impl IndexConnection {
             PRAGMA foreign_keys = ON;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            -- Wait out a concurrent writer (e.g. the background watcher mid-pass, or a lazy heal
+            -- on the query path) instead of failing with SQLITE_BUSY. WAL allows one writer at a
+            -- time; this serializes them safely without erroring.
+            PRAGMA busy_timeout = 5000;
             ",
         )?;
         Ok(())

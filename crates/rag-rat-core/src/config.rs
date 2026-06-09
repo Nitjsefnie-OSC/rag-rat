@@ -16,6 +16,29 @@ pub struct Config {
     pub database: PathBuf,
     pub targets: Vec<ResolvedTarget>,
     pub local_ai: LocalAiConfig,
+    pub watch: WatchConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchConfig {
+    /// Run the background file watcher (default true). `RAG_RAT_NO_WATCH` overrides this off at
+    /// the call site.
+    pub enabled: bool,
+    /// Quiet window (ms) before a debounced reindex pass.
+    pub debounce_ms: u64,
+    /// Hard cap (ms): force a pass after this much continuous activity, so sustained writes never
+    /// starve the quiet-window debounce.
+    pub max_latency_ms: u64,
+    /// Periodic backstop: run a pass at least this often even with no events (0 disables). Covers
+    /// event-blind filesystems (NFS, WSL2 `/mnt`) and a watcher that missed events, and bounds how
+    /// long a wedged peer can leave the index stale.
+    pub periodic_sweep_secs: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self { enabled: true, debounce_ms: 400, max_latency_ms: 2500, periodic_sweep_secs: 300 }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -98,12 +121,22 @@ impl Config {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let root = config_dir.join(raw.index.root.unwrap_or_else(|| ".".to_string()));
         let root = normalize_existing_dir(&root)?;
-        let database =
-            root.join(raw.index.database.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string()));
+        // One database per repo: resolve a relative database path against the *main* worktree so
+        // all linked worktrees of a repo share one index (the commit/worktree overlay is built for
+        // exactly this). An absolute path is honored as-is. The main worktree resolves against its
+        // own root (unchanged), so single-worktree users see no change.
+        let database = match raw.index.database {
+            Some(db) if Path::new(&db).is_absolute() => PathBuf::from(db),
+            other => {
+                let relative = other.unwrap_or_else(|| ".rag-rat/index.sqlite".to_string());
+                shared_db_base(&root).join(relative)
+            },
+        };
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
         let local_ai = raw.local_ai.into();
+        let watch = raw.watch.into();
 
-        Ok(Self { root, database, targets, local_ai })
+        Ok(Self { root, database, targets, local_ai, watch })
     }
 }
 
@@ -186,6 +219,42 @@ fn push_target(
     Ok(())
 }
 
+/// Base directory a relative `database` path resolves against. For a **linked** git worktree this
+/// is the **main** worktree root (so all worktrees share one index DB); for the main worktree or a
+/// non-git dir it is `root` unchanged — single-worktree setups keep their existing DB location.
+fn shared_db_base(root: &Path) -> PathBuf {
+    match main_worktree_root(root) {
+        Some(main_root) if main_root != root => main_root,
+        _ => root.to_path_buf(),
+    }
+}
+
+/// The main worktree root, derived from the git common dir (`<main>/.git`). Returns `None` outside
+/// a standard git repo (bare repo, custom `GIT_DIR`, git unavailable) so resolution falls back to
+/// `root` — never guess.
+fn main_worktree_root(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common_dir = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if common_dir.is_empty() {
+        return None;
+    }
+    let common_dir = root.join(common_dir).canonicalize().ok()?;
+    // Only the standard `<main>/.git` layout maps cleanly to a main worktree root.
+    if common_dir.file_name()?.to_str()? != ".git" {
+        return None;
+    }
+    let main_root = common_dir.parent()?.to_path_buf();
+    main_root.is_dir().then_some(main_root)
+}
+
 fn normalize_existing_dir(path: &Path) -> Result<PathBuf, ConfigError> {
     let absolute =
         if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) };
@@ -203,9 +272,31 @@ struct RawConfig {
     #[serde(default)]
     local_ai: RawLocalAi,
     #[serde(default)]
+    watch: RawWatch,
+    #[serde(default)]
     target_bindings: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "target")]
     target: Vec<RawTarget>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawWatch {
+    enabled: Option<bool>,
+    debounce_ms: Option<u64>,
+    max_latency_ms: Option<u64>,
+    periodic_sweep_secs: Option<u64>,
+}
+
+impl From<RawWatch> for WatchConfig {
+    fn from(raw: RawWatch) -> Self {
+        let default = WatchConfig::default();
+        Self {
+            enabled: raw.enabled.unwrap_or(default.enabled),
+            debounce_ms: raw.debounce_ms.unwrap_or(default.debounce_ms),
+            max_latency_ms: raw.max_latency_ms.unwrap_or(default.max_latency_ms),
+            periodic_sweep_secs: raw.periodic_sweep_secs.unwrap_or(default.periodic_sweep_secs),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -286,7 +377,82 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static CFG_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn config_load_resolves_main_and_linked_worktrees_to_one_database() {
+        // The actual guarantee (review item 1): Config::load from the main worktree and from a
+        // linked worktree of the same repo produce the *same* database path — not two DBs.
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-cfgload-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            main.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        let from_main = Config::load(main.join("rag-rat.toml")).unwrap();
+        let from_linked = Config::load(linked.join("rag-rat.toml")).unwrap();
+        assert_eq!(
+            from_main.database, from_linked.database,
+            "main and linked worktrees must share one index database",
+        );
+        assert_eq!(from_main.database, main.canonicalize().unwrap().join(".rag-rat/index.sqlite"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shared_db_base_shares_one_db_across_worktrees() {
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-cfg-{}-{id}", std::process::id()));
+        let main = tmp.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        std::fs::write(main.join("seed.txt"), "x").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+        let linked = tmp.join("wt");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+
+        let main_c = main.canonicalize().unwrap();
+        let linked_c = linked.canonicalize().unwrap();
+
+        // Main worktree resolves to itself (no redirect → existing DB location preserved).
+        assert_eq!(shared_db_base(&main_c), main_c);
+        // Linked worktree redirects to the main worktree → one shared DB.
+        assert_eq!(shared_db_base(&linked_c), main_c);
+
+        // A non-git directory falls back to itself.
+        let plain = tmp.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain_c = plain.canonicalize().unwrap();
+        assert_eq!(shared_db_base(&plain_c), plain_c);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn parses_simple_and_expanded_targets() {
@@ -344,6 +510,39 @@ mod tests {
                 ort_threads: Some(2),
                 omp_threads: Some(1),
                 max_embedding_chars: 5000,
+            }
+        );
+    }
+
+    #[test]
+    fn watch_config_defaults_on_and_parses_overrides() {
+        let default: WatchConfig = RawWatch::default().into();
+        assert!(default.enabled, "watcher is on by default");
+        assert_eq!(default.debounce_ms, 400);
+        assert_eq!(default.max_latency_ms, 2500);
+        assert_eq!(default.periodic_sweep_secs, 300);
+
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [watch]
+            enabled = false
+            debounce_ms = 750
+            max_latency_ms = 4000
+            periodic_sweep_secs = 0
+            "#,
+        )
+        .unwrap();
+        let watch: WatchConfig = raw.watch.into();
+        assert_eq!(
+            watch,
+            WatchConfig {
+                enabled: false,
+                debounce_ms: 750,
+                max_latency_ms: 4000,
+                periodic_sweep_secs: 0,
             }
         );
     }

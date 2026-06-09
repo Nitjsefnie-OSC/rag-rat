@@ -29,24 +29,29 @@ fn main() -> anyhow::Result<()> {
 
     match command {
         "index" => {
-            let db = if has_flag(&args, "--watch") {
-                anyhow::bail!(
-                    "index --watch is not implemented yet; use --changed, --discover, or --full"
-                );
-            } else if has_flag(&args, "--full") {
-                IndexDatabase::rebuild_with_progress(&config, render_index_progress)?
-            } else if has_flag(&args, "--discover") {
-                IndexDatabase::index_discover_with_progress(&config, render_index_progress)?
+            if has_flag(&args, "--watch") {
+                run_watch(config)?;
             } else {
-                IndexDatabase::index_changed_with_progress(&config, render_index_progress)?
-            };
-            // Re-anchor repo memories against the freshly indexed symbols/chunks so a moved or
-            // renamed binding relocates (or is flagged) instead of silently pointing at a stale
-            // row. Memory rows themselves are never deleted by indexing.
-            if let Err(err) = db.memory_validate() {
-                eprintln!("warning: repo-memory re-validation failed: {err}");
+                // Serialize with the background watcher / other writers (busy_timeout backstops
+                // any heal on the query path).
+                let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
+                    &rag_rat_core::locks::write_lock_path(&config.database),
+                )?;
+                let db = if has_flag(&args, "--full") {
+                    IndexDatabase::rebuild_with_progress(&config, render_index_progress)?
+                } else if has_flag(&args, "--discover") {
+                    IndexDatabase::index_discover_with_progress(&config, render_index_progress)?
+                } else {
+                    IndexDatabase::index_changed_with_progress(&config, render_index_progress)?
+                };
+                // Re-anchor repo memories against the freshly indexed symbols/chunks so a moved or
+                // renamed binding relocates (or is flagged) instead of silently pointing at a stale
+                // row. Memory rows themselves are never deleted by indexing.
+                if let Err(err) = db.memory_validate() {
+                    eprintln!("warning: repo-memory re-validation failed: {err}");
+                }
+                print_json(&db.status(&config.database)?)?;
             }
-            print_json(&db.status(&config.database)?)?;
         },
         "doctor" => {
             doctor(&config)?;
@@ -335,6 +340,18 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
         intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
     };
     print_json(&db.reconcile_with_options_progress(options, render_reconcile_progress)?)
+}
+
+fn run_watch(config: Config) -> anyhow::Result<()> {
+    let Some(_watcher) = rag_rat_core::watch::Watcher::spawn(config.clone()) else {
+        anyhow::bail!("watcher is disabled ([watch] enabled = false or RAG_RAT_NO_WATCH set)");
+    };
+    eprintln!("rag-rat: watching {} for changes (Ctrl-C to stop)", config.root.display());
+    // The watcher runs on its own thread; park here. Ctrl-C ends the process and the OS releases
+    // the locks; the next session's startup catch-up covers any edit in flight.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 pub(crate) fn apply_embedding_runtime_env(runtime: &EmbeddingRuntimeConfig) {
@@ -631,6 +648,12 @@ fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
         }))?;
         return Ok(());
     }
+
+    // Serialize with the background watcher (and other writers). The hook backgrounds this command,
+    // so blocking here never holds up the git operation; busy_timeout backstops the query-path heal.
+    let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
+        &rag_rat_core::locks::write_lock_path(&config.database),
+    )?;
 
     let db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
     let elapsed = started.elapsed().as_secs();

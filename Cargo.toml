@@ -9,7 +9,7 @@ resolver = "3"
 [workspace.package]
 authors = ["Kristaps Karlsons"]
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/cq27-dev/rag-rat"
 readme = "README.md"

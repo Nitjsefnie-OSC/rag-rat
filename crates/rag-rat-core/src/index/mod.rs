@@ -3476,7 +3476,10 @@ fn indexed_file_map(conn: &rusqlite::Connection) -> anyhow::Result<BTreeMap<Stri
     Ok(files)
 }
 
-fn target_for_path(config: &Config, relative_path: &Path) -> Option<(Language, TargetKind)> {
+pub(crate) fn target_for_path(
+    config: &Config,
+    relative_path: &Path,
+) -> Option<(Language, TargetKind)> {
     let relative = path_string(relative_path);
     let language = Language::from_path(relative_path)?;
     let mut targets = config.targets.iter().collect::<Vec<_>>();
@@ -3671,6 +3674,7 @@ mod schema_bootstrap_tests {
                 kind: TargetKind::Docs,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
 
         let db = IndexDatabase::rebuild(&config).unwrap();
@@ -4534,6 +4538,81 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn watch_maintenance_pass_indexes_new_files() {
+        // A watcher pass must pick up a brand-new (uncommitted) file, not just refresh known ones.
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/one.rs"), "pub fn one() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        IndexDatabase::rebuild(&config).unwrap();
+
+        // New file appears after the initial index; a maintenance pass should index it.
+        fs::write(root.join("src/two.rs"), "pub fn newly_added_symbol() {}\n").unwrap();
+        crate::watch::maintenance_pass(&config, false).unwrap();
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        let hits = db.symbols("newly_added_symbol", Some(Language::Rust), 10).unwrap();
+        assert!(!hits.is_empty(), "watcher pass did not index the new file");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discover_deletion_is_worktree_scoped() {
+        // Invariant (watcher spec, review item 1): a discover pass run from worktree A must remove
+        // only A's own rows for files missing from A's disk — never another worktree's overlay
+        // rows. Otherwise two watchers on one shared DB delete each other's live overlays.
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(root.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // A row owned by a *different* worktree, for a path that does not exist on this disk.
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated,
+                     indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+                 VALUES ('src/only_in_other.rs','rust','source','h',0,0,0,'rev','',
+                     'other-worktree')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+
+        // This worktree loses a.rs; re-discover as this worktree.
+        fs::remove_file(root.join("src/a.rs")).unwrap();
+        let db = IndexDatabase::index_discover(&config).unwrap();
+        let conn = db.storage.connection();
+
+        // The other worktree's overlay row survives untouched.
+        let other: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE worktree_id = 'other-worktree' \
+                 AND kind != 'deleted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, 1, "this worktree's pass deleted another worktree's row");
+
+        // Deletion still works within this worktree's own scope: a.rs gone from the active view,
+        // b.rs retained.
+        let active = |path: &str| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM files WHERE path = ?1", [path], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(active("src/a.rs"), 0, "deleted file still active in own worktree");
+        assert_eq!(active("src/b.rs"), 1, "live file dropped from own worktree");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
         let (root, config) = markdown_config(
             "# One\nalpha token with enough surrounding detail for embedding eligibility and useful semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding eligibility and useful semantic context\n",
@@ -4803,6 +4882,7 @@ int main(void)
                 },
             ],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
         let db = IndexDatabase::rebuild(&config).unwrap();
         let status = db.status(&config.database).unwrap();
@@ -5415,6 +5495,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
         let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -6050,6 +6131,7 @@ where
                 },
             ],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
         let db = IndexDatabase::rebuild(&config).unwrap();
         let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);
@@ -6779,6 +6861,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
 
         let db = IndexDatabase::rebuild(&config).unwrap();
@@ -7181,6 +7264,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
         let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -7260,6 +7344,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         };
         let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -7350,6 +7435,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                 kind: TargetKind::Docs,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         }
     }
 
@@ -7366,6 +7452,7 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         }
     }
 

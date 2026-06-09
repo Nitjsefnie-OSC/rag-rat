@@ -431,6 +431,10 @@ impl ServerHandler for RagRatService {
 }
 
 pub async fn run_stdio(config: Config) -> anyhow::Result<()> {
+    // Keep the index fresh while a session is connected. The guard lives until `waiting()` returns
+    // (the rmcp stdio transport completes on stdin EOF — our shutdown signal); dropping it then
+    // stops the watcher and runs a final timeout-skip pass.
+    let _watcher = rag_rat_core::watch::Watcher::spawn(config.clone());
     let service = RagRatService::new(config).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

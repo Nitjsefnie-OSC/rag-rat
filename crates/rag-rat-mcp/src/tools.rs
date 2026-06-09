@@ -2041,6 +2041,7 @@ mod tests {
                     },
                 ],
                 local_ai: Default::default(),
+                watch: Default::default(),
             },
         )
     }
@@ -2063,6 +2064,7 @@ mod tests {
                     kind: TargetKind::Docs,
                 }],
                 local_ai: Default::default(),
+                watch: Default::default(),
             },
         )
     }
@@ -2080,6 +2082,7 @@ mod tests {
                 kind: TargetKind::Source,
             }],
             local_ai: Default::default(),
+            watch: Default::default(),
         }
     }
 

@@ -2,9 +2,11 @@ pub mod config;
 pub mod eval;
 pub mod index;
 pub mod language;
+pub mod locks;
 pub mod query;
 pub mod search;
 pub mod storage;
+pub mod watch;
 
-pub use config::{Config, ResolvedTarget, TargetKind};
+pub use config::{Config, ResolvedTarget, TargetKind, WatchConfig};
 pub use index::{IndexDatabase, IndexStatus};

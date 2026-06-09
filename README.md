@@ -435,7 +435,12 @@ lean automatically; run `rag-rat gc` to prune on demand.
 
 - Graph resolution is pragmatic tree-sitter analysis, not compiler/typechecker resolution.
 - Kotlin and C/C++ graph extraction are useful but less mature than Rust and TypeScript.
-- `index --watch` is reserved and currently returns an explicit not-implemented error.
+- `index --watch` runs a background file watcher that keeps the index fresh as files change
+  (including new files and uncommitted edits), so graph/symbol queries reflect the working tree
+  without a commit. The same watcher runs automatically inside `rag-rat mcp` (on by default; disable
+  with `[watch] enabled = false` or `RAG_RAT_NO_WATCH=1`). One watcher per worktree and one writer
+  at a time per index are enforced with file locks; file locks are unreliable on NFS / WSL2 `/mnt`
+  mounts.
 - `semantic_search` is currently best understood as lexical BM25 recall plus freshness checks unless
   a real embedding model is installed and reconciled.
 - `repo_brief` is a compact file-level triage view. It does not replace direct file reads,
