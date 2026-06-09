@@ -52,8 +52,21 @@ Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.22
 
 `[local_ai.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
 still take precedence: `--batch-size` overrides `batch_size`, and `--max-embedding-chars` overrides
-`max_embedding_chars`. `ort_threads` and `omp_threads` are applied as `ORT_NUM_THREADS` and
-`OMP_NUM_THREADS` when those environment variables are not already set by the caller.
+`max_embedding_chars`.
+
+Thread controls:
+
+- `ort_threads` caps the ONNX Runtime **intra-op** thread pool, applied through fastembed's session
+  (`with_intra_threads`). **Caveat:** the prebuilt ONNX Runtime binaries fastembed downloads are
+  Microsoft's OpenMP builds, where the intra-op setting has no effect — so on the default binaries
+  this knob is inert and `omp_threads` is the one that matters.
+- `omp_threads` is exported as the `OMP_NUM_THREADS` environment variable (only when not already set
+  by the caller). For the OpenMP prebuilt binaries this is **the** effective embedding-thread lever.
+  Note the default is `1`, which makes embedding single-threaded; raise it (e.g. to your core count)
+  for faster reconciliation on multi-core machines.
+
+(`ort_threads` is no longer exported as `ORT_NUM_THREADS` — ONNX Runtime does not read that
+variable.)
 
 `rag-rat hooks install` writes generated `post-checkout`, `post-merge`, `post-rewrite`, and
 `post-commit` hooks to the current worktree's Git hooks directory. Those hooks call `rag-rat

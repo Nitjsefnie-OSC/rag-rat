@@ -85,14 +85,19 @@ pub struct FastEmbedEmbedder {
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedEmbedder {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(intra_threads: Option<usize>) -> anyhow::Result<Self> {
         use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                .with_cache_dir(fastembed_cache_dir())
-                .with_show_download_progress(true),
-        )?;
-        Ok(Self { model: std::sync::Mutex::new(model) })
+        let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            .with_cache_dir(fastembed_cache_dir())
+            .with_show_download_progress(true);
+        // `ort_threads` caps the ONNX Runtime intra-op thread pool. Microsoft's prebuilt ORT
+        // binaries (what fastembed downloads) are OpenMP-based, where this has no effect and
+        // OMP_NUM_THREADS (set from `omp_threads`) is the lever instead — see docs/config.md.
+        // We still apply it so non-OpenMP builds honor the configured cap.
+        if let Some(threads) = intra_threads.filter(|threads| *threads > 0) {
+            options = options.with_intra_threads(threads);
+        }
+        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?) })
     }
 }
 
@@ -319,6 +324,8 @@ pub struct ReconcileOptions {
     pub changed_first: bool,
     pub max_seconds: Option<u64>,
     pub max_embedding_chars: usize,
+    /// ONNX Runtime intra-op thread cap (`ort_threads`). `None` lets the backend pick (all cores).
+    pub intra_threads: Option<usize>,
 }
 
 impl Default for ReconcileOptions {
@@ -331,6 +338,7 @@ impl Default for ReconcileOptions {
             changed_first: false,
             max_seconds: None,
             max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
+            intra_threads: None,
         }
     }
 }
@@ -695,7 +703,7 @@ pub fn reconcile_with_options_progress(
     let attempt_id = conn.last_insert_rowid();
     let timer = Instant::now();
 
-    let embedder = active_embedder(conn);
+    let embedder = active_embedder(conn, options.intra_threads);
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
@@ -1032,7 +1040,7 @@ fn upsert_model(
 fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
     #[cfg(feature = "fastembed")]
     {
-        let embedder = FastEmbedEmbedder::new()
+        let embedder = FastEmbedEmbedder::new(None)
             .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
         conn.execute(
             "UPDATE ai_models
@@ -1864,7 +1872,7 @@ pub struct QueryEmbedding {
 
 pub fn embed_query(conn: &Connection, query: &str) -> anyhow::Result<Option<QueryEmbedding>> {
     ensure_model_manifest(conn)?;
-    let Ok(embedder) = active_embedder(conn) else {
+    let Ok(embedder) = active_embedder(conn, None) else {
         return Ok(None);
     };
     embed_query_with(&*embedder, query).map(Some)
@@ -1940,13 +1948,16 @@ pub fn current_embedding_count(conn: &Connection, model_id: &str) -> anyhow::Res
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-fn active_embedder(conn: &Connection) -> anyhow::Result<Box<dyn Embedder>> {
+fn active_embedder(
+    conn: &Connection,
+    intra_threads: Option<usize>,
+) -> anyhow::Result<Box<dyn Embedder>> {
     let model_id = active_embedding_model_id(conn)?;
     let model = model(conn, &model_id)?;
     validate_ready_model(&model)?;
     match model.model_id.as_str() {
         HASH_MODEL_ID => Ok(Box::new(HashEmbedder)),
-        FASTEMBED_MODEL_ID => fastembed_embedder(),
+        FASTEMBED_MODEL_ID => fastembed_embedder(intra_threads),
         other => anyhow::bail!("unknown active embedding model `{other}`"),
     }
 }
@@ -1991,13 +2002,14 @@ fn expected_dim(model_id: &str) -> Option<usize> {
     }
 }
 
-fn fastembed_embedder() -> anyhow::Result<Box<dyn Embedder>> {
+fn fastembed_embedder(intra_threads: Option<usize>) -> anyhow::Result<Box<dyn Embedder>> {
     #[cfg(feature = "fastembed")]
     {
-        Ok(Box::new(FastEmbedEmbedder::new()?))
+        Ok(Box::new(FastEmbedEmbedder::new(intra_threads)?))
     }
     #[cfg(not(feature = "fastembed"))]
     {
+        let _ = intra_threads;
         anyhow::bail!("{}", FASTEMBED_MISSING_FEATURE_MESSAGE)
     }
 }

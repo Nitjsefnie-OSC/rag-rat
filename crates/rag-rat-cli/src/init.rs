@@ -243,6 +243,7 @@ fn setup_model_and_reconcile(
             changed_first: true,
             max_seconds: None,
             max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
+            intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
         },
         render_reconcile_progress,
     )?;

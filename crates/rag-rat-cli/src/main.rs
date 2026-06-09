@@ -326,12 +326,16 @@ fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
         changed_first: has_flag(args, "--changed-first"),
         max_seconds,
         max_embedding_chars,
+        intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
     };
     print_json(&db.reconcile_with_options_progress(options, render_reconcile_progress)?)
 }
 
 pub(crate) fn apply_embedding_runtime_env(runtime: &EmbeddingRuntimeConfig) {
-    set_env_if_absent("ORT_NUM_THREADS", runtime.ort_threads);
+    // `ort_threads` is applied via fastembed's session `with_intra_threads` (see
+    // FastEmbedEmbedder::new), not an env var — ONNX Runtime does not read `ORT_NUM_THREADS`.
+    // `omp_threads` IS effective: Microsoft's prebuilt ORT is OpenMP-based and honors
+    // `OMP_NUM_THREADS`, so it is the real thread lever for the default binaries.
     set_env_if_absent("OMP_NUM_THREADS", runtime.omp_threads);
 }
 
@@ -634,6 +638,7 @@ fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
             changed_first: true,
             max_seconds: Some(remaining_seconds),
             max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
+            intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
         };
         Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?)
     } else {
