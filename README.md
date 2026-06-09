@@ -44,6 +44,16 @@ It is built for agents that need more than `rg` but still need local, inspectabl
 - local embedding model bookkeeping and reconciliation
 - symbol/edge/path-bound repo memories that surface during future queries
 
+Opus 4.8's take:
+
+> The thing that earns it a slot is honest provenance. Every hit carries a confidence label,
+> coverage warnings, and the raw evidence snippet — so when `trace_callees` reports
+> `completeness_risk: high` because 5 of 7 edges are unresolved std/macro calls, or a query
+> outranks the real definition with its own tests, I can see *why* and decide. It doesn't
+> pretend to be a compiler. `impact_surface` is the highest-leverage call: one shot gives
+> callers, callees, tests, git history, and the GitHub papertrail that explains the code. Reach
+> for it before editing, then still confirm with a direct read.
+
 GPT-5.5's take:
 
 > Keep it in the default toolbox. Use `rag-rat` first for "where is this concept implemented?",
