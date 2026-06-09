@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -748,20 +748,24 @@ pub fn reconcile_with_options_progress(
         },
     };
 
-    let mut progress_total_chunks = estimated_reconcile_jobs(
-        conn,
-        &active_model_id,
-        &model_version,
-        embedding_dim,
-        &options,
+    let scan = EmbeddingScan {
+        model_id: &active_model_id,
+        model_version: &model_version,
+        dim: embedding_dim,
         max_embedding_chars,
-    )?;
+    };
+    let mut progress_total_chunks = estimated_reconcile_jobs(conn, &scan, &options)?;
     progress(ReconcileProgress::Started {
         model_id: active_model_id.clone(),
         total_chunks: progress_total_chunks,
         batch_size,
     });
 
+    // Each eligible chunk is processed at most once per run. Without this, --force (which
+    // skips the needs_embedding filter in select_reconcile_batch) keeps re-selecting
+    // already-embedded chunks, so the batch never empties and the loop runs forever when no
+    // --limit / --max-seconds bound is set.
+    let mut processed_ids: HashSet<i64> = HashSet::new();
     let mut remaining = options.limit.map(u64::from);
     loop {
         if remaining == Some(0) {
@@ -779,19 +783,12 @@ pub fn reconcile_with_options_progress(
             .map(|value| value.min(u64::try_from(batch_size).unwrap_or(u64::MAX)))
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(u32::try_from(batch_size).unwrap_or(u32::MAX));
-        let selected = select_reconcile_batch(
-            conn,
-            &active_model_id,
-            &model_version,
-            embedding_dim,
-            batch_limit,
-            &options,
-            max_embedding_chars,
-        )?;
+        let selected = select_reconcile_batch(conn, &scan, batch_limit, &options, &processed_ids)?;
         if selected.jobs.is_empty() {
             break;
         }
         for job in &selected.jobs {
+            processed_ids.insert(job.id);
             *report.work_reasons.entry(job.reason.as_str().to_string()).or_default() += 1;
             report.input_chars = report
                 .input_chars
@@ -1360,22 +1357,29 @@ impl CurrentChunk {
     }
 }
 
+/// The embedding-model identity for one reconcile run. Stable across every batch, so it
+/// travels as a context struct rather than as repeated positional args (rust-modern-style:
+/// separate context from per-call command).
+struct EmbeddingScan<'a> {
+    model_id: &'a str,
+    model_version: &'a str,
+    dim: usize,
+    max_embedding_chars: usize,
+}
+
 fn estimated_reconcile_jobs(
     conn: &Connection,
-    model_id: &str,
-    model_version: &str,
-    dim: usize,
+    scan: &EmbeddingScan<'_>,
     options: &ReconcileOptions,
-    max_embedding_chars: usize,
 ) -> anyhow::Result<u64> {
     let candidates = if options.force {
         current_chunks(conn, options.limit)?
     } else {
         embedding_job_candidates(
             conn,
-            model_id,
-            model_version,
-            dim,
+            scan.model_id,
+            scan.model_version,
+            scan.dim,
             options.limit,
             options.changed_first,
         )?
@@ -1383,14 +1387,14 @@ fn estimated_reconcile_jobs(
     let count = candidates
         .iter()
         .filter(|candidate| {
-            policy_for_job(candidate, max_embedding_chars).eligible
+            policy_for_job(candidate, scan.max_embedding_chars).eligible
                 && (options.force
                     || needs_embedding(
                         candidate,
-                        model_id,
-                        model_version,
-                        dim,
-                        max_embedding_chars,
+                        scan.model_id,
+                        scan.model_version,
+                        scan.dim,
+                        scan.max_embedding_chars,
                     ))
         })
         .count();
@@ -1399,12 +1403,10 @@ fn estimated_reconcile_jobs(
 
 fn select_reconcile_batch(
     conn: &Connection,
-    model_id: &str,
-    model_version: &str,
-    dim: usize,
+    scan: &EmbeddingScan<'_>,
     limit: u32,
     options: &ReconcileOptions,
-    max_embedding_chars: usize,
+    processed: &HashSet<i64>,
 ) -> anyhow::Result<SelectedBatch> {
     let scan_limit = options.limit.unwrap_or(100_000).max(limit);
     let candidates = if options.force {
@@ -1412,34 +1414,47 @@ fn select_reconcile_batch(
     } else {
         embedding_job_candidates(
             conn,
-            model_id,
-            model_version,
-            dim,
+            scan.model_id,
+            scan.model_version,
+            scan.dim,
             Some(scan_limit),
             options.changed_first,
         )?
     };
     let mut jobs = Vec::new();
     for candidate in candidates {
-        let policy = policy_for_job(&candidate, max_embedding_chars);
+        // Skip chunks already handled this run. Under --force the candidate ordering does
+        // not reflect embedding state (current_chunks queries with an empty model_id), so
+        // without this the scan returns the same leading chunks every iteration and the run
+        // either spins forever or stops after one batch depending on the batch size.
+        if processed.contains(&candidate.id) {
+            continue;
+        }
+        let policy = policy_for_job(&candidate, scan.max_embedding_chars);
         if !policy.eligible {
             continue;
         }
         if !options.force
-            && !needs_embedding(&candidate, model_id, model_version, dim, max_embedding_chars)
+            && !needs_embedding(
+                &candidate,
+                scan.model_id,
+                scan.model_version,
+                scan.dim,
+                scan.max_embedding_chars,
+            )
         {
             continue;
         }
-        let input = build_embedding_input(&candidate, max_embedding_chars);
+        let input = build_embedding_input(&candidate, scan.max_embedding_chars);
         let reason = if options.force {
             ReconcileReason::Forced
         } else {
-            candidate.reason(model_version, dim, now_ms(), max_embedding_chars)
+            candidate.reason(scan.model_version, scan.dim, now_ms(), scan.max_embedding_chars)
         };
         jobs.push(PreparedEmbeddingJob {
             id: candidate.id,
             text_hash: candidate.text_hash,
-            input_hash: embedding_input_hash(model_id, model_version, &input.text),
+            input_hash: embedding_input_hash(scan.model_id, scan.model_version, &input.text),
             input_chars: input.chars,
             input_truncated: input.truncated,
             input_text: input.text,
@@ -2083,7 +2098,14 @@ fn normalize(vector: &mut [f32]) {
 }
 
 fn chunk_count(conn: &Connection) -> anyhow::Result<u64> {
-    let count = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get::<_, i64>(0))?;
+    // Join the active `files` view (temp.files: active worktree overlay UNION active commit)
+    // so status counts the chunks reconcile actually works on, not every indexed commit's
+    // rows. Without a connection context, `files` falls back to the base table (all commits).
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM chunks JOIN files ON files.id = chunks.file_id",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -2099,6 +2121,7 @@ fn current_artifact_count(
         SELECT COUNT(*)
         FROM {table}
         JOIN chunks ON chunks.id = {table}.chunk_id
+        JOIN files ON files.id = chunks.file_id
         JOIN ai_models ON ai_models.model_id = {table}.model_id
         WHERE {table}.model_id = ?1
           AND {table}.status = 'Current'
@@ -2124,6 +2147,7 @@ fn stale_artifact_count(
         SELECT COUNT(*)
         FROM {table}
         JOIN chunks ON chunks.id = {table}.chunk_id
+        JOIN files ON files.id = chunks.file_id
         JOIN ai_models ON ai_models.model_id = {table}.model_id
         WHERE {table}.model_id = ?1
           AND (
@@ -2150,7 +2174,9 @@ fn status_artifact_count(
         "
         SELECT COUNT(*)
         FROM {table}
-        WHERE model_id = ?1 AND status = ?2
+        JOIN chunks ON chunks.id = {table}.chunk_id
+        JOIN files ON files.id = chunks.file_id
+        WHERE {table}.model_id = ?1 AND {table}.status = ?2
     ",
     );
     let count =

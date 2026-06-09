@@ -4302,6 +4302,94 @@ mod schema_bootstrap_tests {
     }
 
     #[test]
+    fn force_reconcile_processes_each_chunk_once_and_terminates() {
+        // Regression: --force skipped the needs_embedding filter, so select_reconcile_batch
+        // never returned an empty batch and the loop re-embedded the active set forever when
+        // no --limit/--max-seconds was set. A generous finite limit lets this test terminate
+        // either way; the processed/written counts distinguish fixed (==2) from buggy (==50).
+        let (root, config) = markdown_config(
+            "# One\nalpha token with enough surrounding detail for embedding eligibility and useful semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding eligibility and useful semantic context\n",
+        );
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+        // Two eligible chunks; force with a limit far above the chunk count.
+        let report = db.reconcile_with_progress(Some(50), Some(2), true, |_| {}).unwrap();
+
+        assert_eq!(report.embeddings_written, 2, "force re-embedded chunks: {report:?}");
+        assert_eq!(report.processed_chunks, 2, "force re-processed chunks: {report:?}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
+        let (root, config) = markdown_config(
+            "# One\nalpha token with enough surrounding detail for embedding eligibility and useful semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding eligibility and useful semantic context\n",
+        );
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+        // No --limit. max_seconds is only a safety net: if the force loop regressed to
+        // re-embedding forever it would trip max_seconds and report "Partial" rather than
+        // terminating naturally, which this test asserts against (no CI hang on regression).
+        let mut events = Vec::new();
+        let report = db
+            .reconcile_with_options_progress(
+                ai::ReconcileOptions {
+                    force: true,
+                    batch_size: Some(1),
+                    max_seconds: Some(30),
+                    ..ai::ReconcileOptions::default()
+                },
+                |event| events.push(event),
+            )
+            .unwrap();
+
+        assert_eq!(report.status, "Current", "did not terminate naturally: {report:?}");
+        assert_eq!(report.processed_chunks, 2);
+
+        let started_total = events.iter().find_map(|event| match event {
+            ai::ReconcileProgress::Started { total_chunks, .. } => Some(*total_chunks),
+            _ => None,
+        });
+        assert_eq!(started_total, Some(2), "denominator should equal the eligible set");
+
+        for event in &events {
+            if let ai::ReconcileProgress::Batch { processed_chunks, total_chunks, .. } = event {
+                assert!(
+                    processed_chunks <= total_chunks,
+                    "progress exceeded 100%: {processed_chunks}/{total_chunks}",
+                );
+            }
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn status_counts_only_active_context_chunks() {
+        let (root, config) = markdown_config(
+            "# One\nalpha token with enough surrounding detail for embedding eligibility and useful semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding eligibility and useful semantic context\n",
+        );
+        let mut db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+        let active = db.local_ai_status().unwrap().artifacts.total_chunks;
+        assert!(active > 0, "expected active chunks, got {active}");
+
+        // Point the connection at a context that matches no indexed rows. The active set
+        // (temp.files) is now empty, so status must report 0 chunks. Pre-fix the counts ran
+        // over main.chunks (every indexed commit) and ignored the active context entirely.
+        db.set_context("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "ghost-worktree").unwrap();
+        let scoped = db.local_ai_status().unwrap().artifacts;
+        assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
+        assert_eq!(scoped.current, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reconcile_treats_c_chunks_as_embedding_eligible() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
