@@ -6124,6 +6124,14 @@ pub fn caller() {
             paths.sort_unstable();
             paths.dedup();
             assert_eq!(paths.len(), total, "section must have one row per file: {section:?}");
+
+            // Precedence: a path match must not carry a spurious symbol (a qualified name is
+            // `path::symbol`, so a path needle matches every symbol in the file).
+            for item in section {
+                if item.evidence.iter().any(|evidence| evidence.starts_with("path match")) {
+                    assert!(item.symbol.is_none(), "path match must not name a symbol: {item:?}");
+                }
+            }
         }
 
         let store_rows = report

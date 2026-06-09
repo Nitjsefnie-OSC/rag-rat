@@ -1064,18 +1064,23 @@ fn section_like_items(
     let rows = stmt.query_map(params![like, i64::from(limit)], |row| {
         let matched_symbol: Option<String> = row.get(3)?;
         let path_match: i64 = row.get(4)?;
-        let match_kind = if matched_symbol.is_some() {
-            "symbol match"
-        } else if path_match == 1 {
-            "path match"
+        // Precedence is path > symbol > chunk text. A path match is checked first because a
+        // qualified name is `path::symbol`, so when the needle is the file's own path EVERY symbol
+        // in it matches `qualified_name LIKE` — naming any one of them (the lexically-greatest)
+        // would be spurious. A genuine symbol-name match (needle is the bare symbol) still names
+        // the symbol.
+        let (symbol, match_kind) = if path_match == 1 {
+            (None, "path match")
+        } else if let Some(symbol) = matched_symbol {
+            (Some(symbol), "symbol match")
         } else {
-            "chunk text match"
+            (None, "chunk text match")
         };
         Ok(ImpactItem {
             path: row.get(0)?,
             language: row.get(1)?,
             kind: row.get(2)?,
-            symbol: matched_symbol,
+            symbol,
             category: category.to_string(),
             reason: reason.to_string(),
             evidence: vec![format!("{match_kind} for `{needle}`")],
