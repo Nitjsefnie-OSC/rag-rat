@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+};
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -125,8 +128,46 @@ pub fn index_file_edges(
     insert_candidates(conn, file_id, candidates)
 }
 
+/// Name-keyed indexes over the symbol set, built once per resolve pass. Edge resolution used to
+/// scan the entire `Vec<IndexedSymbol>` (several times) per edge — O(edges × symbols), the single
+/// biggest cost in a full rebuild. These maps make each lookup ~O(1). Bucket order mirrors the
+/// input `symbols` order, so first-match semantics are preserved exactly.
+struct SymbolIndex<'a> {
+    /// Exact `qualified_name` match.
+    by_qualified: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    /// Short-name fallback (`symbol.name`).
+    by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
+    /// `::`-segment of the qualified name (a name ending in `::{q}` necessarily shares `q`'s tail).
+    by_qn_tail: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    /// Language of each source file (first symbol seen for the file).
+    file_language: HashMap<i64, &'a str>,
+}
+
+impl<'a> SymbolIndex<'a> {
+    fn build(symbols: &'a [IndexedSymbol]) -> Self {
+        let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut file_language: HashMap<i64, &str> = HashMap::new();
+        for symbol in symbols {
+            by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
+            by_name.entry(symbol.name.as_str()).or_default().push(symbol);
+            by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
+            file_language.entry(symbol.file_id).or_insert(symbol.language.as_str());
+        }
+        Self { by_qualified, by_name, by_qn_tail, file_language }
+    }
+}
+
+/// The last `::`-separated segment of a qualified name.
+fn qn_tail(qualified_name: &str) -> &str {
+    qualified_name.rsplit("::").next().unwrap_or(qualified_name)
+}
+
 pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     let symbols = all_symbols(conn)?;
+    let index = SymbolIndex::build(&symbols);
     let mut stmt = conn.prepare(
         "SELECT id, source_file_id, to_name, target_qualified_name, edge_kind, confidence, evidence, receiver_hint FROM edges ORDER BY id",
     )?;
@@ -162,9 +203,9 @@ pub fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                 evidence: evidence.as_deref(),
                 receiver_hint: receiver_hint.as_deref(),
                 source_file_id,
-                source_language: source_language(&symbols, source_file_id),
+                source_language: index.file_language.get(&source_file_id).copied(),
             },
-            &symbols,
+            &index,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
             let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_str() {
@@ -217,20 +258,30 @@ struct ResolveSymbolRequest<'a> {
 
 fn resolve_symbol<'a>(
     request: ResolveSymbolRequest<'_>,
-    symbols: &'a [IndexedSymbol],
+    index: &SymbolIndex<'a>,
 ) -> Option<(&'a IndexedSymbol, EdgeConfidence, &'static str)> {
     let kind_matches = |symbol: &IndexedSymbol| {
         request.edge_kind != EdgeKind::UsesMacro.as_str() || symbol.kind == "macro"
     };
     if let Some(qualified) = request.target_qualified_name.filter(|value| !value.is_empty()) {
-        if let Some(symbol) =
-            symbols.iter().find(|symbol| kind_matches(symbol) && symbol.qualified_name == qualified)
+        // Exact qualified-name match (bucket entries already share `qualified_name == qualified`).
+        if let Some(symbol) = index
+            .by_qualified
+            .get(qualified)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|symbol| kind_matches(symbol))
         {
             return Some((symbol, EdgeConfidence::Exact, "exact"));
         }
         let suffix = format!("::{qualified}");
-        let matches = symbols
-            .iter()
+        let matches = index
+            .by_qn_tail
+            .get(qn_tail(qualified))
+            .into_iter()
+            .flatten()
+            .copied()
             .filter(|symbol| kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
             .collect::<Vec<_>>();
         match matches.as_slice() {
@@ -253,9 +304,13 @@ fn resolve_symbol<'a>(
         }
     }
     let short = short_name(request.name);
-    let matches = symbols
-        .iter()
-        .filter(|symbol| kind_matches(symbol) && symbol.name == short)
+    let matches = index
+        .by_name
+        .get(short)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|symbol| kind_matches(symbol))
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, &matches);
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
@@ -334,13 +389,6 @@ fn allow_unqualified_fallback(
         return false;
     }
     true
-}
-
-fn source_language(symbols: &[IndexedSymbol], source_file_id: i64) -> Option<&str> {
-    symbols
-        .iter()
-        .find(|symbol| symbol.file_id == source_file_id)
-        .map(|symbol| symbol.language.as_str())
 }
 
 fn is_external_rust_root(value: &str) -> bool {
