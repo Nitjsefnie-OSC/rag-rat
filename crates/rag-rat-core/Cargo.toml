@@ -15,6 +15,7 @@ categories.workspace = true
 anyhow.workspace = true
 fastembed = { workspace = true, optional = true }
 gix.workspace = true
+model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 notify = "8.2.0"
 rayon.workspace = true
 regex.workspace = true
@@ -35,5 +36,6 @@ tree-sitter-typescript.workspace = true
 libc.workspace = true
 
 [features]
-default = ["fastembed"]
+default = ["fastembed", "model2vec"]
 fastembed = ["dep:fastembed"]
+model2vec = ["dep:model2vec-rs"]

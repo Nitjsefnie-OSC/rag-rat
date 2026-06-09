@@ -26,5 +26,6 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [features]
-default = ["fastembed"]
+default = ["fastembed", "model2vec"]
 fastembed = ["rag-rat-core/fastembed", "rag-rat-mcp/fastembed"]
+model2vec = ["rag-rat-core/model2vec", "rag-rat-mcp/model2vec"]

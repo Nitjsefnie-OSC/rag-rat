@@ -351,10 +351,18 @@ and it is empty in repos without FFI.
 Local AI state is explicit and inspectable:
 
 - `embedding-hash`: deterministic baseline embedder
-- `fastembed-all-minilm-l6-v2`: local FastEmbed backend, included in the default build
+- `fastembed-all-minilm-l6-v2`: local FastEmbed backend (MiniLM), included in the default build
+- `model2vec-potion-retrieval-32m`: static-embedding backend (`minishlab/potion-retrieval-32M`,
+  512-dim) — ~100-500× faster on CPU than MiniLM at some retrieval-quality cost; the right choice
+  for large repos where the MiniLM backfill is too slow
 - `models list/install`: model registry and install state
 - `local_ai_status`: active/installed/missing status plus chunk/vector counters
 - `reconcile`: derived-artifact queue for embedding current eligible chunks
+
+The embedding backend is selected per index with `[local_ai.embedding] model = "minilm" |
+"model2vec" | "none"` (see `docs/config.md`). `rag-rat init` recommends one from repo size: small
+repos default to `minilm` (quality), large repos to `model2vec` (speed), and you can choose `none`
+to skip vectors entirely (BM25 + structure only) for codebases too large to embed at all.
 
 `reconcile` embeds only eligible current chunks whose bounded embedding input is missing, stale by
 input hash, stale by model/version/dimension, or retryable after failure. Low-signal chunks are

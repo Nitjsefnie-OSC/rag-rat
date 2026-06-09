@@ -48,7 +48,61 @@ pub struct LocalAiConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingConfig {
+    /// Which embedding backend to use for semantic (vector) recall. `init` picks a default based
+    /// on repo size; see [`EmbeddingBackend`].
+    pub backend: EmbeddingBackend,
     pub runtime: EmbeddingRuntimeConfig,
+}
+
+/// The embedding backend selector (`[local_ai.embedding] model = "..."`).
+///
+/// - `FastEmbed` (default): MiniLM transformer — best quality, but the cold backfill is CPU-bound
+///   (~10-100 chunks/sec), so impractical for very large repos.
+/// - `Model2Vec`: static token-vector lookup + mean-pool — ~100-500× faster on CPU at some
+///   retrieval-quality cost (no context/word-order). The choice for huge repos that still want
+///   vectors.
+/// - `None`: structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25. The
+///   cheapest option for enormous codebases where any embedding backfill is too slow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmbeddingBackend {
+    #[default]
+    FastEmbed,
+    Model2Vec,
+    None,
+}
+
+impl EmbeddingBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FastEmbed => "minilm",
+            Self::Model2Vec => "model2vec",
+            Self::None => "none",
+        }
+    }
+
+    /// The persisted embedding-model id this backend installs/activates, or `None` for the
+    /// embeddings-off choice. Kept as a string so `rag-rat-core::index::ai` model ids stay the
+    /// single source of truth without `config` depending on `index`.
+    pub fn model_id(self) -> Option<&'static str> {
+        match self {
+            Self::FastEmbed => Some("fastembed-all-minilm-l6-v2"),
+            Self::Model2Vec => Some("model2vec-potion-retrieval-32m"),
+            Self::None => None,
+        }
+    }
+}
+
+impl FromStr for EmbeddingBackend {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "minilm" | "fastembed" | "minilm-l6" => Ok(Self::FastEmbed),
+            "model2vec" | "potion" | "static" => Ok(Self::Model2Vec),
+            "none" | "off" | "bm25" => Ok(Self::None),
+            other => Err(ConfigError::UnknownEmbeddingBackend(other.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +187,7 @@ impl Config {
             },
         };
         let targets = resolve_targets(&root, raw.target_bindings, raw.target)?;
-        let local_ai = raw.local_ai.into();
+        let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
         let watch = raw.watch.into();
 
         Ok(Self { root, database, targets, local_ai, watch })
@@ -311,21 +365,31 @@ struct RawLocalAi {
     embedding: RawEmbedding,
 }
 
-impl From<RawLocalAi> for LocalAiConfig {
-    fn from(raw: RawLocalAi) -> Self {
-        Self { embedding: raw.embedding.into() }
+impl TryFrom<RawLocalAi> for LocalAiConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawLocalAi) -> Result<Self, Self::Error> {
+        Ok(Self { embedding: EmbeddingConfig::try_from(raw.embedding)? })
     }
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawEmbedding {
+    /// `model = "minilm" | "model2vec" | "none"` — the embedding backend selector.
+    model: Option<String>,
     #[serde(default)]
     runtime: RawEmbeddingRuntime,
 }
 
-impl From<RawEmbedding> for EmbeddingConfig {
-    fn from(raw: RawEmbedding) -> Self {
-        Self { runtime: raw.runtime.into() }
+impl TryFrom<RawEmbedding> for EmbeddingConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawEmbedding) -> Result<Self, Self::Error> {
+        let backend = match raw.model.as_deref() {
+            Some(value) => value.parse()?,
+            None => EmbeddingBackend::default(),
+        };
+        Ok(Self { backend, runtime: raw.runtime.into() })
     }
 }
 
@@ -369,6 +433,8 @@ pub enum ConfigError {
     Language(#[from] LanguageError),
     #[error("unknown target kind `{0}`")]
     UnknownTargetKind(String),
+    #[error("unknown embedding backend `{0}` (expected `minilm`, `model2vec`, or `none`)")]
+    UnknownEmbeddingBackend(String),
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -501,7 +567,7 @@ mod tests {
         )
         .unwrap();
 
-        let local_ai: LocalAiConfig = raw.local_ai.into();
+        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
 
         assert_eq!(
             local_ai.embedding.runtime,

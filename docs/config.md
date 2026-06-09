@@ -7,12 +7,36 @@
 root = "."
 database = ".rag-rat/index.sqlite"
 
+[local_ai.embedding]
+model = "minilm"   # embedding backend: "minilm" | "model2vec" | "none"
+
 [local_ai.embedding.runtime]
 batch_size = 64
 ort_threads = 4
 omp_threads = 1
 max_embedding_chars = 4000
 ```
+
+## Embedding backend (`[local_ai.embedding] model`)
+
+Selects how `semantic_search` computes the **vector** half of its hybrid ranking. `rag-rat init`
+recommends a default from repo size; you can override it here.
+
+- `minilm` (default) — MiniLM transformer via FastEmbed. Best retrieval quality, but the cold
+  embedding backfill is CPU-bound (~10-100 chunks/sec), so it's only comfortable for repos that
+  finish in a few minutes.
+- `model2vec` — static token-vector lookup + mean-pool (`minishlab/potion-retrieval-32M`, 512-dim).
+  ~100-500× faster on CPU at some retrieval-quality cost: it has distributional/synonym semantics
+  but no context, word order, or polysemy disambiguation. The right choice for large repos that
+  still want vectors. BM25 (the other half of the hybrid) cushions the quality drop.
+- `none` — structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25, and every
+  other tool (symbols, graph, impact, git/papertrail, memories) is unaffected. The cheapest option
+  for enormous codebases (e.g. the Linux kernel) where any embedding backfill is impractical.
+
+The selector chooses which model `init` installs and activates. The active model is recorded in the
+index, so switching the backend in the config takes effect after re-running `rag-rat init` or
+`rag-rat models install <model-id>` (and a reconcile to re-embed under the new model). Different
+backends have different vector dimensions, so switching re-embeds from scratch.
 
 The database stores explicit schema migrations in `schema_version` with migration id,
 `applied_at_ms`, checksum, and description. `rag-rat migrate --check` verifies compatibility without

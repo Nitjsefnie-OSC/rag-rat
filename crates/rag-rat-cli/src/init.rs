@@ -8,7 +8,8 @@ use std::{
 use dialoguer::{Confirm, MultiSelect, Select};
 use rag_rat_core::{
     Config, IndexDatabase,
-    index::ai::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, ReconcileOptions},
+    config::EmbeddingBackend,
+    index::ai::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID, ReconcileOptions},
     language::Language,
 };
 
@@ -44,6 +45,7 @@ struct InitPlan {
     root_value: String,
     languages: Vec<Language>,
     bindings: BTreeMap<Language, Vec<PathBuf>>,
+    backend: EmbeddingBackend,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +53,36 @@ struct RepoScan {
     language_counts: BTreeMap<Language, usize>,
     dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
     direct_dir_counts: BTreeMap<Language, BTreeMap<PathBuf, usize>>,
+    total_source_bytes: u64,
+}
+
+/// Very rough chunk-count estimate from total indexable source bytes (~500 chars per chunk after
+/// policy skips). Used only to *recommend* an embedding backend at init time.
+fn estimated_chunks(total_source_bytes: u64) -> u64 {
+    total_source_bytes / 500
+}
+
+/// Recommend an embedding backend by repo scale. The FastEmbed (MiniLM) cold backfill is CPU-bound
+/// at ~10-100 chunks/sec, so it's only comfortable for repos that finish in a few minutes; larger
+/// repos default to the static Model2Vec backend (orders of magnitude faster, some quality cost).
+fn recommend_backend(estimated_chunks: u64) -> EmbeddingBackend {
+    if estimated_chunks <= 5_000 {
+        EmbeddingBackend::FastEmbed
+    } else {
+        EmbeddingBackend::Model2Vec
+    }
+}
+
+fn backend_label(backend: EmbeddingBackend) -> &'static str {
+    match backend {
+        EmbeddingBackend::FastEmbed => {
+            "minilm — MiniLM transformer; best quality, CPU backfill ~10-100 chunks/sec"
+        },
+        EmbeddingBackend::Model2Vec => {
+            "model2vec — static embeddings; ~100-500x faster on CPU, some quality cost"
+        },
+        EmbeddingBackend::None => "none — BM25 + structure only, no dense vectors",
+    }
 }
 
 pub fn run(args: &[String]) -> anyhow::Result<()> {
@@ -168,7 +200,36 @@ fn prompt_plan(root: PathBuf, root_value: String, scan: &RepoScan) -> anyhow::Re
         bindings.insert(*language, dirs);
     }
 
-    Ok(InitPlan { root_value, languages, bindings })
+    let backend = prompt_backend(scan)?;
+    Ok(InitPlan { root_value, languages, bindings, backend })
+}
+
+fn prompt_backend(scan: &RepoScan) -> anyhow::Result<EmbeddingBackend> {
+    let estimate = estimated_chunks(scan.total_source_bytes);
+    let recommended = recommend_backend(estimate);
+    println!();
+    println!(
+        "Embedding backend (≈{estimate} chunks from {} of source):",
+        human_bytes(scan.total_source_bytes)
+    );
+    println!("  recommended: {}", backend_label(recommended));
+    let choices = [EmbeddingBackend::FastEmbed, EmbeddingBackend::Model2Vec, EmbeddingBackend::None];
+    let default_index = choices.iter().position(|backend| *backend == recommended).unwrap_or(0);
+    let items = choices.iter().map(|backend| backend_label(*backend)).collect::<Vec<_>>();
+    let selected = Select::new()
+        .with_prompt("Select embedding backend")
+        .items(&items)
+        .default(default_index)
+        .interact()?;
+    Ok(choices[selected])
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1 << 20 {
+        format!("{:.1} MB", bytes as f64 / (1u64 << 20) as f64)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
 }
 
 fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
@@ -189,7 +250,8 @@ fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
             (*language, dirs)
         })
         .collect();
-    InitPlan { root_value, languages, bindings }
+    let backend = recommend_backend(estimated_chunks(scan.total_source_bytes));
+    InitPlan { root_value, languages, bindings, backend }
 }
 
 fn setup_index(config: &Config) -> anyhow::Result<IndexDatabase> {
@@ -207,27 +269,28 @@ fn setup_model_and_reconcile(
     db: &IndexDatabase,
     assume_yes: bool,
 ) -> anyhow::Result<()> {
+    let backend = config.local_ai.embedding.backend;
+    let Some(model_id) = backend.model_id() else {
+        eprintln!(
+            "init: embeddings disabled (model = \"none\") — structural + BM25 search only, no \
+             vector backfill"
+        );
+        return Ok(());
+    };
     let install = assume_yes
         || Confirm::new()
-            .with_prompt("Install an embedding model and reconcile vectors now?")
+            .with_prompt(format!("Install the {} embedding model and reconcile vectors now?", backend.as_str()))
             .default(true)
             .interact()?;
     if !install {
         eprintln!("init: skipped model install and reconcile");
         return Ok(());
     }
-    let choices = [FASTEMBED_MODEL_ID, HASH_MODEL_ID];
-    let model_index = if assume_yes {
-        0
-    } else {
-        Select::new().with_prompt("Select embedding model").items(choices).default(0).interact()?
-    };
-    let model_id = choices[model_index];
     eprintln!("init: installing model {model_id}");
     match db.install_model(model_id) {
         Ok(model) => eprintln!("init: model status {} {}", model.model_id, model.status),
-        Err(err) if model_id == FASTEMBED_MODEL_ID => {
-            eprintln!("init: FastEmbed install failed: {err}");
+        Err(err) if model_id == FASTEMBED_MODEL_ID || model_id == MODEL2VEC_MODEL_ID => {
+            eprintln!("init: {} install failed: {err}", backend.as_str());
             eprintln!("init: falling back to {HASH_MODEL_ID}");
             db.install_model(HASH_MODEL_ID)?;
         },
@@ -380,6 +443,8 @@ fn scan_dir(root: &Path, dir: &Path, depth: usize, scan: &mut RepoScan) -> anyho
         {
             *scan.language_counts.entry(language).or_default() += 1;
             add_file_to_dir_counts(root, &path, language, scan)?;
+            scan.total_source_bytes +=
+                entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         }
     }
     Ok(())
@@ -499,6 +564,9 @@ fn render_config(plan: &InitPlan) -> String {
     text.push_str("[index]\n");
     text.push_str(&format!("root = {}\n", toml_string(&plan.root_value)));
     text.push_str(&format!("database = {}\n\n", toml_string(DEFAULT_DATABASE)));
+    text.push_str("[local_ai.embedding]\n");
+    text.push_str(&format!("# {}\n", backend_label(plan.backend)));
+    text.push_str(&format!("model = {}\n\n", toml_string(plan.backend.as_str())));
     text.push_str("[local_ai.embedding.runtime]\n");
     text.push_str("batch_size = 64\n");
     text.push_str("ort_threads = 4\n");
@@ -711,6 +779,7 @@ mod tests {
                 (Language::Rust, vec![PathBuf::from("crates/app/src")]),
                 (Language::TypeScript, vec![PathBuf::from("web/src"), PathBuf::from("app/src")]),
             ]),
+            backend: EmbeddingBackend::Model2Vec,
         };
 
         let text = render_config(&plan);
@@ -719,6 +788,14 @@ mod tests {
         assert!(text.contains("database = \".rag-rat/index.sqlite\""));
         assert!(text.contains("rust = [\"crates/app/src\"]"));
         assert!(text.contains("typescript = [\"web/src\", \"app/src\"]"));
+        assert!(text.contains("[local_ai.embedding]"));
+        assert!(text.contains("model = \"model2vec\""));
+    }
+
+    #[test]
+    fn recommend_backend_scales_with_repo_size() {
+        assert_eq!(recommend_backend(estimated_chunks(500_000)), EmbeddingBackend::FastEmbed);
+        assert_eq!(recommend_backend(estimated_chunks(50_000_000)), EmbeddingBackend::Model2Vec);
     }
 
     #[test]
@@ -736,6 +813,7 @@ mod tests {
                 ),
             ]),
             direct_dir_counts: BTreeMap::new(),
+            total_source_bytes: 0,
         };
 
         let plan = default_plan(".".to_string(), &scan);
@@ -770,6 +848,7 @@ mod tests {
                     (PathBuf::from("samples/simple_txrx/src"), 1),
                 ]),
             )]),
+            total_source_bytes: 0,
         };
 
         let defaults = candidate_dirs(&scan, Language::C)

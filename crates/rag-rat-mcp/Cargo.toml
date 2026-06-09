@@ -24,5 +24,6 @@ tokio = { workspace = true, features = ["signal", "sync", "io-util"] }
 libc.workspace = true
 
 [features]
-default = ["fastembed"]
+default = ["fastembed", "model2vec"]
 fastembed = ["rag-rat-core/fastembed"]
+model2vec = ["rag-rat-core/model2vec"]

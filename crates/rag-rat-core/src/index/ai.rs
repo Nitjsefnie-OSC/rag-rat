@@ -15,6 +15,14 @@ pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
 pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 pub const HASH_EMBEDDING_DIM: usize = 384;
 pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
+/// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
+/// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
+/// for very large repos where the FastEmbed backfill is infeasible. See `EmbeddingBackend`.
+pub const MODEL2VEC_MODEL_ID: &str = "model2vec-potion-retrieval-32m";
+pub const MODEL2VEC_DISPLAY_MODEL: &str = "minishlab/potion-retrieval-32M";
+pub const MODEL2VEC_HF_REPO: &str = "minishlab/potion-retrieval-32M";
+pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
+pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str = "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild with default features enabled:\n  cargo install rag-rat";
 pub const FASTEMBED_MISSING_FEATURE_MESSAGE: &str = "FastEmbed backend requested, but this binary was built without default FastEmbed support.\nRebuild with default features enabled:\n  cargo install rag-rat";
 const ACTIVE_EMBEDDING_MODEL_META: &str = "active_embedding_model";
 const ACTIVE_EMBEDDING_MODEL_VERSION_META: &str = "embedding_active_model_version";
@@ -116,6 +124,42 @@ impl Embedder for FastEmbedEmbedder {
         let mut model =
             self.model.lock().map_err(|_| anyhow::anyhow!("fastembed model lock poisoned"))?;
         model.embed(documents, None)
+    }
+}
+
+#[cfg(feature = "model2vec")]
+pub struct Model2VecEmbedder {
+    model: model2vec_rs::model::StaticModel,
+}
+
+#[cfg(feature = "model2vec")]
+impl Model2VecEmbedder {
+    pub fn new() -> anyhow::Result<Self> {
+        // Downloads (and caches) the static model from the Hugging Face hub on first use; L2-
+        // normalize so cosine similarity matches the FastEmbed path's expectations.
+        let model = model2vec_rs::model::StaticModel::from_pretrained(
+            MODEL2VEC_HF_REPO,
+            None,
+            Some(true),
+            None,
+        )
+        .map_err(|err| anyhow::anyhow!("failed to load Model2Vec model: {err}"))?;
+        Ok(Self { model })
+    }
+}
+
+#[cfg(feature = "model2vec")]
+impl Embedder for Model2VecEmbedder {
+    fn model_id(&self) -> &str {
+        MODEL2VEC_MODEL_ID
+    }
+
+    fn dim(&self) -> usize {
+        MODEL2VEC_EMBEDDING_DIM
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(self.model.encode(texts))
     }
 }
 
@@ -368,6 +412,14 @@ pub fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
         "fastembed",
         false,
     )?;
+    upsert_model(
+        conn,
+        MODEL2VEC_MODEL_ID,
+        "embedding",
+        Some(MODEL2VEC_EMBEDDING_DIM),
+        "model2vec",
+        false,
+    )?;
     normalize_embedding_model_versions(conn)?;
     Ok(())
 }
@@ -494,6 +546,10 @@ pub fn install_model(conn: &Connection, model_id: &str) -> anyhow::Result<ModelI
         },
         FASTEMBED_MODEL_ID => {
             install_fastembed_model(conn, model_id)?;
+            set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
+        },
+        MODEL2VEC_MODEL_ID => {
+            install_model2vec_model(conn, model_id)?;
             set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
         },
         other => anyhow::bail!("unknown local AI model `{other}`"),
@@ -1055,6 +1111,31 @@ fn upsert_model(
         ],
     )?;
     Ok(())
+}
+
+fn install_model2vec_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
+    #[cfg(feature = "model2vec")]
+    {
+        let embedder = Model2VecEmbedder::new()?;
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
+                 embedding_dim = ?3, runtime = 'model2vec', last_error = NULL
+             WHERE model_id = ?1",
+            params![model_id, now_ms(), i64::try_from(embedder.dim()).unwrap_or(i64::MAX)],
+        )?;
+        Ok(())
+    }
+    #[cfg(not(feature = "model2vec"))]
+    {
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 0, disabled = 0, status = 'MissingRuntime', last_error = ?2
+             WHERE model_id = ?1",
+            params![model_id, MODEL2VEC_MISSING_FEATURE_MESSAGE],
+        )?;
+        anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
+    }
 }
 
 fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
@@ -2007,6 +2088,7 @@ fn default_model_version(model_id: &str) -> &'static str {
     match model_id {
         HASH_MODEL_ID => "hash-v1",
         FASTEMBED_MODEL_ID => "fastembed-all-minilm-l6-v2-v1",
+        MODEL2VEC_MODEL_ID => "model2vec-potion-retrieval-32m-v1",
         _ => "v1",
     }
 }
@@ -2047,7 +2129,19 @@ fn active_embedder(
     match model.model_id.as_str() {
         HASH_MODEL_ID => Ok(Box::new(HashEmbedder)),
         FASTEMBED_MODEL_ID => fastembed_embedder(intra_threads),
+        MODEL2VEC_MODEL_ID => model2vec_embedder(),
         other => anyhow::bail!("unknown active embedding model `{other}`"),
+    }
+}
+
+fn model2vec_embedder() -> anyhow::Result<Box<dyn Embedder>> {
+    #[cfg(feature = "model2vec")]
+    {
+        Ok(Box::new(Model2VecEmbedder::new()?))
+    }
+    #[cfg(not(feature = "model2vec"))]
+    {
+        anyhow::bail!("{}", MODEL2VEC_MISSING_FEATURE_MESSAGE)
     }
 }
 
@@ -2087,6 +2181,7 @@ fn expected_dim(model_id: &str) -> Option<usize> {
     match model_id {
         HASH_MODEL_ID => Some(HASH_EMBEDDING_DIM),
         FASTEMBED_MODEL_ID => Some(FASTEMBED_EMBEDDING_DIM),
+        MODEL2VEC_MODEL_ID => Some(MODEL2VEC_EMBEDDING_DIM),
         _ => None,
     }
 }
