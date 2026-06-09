@@ -965,7 +965,7 @@ fn test_items(
             limit,
         )?);
     }
-    dedupe_items(&mut items);
+    let mut items = collapse_by_path(items);
     items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(items)
 }
@@ -987,7 +987,7 @@ fn docs_items(
             limit,
         )?);
     }
-    dedupe_items(&mut items);
+    let mut items = collapse_by_path(items);
     items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(items)
 }
@@ -1009,7 +1009,7 @@ fn text_fallback_items(
             limit,
         )?);
     }
-    dedupe_items(&mut items);
+    let mut items = collapse_by_path(items);
     items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(items)
 }
@@ -1034,14 +1034,17 @@ fn section_like_items(
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let like = format!("%{needle}%");
+    // Collapse to ONE row per file. The previous `LEFT JOIN symbols` without aggregation fanned a
+    // file out into one row per symbol whenever the match was file-level (path or chunk text),
+    // flooding the output and letting one big file starve the `LIMIT` (see issue #48). Grouping by
+    // file keeps the match kind (symbol > path > chunk text) and names the symbol only when it was
+    // a genuine symbol match.
     let sql = format!(
         "
-        SELECT DISTINCT files.path, files.language, files.kind, symbols.qualified_name,
-               CASE
-                   WHEN files.path LIKE ?1 THEN 'path match'
-                   WHEN symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1 THEN 'symbol match'
-                   ELSE 'chunk text match'
-               END
+        SELECT files.path, files.language, files.kind,
+               MAX(CASE WHEN symbols.name LIKE ?1 OR symbols.qualified_name LIKE ?1
+                        THEN symbols.qualified_name END) AS matched_symbol,
+               MAX(CASE WHEN files.path LIKE ?1 THEN 1 ELSE 0 END) AS path_match
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
         LEFT JOIN chunks ON chunks.file_id = files.id
@@ -1052,20 +1055,30 @@ fn section_like_items(
               OR symbols.qualified_name LIKE ?1
               OR chunks.text LIKE ?1
           )
-        ORDER BY files.kind, files.path, symbols.qualified_name
+        GROUP BY files.path, files.language, files.kind
+        ORDER BY files.kind, files.path
         LIMIT ?2
         "
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![like, i64::from(limit)], |row| {
+        let matched_symbol: Option<String> = row.get(3)?;
+        let path_match: i64 = row.get(4)?;
+        let match_kind = if matched_symbol.is_some() {
+            "symbol match"
+        } else if path_match == 1 {
+            "path match"
+        } else {
+            "chunk text match"
+        };
         Ok(ImpactItem {
             path: row.get(0)?,
             language: row.get(1)?,
             kind: row.get(2)?,
-            symbol: row.get(3)?,
+            symbol: matched_symbol,
             category: category.to_string(),
             reason: reason.to_string(),
-            evidence: vec![format!("{} for `{needle}`", row.get::<_, String>(4)?)],
+            evidence: vec![format!("{match_kind} for `{needle}`")],
         })
     })?;
     rows_to_items(rows)
@@ -1120,6 +1133,29 @@ fn impact_item_row(
         reason: reason.to_string(),
         evidence: vec![format!("{} edge ({})", row.get::<_, String>(4)?, row.get::<_, String>(5)?)],
     })
+}
+
+/// Collapse a file-granularity section (tests / docs / text fallback) to one row per file. Across
+/// the several search needles (symbol name, qualified name, path) the same file can surface more
+/// than once — keep a single representative per path, preferring the row that named a symbol (a
+/// symbol match) over a bare path/chunk match so the more specific evidence wins.
+fn collapse_by_path(items: Vec<ImpactItem>) -> Vec<ImpactItem> {
+    use std::collections::btree_map::Entry;
+
+    let mut by_path: BTreeMap<String, ImpactItem> = BTreeMap::new();
+    for item in items {
+        match by_path.entry(item.path.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(item);
+            },
+            Entry::Occupied(mut slot) => {
+                if slot.get().symbol.is_none() && item.symbol.is_some() {
+                    slot.insert(item);
+                }
+            },
+        }
+    }
+    by_path.into_values().collect()
 }
 
 fn dedupe_items(items: &mut Vec<ImpactItem>) {

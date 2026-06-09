@@ -6081,6 +6081,62 @@ pub fn caller() {
     }
 
     #[test]
+    fn impact_surface_collapses_file_matches_to_one_row_per_file() {
+        // Regression for #48: a file-granularity match (path/chunk text) used to fan out into one
+        // row per symbol in the file. Each such section must now yield at most one row per file.
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/widget_store.rs"),
+            "pub fn widget_alpha() {}\npub fn widget_beta() {}\n\
+             pub fn widget_gamma() {}\npub fn widget_delta() {}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let selector = crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("widget_alpha".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        };
+        let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol");
+        let report = db
+            .impact_surface_report_for_selected_symbol(
+                &symbol,
+                50,
+                &crate::query::impact::ImpactSurfaceOptions::default(),
+            )
+            .unwrap();
+
+        for section in [
+            &report.text_fallback_hits,
+            &report.tests_touching_symbol_path,
+            &report.docs_mentioning_symbol_path,
+        ] {
+            let total = section.len();
+            let mut paths: Vec<&str> = section.iter().map(|item| item.path.as_str()).collect();
+            paths.sort_unstable();
+            paths.dedup();
+            assert_eq!(paths.len(), total, "section must have one row per file: {section:?}");
+        }
+
+        let store_rows = report
+            .text_fallback_hits
+            .iter()
+            .filter(|item| item.path.ends_with("widget_store.rs"))
+            .count();
+        assert_eq!(store_rows, 1, "a file with four symbols collapses to one fallback row");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn docs_for_symbol_prefers_local_source_context_before_broad_markdown() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
