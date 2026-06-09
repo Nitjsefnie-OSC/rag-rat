@@ -19,6 +19,8 @@ use std::{
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 
+use crate::config::Config;
+
 /// A held exclusive file lock. Released on drop.
 #[derive(Debug)]
 pub struct FileLock {
@@ -81,6 +83,22 @@ pub fn write_lock_path(database: &Path) -> PathBuf {
     database.parent().unwrap_or_else(|| Path::new(".")).join("rag-rat-write.lock")
 }
 
+/// `sun_path` budget for Unix domain sockets (108 bytes on Linux, 104 on macOS) with headroom.
+pub const MAX_SOCKET_PATH_LEN: usize = 100;
+
+/// Stable per-worktree key: sha256 of the canonicalized root (see `election_lock_path` doc
+/// comment for why canonicalize-but-not-case-fold).
+fn worktree_hash(worktree_root: &Path) -> String {
+    let canonical = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let mut hash = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(hash, "{byte:02x}");
+    }
+    hash
+}
+
 /// Per-worktree election lock path, keyed by a hash of the **canonicalized** worktree root —
 /// `canonicalize` resolves symlink aliases (the common way one checkout is reached via two paths) to
 /// one key. We deliberately do **not** case-fold: folding would, on a case-sensitive volume,
@@ -90,14 +108,65 @@ pub fn write_lock_path(database: &Path) -> PathBuf {
 /// watchers, which the write lock makes harmless. `base_dir` is the index DB's directory (the
 /// shared location across a repo's worktrees), so all election locks sit under `<base_dir>/locks/`.
 pub fn election_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
-    let canonical = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let mut hash = String::with_capacity(32);
-    for byte in &digest[..16] {
-        use std::fmt::Write as _;
-        let _ = write!(hash, "{byte:02x}");
+    base_dir.join("locks").join(format!("{}.lock", worktree_hash(worktree_root)))
+}
+
+/// Election lock for the grep-augment hook socket: one listener per worktree, separate from the
+/// watcher election so core never calls back into the MCP crate and either process may win each.
+pub fn socket_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
+    base_dir.join("locks").join(format!("{}.socket.lock", worktree_hash(worktree_root)))
+}
+
+/// Where the elected listener binds. Prefers a `sockets/` sibling of `locks/` under the shared
+/// DB dir; diverts to `$XDG_RUNTIME_DIR/rag-rat/` then the OS temp dir when the result would
+/// exceed the `sun_path` budget. Hook clients compute the same path independently, so this must
+/// stay deterministic for a given (base_dir, worktree_root) and environment.
+pub fn hook_socket_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
+    let runtime_base =
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    socket_path_with_runtime_base(base_dir, worktree_root, &runtime_base)
+}
+
+/// Single source of truth for the hook socket path given a `Config`. Shared by the MCP listener
+/// and the CLI client so the two cannot diverge.
+pub fn hook_socket_path_for(config: &Config) -> PathBuf {
+    let base =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
+    hook_socket_path(&base, &config.root)
+}
+
+/// Single source of truth for the hook socket election-lock path given a `Config`. Shared by the
+/// MCP listener and the CLI client so the two cannot diverge.
+pub fn hook_socket_lock_path_for(config: &Config) -> PathBuf {
+    let base =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
+    socket_lock_path(&base, &config.root)
+}
+
+/// Inner implementation: builds the candidate path cascade with an explicit `runtime_base` so the
+/// fallback logic can be unit-tested without touching the process environment.
+///
+/// Priority:
+/// 1. `<base_dir>/sockets/<hash>.sock` — within budget?  Use it.
+/// 2. `<runtime_base>/rag-rat/<hash>.sock` — within budget?  Use it.
+/// 3. `<temp_dir>/rag-rat/<hash>.sock` — best effort; callers fail open if still over budget.
+fn socket_path_with_runtime_base(
+    base_dir: &Path,
+    worktree_root: &Path,
+    runtime_base: &Path,
+) -> PathBuf {
+    let name = format!("{}.sock", worktree_hash(worktree_root));
+    let preferred = base_dir.join("sockets").join(&name);
+    if preferred.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return preferred;
     }
-    base_dir.join("locks").join(format!("{hash}.lock"))
+    let xdg_candidate = runtime_base.join("rag-rat").join(&name);
+    if xdg_candidate.as_os_str().len() <= MAX_SOCKET_PATH_LEN {
+        return xdg_candidate;
+    }
+    // Both preferred and XDG are over budget — fall through to the OS temp dir.
+    // If even this is over budget there is nothing better; callers fail open.
+    std::env::temp_dir().join("rag-rat").join(name)
 }
 
 #[cfg(test)]
@@ -146,5 +215,73 @@ mod tests {
         assert_eq!(a1, a2, "same worktree root → same lock");
         assert_ne!(a1, b, "different worktree roots → different locks");
         assert!(a1.starts_with(base.join("locks")));
+    }
+
+    #[test]
+    fn socket_lock_path_is_distinct_from_election_lock_path() {
+        let base = temp_dir();
+        let root = temp_dir();
+        let election = election_lock_path(&base, &root);
+        let socket_lock = socket_lock_path(&base, &root);
+        assert_ne!(election, socket_lock);
+        assert!(socket_lock.to_string_lossy().ends_with(".socket.lock"));
+        // Same worktree key: both live under <base>/locks/ with the same hash stem.
+        assert_eq!(election.parent(), socket_lock.parent());
+    }
+
+    #[test]
+    fn hook_socket_path_lives_under_base_sockets_dir() {
+        let base = temp_dir();
+        let root = temp_dir();
+        let socket = hook_socket_path(&base, &root);
+        assert_eq!(socket.parent().unwrap().file_name().unwrap(), "sockets");
+        assert!(socket.extension().is_some_and(|ext| ext == "sock"));
+    }
+
+    /// Build a base dir long enough that `<base>/sockets/<hash>.sock` exceeds `MAX_SOCKET_PATH_LEN`.
+    fn long_base_dir() -> PathBuf {
+        let mut base = temp_dir();
+        // Each push appends ~28 bytes; 12 × 28 = 336, well over the 100-byte budget.
+        for _ in 0..12 {
+            base.push("very-long-directory-segment");
+        }
+        base
+    }
+
+    #[test]
+    fn hook_socket_path_falls_back_when_base_path_is_too_long() {
+        // When the preferred path is over budget and XDG_RUNTIME_DIR is a short /tmp path, the
+        // XDG candidate fits within budget and is returned.
+        let long_base = long_base_dir();
+        let root = temp_dir();
+        // Use a known-short runtime_base so the test is independent of the runner environment.
+        let short_runtime_base = std::env::temp_dir(); // e.g. /tmp — always short
+        let socket = socket_path_with_runtime_base(&long_base, &root, &short_runtime_base);
+        assert!(
+            socket.as_os_str().len() <= MAX_SOCKET_PATH_LEN,
+            "XDG fallback path still too long: {}",
+            socket.display()
+        );
+        // Should NOT live under the long base dir.
+        assert!(!socket.starts_with(&long_base), "expected fallback, got preferred path");
+    }
+
+    #[test]
+    fn hook_socket_path_falls_back_to_temp_when_xdg_also_too_long() {
+        // When both the preferred path and the XDG candidate are over budget, the function falls
+        // through to the OS temp dir (best-effort; callers fail open).
+        let long_base = long_base_dir();
+        let long_runtime_base = long_base_dir();
+        let root = temp_dir();
+        let socket = socket_path_with_runtime_base(&long_base, &root, &long_runtime_base);
+        // Must not be under either long base.
+        assert!(!socket.starts_with(&long_base));
+        assert!(!socket.starts_with(&long_runtime_base));
+        // Should be rooted at the OS temp dir.
+        assert!(
+            socket.starts_with(std::env::temp_dir()),
+            "expected temp-dir fallback, got: {}",
+            socket.display()
+        );
     }
 }

@@ -1,0 +1,753 @@
+//! Payload composition for the Claude Code grep-augmentation PreToolUse hook.
+//!
+//! Shared by the `rag-rat mcp` socket listener (with per-session dedupe) and the hook
+//! client's direct read-only fallback (stateless). Spec:
+//! `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`. Never loads the embedding
+//! model — symbol/FTS lanes only.
+
+use std::collections::HashSet;
+
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::query::{memory, symbol};
+use crate::search::lexical;
+
+/// Hard cap on rendered context. Truncation drops whole items, never mid-item.
+pub const MAX_CONTEXT_CHARS: usize = 1500;
+const MAX_SYMBOLS: u32 = 3;
+const MAX_MEMORIES: u32 = 4;
+const MAX_LEXICAL_HITS: u32 = 3;
+
+/// Maximum body length in a rendered memory digest line; longer bodies are truncated with `…`.
+const MAX_MEMORY_BODY_CHARS: usize = 240;
+
+/// Strip regex syntax from a grep pattern, leaving plain query text. Metacharacters become
+/// spaces (so alternation/group contents survive as separate words); runs of whitespace
+/// collapse; result is trimmed.
+///
+/// Exception: a `.` (bare metachar) or `\.` (escaped) that sits directly between two ASCII
+/// word characters is preserved as a literal `.` — this keeps `foo.bar`-style qualified names
+/// intact. All other positions keep the space-substitution behavior.
+pub fn normalize_pattern(pattern: &str) -> String {
+    let chars_vec: Vec<char> = pattern.chars().collect();
+    let n = chars_vec.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let ch = chars_vec[i];
+        match ch {
+            '\\' if i + 1 < n => {
+                let next = chars_vec[i + 1];
+                if next == '.' {
+                    // `\.` — check whether it's between two word chars in the *output* context.
+                    // We look at the last non-space char pushed to `out` (prev) and the char
+                    // after the escape sequence (lookahead).
+                    let prev_word = out
+                        .chars()
+                        .rev()
+                        .find(|c| *c != ' ')
+                        .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                        .unwrap_or(false);
+                    let next_word = chars_vec
+                        .get(i + 2)
+                        .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .unwrap_or(false);
+                    if prev_word && next_word {
+                        out.push('.');
+                    } else {
+                        out.push(' ');
+                    }
+                    i += 2;
+                } else {
+                    // All other escapes → space; consume both chars.
+                    out.push(' ');
+                    i += 2;
+                }
+            },
+            '.' => {
+                // Bare `.` metachar — preserve between word chars, else space.
+                let prev_word = out
+                    .chars()
+                    .rev()
+                    .find(|c| *c != ' ')
+                    .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .unwrap_or(false);
+                let next_word = chars_vec
+                    .get(i + 1)
+                    .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .unwrap_or(false);
+                if prev_word && next_word {
+                    out.push('.');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            },
+            '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
+                out.push(' ');
+                i += 1;
+            },
+            _ => {
+                out.push(ch);
+                i += 1;
+            },
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A normalized pattern that looks like one code identifier (optionally `::`/`.`-qualified):
+/// the symbol-lane trigger. Multi-word or short patterns return `None`.
+pub fn identifier_candidate(normalized: &str) -> Option<&str> {
+    if normalized.len() < 3 || normalized.contains(' ') {
+        return None;
+    }
+    let mut chars = normalized.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.')).then_some(normalized)
+}
+
+/// What the listener/fallback already injected for this session. Default = inject everything.
+#[derive(Debug, Default, Clone)]
+pub struct DedupeFilter {
+    pub memory_ids: HashSet<String>,
+    pub symbol_keys: HashSet<String>,
+}
+
+/// A rendered digest plus the IDs it contains, for the caller's dedupe bookkeeping.
+#[derive(Debug)]
+pub struct GrepAugment {
+    pub context: String,
+    pub memory_ids: Vec<String>,
+    pub symbol_keys: Vec<String>,
+}
+
+/// Compose the grep-augmentation digest for one search. Lanes per the spec: symbol lane when
+/// the pattern looks like an identifier, memory lane always, lexical lane only when the
+/// symbol lane is empty. Returns `None` when nothing (new) is worth injecting.
+pub fn compose(
+    conn: &Connection,
+    raw_pattern: &str,
+    search_path: Option<&str>,
+    dedupe: &DedupeFilter,
+) -> anyhow::Result<Option<GrepAugment>> {
+    let normalized = normalize_pattern(raw_pattern);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+
+    let mut memories = Vec::new();
+    let mut symbol_items: Vec<SymbolItem> = Vec::new();
+    // Track whether the symbol lane produced any raw hits (before dedup).
+    // Lexical lane only runs when there were no symbol hits at all (not just all deduped).
+    let mut symbol_lane_had_hits = false;
+
+    // Seen set for memory dedup — preserves insertion order (symbol-bound first, then FTS,
+    // then path-bound), unlike the old sort+dedup which ordered by creation-time ID.
+    let mut seen_memory_ids: HashSet<String> = HashSet::new();
+
+    if let Some(ident) = identifier_candidate(&normalized) {
+        // Symbol lane. Bare name for qualified queries: `Watcher::spawn` → `spawn`.
+        let bare = ident.rsplit([':', '.']).next().unwrap_or(ident);
+        for hit in symbol::lookup(conn, bare, None, MAX_SYMBOLS)? {
+            symbol_lane_had_hits = true;
+            let key = format!("{}:{}", hit.path, hit.qualified_name);
+            if dedupe.symbol_keys.contains(&key) {
+                continue;
+            }
+            let (callers, callees) = edge_counts(conn, &hit)?;
+            let start_line = line_for_symbol(conn, &hit)?;
+            let line_suffix = match start_line {
+                Some(l) => format!("{}:{}", hit.path, l),
+                None => hit.path.clone(),
+            };
+            let rendered = format!(
+                "- `{}` ({}) — {} — {} callers / {} callees{}",
+                hit.qualified_name,
+                hit.kind,
+                line_suffix,
+                callers,
+                callees,
+                hit.signature.as_deref().map(|s| format!(" — `{s}`")).unwrap_or_default(),
+            );
+            // Gather symbol-bound memories before adding them to the main list so they
+            // come first (highest priority lane).
+            for m in memory::memories_for_symbol(conn, &hit, MAX_MEMORIES)? {
+                if seen_memory_ids.insert(m.memory_id.clone()) {
+                    memories.push(m);
+                }
+            }
+            symbol_items.push(SymbolItem { rendered, key });
+        }
+    }
+
+    // Memory lane: always. FTS over the normalized pattern + path-bound memories.
+    for m in memory::memory_search(conn, &normalized, MAX_MEMORIES)? {
+        if seen_memory_ids.insert(m.memory_id.clone()) {
+            memories.push(m);
+        }
+    }
+    if let Some(path) = search_path {
+        for m in memory::memories_for_path(conn, path, MAX_MEMORIES)? {
+            if seen_memory_ids.insert(m.memory_id.clone()) {
+                memories.push(m);
+            }
+        }
+    }
+    // Apply session-level dedupe filter last (after insertion-order dedup above).
+    memories.retain(|m| !dedupe.memory_ids.contains(&m.memory_id));
+
+    // Lexical lane: only when the symbol lane found nothing (never had any raw hits).
+    let lexical_lines = if !symbol_lane_had_hits {
+        lexical::search_lexical_only(conn, &normalized, MAX_LEXICAL_HITS, false)?
+            .into_iter()
+            .map(|hit| {
+                format!("- {}:{}-{} — {}", hit.path, hit.start_line, hit.end_line, hit.summary)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if memories.is_empty() && symbol_items.is_empty() && lexical_lines.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(render(memories, symbol_items, lexical_lines)))
+}
+
+/// A single rendered symbol line plus the key that identifies it in the dedupe set.
+struct SymbolItem {
+    rendered: String,
+    key: String,
+}
+
+/// A single renderable item in a section, with optional bookkeeping IDs.
+struct RenderItem {
+    line: String,
+    memory_id: Option<String>,
+    symbol_key: Option<String>,
+}
+
+/// A section is a header line + a list of items. Header is only committed when at least one
+/// item fits; the caller's ID is only appended to the output IDs when the item's line lands.
+struct Section {
+    header: String,
+    items: Vec<RenderItem>,
+    /// An optional closing/footer line (not associated with an ID).
+    footer: Option<String>,
+}
+
+/// Collapse all whitespace runs (including newlines) to single spaces and truncate to
+/// `MAX_MEMORY_BODY_CHARS`, appending `…` when truncated.
+fn clamp_body(body: &str) -> String {
+    let collapsed: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Compare char count (not byte length) so multibyte bodies don't get `…` with nothing removed.
+    if collapsed.chars().count() <= MAX_MEMORY_BODY_CHARS {
+        collapsed
+    } else {
+        // Truncate at exactly MAX_MEMORY_BODY_CHARS chars.
+        let truncated: String = collapsed.chars().take(MAX_MEMORY_BODY_CHARS).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Memories first (the unique signal), then symbols, then lexical hits; whole-item truncation
+/// against `MAX_CONTEXT_CHARS`. Section headers are committed ONLY together with their first
+/// fitting item. IDs are appended to the returned vecs ONLY when their item line lands.
+fn render(
+    memories: Vec<memory::RepoMemory>,
+    symbol_items: Vec<SymbolItem>,
+    lexical_lines: Vec<String>,
+) -> GrepAugment {
+    let mut sections: Vec<Section> = Vec::new();
+
+    if !memories.is_empty() {
+        let items = memories
+            .into_iter()
+            .map(|m| RenderItem {
+                line: format!(
+                    "- [{} | {}] {} — {} (rag-rat: memory_search)",
+                    m.kind,
+                    m.status,
+                    m.title,
+                    clamp_body(&m.body),
+                ),
+                memory_id: Some(m.memory_id),
+                symbol_key: None,
+            })
+            .collect();
+        sections.push(Section {
+            header: "**Repo memories bound to this code:**".to_string(),
+            items,
+            footer: None,
+        });
+    }
+
+    if !symbol_items.is_empty() {
+        let items = symbol_items
+            .into_iter()
+            .map(|s| RenderItem { line: s.rendered, memory_id: None, symbol_key: Some(s.key) })
+            .collect();
+        sections.push(Section {
+            header: "**Known symbols matching this pattern:**".to_string(),
+            items,
+            footer: Some("(rag-rat: impact_surface <name> before editing)".to_string()),
+        });
+    }
+
+    if !lexical_lines.is_empty() {
+        let items = lexical_lines
+            .into_iter()
+            .map(|line| RenderItem { line, memory_id: None, symbol_key: None })
+            .collect();
+        sections.push(Section {
+            header: "**Indexed hits (rag-rat semantic_search has more):**".to_string(),
+            items,
+            footer: None,
+        });
+    }
+
+    let mut context = String::from("rag-rat index context for this search:\n");
+    let mut memory_ids: Vec<String> = Vec::new();
+    let mut symbol_keys: Vec<String> = Vec::new();
+
+    'section: for section in sections {
+        // We only know if the header fits once we find the first fitting item.
+        // Speculatively account for: header + '\n' + first item + '\n'.
+        let mut section_committed = false;
+
+        for item in section.items {
+            // Space needed: item line + newline. If the section header hasn't been
+            // committed yet, include it too.
+            let needed = if section_committed {
+                item.line.len() + 1
+            } else {
+                section.header.len() + 1 + item.line.len() + 1
+            };
+
+            if context.len() + needed > MAX_CONTEXT_CHARS {
+                // Whole-item truncation: stop at the first item that doesn't fit.
+                break 'section;
+            }
+
+            if !section_committed {
+                context.push_str(&section.header);
+                context.push('\n');
+                section_committed = true;
+            }
+            context.push_str(&item.line);
+            context.push('\n');
+
+            // Record IDs only for items whose lines actually landed.
+            if let Some(mid) = item.memory_id {
+                memory_ids.push(mid);
+            }
+            if let Some(key) = item.symbol_key {
+                symbol_keys.push(key);
+            }
+        }
+
+        // Footer is best-effort: append only if section was committed and it fits.
+        if section_committed
+            && let Some(footer) = section.footer
+            && context.len() + footer.len() < MAX_CONTEXT_CHARS
+        {
+            context.push_str(&footer);
+            context.push('\n');
+        }
+    }
+
+    GrepAugment { context: context.trim_end().to_string(), memory_ids, symbol_keys }
+}
+
+/// Caller/callee edge counts. Callers resolve by `to_symbol_id` or qualified-name match;
+/// callees are edges leaving any of the symbol's concrete rows.
+fn edge_counts(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<(i64, i64)> {
+    let callers: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE to_symbol_id = ?1 OR target_qualified_name = ?2",
+        rusqlite::params![hit.symbol_id, hit.qualified_name],
+        |row| row.get(0),
+    )?;
+    let callees: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE from_symbol_id = ?1",
+        [hit.symbol_id],
+        |row| row.get(0),
+    )?;
+    Ok((callers, callees))
+}
+
+/// Start line for a symbol hit (line spans live on chunks).
+/// Returns `None` when no matching chunk is found; callers render `{path}` without `:{line}`
+/// rather than a confidently-wrong `:1`.
+fn line_for_symbol(conn: &Connection, hit: &symbol::SymbolHit) -> anyhow::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT start_line FROM chunks
+         WHERE file_id = ?1 AND start_byte <= ?2 AND end_byte >= ?2
+         ORDER BY (end_byte - start_byte) ASC LIMIT 1",
+        rusqlite::params![hit.file_id, hit.start_byte],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::index::schema;
+    use crate::query::memory::{self, RepoMemoryBindTarget, RepoMemoryCreate};
+
+    fn seeded_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('src/watch.rs', 'rust', 'source', 'abc', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                                 end_byte, signature, docs)
+             VALUES (1, 'rust', 'watcher_main', 'watch::watcher_main', 'function', 0, 100,
+                     'fn watcher_main(config: Config)', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
+                                start_line, end_line, text, text_hash)
+             VALUES (1, 'symbol', 'watch::watcher_main', 0, 100, 1, 20,
+                     'fn watcher_main() { /* election retry loop */ }', 'h1')",
+            [],
+        )
+        .unwrap();
+        let chunk_id = conn.last_insert_rowid();
+        // One caller edge and one callee edge for the counts line.
+        conn.execute(
+            "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                               target_qualified_name, edge_kind, confidence)
+             VALUES (1, NULL, 1, 'watcher_main', 'watch::watcher_main', 'calls_name', 'exact')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges(source_file_id, from_symbol_id, to_symbol_id, to_name,
+                               target_qualified_name, edge_kind, confidence)
+             VALUES (1, 1, NULL, 'maintenance_pass', NULL, 'calls_name', 'name_only')",
+            [],
+        )
+        .unwrap();
+        memory::create_memory(
+            &conn,
+            RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: "One watcher per worktree".to_string(),
+                body: "The election lock guarantees a single watcher; never bind without it."
+                    .to_string(),
+                confidence: "high".to_string(),
+                created_by: Some("test".to_string()),
+                source: None,
+                tags: vec![],
+                bind: RepoMemoryBindTarget {
+                    symbol_id: Some(1),
+                    logical_symbol_id: None,
+                    chunk_id: None,
+                    edge_id: None,
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
+                },
+            },
+        )
+        .unwrap();
+        // Sync chunk_fts directly — external-content FTS5 needs explicit INSERT.
+        conn.execute(
+            "INSERT INTO chunk_fts(rowid, text)
+             VALUES (?1, 'fn watcher_main() { /* election retry loop */ }')",
+            [chunk_id],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn compose_identifier_pattern_yields_symbol_and_memory() {
+        let conn = seeded_conn();
+        let out = compose(&conn, r"watcher_main\b", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("payload expected");
+        assert!(out.context.contains("src/watch.rs"), "symbol location present");
+        assert!(out.context.contains("One watcher per worktree"), "memory title present");
+        let memory_pos = out.context.find("One watcher per worktree").unwrap();
+        let symbol_pos = out.context.find("src/watch.rs").unwrap();
+        assert!(memory_pos < symbol_pos, "memories render before symbols");
+        assert_eq!(out.memory_ids.len(), 1);
+        assert_eq!(out.symbol_keys.len(), 1);
+        assert!(out.context.len() <= MAX_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn compose_respects_dedupe_filter_and_returns_none_when_everything_filtered() {
+        let conn = seeded_conn();
+        let first = compose(&conn, "watcher_main", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("first payload");
+        let filter = DedupeFilter {
+            memory_ids: first.memory_ids.iter().cloned().collect::<HashSet<_>>(),
+            symbol_keys: first.symbol_keys.iter().cloned().collect::<HashSet<_>>(),
+        };
+        assert!(compose(&conn, "watcher_main", None, &filter).unwrap().is_none());
+    }
+
+    #[test]
+    fn compose_non_identifier_pattern_uses_lexical_lane() {
+        let conn = seeded_conn();
+        let out = compose(&conn, "election retry loop", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("lexical payload");
+        assert!(out.context.contains("src/watch.rs"));
+    }
+
+    #[test]
+    fn compose_unknown_pattern_yields_none() {
+        let conn = seeded_conn();
+        assert!(
+            compose(&conn, "zzqqyyxx_nothing", None, &DedupeFilter::default()).unwrap().is_none()
+        );
+    }
+
+    #[test]
+    fn normalize_strips_regex_metacharacters_and_anchors() {
+        assert_eq!(normalize_pattern(r"^fn\s+watcher_main\b"), "fn watcher_main");
+        assert_eq!(
+            normalize_pattern(r"Watcher::spawn(_with_fleet)?"),
+            "Watcher::spawn _with_fleet"
+        );
+        assert_eq!(normalize_pattern("plain words"), "plain words");
+        assert_eq!(normalize_pattern(r".*[]()|+?^$\\"), "");
+    }
+
+    #[test]
+    fn normalize_preserves_dot_between_word_chars() {
+        assert_eq!(normalize_pattern("foo.bar"), "foo.bar");
+        assert_eq!(normalize_pattern(r"foo\.bar"), "foo.bar");
+        // Leading/trailing dot is NOT between word chars → space.
+        assert_eq!(normalize_pattern(".foo"), "foo");
+        assert_eq!(normalize_pattern("foo."), "foo");
+        // Dot between non-word chars → space.
+        assert_eq!(normalize_pattern("foo. bar"), "foo bar");
+    }
+
+    #[test]
+    fn identifier_candidate_accepts_identifier_shapes_only() {
+        assert_eq!(identifier_candidate("watcher_main"), Some("watcher_main"));
+        assert_eq!(identifier_candidate("Watcher::spawn"), Some("Watcher::spawn"));
+        assert_eq!(identifier_candidate("foo.bar"), Some("foo.bar"));
+        assert_eq!(identifier_candidate("fn watcher_main"), None); // two words
+        assert_eq!(identifier_candidate("ab"), None); // too short
+        assert_eq!(identifier_candidate("1abc"), None); // leading digit
+        assert_eq!(identifier_candidate(""), None);
+    }
+
+    #[test]
+    fn normalize_and_identifier_candidate_compose_for_dot_qualified() {
+        // End-to-end: a grep pattern `foo.bar` reaches the symbol lane.
+        let norm = normalize_pattern("foo.bar");
+        assert_eq!(norm, "foo.bar");
+        assert_eq!(identifier_candidate(&norm), Some("foo.bar"));
+
+        // `r"foo\.bar"` (escaped) also reaches the symbol lane.
+        let norm2 = normalize_pattern(r"foo\.bar");
+        assert_eq!(norm2, "foo.bar");
+        assert_eq!(identifier_candidate(&norm2), Some("foo.bar"));
+    }
+
+    #[test]
+    fn render_truncation_respects_cap_no_dangling_headers_ids_match() {
+        // ── Setup ──────────────────────────────────────────────────────────────────────
+        // seeded_conn() already contains one memory ("One watcher per worktree") bound to
+        // symbol_id=1.  We add FOUR more memories, each with a body long enough to survive
+        // the 240-char clamp as a full 241-char string (body trimmed = 300 ASCII words ≈
+        // 1499 chars, collapses to 1499 chars, clamped to exactly 240 chars + `…`).
+        //
+        // Each rendered memory line is:
+        //   "- [Invariant | active] <title≈80chars> — <241-char-body>\n"
+        //   ≈ 24 + 80 + 4 + 241 + 1 = ~350 chars
+        //
+        // With four such lines:
+        //   preamble(41) + header(39) + 4×350(1400) = 1480 chars for memories alone.
+        //
+        // The symbol section header+line needs ~151 chars more → 1480+151 = 1631 > 1500.
+        // Therefore the render loop MUST drop the symbol section entirely, giving us a
+        // genuine truncation scenario.  We assert below that the candidate total exceeds
+        // the cap so the test is self-verifying.
+        let conn = seeded_conn();
+
+        // Body: 300 distinct English words × ~5 chars = ~1499 chars → collapses to 1499
+        // chars → clamped to 240 chars + `…`.  All ASCII so char count == byte count.
+        let long_body: String =
+            (0u32..300).map(|i| format!("word{i:04}")).collect::<Vec<_>>().join(" ");
+        assert!(long_body.len() > MAX_MEMORY_BODY_CHARS, "body must survive clamp");
+        assert!(long_body.len() < 4000, "must not exceed validation cap");
+
+        // Titles are ~80 chars — recognizable and unique, long enough to push each rendered
+        // line to ~350 chars.
+        let titles = [
+            "Truncation memory one — extra padding words fill the title field here ok",
+            "Truncation memory two — extra padding words fill the title field here ok",
+            "Truncation memory three — extra padding words fill the title field here",
+            "Truncation memory four — extra padding words fill the title field here ok",
+        ];
+
+        let mut created_ids: Vec<String> = Vec::new();
+        for title in &titles {
+            let result = memory::create_memory(
+                &conn,
+                RepoMemoryCreate {
+                    kind: "Invariant".to_string(),
+                    title: title.to_string(),
+                    body: long_body.clone(),
+                    confidence: "high".to_string(),
+                    created_by: Some("test".to_string()),
+                    source: None,
+                    tags: vec![],
+                    bind: RepoMemoryBindTarget {
+                        symbol_id: Some(1),
+                        logical_symbol_id: None,
+                        chunk_id: None,
+                        edge_id: None,
+                        path: None,
+                        start_line: None,
+                        end_line: None,
+                        commit_hash: None,
+                        github_owner: None,
+                        github_repo: None,
+                        github_number: None,
+                        start_logical_symbol_id: None,
+                        end_logical_symbol_id: None,
+                        edge_sequence_hash: None,
+                        path_summary: None,
+                    },
+                },
+            )
+            .unwrap();
+            created_ids.push(result.memory.memory_id);
+        }
+        assert_eq!(created_ids.len(), 4, "all four memories must be created");
+
+        // ── Sanity-check: verify the cap path triggers ─────────────────────────────────
+        // A single memory render line ≈ 350 chars (conservative lower bound: 24+70+4+241+1).
+        // Four lines + preamble + mem-header = min ~1480 chars; symbol section adds ~151.
+        // Assert total candidate content exceeds MAX_CONTEXT_CHARS so truncation is forced.
+        let per_mem_line_min: usize = "- [Invariant | active] ".len()  // 24
+            + titles[0].len()                                            // ≥70
+            + " — ".len()                                                // 4
+            + MAX_MEMORY_BODY_CHARS + 1; // 241 (clamped+…)
+        let preamble_len = "rag-rat index context for this search:\n".len();
+        let mem_header_len = "**Repo memories bound to this code:**\n".len();
+        let symbol_section_min: usize = "**Known symbols matching this pattern:**\n".len() + 80; // header + short line
+        let candidate_total =
+            preamble_len + mem_header_len + 4 * per_mem_line_min + symbol_section_min;
+        assert!(
+            candidate_total > MAX_CONTEXT_CHARS,
+            "candidate_total={candidate_total} must exceed MAX_CONTEXT_CHARS={MAX_CONTEXT_CHARS} \
+             for truncation to trigger",
+        );
+
+        // ── Run compose ────────────────────────────────────────────────────────────────
+        let out = compose(&conn, "watcher_main", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("payload expected");
+
+        // (a) Context must not exceed the cap.
+        assert!(
+            out.context.len() <= MAX_CONTEXT_CHARS,
+            "context.len()={} > MAX_CONTEXT_CHARS={}",
+            out.context.len(),
+            MAX_CONTEXT_CHARS,
+        );
+
+        // (b) No section header is the last line / every committed header is followed by
+        //     at least one item line.
+        let section_headers = [
+            "**Repo memories bound to this code:**",
+            "**Known symbols matching this pattern:**",
+            "**Indexed hits (rag-rat semantic_search has more):**",
+        ];
+        let lines: Vec<&str> = out.context.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let is_header = section_headers.iter().any(|h| line.trim() == *h);
+            if is_header {
+                assert!(
+                    idx + 1 < lines.len(),
+                    "section header '{line}' is the last line — dangling header",
+                );
+            }
+        }
+
+        // (c) Exact two-way correspondence for every seeded memory:
+        //     context.contains(title)  ⟺  memory_ids.contains(that_id)
+        for (title, id) in titles.iter().zip(created_ids.iter()) {
+            let in_context = out.context.contains(*title);
+            let id_present = out.memory_ids.contains(id);
+            assert_eq!(
+                in_context, id_present,
+                "mismatch for '{title}': in_context={in_context}, id_present={id_present}",
+            );
+        }
+
+        // (d) Two-way correspondence for the symbol: symbol_keys non-empty ⟺
+        //     "watch::watcher_main" appears in context.
+        let sym_in_context = out.context.contains("watch::watcher_main");
+        let sym_keys_non_empty = !out.symbol_keys.is_empty();
+        assert_eq!(
+            sym_in_context, sym_keys_non_empty,
+            "symbol context/key mismatch: sym_in_context={sym_in_context}, \
+             sym_keys_non_empty={sym_keys_non_empty}",
+        );
+
+        // (e) Truncation actually occurred: at least one seeded memory title OR the symbol
+        //     must be absent from context (we have more content than the cap allows).
+        let all_titles_present = titles.iter().all(|t| out.context.contains(*t));
+        let symbol_present = out.context.contains("watch::watcher_main");
+        assert!(
+            !all_titles_present || !symbol_present,
+            "no truncation detected: all memory titles and the symbol section all fit within \
+             MAX_CONTEXT_CHARS — increase body/title size so the cap is actually exercised",
+        );
+    }
+
+    #[test]
+    fn clamp_body_truncates_long_bodies_and_collapses_whitespace() {
+        let short = "hello world";
+        assert_eq!(clamp_body(short), "hello world");
+
+        // Whitespace collapse.
+        let multiline = "line one\nline two\n  indented";
+        assert_eq!(clamp_body(multiline), "line one line two indented");
+
+        // Long body truncation.
+        let long = "x".repeat(300);
+        let clamped = clamp_body(&long);
+        assert!(clamped.ends_with('…'), "truncated body must end with ellipsis");
+        // The char count of the non-ellipsis prefix must be exactly MAX_MEMORY_BODY_CHARS.
+        let without_ellipsis: String = clamped.chars().take(MAX_MEMORY_BODY_CHARS).collect();
+        assert_eq!(without_ellipsis.len(), MAX_MEMORY_BODY_CHARS);
+    }
+}

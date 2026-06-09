@@ -12,6 +12,8 @@ use rag_rat_core::{
     search::lexical::SearchHit,
 };
 
+mod claude_hook;
+mod claude_settings;
 mod init;
 
 fn main() -> anyhow::Result<()> {
@@ -22,6 +24,9 @@ fn main() -> anyhow::Result<()> {
     };
     if command == "init" {
         return init::run(&args);
+    }
+    if command == "claude-hook" {
+        return claude_hook::run();
     }
     let config_path = option_value(&args, "--config").unwrap_or_else(|| "rag-rat.toml".to_string());
     let config = Config::load(&config_path)?;
@@ -560,6 +565,9 @@ fn hooks(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let Some(subcommand) = args.get(1).map(String::as_str) else {
         anyhow::bail!("hooks command needs install, uninstall, or status");
     };
+    if args.iter().any(|a| a == "--claude") {
+        return claude_hooks(config, subcommand, args.iter().any(|a| a == "--global"));
+    }
     let git = git_paths(&config.root)?;
     match subcommand {
         "install" => {
@@ -620,6 +628,43 @@ fn hooks(config: &Config, args: &[String]) -> anyhow::Result<()> {
                 "git_common_dir": git.git_common_dir,
                 "hooks_dir": git.hooks_dir,
                 "hooks": hooks,
+            }))
+        },
+        other => anyhow::bail!("unknown hooks subcommand `{other}`"),
+    }
+}
+
+fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> anyhow::Result<()> {
+    let path = claude_settings::settings_path(&config.root, global)?;
+    let mut settings = claude_settings::read_settings(&path)?;
+    match subcommand {
+        "install" => {
+            let changed = claude_settings::merge_hook_entries(&mut settings);
+            if changed {
+                claude_settings::write_settings(&path, &settings)?;
+            }
+            print_json(&serde_json::json!({
+                "status": if changed { "installed" } else { "already_installed" },
+                "settings_path": path,
+                "matchers": ["Grep", "Bash"],
+            }))
+        },
+        "uninstall" => {
+            let changed = claude_settings::remove_hook_entries(&mut settings);
+            if changed {
+                claude_settings::write_settings(&path, &settings)?;
+            }
+            print_json(&serde_json::json!({
+                "status": if changed { "uninstalled" } else { "not_installed" },
+                "settings_path": path,
+            }))
+        },
+        "status" => {
+            let (grep, bash) = claude_settings::hook_status(&settings);
+            print_json(&serde_json::json!({
+                "settings_path": path,
+                "grep_matcher_installed": grep,
+                "bash_matcher_installed": bash,
             }))
         },
         other => anyhow::bail!("unknown hooks subcommand `{other}`"),
@@ -889,7 +934,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
+        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|claude-hook|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
          default config: rag-rat.toml\n\
          examples:\n\
          rag-rat init\n\
