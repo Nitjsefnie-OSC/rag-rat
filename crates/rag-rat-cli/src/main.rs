@@ -40,6 +40,12 @@ fn main() -> anyhow::Result<()> {
             } else {
                 IndexDatabase::index_changed_with_progress(&config, render_index_progress)?
             };
+            // Re-anchor repo memories against the freshly indexed symbols/chunks so a moved or
+            // renamed binding relocates (or is flagged) instead of silently pointing at a stale
+            // row. Memory rows themselves are never deleted by indexing.
+            if let Err(err) = db.memory_validate() {
+                eprintln!("warning: repo-memory re-validation failed: {err}");
+            }
             print_json(&db.status(&config.database)?)?;
         },
         "doctor" => {
@@ -647,6 +653,10 @@ fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.gc().ok();
+    // Re-anchor repo memories: post-checkout/merge/rewrite/commit are exactly when files move,
+    // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
+    // leaving stale anchors until a manual memory_validate.
+    let memory_validation = db.memory_validate().ok();
     let plan = db.reconcile_plan()?;
     print_json(&serde_json::json!({
         "trigger": trigger,
@@ -658,6 +668,7 @@ fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
         "elapsed_seconds": started.elapsed().as_secs_f64(),
         "reconcile": reconcile_report,
         "gc": gc_report,
+        "memory_validation": memory_validation,
         "remaining_backlog": {
             "model": plan.embeddings.model_id,
             "current": plan.embeddings.current,

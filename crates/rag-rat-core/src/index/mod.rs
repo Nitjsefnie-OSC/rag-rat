@@ -6871,6 +6871,81 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
     }
 
     #[test]
+    fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
+        // The user-facing guarantee: a memory is never lost to reindexing (no FK cascade from
+        // symbols/chunks), and a symbol binding re-anchors to the symbol's new location when the
+        // file is edited/moved rather than going stale.
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn keystone() {}\n").unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let selector = crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("keystone".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        };
+        let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol");
+        let created = db
+            .memory_create(crate::query::memory::RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: "keystone holds an invariant".to_string(),
+                body: "This memory must survive a reindex and follow the symbol when it moves."
+                    .to_string(),
+                confidence: "high".to_string(),
+                created_by: Some("test".to_string()),
+                source: Some("agent".to_string()),
+                tags: Vec::new(),
+                bind: crate::query::memory::RepoMemoryBindTarget {
+                    symbol_id: Some(symbol.symbol_id),
+                    logical_symbol_id: None,
+                    chunk_id: None,
+                    edge_id: None,
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
+                },
+            })
+            .unwrap();
+
+        // Edit the file so keystone moves down (new symbol ids on reindex), then rebuild.
+        fs::write(root.join("src/lib.rs"), "pub fn added_above() {}\n\npub fn keystone() {}\n")
+            .unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Memory row survives the reindex (no cascade from deleted symbols).
+        assert!(
+            crate::query::memory::memory_by_id(db.storage.connection(), &created.memory.memory_id,)
+                .unwrap()
+                .is_some(),
+            "memory was lost to reindex",
+        );
+
+        // Re-validation re-anchors the binding to keystone's new location, not "gone".
+        db.memory_validate().unwrap();
+        let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol after move");
+        let anchored = db.memory_for_symbol(&symbol, 10).unwrap();
+        assert_eq!(anchored.len(), 1, "memory did not re-anchor to moved symbol");
+        assert_ne!(anchored[0].bindings[0].anchor_status, "gone");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
