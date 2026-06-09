@@ -59,4 +59,5 @@ still take precedence: `--batch-size` overrides `batch_size`, and `--max-embeddi
 `post-commit` hooks to the current worktree's Git hooks directory. Those hooks call `rag-rat
 maintenance --max-seconds 30` in the background so branch switches, merges, rebases, and commits
 refresh the current worktree index and advance changed-first embedding reconciliation without
-blocking normal Git operations.
+blocking normal Git operations. Each maintenance pass also runs a worktree-safe `gc` that prunes
+index rows for commits no longer held by any live worktree (run `rag-rat gc` to prune on demand).

@@ -111,6 +111,10 @@ fn main() -> anyhow::Result<()> {
         "reconcile" => {
             reconcile(&config, &args)?;
         },
+        "gc" => {
+            let db = IndexDatabase::open_config(&config)?;
+            print_json(&db.gc()?)?;
+        },
         "eval" => {
             eval(&config, &args)?;
         },
@@ -635,6 +639,9 @@ fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
     } else {
         None
     };
+    // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
+    // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
+    let gc_report = db.gc().ok();
     let plan = db.reconcile_plan()?;
     print_json(&serde_json::json!({
         "trigger": trigger,
@@ -645,6 +652,7 @@ fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
         "max_seconds": max_seconds,
         "elapsed_seconds": started.elapsed().as_secs_f64(),
         "reconcile": reconcile_report,
+        "gc": gc_report,
         "remaining_backlog": {
             "model": plan.embeddings.model_id,
             "current": plan.embeddings.current,
@@ -842,7 +850,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|maintenance|models|reconcile|eval|dump-config> [--config <path>] [query]\n\
+        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
          default config: rag-rat.toml\n\
          examples:\n\
          rag-rat init\n\
@@ -864,6 +872,7 @@ fn usage() {
          rag-rat reconcile --limit 100 --batch-size 32\n\
          rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64\n\
          rag-rat reconcile --until-clean --batch-size 64\n\
+         rag-rat gc\n\
          rag-rat reconcile --force --limit 100 --batch-size 32\n\
          rag-rat eval\n\
          rag-rat eval --json\n\

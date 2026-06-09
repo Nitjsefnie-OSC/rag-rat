@@ -414,6 +414,7 @@ Supported operational commands:
 - `heal_index`
 - `hooks install/status/uninstall`
 - `maintenance --trigger <hook> --max-seconds <n>`
+- `gc`
 - `eval`, `eval --json`, `eval --update-baseline`
 - `dump-config`
 - `brief --mode spine|churn|god_modules|refactor_candidates`
@@ -421,6 +422,14 @@ Supported operational commands:
 
 `eval` runs fixture-driven ranking and freshness checks and reports search, graph, impact, git, and
 papertrail metrics. Current-source violations must stay at zero.
+
+`gc` reclaims index rows for git contexts that are no longer live. Index rows are stored per
+commit/worktree so they can be reused across branch switches, but commits that are no longer the
+HEAD of any live worktree accumulate. `gc` enumerates `git worktree list`, keeps the active commit
+and overlay of every live worktree, and prunes files/chunks/embeddings/symbols/edges for every other
+commit. It never prunes when no live context can be determined, so a missing or non-git context
+cannot wipe the index. `maintenance` runs a `gc` pass after reconciling, so the hooks keep the index
+lean automatically; run `rag-rat gc` to prune on demand.
 
 ## Known Limits
 
@@ -462,6 +471,7 @@ rag-rat models install fastembed-all-minilm-l6-v2
 rag-rat reconcile --limit 100 --batch-size 32
 rag-rat reconcile --changed-first --max-seconds 60 --batch-size 64
 rag-rat reconcile --until-clean --batch-size 64
+rag-rat gc
 rag-rat hooks install
 rag-rat hooks status
 rag-rat maintenance --trigger post-checkout --max-seconds 30

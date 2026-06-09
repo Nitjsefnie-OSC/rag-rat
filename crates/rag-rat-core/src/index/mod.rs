@@ -149,6 +149,16 @@ pub struct HealIndexReport {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GcReport {
+    pub files_pruned: u64,
+    pub chunks_pruned: u64,
+    pub files_remaining: u64,
+    pub chunks_remaining: u64,
+    /// True when no live context could be determined and pruning was skipped (nothing deleted).
+    pub skipped: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ParserFailure {
     pub path: String,
@@ -348,16 +358,17 @@ impl IndexDatabase {
     }
 
     fn clear_full_rebuild_tables(&self) -> anyhow::Result<()> {
+        // Stage the active context's file ids, then cascade-delete them and their derived rows.
         self.storage.execute_batch(
             "
-            CREATE TEMP TABLE IF NOT EXISTS full_rebuild_file_ids(id INTEGER PRIMARY KEY);
-            DELETE FROM temp.full_rebuild_file_ids;
-            INSERT OR IGNORE INTO temp.full_rebuild_file_ids(id)
+            CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
+            DELETE FROM temp.staged_file_ids;
+            INSERT OR IGNORE INTO temp.staged_file_ids(id)
             SELECT id
             FROM main.files
             WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = 'worktree_id')
               AND worktree_id != '';
-            INSERT OR IGNORE INTO temp.full_rebuild_file_ids(id)
+            INSERT OR IGNORE INTO temp.staged_file_ids(id)
             SELECT id
             FROM main.files
             WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
@@ -367,7 +378,20 @@ impl IndexDatabase {
                   WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = 'worktree_id')
                     AND worktree_id != ''
               );
+            ",
+        )?;
+        self.delete_staged_files_cascade()?;
+        self.storage.execute_batch("DELETE FROM temp.staged_file_ids;")?;
+        Ok(())
+    }
 
+    /// Cascade-delete every derived row (edges, symbols, chunks, embeddings, FTS, blame, docs,
+    /// parser failures) for the file ids staged in `temp.staged_file_ids`, then the files
+    /// themselves. The caller is responsible for populating and clearing the temp table.
+    /// Shared by full rebuild (active context) and GC (dead, non-live contexts).
+    fn delete_staged_files_cascade(&self) -> anyhow::Result<()> {
+        self.storage.execute_batch(
+            "
             UPDATE main.edges
             SET to_symbol_id = NULL,
                 target_start_line = NULL,
@@ -376,21 +400,21 @@ impl IndexDatabase {
             WHERE to_symbol_id IN (
                 SELECT symbols.id
                 FROM main.symbols
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
             );
             DELETE FROM main.edges
-            WHERE source_file_id IN (SELECT id FROM temp.full_rebuild_file_ids)
+            WHERE source_file_id IN (SELECT id FROM temp.staged_file_ids)
                OR from_symbol_id IN (
                     SELECT symbols.id
                     FROM main.symbols
-                    JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+                    JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
                );
 
             DELETE FROM main.logical_symbol_members
             WHERE symbol_id IN (
                 SELECT symbols.id
                 FROM main.symbols
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
             );
             DELETE FROM main.logical_symbols
             WHERE id NOT IN (
@@ -400,51 +424,50 @@ impl IndexDatabase {
             WHERE symbol_id IN (
                 SELECT symbols.id
                 FROM main.symbols
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = symbols.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
             );
             DELETE FROM main.chunk_fts
             WHERE rowid IN (
                 SELECT chunks.id
                 FROM main.chunks
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.chunk_summaries
             WHERE chunk_id IN (
                 SELECT chunks.id
                 FROM main.chunks
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.chunk_embeddings
             WHERE chunk_id IN (
                 SELECT chunks.id
                 FROM main.chunks
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.git_chunk_blame
             WHERE chunk_id IN (
                 SELECT chunks.id
                 FROM main.chunks
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.docs
             WHERE chunk_id IN (
                 SELECT chunks.id
                 FROM main.chunks
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = chunks.file_id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.parser_failures
             WHERE path IN (
                 SELECT path
                 FROM main.files
-                JOIN temp.full_rebuild_file_ids ON full_rebuild_file_ids.id = files.id
+                JOIN temp.staged_file_ids ON staged_file_ids.id = files.id
             );
             DELETE FROM main.symbols
-            WHERE file_id IN (SELECT id FROM temp.full_rebuild_file_ids);
+            WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
             DELETE FROM main.chunks
-            WHERE file_id IN (SELECT id FROM temp.full_rebuild_file_ids);
+            WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
             DELETE FROM main.files
-            WHERE id IN (SELECT id FROM temp.full_rebuild_file_ids);
-            DELETE FROM temp.full_rebuild_file_ids;
+            WHERE id IN (SELECT id FROM temp.staged_file_ids);
             ",
         )?;
         Ok(())
@@ -1249,6 +1272,101 @@ impl IndexDatabase {
         progress: impl FnMut(ai::ReconcileProgress),
     ) -> anyhow::Result<ReconcileReport> {
         ai::reconcile_with_options_progress(self.storage.connection(), options, progress)
+    }
+
+    /// Garbage-collect index rows for git contexts that are no longer live. Keeps the active
+    /// commit and overlay of every worktree reported by `git worktree list` (plus this
+    /// connection's active context) and prunes file/chunk/embedding/symbol/edge rows for any
+    /// other commit. Never prunes when no live context can be determined (non-git, git error).
+    pub fn gc(&self) -> anyhow::Result<GcReport> {
+        let mut live_commits = Vec::new();
+        let mut live_worktrees = Vec::new();
+        if let Some(root) = self.storage.source_root() {
+            let (commits, worktrees) = live_worktree_contexts(root);
+            live_commits.extend(commits);
+            live_worktrees.extend(worktrees);
+        }
+        // Always keep this connection's active context, even if git enumeration missed it.
+        if !self.active_commit_sha.is_empty() {
+            live_commits.push(self.active_commit_sha.clone());
+        }
+        if !self.active_worktree_id.is_empty() {
+            live_worktrees.push(self.active_worktree_id.clone());
+        }
+        live_commits.sort();
+        live_commits.dedup();
+        live_worktrees.sort();
+        live_worktrees.dedup();
+        self.prune_to_live(&live_commits, &live_worktrees)
+    }
+
+    /// Prune file rows (and their derived rows) whose `commit_sha` and `worktree_id` are both
+    /// outside the live sets. Refuses to prune when both live sets are empty, so a missing
+    /// live set never wipes the index. `parser_failures` are keyed by path (shared across
+    /// commits) and are regenerated on the next index, so they are not preserved per-commit.
+    pub fn prune_to_live(
+        &self,
+        live_commits: &[String],
+        live_worktrees: &[String],
+    ) -> anyhow::Result<GcReport> {
+        let conn = self.storage.connection();
+        let files_before = table_row_count(conn, "files")?;
+        let chunks_before = table_row_count(conn, "chunks")?;
+        if live_commits.is_empty() && live_worktrees.is_empty() {
+            return Ok(GcReport {
+                files_pruned: 0,
+                chunks_pruned: 0,
+                files_remaining: files_before,
+                chunks_remaining: chunks_before,
+                skipped: true,
+            });
+        }
+        conn.execute_batch(
+            "
+            CREATE TEMP TABLE IF NOT EXISTS gc_live_commits(sha TEXT PRIMARY KEY);
+            DELETE FROM temp.gc_live_commits;
+            CREATE TEMP TABLE IF NOT EXISTS gc_live_worktrees(id TEXT PRIMARY KEY);
+            DELETE FROM temp.gc_live_worktrees;
+            CREATE TEMP TABLE IF NOT EXISTS staged_file_ids(id INTEGER PRIMARY KEY);
+            DELETE FROM temp.staged_file_ids;
+            ",
+        )?;
+        {
+            let mut stmt =
+                conn.prepare("INSERT OR IGNORE INTO temp.gc_live_commits(sha) VALUES (?1)")?;
+            for sha in live_commits {
+                stmt.execute([sha])?;
+            }
+        }
+        {
+            let mut stmt =
+                conn.prepare("INSERT OR IGNORE INTO temp.gc_live_worktrees(id) VALUES (?1)")?;
+            for id in live_worktrees {
+                stmt.execute([id])?;
+            }
+        }
+        // A file survives if its commit is live OR its worktree overlay is live. Empty-string
+        // keys never appear in the live sets, so unkeyed rows are pruned.
+        conn.execute(
+            "
+            INSERT OR IGNORE INTO temp.staged_file_ids(id)
+            SELECT id FROM main.files
+            WHERE commit_sha NOT IN (SELECT sha FROM temp.gc_live_commits)
+              AND worktree_id NOT IN (SELECT id FROM temp.gc_live_worktrees)
+            ",
+            [],
+        )?;
+        self.delete_staged_files_cascade()?;
+        conn.execute_batch("DELETE FROM temp.staged_file_ids;")?;
+        let files_remaining = table_row_count(conn, "files")?;
+        let chunks_remaining = table_row_count(conn, "chunks")?;
+        Ok(GcReport {
+            files_pruned: files_before.saturating_sub(files_remaining),
+            chunks_pruned: chunks_before.saturating_sub(chunks_remaining),
+            files_remaining,
+            chunks_remaining,
+            skipped: false,
+        })
     }
 
     pub fn current_embedding_count(&self, model_id: &str) -> anyhow::Result<u64> {
@@ -3472,6 +3590,32 @@ fn resolve_git_context(root: &Path) -> (String, String) {
     (commit_sha, worktree_id)
 }
 
+/// The live (commit_sha, worktree_id) keys across every worktree that shares this repo, from
+/// `git worktree list --porcelain`. Each worktree contributes its HEAD commit (for clean rows)
+/// and its path (for dirty/overlay rows). Returns empty vecs outside a git worktree.
+fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) {
+    let mut commits = Vec::new();
+    let mut worktrees = Vec::new();
+    let Some(output) = git_output(root, &["worktree", "list", "--porcelain"]) else {
+        return (commits, worktrees);
+    };
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            worktrees.push(path.trim().trim_end_matches('/').to_string());
+        } else if let Some(sha) = line.strip_prefix("HEAD ") {
+            commits.push(sha.trim().to_string());
+        }
+    }
+    (commits, worktrees)
+}
+
+fn table_row_count(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<u64> {
+    // `table` is always an internal string literal, never user input.
+    let count = conn
+        .query_row(&format!("SELECT COUNT(*) FROM main.{table}"), [], |row| row.get::<_, i64>(0))?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 fn file_metadata_ms(path: &Path) -> anyhow::Result<i64> {
     let modified = fs::metadata(path)?.modified()?;
     Ok(duration_ms(modified.duration_since(UNIX_EPOCH)?))
@@ -4385,6 +4529,69 @@ mod schema_bootstrap_tests {
         let scoped = db.local_ai_status().unwrap().artifacts;
         assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
         assert_eq!(scoped.current, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
+        let (root, config) = markdown_config(
+            "# One\nalpha token with enough surrounding detail for embedding eligibility and useful semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding eligibility and useful semantic context\n",
+        );
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.install_model(ai::HASH_MODEL_ID).unwrap();
+        db.reconcile(None, Some(8)).unwrap();
+
+        let live_files = table_row_count(db.storage.connection(), "files").unwrap();
+        let live_chunks = table_row_count(db.storage.connection(), "chunks").unwrap();
+        assert!(live_files > 0 && live_chunks > 0);
+
+        // A ghost file from a commit/worktree that is not live.
+        db.storage
+            .connection()
+            .execute(
+                "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated,
+                     indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+                 VALUES ('ghost.md','markdown','source','deadhash',0,0,0,'deadrev',
+                     'deadcommit','dead-worktree')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(table_row_count(db.storage.connection(), "files").unwrap(), live_files + 1);
+
+        // Keep only the active worktree. The ghost's commit and worktree are not live.
+        let live_worktree = db.active_worktree_id.clone();
+        let report = db.prune_to_live(&[], &[live_worktree]).unwrap();
+
+        assert!(!report.skipped);
+        assert_eq!(report.files_pruned, 1, "ghost not pruned: {report:?}");
+        assert_eq!(
+            table_row_count(db.storage.connection(), "files").unwrap(),
+            live_files,
+            "live files were pruned",
+        );
+        assert_eq!(
+            table_row_count(db.storage.connection(), "chunks").unwrap(),
+            live_chunks,
+            "live chunks were pruned",
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_refuses_to_prune_with_no_live_context() {
+        let (root, config) =
+            markdown_config("# Only\nsome content with enough detail for a chunk\n");
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let before = table_row_count(db.storage.connection(), "files").unwrap();
+        assert!(before > 0);
+
+        // Empty live sets must never wipe the index.
+        let report = db.prune_to_live(&[], &[]).unwrap();
+        assert!(report.skipped);
+        assert_eq!(report.files_pruned, 0);
+        assert_eq!(table_row_count(db.storage.connection(), "files").unwrap(), before);
 
         fs::remove_dir_all(root).unwrap();
     }
