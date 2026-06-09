@@ -516,15 +516,16 @@ include = ["**/*.kt"]
 
 ## Git Hooks
 
-`rag-rat hooks install` installs generated `post-checkout`, `post-merge`, and `post-rewrite` hooks
-for the current worktree. The hooks run in the background and call one bounded command:
-`rag-rat maintenance --trigger <hook> --max-seconds 30`. Existing unmanaged hook files are never
-overwritten.
+`rag-rat hooks install` installs generated `post-checkout`, `post-merge`, `post-rewrite`, and
+`post-commit` hooks for the current worktree. The hooks run in the background and call one bounded
+command: `rag-rat maintenance --trigger <hook> --max-seconds 30`. Existing unmanaged hook files are
+never overwritten.
 
-`rag-rat maintenance` operates on the current worktree only. For branch switches, merges, and
-rewrites it runs discover indexing for new/changed/deleted files, refreshes SQLite FTS through the
-index path when needed, then reconciles embeddings with `changed_first` until the remaining time
-budget is spent.
+`rag-rat maintenance` operates on the current worktree only. For branch switches, merges, rewrites,
+and commits it runs discover indexing for new/changed/deleted files, refreshes SQLite FTS through
+the index path when needed, then reconciles embeddings with `changed_first` until the remaining time
+budget is spent. The `post-commit` hook keeps the index current with the just-committed tree without
+waiting for the next checkout or merge.
 
 ## Security
 

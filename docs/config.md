@@ -55,7 +55,8 @@ still take precedence: `--batch-size` overrides `batch_size`, and `--max-embeddi
 `max_embedding_chars`. `ort_threads` and `omp_threads` are applied as `ORT_NUM_THREADS` and
 `OMP_NUM_THREADS` when those environment variables are not already set by the caller.
 
-`rag-rat hooks install` writes generated `post-checkout`, `post-merge`, and `post-rewrite` hooks to
-the current worktree's Git hooks directory. Those hooks call `rag-rat maintenance --max-seconds 30`
-in the background so branch switches, merges, and rebases refresh the current worktree index and
-advance changed-first embedding reconciliation without blocking normal Git operations.
+`rag-rat hooks install` writes generated `post-checkout`, `post-merge`, `post-rewrite`, and
+`post-commit` hooks to the current worktree's Git hooks directory. Those hooks call `rag-rat
+maintenance --max-seconds 30` in the background so branch switches, merges, rebases, and commits
+refresh the current worktree index and advance changed-first embedding reconciliation without
+blocking normal Git operations.
