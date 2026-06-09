@@ -17,6 +17,8 @@ pub const MAX_CONTEXT_CHARS: usize = 1500;
 const MAX_SYMBOLS: u32 = 3;
 const MAX_MEMORIES: u32 = 4;
 const MAX_LEXICAL_HITS: u32 = 3;
+/// Lexical hits below this fraction of the best hit's score are dropped as low-relevance noise.
+const LEXICAL_RELATIVE_FLOOR: f64 = 0.6;
 
 /// Maximum body length in a rendered memory digest line; longer bodies are truncated with `…`.
 const MAX_MEMORY_BODY_CHARS: usize = 240;
@@ -110,6 +112,44 @@ pub fn identifier_candidate(normalized: &str) -> Option<&str> {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.')).then_some(normalized)
 }
 
+/// Definition/declaration keywords that commonly prefix the symbol in a grep pattern, across the
+/// indexed languages. Stripped when isolating the one identifier a multi-word pattern targets.
+const DEFINITION_KEYWORDS: &[&str] = &[
+    "fn", "pub", "mut", "let", "const", "static", "struct", "enum", "trait", "impl", "type", "mod",
+    "use", "async", "await", "return", "class", "def", "func", "function", "interface", "export",
+    "import", "var", "val", "public", "private", "protected", "final", "override", "suspend",
+    "void", "extern", "unsafe", "where", "dyn",
+];
+
+/// The single identifier a pattern targets, for the symbol lane. A lone identifier is used
+/// directly; a definition-style multi-word pattern (`fn resolve_all_edges`, `pub struct
+/// SymbolIndex`) is reduced by dropping definition keywords — if exactly one identifier-shaped
+/// token remains, that is the target. Anything more ambiguous (two+ identifiers, or free text)
+/// returns `None` and falls to the lexical lane, where multi-concept search is actually useful.
+///
+/// This is what stops a precise `grep "fn foo"` from getting a redundant lexical echo of results
+/// grep already found: it routes to the symbol lane (symbol + bound memories) instead.
+pub fn extract_symbol_identifier(normalized: &str) -> Option<&str> {
+    if let Some(ident) = identifier_candidate(normalized) {
+        return Some(ident);
+    }
+    let mut candidate: Option<&str> = None;
+    for token in normalized.split(' ') {
+        if DEFINITION_KEYWORDS.contains(&token) {
+            continue;
+        }
+        if identifier_candidate(token).is_some() {
+            if candidate.is_some() {
+                return None; // more than one identifier — ambiguous; use the lexical lane
+            }
+            candidate = Some(token);
+        } else {
+            return None; // a non-keyword, non-identifier token → free text; use the lexical lane
+        }
+    }
+    candidate
+}
+
 /// What the listener/fallback already injected for this session. Default = inject everything.
 #[derive(Debug, Default, Clone)]
 pub struct DedupeFilter {
@@ -149,7 +189,7 @@ pub fn compose(
     // then path-bound), unlike the old sort+dedup which ordered by creation-time ID.
     let mut seen_memory_ids: HashSet<String> = HashSet::new();
 
-    if let Some(ident) = identifier_candidate(&normalized) {
+    if let Some(ident) = extract_symbol_identifier(&normalized) {
         // Symbol lane. Bare name for qualified queries: `Watcher::spawn` → `spawn`.
         let bare = ident.rsplit([':', '.']).next().unwrap_or(ident);
         for hit in symbol::lookup(conn, bare, None, MAX_SYMBOLS)? {
@@ -200,10 +240,15 @@ pub fn compose(
     // Apply session-level dedupe filter last (after insertion-order dedup above).
     memories.retain(|m| !dedupe.memory_ids.contains(&m.memory_id));
 
-    // Lexical lane: only when the symbol lane found nothing (never had any raw hits).
+    // Lexical lane: only when the symbol lane found nothing (never had any raw hits). Relevance
+    // gate: keep only hits within LEXICAL_RELATIVE_FLOOR of the best hit's score, so the weak tail
+    // (e.g. an incidental match several ranks down) isn't injected as noise.
     let lexical_lines = if !symbol_lane_had_hits {
-        lexical::search_lexical_only(conn, &normalized, MAX_LEXICAL_HITS, false)?
-            .into_iter()
+        let hits = lexical::search_lexical_only(conn, &normalized, MAX_LEXICAL_HITS, false)?;
+        let best = hits.iter().map(|hit| hit.score).fold(0.0_f64, f64::max);
+        let floor = best * LEXICAL_RELATIVE_FLOOR;
+        hits.into_iter()
+            .filter(|hit| hit.score >= floor)
             .map(|hit| {
                 format!("- {}:{}-{} — {}", hit.path, hit.start_line, hit.end_line, hit.summary)
             })
@@ -513,6 +558,37 @@ mod tests {
             symbol_keys: first.symbol_keys.iter().cloned().collect::<HashSet<_>>(),
         };
         assert!(compose(&conn, "watcher_main", None, &filter).unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_symbol_identifier_handles_definition_patterns() {
+        // Lone identifier passes through.
+        assert_eq!(extract_symbol_identifier("watcher_main"), Some("watcher_main"));
+        // Definition keywords are stripped, leaving the one target identifier.
+        assert_eq!(extract_symbol_identifier("fn watcher_main"), Some("watcher_main"));
+        assert_eq!(extract_symbol_identifier("pub struct SymbolIndex"), Some("SymbolIndex"));
+        assert_eq!(extract_symbol_identifier("pub async fn resolve_all_edges"), Some("resolve_all_edges"));
+        // Two real identifiers → ambiguous → lexical lane.
+        assert_eq!(extract_symbol_identifier("election retry loop"), None);
+        // Free text token (not keyword, not identifier-shaped) → lexical lane.
+        assert_eq!(extract_symbol_identifier("foo == bar"), None);
+    }
+
+    #[test]
+    fn compose_definition_pattern_routes_to_symbol_lane_not_lexical() {
+        let conn = seeded_conn();
+        let out = compose(&conn, r"fn watcher_main", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("payload expected");
+        // Resolves to the symbol + its bound memory; the redundant lexical echo is suppressed.
+        assert!(out.context.contains("watch::watcher_main"), "symbol lane fired");
+        assert!(out.context.contains("One watcher per worktree"), "bound memory surfaced");
+        assert!(
+            !out.context.contains("Indexed hits"),
+            "lexical lane must be suppressed when the symbol lane has hits: {}",
+            out.context
+        );
+        assert!(!out.symbol_keys.is_empty());
     }
 
     #[test]
