@@ -4990,6 +4990,35 @@ pub fn exported_fn() {}
     }
 
     #[test]
+    fn find_callers_sees_calls_in_let_bindings() {
+        // Regression for issue #47: calls in `let x = f();` and `let-else` initializers produced
+        // no caller edge, so find_callers reported 0 callers for a function that is called.
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn target() -> Option<i32> {\n    Some(1)\n}\n\n\
+             pub fn via_statement() {\n    target();\n}\n\n\
+             pub fn via_let() {\n    let _x = target();\n}\n\n\
+             pub fn via_let_else() {\n    let Some(_x) = target() else {\n        return;\n    };\n}\n",
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let callers = db.find_callers("target", 50).unwrap();
+        let names: Vec<String> = callers.iter().filter_map(|hop| hop.from_symbol.clone()).collect();
+        let has = |suffix: &str| names.iter().any(|name| name.ends_with(suffix));
+
+        assert!(has("via_statement"), "missing plain-statement caller; got {names:?}");
+        assert!(has("via_let"), "missing `let x = target()` caller; got {names:?}");
+        assert!(has("via_let_else"), "missing `let-else` caller; got {names:?}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn search_and_read_chunk_attach_bounded_graph_evidence() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);

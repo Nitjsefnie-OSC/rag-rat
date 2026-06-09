@@ -939,20 +939,40 @@ fn keep_literal_github_refs_if_present(value: &mut Value) {
 }
 
 fn compact_graph_coverage(value: &mut Value, include_coverage: bool) {
-    if include_coverage {
-        return;
-    }
     let Some(report) = value.as_object_mut() else {
         return;
     };
-    let Some(coverage) = report.remove("coverage").and_then(|value| value.as_object().cloned())
-    else {
+    let (parser_failures, stale_files, known_gaps) = report
+        .get("coverage")
+        .and_then(Value::as_object)
+        .map(|coverage| {
+            (
+                coverage.get("parser_failures").and_then(Value::as_u64).unwrap_or_default(),
+                coverage.get("stale_files").and_then(Value::as_u64).unwrap_or_default(),
+                coverage.get("known_index_gaps").and_then(Value::as_array).map_or(0, Vec::len),
+            )
+        })
+        .unwrap_or_default();
+
+    // A stale or partially-parsed index can hide caller/callee edges entirely, so a 0-result
+    // must not read as confident. Never report `low` completeness when coverage is degraded
+    // (issue #47: a stale index produced "0 callers, completeness_risk: low").
+    if (stale_files > 0 || parser_failures > 0 || known_gaps > 0)
+        && let Some(risk) = report
+            .get_mut("summary")
+            .and_then(Value::as_object_mut)
+            .and_then(|summary| summary.get_mut("completeness_risk"))
+        && risk.as_str() == Some("low")
+    {
+        *risk = Value::String("medium".to_string());
+    }
+
+    if include_coverage {
         return;
-    };
-    let parser_failures =
-        coverage.get("parser_failures").and_then(Value::as_u64).unwrap_or_default();
-    let stale_files = coverage.get("stale_files").and_then(Value::as_u64).unwrap_or_default();
-    let known_gaps = coverage.get("known_index_gaps").and_then(Value::as_array).map_or(0, Vec::len);
+    }
+    if report.remove("coverage").is_none() {
+        return;
+    }
     let mut warnings = Vec::new();
     if parser_failures > 0 {
         warnings.push(Value::String(format!(
@@ -1342,6 +1362,34 @@ mod tests {
     use super::*;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn degraded_coverage_escalates_low_completeness_risk() {
+        // issue #47: a stale/partial index can hide caller edges, so a 0-result must not read
+        // as confident. `low` is escalated to `medium` when coverage is degraded.
+        let mut stale = json!({
+            "summary": { "completeness_risk": "low", "returned_count": 0 },
+            "coverage": { "stale_files": 1, "parser_failures": 0, "known_index_gaps": [] },
+        });
+        compact_graph_coverage(&mut stale, true);
+        assert_eq!(stale["summary"]["completeness_risk"], "medium");
+
+        // Clean coverage leaves an honest `low` untouched.
+        let mut clean = json!({
+            "summary": { "completeness_risk": "low" },
+            "coverage": { "stale_files": 0, "parser_failures": 0, "known_index_gaps": [] },
+        });
+        compact_graph_coverage(&mut clean, true);
+        assert_eq!(clean["summary"]["completeness_risk"], "low");
+
+        // A medium/high risk is never downgraded by this path.
+        let mut high = json!({
+            "summary": { "completeness_risk": "high" },
+            "coverage": { "stale_files": 3, "parser_failures": 0, "known_index_gaps": [] },
+        });
+        compact_graph_coverage(&mut high, true);
+        assert_eq!(high["summary"]["completeness_risk"], "high");
+    }
 
     #[test]
     fn list_tools_exposes_complete_typed_schemas() {
