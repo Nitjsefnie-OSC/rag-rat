@@ -178,12 +178,14 @@ impl RankedHit {
     }
 
     fn finish(mut self, explain: bool, vector_available: bool) -> SearchHit {
-        self.hit.score = self.components.bm25
-            + self.components.vector
-            + self.components.symbol
-            + self.components.graph
-            + self.components.git
-            + self.components.github;
+        self.hit.score = crate::query::round_score(
+            self.components.bm25
+                + self.components.vector
+                + self.components.symbol
+                + self.components.graph
+                + self.components.git
+                + self.components.github,
+        );
         if explain {
             if !vector_available {
                 self.components.vector_note =

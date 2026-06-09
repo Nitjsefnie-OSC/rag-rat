@@ -2351,12 +2351,14 @@ impl IndexDatabase {
         }
         for (key, members) in groups {
             let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
+            let logical_symbol_id = key.stable_id();
             self.storage.connection().execute(
                 "
-                INSERT INTO logical_symbols(language, path, logical_name, qualified_name, kind, variant_count, group_reason)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, kind, variant_count, group_reason)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ",
                 params![
+                    logical_symbol_id,
                     key.language,
                     key.path,
                     key.name,
@@ -2366,7 +2368,6 @@ impl IndexDatabase {
                     group_reason,
                 ],
             )?;
-            let logical_symbol_id = self.storage.connection().last_insert_rowid();
             for member in members {
                 let signature_hash =
                     member.signature.as_deref().map(|signature| hex_sha256(signature.as_bytes()));
@@ -2997,6 +2998,10 @@ struct LogicalSymbolKey {
     name: String,
     qualified_name: String,
     kind: String,
+    // Signature is part of the identity so that two distinct same-named symbols in one file (e.g.
+    // `new` on two different impls — same `qualified_name`, different signatures) do NOT collapse
+    // into one logical symbol. Genuine cfg variants share a signature, so they still group.
+    signature: Option<String>,
 }
 
 impl LogicalSymbolKey {
@@ -3007,7 +3012,29 @@ impl LogicalSymbolKey {
             name: row.name.clone(),
             qualified_name: row.qualified_name.clone(),
             kind: row.kind.clone(),
+            signature: row.signature.clone(),
         }
+    }
+
+    /// Deterministic logical-symbol id derived from the key, so it is **stable across reindex**
+    /// (the table is fully rebuilt each pass; an autoincrement rowid would churn the id every
+    /// time, breaking any cached id or logical-symbol-bound memory). A 63-bit truncation of the
+    /// key's SHA-256 — collisions are astronomically unlikely across a repo's symbols, and a
+    /// collision would surface as a loud primary-key error on rebuild rather than silent merging.
+    fn stable_id(&self) -> i64 {
+        let canonical = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            self.language,
+            self.path,
+            self.name,
+            self.qualified_name,
+            self.kind,
+            self.signature.as_deref().unwrap_or(""),
+        );
+        let digest = Sha256::digest(canonical.as_bytes());
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        (u64::from_be_bytes(bytes) >> 1) as i64
     }
 }
 
@@ -3070,8 +3097,8 @@ fn is_likely_false_positive_graph_only(
         return true;
     }
     edge.resolution == "target_name_fallback"
-        || edge.confidence == "NameOnly"
-        || edge.confidence == "Ambiguous"
+        || edge.confidence == "name_only"
+        || edge.confidence == "ambiguous"
         || !edge.verified_target_symbol
 }
 
@@ -4805,7 +4832,8 @@ int main(void)
             + components.graph
             + components.git
             + components.github;
-        assert!((hits[0].score - component_sum).abs() < 0.000_001);
+        // `score` is rounded to 4dp for display, so compare against the rounded component sum.
+        assert!((hits[0].score - crate::query::round_score(component_sum)).abs() < 1e-9);
         assert!(components.bm25 > 0.0);
         assert!(components.vector > 0.0);
         assert!(components.vector_note.is_none());
@@ -5253,6 +5281,71 @@ pub struct Database;
     }
 
     #[test]
+    fn distinct_same_named_methods_do_not_merge_and_logical_ids_are_stable() {
+        // Two `new` on different impls share a `qualified_name` (`…lib.rs::new`) but differ in
+        // signature — they must NOT collapse into one "cfg_variant" logical symbol. And the
+        // logical id must be stable across a reindex (it is content-derived, not an autoincrement).
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            r#"
+pub struct A;
+pub struct B;
+
+impl A {
+    pub fn new(name: String) -> Self { A }
+}
+
+impl B {
+    pub fn new(count: usize, flag: bool) -> Self { B }
+}
+"#,
+        )
+        .unwrap();
+        let config = source_config(root.clone(), Language::Rust);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let selector = crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("new".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        };
+        let lookup = db.symbol_candidates(&selector).unwrap();
+        let new_candidates: Vec<_> =
+            lookup.candidates.iter().filter(|candidate| candidate.name == "new").collect();
+        assert_eq!(new_candidates.len(), 2, "both constructors present: {new_candidates:?}");
+        let logical_ids: std::collections::BTreeSet<i64> =
+            new_candidates.iter().filter_map(|candidate| candidate.logical_symbol_id).collect();
+        assert_eq!(logical_ids.len(), 2, "distinct signatures get distinct logical ids");
+        for candidate in &new_candidates {
+            assert_eq!(
+                candidate.logical_group_reason.as_deref(),
+                Some("single"),
+                "differently-signed methods are not cfg variants: {candidate:?}"
+            );
+        }
+
+        // Reindex and confirm the logical ids are unchanged (content-derived, not churned).
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let relookup = db.symbol_candidates(&selector).unwrap();
+        let reindexed_ids: std::collections::BTreeSet<i64> = relookup
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.name == "new")
+            .filter_map(|candidate| candidate.logical_symbol_id)
+            .collect();
+        assert_eq!(reindexed_ids, logical_ids, "logical ids must be stable across reindex");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn logical_symbol_exact_mode_covers_duplicate_rust_variants() {
         let root = unique_temp_root();
         let _ = fs::remove_dir_all(&root);
@@ -5418,7 +5511,7 @@ export const callRun = () => run();
         assert!(
             callees.iter().any(|edge| {
                 edge.to_symbol.as_deref().is_some_and(|name| name.ends_with("run"))
-                    && edge.confidence == "Syntactic"
+                    && edge.confidence == "syntactic"
             }),
             "callRun callees: {callees:?}"
         );

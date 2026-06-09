@@ -12,12 +12,17 @@ pub struct RepoMemory {
     pub body: String,
     pub confidence: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub source: String,
+    // Internal anchoring/dedup mechanics — never actionable for a reader, so kept off the wire.
+    #[serde(skip_serializing)]
     pub source_text_hash: Option<String>,
+    #[serde(skip_serializing)]
     pub input_hash: Option<String>,
+    #[serde(skip_serializing)]
     pub memory_version: String,
     pub bindings: Vec<RepoMemoryBinding>,
     pub call_paths: Vec<RepoMemoryCallPath>,
@@ -29,16 +34,27 @@ pub struct RepoMemoryBinding {
     pub memory_id: String,
     pub binding_kind: String,
     pub binding_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logical_symbol_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub edge_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub github_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub github_repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub github_number: Option<i64>,
     pub anchor_status: String,
     pub created_at_ms: i64,
@@ -47,7 +63,9 @@ pub struct RepoMemoryBinding {
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoMemoryCallPath {
     pub memory_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub start_logical_symbol_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: String,
     pub path_summary: String,

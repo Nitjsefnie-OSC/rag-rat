@@ -283,10 +283,12 @@ back to unsafe bare-name matching.
 
 The MCP surface includes:
 
-- `semantic_search`: indexed source/docs recall with SQLite BM25 lexical search and stale-hit
-  validation
+- `semantic_search`: indexed source/docs recall. `score` blends BM25 lexical rank with vector
+  cosine similarity when an embedding model is installed (BM25-only otherwise); `explain=true`
+  returns the per-component breakdown. Hits are validated against current source.
 - `symbol_lookup`: exact or fuzzy Rust/TypeScript/Kotlin/C/C++ symbol lookup
-- `find_callers` and `trace_callees`: reverse/forward graph traversal
+- `find_callers` and `trace_callees`: reverse/forward graph traversal (unresolved std/common-method
+  noise filtered by default)
 - `compare_graph_to_text`: graph caller edges compared against regex text hits
 - `impact_surface`: coding preflight that combines graph, optional text fallback, docs, git,
   GitHub papertrail, tests, and repo memories
@@ -297,9 +299,10 @@ The MCP surface includes:
 - `docs_for_symbol`: documentation chunks related to a symbol
 - `read_chunk`: current text for a selected chunk with anchor validation
 
-The name `semantic_search` is historical: the current supported MCP behavior is lexical BM25 recall
-plus freshness checks. Local embedding infrastructure exists, but vector recall should be treated as
-model/artifact-dependent rather than guaranteed.
+`semantic_search` ranking is hybrid: BM25 lexical recall plus vector cosine similarity, blended into
+one `score`, with stale-hit validation. Vector recall is model-dependent — it contributes only when
+a local embedding model is installed (see `local_ai_status`), and the tool degrades to BM25-only
+otherwise. Pass `explain=true` to see the BM25/vector/symbol/graph/git/github score components.
 
 ### Git And GitHub Evidence
 
@@ -335,11 +338,13 @@ Reference discovery supports common issue forms such as `Fixes #123`, `GH-123`,
 
 `ffi_surface` finds likely FFI-relevant rows with evidence classes:
 
-- Rust UniFFI/exported items
-- native binding references
-- generated binding artifacts
+- Rust UniFFI/exported items (`#[uniffi::export]` and exported impl members, via parsed symbol
+  facts)
+- generated binding artifacts (detected by path, e.g. `**/generated/**`)
 
-This is a discovery/preflight tool, not a proof of ABI compatibility.
+Detection is generic: it keys on language-level export attributes and generated paths, not on any
+project-specific symbol names. This is a discovery/preflight tool, not a proof of ABI compatibility,
+and it is empty in repos without FFI.
 
 ### Local AI Artifacts
 
@@ -441,8 +446,9 @@ lean automatically; run `rag-rat gc` to prune on demand.
   with `[watch] enabled = false` or `RAG_RAT_NO_WATCH=1`). One watcher per worktree and one writer
   at a time per index are enforced with file locks; file locks are unreliable on NFS / WSL2 `/mnt`
   mounts.
-- `semantic_search` is currently best understood as lexical BM25 recall plus freshness checks unless
-  a real embedding model is installed and reconciled.
+- `semantic_search` blends BM25 lexical recall with vector cosine similarity; the vector component
+  contributes only when a real embedding model is installed and reconciled, and the tool degrades to
+  BM25-only otherwise.
 - `repo_brief` is a compact file-level triage view. It does not replace direct file reads,
   `impact_surface`, or tests before refactoring.
 - `repo_clusters` is a file-level heuristic. It highlights co-changing and graph-related code, but

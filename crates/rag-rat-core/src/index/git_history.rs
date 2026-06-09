@@ -256,7 +256,7 @@ pub fn commit_search(
 }
 
 fn positive_rank_score(rank: usize) -> f64 {
-    1.0 / ((rank + 1) as f64).sqrt()
+    crate::query::round_score(1.0 / ((rank + 1) as f64).sqrt())
 }
 
 pub fn history_for_path(

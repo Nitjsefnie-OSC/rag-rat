@@ -553,7 +553,14 @@ fn rust_edges(
                     },
                 ));
             }
-            if let Some(receiver) = scoped_receiver_name(node, text) {
+            // A scoped call receiver is a type reference only when it names a type. By Rust
+            // convention types are PascalCase, while module paths (`std::env::…`) and method
+            // receivers on locals (`p.as_os_str()`) are snake_case — emitting those as
+            // `references_type` produced bogus "types" like `std` and `p`. Gate on an
+            // uppercase-leading receiver so `Foo::bar()` still records a type reference.
+            if let Some(receiver) = scoped_receiver_name(node, text)
+                && receiver.chars().next().is_some_and(char::is_uppercase)
+            {
                 out.push(symbol_edge(
                     symbols,
                     node,

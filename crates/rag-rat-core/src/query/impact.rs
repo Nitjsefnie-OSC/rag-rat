@@ -322,24 +322,19 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
               AND impls.kind = 'impl'
         ),
         binding_refs AS (
+            -- Generated/binding artifacts detected by path. Detection is generic on purpose:
+            -- matching specific native-symbol substrings in chunk text was project-specific and
+            -- self-matched any source that merely mentions those names (e.g. this query). The
+            -- `#[uniffi::export]` symbol facts above are the principled, language-level signal.
             SELECT DISTINCT
                    files.path AS path,
                    files.language AS language,
                    files.kind AS kind,
                    chunks.symbol_path AS symbol,
-                   CASE
-                       WHEN chunks.text LIKE '%NativeHeldCore%'
-                         OR chunks.text LIKE '%uniffi_held_core_%'
-                         OR chunks.text LIKE '%ffi_held_core_%'
-                           THEN 'native_binding_reference'
-                       ELSE 'generated_binding_artifact'
-                   END AS reason
+                   'generated_binding_artifact' AS reason
             FROM files
             JOIN chunks ON chunks.file_id = files.id
-            WHERE chunks.text LIKE '%NativeHeldCore%'
-               OR chunks.text LIKE '%uniffi_held_core_%'
-               OR chunks.text LIKE '%ffi_held_core_%'
-               OR files.path LIKE '%/src/generated/%'
+            WHERE files.path LIKE '%/src/generated/%'
                OR files.path LIKE '%/generated/%'
                OR files.path LIKE '%generated-manifest.json'
         )

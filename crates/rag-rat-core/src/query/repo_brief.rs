@@ -208,7 +208,7 @@ fn candidate_for(
     let category = category_for(mode, row, &metrics).to_string();
     let why = why_for(mode, row, &metrics, include_memories);
     let split_hints = split_hints_for(mode, row, &metrics);
-    let next_tools = next_tools_for(mode, row, include_memories);
+    let next_tools = next_tools_for(row, include_memories);
 
     RepoBriefCandidate {
         path: row.path.clone(),
@@ -283,7 +283,7 @@ fn score_for(mode: RepoBriefMode, row: &FileBriefRow) -> f64 {
     };
 
     let score = if row.generated { score * 0.25 } else { score };
-    score * support_path_multiplier(mode, &row.path)
+    super::round_score(score * support_path_multiplier(mode, &row.path))
 }
 
 fn capped(value: f64) -> f64 {
@@ -448,11 +448,10 @@ fn split_hints_for(
     hints
 }
 
-fn next_tools_for(
-    mode: RepoBriefMode,
-    row: &FileBriefRow,
-    include_memories: bool,
-) -> Vec<RepoBriefNextTool> {
+fn next_tools_for(row: &FileBriefRow, include_memories: bool) -> Vec<RepoBriefNextTool> {
+    // Suggest path-native tools only. `semantic_search` takes a concept query, not a path, so it
+    // was misleading here; `impact_surface` text-falls-back on a path and surfaces graph, git,
+    // papertrail, and the memories crossing it — the right orientation before editing.
     let mut tools = vec![
         next_tool(
             "git_history_for_path",
@@ -460,18 +459,11 @@ fn next_tools_for(
             [("path", row.path.clone())],
         ),
         next_tool(
-            "semantic_search",
-            "search within the candidate path before editing",
+            "impact_surface",
+            "inspect graph, git, papertrail, and repo memories crossing this path",
             [("query", row.path.clone())],
         ),
     ];
-    if matches!(mode, RepoBriefMode::GodModules | RepoBriefMode::RefactorCandidates) {
-        tools.push(next_tool(
-            "impact_surface",
-            "check graph, docs, git, and papertrail before splitting",
-            [("query", row.path.clone())],
-        ));
-    }
     if include_memories && (row.memories.active > 0 || row.memories.stale > 0) {
         tools.push(next_tool(
             "memory_for_path",

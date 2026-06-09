@@ -382,6 +382,7 @@ pub fn traverse_with_options(
         let callsite_path: String = row.get("callsite_path")?;
         let callsite_start = row.get("callsite_start_line")?;
         let callsite_end = row.get("callsite_end_line")?;
+        let confidence = normalize_confidence(&confidence).to_string();
         Ok(GraphHop {
             edge_id: row.get("edge_id")?,
             from_symbol: row.get("from_symbol")?,
@@ -525,12 +526,30 @@ fn count_col(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     Ok(u64::try_from(value).unwrap_or(0))
 }
 
+/// Normalize a raw DB edge-confidence value (`Exact`/`Syntactic`/`NameOnly`/`Ambiguous`) to the
+/// snake_case form used everywhere in tool output, so graph traversal, read_chunk, and search all
+/// serialize confidence identically.
+pub(crate) fn normalize_confidence(value: &str) -> &'static str {
+    match value {
+        "Exact" => "exact",
+        "Syntactic" => "syntactic",
+        "NameOnly" => "name_only",
+        "Ambiguous" => "ambiguous",
+        _ => "name_only",
+    }
+}
+
 fn false_positive_risk(summary: &GraphTraversalSummary, mode: GraphResolutionMode) -> &'static str {
+    // Risk reflects whether the *returned* edges could be wrong, not the mode alone. Syntactic is
+    // the default mode, so charging it "medium" unconditionally mislabels results where every edge
+    // resolved to a verified target symbol (the common, trustworthy case). Only bump for syntactic
+    // mode when some matching edge was NOT verified against the target.
+    let has_unverified = summary.exact_verified < summary.total_matching_edges;
     if summary.ambiguous > 0 || mode == GraphResolutionMode::Fuzzy {
         "high"
     } else if summary.name_only > 0
         || summary.unresolved > 0
-        || mode == GraphResolutionMode::Syntactic
+        || (mode == GraphResolutionMode::Syntactic && has_unverified)
     {
         "medium"
     } else {

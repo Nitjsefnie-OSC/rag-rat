@@ -5,7 +5,6 @@ use serde::Serialize;
 
 use crate::{query::ReadChunk, search::lexical::SearchHit};
 
-const CALL_EDGE_KINDS: &[&str] = &["calls_name", "constructs", "uses_macro"];
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +253,24 @@ fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u6
 }
 
 fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
-    count_edges_for_symbol(conn, symbol_id, CALL_EDGE_KINDS)
+    // Mirror the filter in `callees()` so `callee_count` (and thus the `truncated` flag) reflects
+    // the callees actually surfaced — not the unresolved name-only std calls we hide.
+    let count = conn.query_row(
+        "
+        SELECT COUNT(DISTINCT COALESCE(CAST(to_symbol_id AS TEXT), to_name))
+        FROM edges
+        WHERE from_symbol_id = ?1
+          AND edge_kind IN ('calls_name', 'constructs', 'uses_macro')
+          AND (
+              edge_kind != 'calls_name'
+              OR to_symbol_id IS NOT NULL
+              OR (confidence = 'Syntactic' AND target_qualified_name IS NOT NULL)
+          )
+        ",
+        [symbol_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 fn count_imports(conn: &Connection, chunk_id: i64) -> anyhow::Result<u64> {
@@ -396,6 +412,14 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
           AND source_symbols.start_byte < source_chunks.end_byte
         WHERE edges.from_symbol_id = ?1
           AND edges.edge_kind IN ('calls_name', 'constructs', 'uses_macro')
+          -- Drop unresolved name-only calls (`.map()`, `.var_os()`, std combinators): they
+          -- resolve to nothing in-repo and are pure noise in a chunk's callee summary. Keep
+          -- resolved calls and syntactically-resolvable ones, plus constructs/macros.
+          AND (
+              edges.edge_kind != 'calls_name'
+              OR edges.to_symbol_id IS NOT NULL
+              OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+          )
         ORDER BY
           CASE edges.confidence
             WHEN 'Exact' THEN 0
@@ -508,13 +532,7 @@ fn symbol_path(path: &str, qualified_name: &str) -> String {
 }
 
 fn confidence(value: &str) -> &'static str {
-    match value {
-        "Exact" => "exact",
-        "Syntactic" => "syntactic",
-        "NameOnly" => "name_only",
-        "Ambiguous" => "ambiguous",
-        _ => "name_only",
-    }
+    crate::query::graph::normalize_confidence(value)
 }
 
 fn quoted(values: &[&str]) -> String {

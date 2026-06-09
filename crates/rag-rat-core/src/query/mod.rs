@@ -9,6 +9,12 @@ pub mod symbol;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
+/// Round a relevance/weight score to 4 decimal places for serialization — enough precision to
+/// preserve ranking, without leaking float noise like `0.7071067811865475` into tool output.
+pub(crate) fn round_score(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReadChunk {
     pub chunk_id: i64,

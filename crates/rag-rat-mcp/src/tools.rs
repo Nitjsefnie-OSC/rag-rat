@@ -711,13 +711,28 @@ fn call_tool_with_db(db: &IndexDatabase, name: &str, arguments: Value) -> anyhow
             }
             value
         },
-        "local_ai_status" => json!(db.local_ai_status()?),
+        "local_ai_status" => {
+            let mut value = json!(db.local_ai_status()?);
+            // `fastembed` re-states the same counts as `embedding` plus backend diagnostics; keep
+            // the canonical `embedding` capability/state block and the `artifacts` coverage block.
+            remove_object_key(&mut value, "fastembed");
+            value
+        },
         "heal_index" => {
             let args: HealIndexArgs = serde_json::from_value(arguments)?;
             json!(db.heal_index(args.limit)?)
         },
         "github_sync_status" => json!(db.github_sync_status()?),
-        "index_status" => json!(db.status(db.database_path())?),
+        "index_status" => {
+            let mut value = json!(db.status(db.database_path())?);
+            // The full migration ledger is static detail (use the CLI `doctor`/`migrate` for it),
+            // and the embedded local_ai block duplicates the `local_ai_status` tool.
+            if let Some(schema) = value.get_mut("schema") {
+                remove_object_key(schema, "migrations");
+            }
+            remove_object_key(&mut value, "local_ai");
+            value
+        },
         "memory_create" => {
             let args: MemoryCreateArgs = serde_json::from_value(arguments)?;
             json!(db.memory_create(args.core())?)
@@ -919,6 +934,14 @@ fn compare_graph_to_text_tool(
 fn strip_fallback_github_evidence(value: &mut Value) {
     if let Value::Object(map) = value {
         map.remove("fallback_github_evidence");
+    }
+}
+
+/// Drop a top-level object key from a JSON value, if present. Used to trim verbose/redundant
+/// sub-blocks from status tool output without touching the shared core status structs.
+fn remove_object_key(value: &mut Value, key: &str) {
+    if let Value::Object(map) = value {
+        map.remove(key);
     }
 }
 
@@ -1178,59 +1201,135 @@ fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<SymbolSelecto
 pub fn description(name: &str) -> &'static str {
     match name {
         "semantic_search" => {
-            "Search indexed source and docs with SQLite BM25 lexical recall; validates stale hits."
+            "Search indexed source and docs. `score` is a blended relevance score combining BM25 \
+             lexical rank and (when an embedding model is installed) vector cosine similarity; \
+             pass explain=true for the per-component breakdown. Hits are validated against current \
+             source. Falls back to BM25-only when no embedding model is present."
         },
-        "symbol_lookup" => "Find exact or fuzzy Rust, TypeScript, Kotlin, C, or C++ symbols.",
-        "find_callers" => "Traverse tree-sitter-derived reverse graph edges for callers.",
-        "trace_callees" => "Traverse tree-sitter-derived forward graph edges for callees.",
+        "symbol_lookup" => {
+            "Resolve a symbol name (or symbol_path/id) to its definition(s) in Rust, TypeScript, \
+             Kotlin, C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
+             logical-symbol grouping (cfg variants), and any bound repo memories. Use to \
+             disambiguate before a graph or read call."
+        },
+        "find_callers" => {
+            "Find what calls a symbol (reverse call graph), instead of grepping for call sites. \
+             Returns call sites with confidence + target verification, a completeness / \
+             false-positive risk summary, and repo memories crossing the call path. Resolve the \
+             symbol with symbol_lookup first when a name is ambiguous."
+        },
+        "trace_callees" => {
+            "Find what a symbol calls (forward call graph). Same evidence shape as find_callers; \
+             unresolved std/common-method noise is filtered out by default (toggle with \
+             include_common_methods / include_unresolved)."
+        },
         "compare_graph_to_text" => {
-            "Compare graph caller edges for a symbol against regex text hits in indexed source."
+            "Cross-check a symbol's graph caller edges against a regex text search of indexed \
+             source — surfaces call sites the tree-sitter graph missed and flags likely false \
+             edges. Use when you suspect graph coverage gaps."
         },
         "impact_surface" => {
-            "Graph-backed coding preflight with structural, textual fallback, and papertrail evidence."
+            "Pre-edit blast radius for a symbol or path: graph callers/callees, tests, docs, git \
+             history, GitHub papertrail, and the repo memories crossing it, with a completeness / \
+             risk summary. Run this before changing anything non-trivial."
         },
         "repo_brief" => {
-            "Orientation-first repo brief with spine, churn, god-module, and refactor-candidate modes."
+            "Orientation for an unfamiliar repo: ranked files by mode — spine (central coupling), \
+             churn, god_modules, or refactor_candidates — with size/coupling/churn/memory signals \
+             and suggested next tools. Start here when you don't know the codebase."
         },
         "repo_clusters" => {
-            "Cheap file-level ownership clusters using path proximity, graph edges, and git co-touches."
+            "Map the repo into ownership clusters from path proximity, graph edges, and git \
+             co-touch — a cheap overview of subsystems and their representative files."
         },
-        "ffi_surface" => "Find UniFFI/export/generated-binding/call-site candidates.",
-        "docs_for_symbol" => "Find docs chunks related to a symbol.",
-        "read_chunk" => "Read current text for one selected chunk ID with anchor validation.",
-        "commit_search" => "Search historical git commit subjects and bodies.",
-        "git_history_for_path" => "Return historical commits that touched one current path.",
+        "ffi_surface" => {
+            "Find the FFI surface: #[uniffi::export] items, exported impl members, and generated \
+             binding artifacts (detected by path). Empty in repos without FFI."
+        },
+        "docs_for_symbol" => {
+            "Find documentation related to a symbol — markdown chunks and doc comments, preferring \
+             local context before broad docs."
+        },
+        "read_chunk" => {
+            "Read the current source text for one chunk id, validated against HEAD (relocates or \
+             flags stale/gone), with compact call-graph context and bound repo memories. Use to \
+             read exact text after a search returns a chunk_id."
+        },
+        "commit_search" => {
+            "Full-text search over historical commit subjects and bodies — find when/why \
+             something changed by keyword."
+        },
+        "git_history_for_path" => {
+            "List commits that touched a current path, newest first, with additions/deletions and \
+             subjects."
+        },
         "git_history_for_symbol" => {
-            "Resolve a current symbol, then return historical commits touching its path."
+            "Resolve a symbol, then list commits touching its file — symbol-scoped history without \
+             needing the path."
         },
         "commits_touching_query" => {
-            "Combine commit-message and current file-change evidence for a query."
+            "Combine commit-message matches with current file-change evidence for a query — \
+             \"what work relates to X?\" across both messages and the files that changed."
         },
-        "git_blame_chunk" => "Compute lazy hash-bound git blame summary for one current chunk.",
-        "papertrail_for_chunk" => "Return current chunk context plus cached GitHub rationale.",
-        "papertrail_for_symbol" => "Return current symbol context plus cached GitHub rationale.",
-        "papertrail_for_commit" => "Return cached GitHub rationale related to a historical commit.",
-        "github_issue_search" => "Search cached GitHub issue and PR text.",
-        "github_refs_for_path" => "List discovered GitHub references for one current path.",
-        "rationale_search" => "Search cached GitHub rationale snippets.",
-        "local_ai_status" => "Report explicit local AI capability and artifact status.",
-        "heal_index" => "Repair stale already-indexed files and refresh SQLite FTS.",
-        "github_sync_status" => "Report local GitHub papertrail cache status.",
+        "git_blame_chunk" => {
+            "Hash-bound git blame for one chunk: who last touched its lines, computed lazily and \
+             cached against the chunk hash."
+        },
+        "papertrail_for_chunk" => {
+            "The 'why' behind a chunk: its current text plus the cached GitHub issues/PRs/reviews \
+             that reference it."
+        },
+        "papertrail_for_symbol" => {
+            "Resolve a symbol, then return its current context plus the cached GitHub rationale \
+             (issues/PRs/reviews) referencing it."
+        },
+        "papertrail_for_commit" => {
+            "Cached GitHub issues/PRs/reviews related to a historical commit."
+        },
+        "github_issue_search" => "Full-text search across cached GitHub issue and PR titles and bodies.",
+        "github_refs_for_path" => {
+            "List cached GitHub issues/PRs discovered to reference a current path."
+        },
+        "rationale_search" => {
+            "Search cached GitHub rationale snippets (review comments, PR/issue discussion) by \
+             keyword."
+        },
+        "local_ai_status" => {
+            "On-device embedding status: model, install state, and how many chunks are embedded / \
+             missing / skipped."
+        },
+        "heal_index" => {
+            "Re-index stale already-indexed files and refresh FTS — repair when reads report \
+             drift. Writes only to the index, never to source."
+        },
+        "github_sync_status" => {
+            "GitHub papertrail cache status: counts of issues, PRs, comments, and refs, plus last \
+             sync time."
+        },
         "index_status" => {
-            "Report SQLite index freshness, git metadata, parser failures, and file counts."
+            "Index freshness vs HEAD: git/indexed head, per-language file counts, parser failures, \
+             FTS sync state, and schema version."
         },
         "memory_create" => {
-            "Create a source-anchored repo memory bound to a symbol, chunk, path, commit, or GitHub ref."
+            "Record a durable, source-anchored repo memory (Invariant / Decision / Risk / \
+             BugPattern / …) bound to a symbol, chunk, path, edge/call-path, commit, or GitHub \
+             ref — so the rationale resurfaces for the next agent editing that code. Capture \
+             non-obvious invariants and decisions as you discover them."
         },
-        "memory_update" => "Update typed repo-memory text, status, confidence, kind, or tags.",
-        "memory_search" => "Search active or stale repo memories with deterministic FTS recall.",
-        "memory_for_symbol" => "Return repo memories bound to a selected symbol or logical symbol.",
-        "memory_for_path" => "Return repo memories bound to one current repository path.",
-        "memory_for_call_path" => "Return repo memories bound to one call-path edge sequence hash.",
+        "memory_update" => "Update a repo memory's text, status, confidence, kind, or tags by id.",
+        "memory_search" => "Full-text search across active (or stale) repo memories by keyword.",
+        "memory_for_symbol" => "Return repo memories bound to a symbol (or its logical-symbol group).",
+        "memory_for_path" => "Return repo memories bound to a path.",
+        "memory_for_call_path" => {
+            "Return repo memories bound to a specific call-path edge sequence."
+        },
         "memory_validate" => {
-            "Validate repo-memory anchors and mark current, relocated, stale, or gone."
+            "Re-anchor every repo memory against current source and mark each current / relocated \
+             / stale / gone. Runs automatically after indexing."
         },
-        "memory_mark_obsolete" => "Mark a repo memory obsolete without deleting its audit trail.",
+        "memory_mark_obsolete" => {
+            "Mark a repo memory obsolete — kept for audit, hidden from active recall."
+        },
         _ => "Unknown tool.",
     }
 }
@@ -1329,7 +1428,10 @@ fn default_min_cluster_size() -> u32 {
 }
 
 fn default_read_chunk_graph_mode() -> McpGraphMode {
-    McpGraphMode::Full
+    // Compact by default: callers/callees summaries without the full imports + referenced-types
+    // dump (pass `include_graph: "full"` when you need them). Keeps a chunk read focused on the
+    // text plus high-signal graph context.
+    McpGraphMode::Compact
 }
 
 fn default_read_chunk_graph_limit() -> u32 {
@@ -1605,7 +1707,13 @@ mod tests {
         let status = call_tool(&config.database, "index_status", json!({})).unwrap();
         assert!(status["database"].as_str().unwrap().ends_with("index.sqlite"));
         assert_eq!(status["fts_fresh"], true);
-        assert!(status["local_ai"].is_object());
+        // index_status trims the embedded local_ai block (use local_ai_status) and the static
+        // migration ledger (use the CLI doctor/migrate).
+        assert!(status.get("local_ai").is_none(), "local_ai should not be embedded in index_status");
+        assert!(
+            status["schema"].get("migrations").is_none(),
+            "migration ledger should be trimmed from index_status"
+        );
 
         let papertrail = call_tool(
             &config.database,

@@ -451,14 +451,14 @@ fn file_representative_score(row: &FileBriefRow) -> f64 {
 }
 
 fn cluster_score(metrics: &RepoClusterMetrics, avg_edge_score: f64) -> f64 {
-    capped(
+    super::round_score(capped(
         avg_edge_score * 0.35
             + capped(metrics.file_count as f64 / 12.0) * 0.12
             + capped((metrics.fan_in + metrics.fan_out) as f64 / 100.0) * 0.18
             + capped(metrics.commit_touch_count as f64 / 60.0) * 0.15
             + capped(metrics.total_symbols as f64 / 120.0) * 0.12
             + capped((metrics.co_touch_edges + metrics.graph_edges) as f64 / 20.0) * 0.08,
-    )
+    ))
 }
 
 fn cluster_category(metrics: &RepoClusterMetrics) -> &'static str {
