@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -769,10 +769,16 @@ pub fn reconcile_with_options_progress(
         batch_size,
     });
 
-    // Each eligible chunk is processed at most once per run. Without this, --force (which
-    // skips the needs_embedding filter in select_reconcile_batch) keeps re-selecting
-    // already-embedded chunks, so the batch never empties and the loop runs forever when no
-    // --limit / --max-seconds bound is set.
+    // Ordered candidate ids fetched ONCE (ids only, need-first). The loop walks them with a cursor
+    // and loads text per batch, so each chunk's text is read at most once — see
+    // `embedding_candidate_ids`. The processed set guards against a chunk being revisited (e.g.
+    // under --force, whose ordering does not reflect embedding state).
+    let candidate_ids = embedding_candidate_ids(
+        conn,
+        if options.force { "" } else { scan.model_id },
+        options.changed_first,
+    )?;
+    let mut cursor = 0usize;
     let mut processed_ids: HashSet<i64> = HashSet::new();
     let mut remaining = options.limit.map(u64::from);
     loop {
@@ -789,11 +795,25 @@ pub fn reconcile_with_options_progress(
         }
         let batch_limit = remaining
             .map(|value| value.min(u64::try_from(batch_size).unwrap_or(u64::MAX)))
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(u32::try_from(batch_size).unwrap_or(u32::MAX));
-        let selected = select_reconcile_batch(conn, &scan, batch_limit, &options, &processed_ids)?;
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(batch_size);
+        // Pull the next batch of unprocessed candidate ids.
+        let mut batch_ids = Vec::with_capacity(batch_limit);
+        while cursor < candidate_ids.len() && batch_ids.len() < batch_limit {
+            let id = candidate_ids[cursor];
+            cursor += 1;
+            if !processed_ids.contains(&id) {
+                batch_ids.push(id);
+            }
+        }
+        if batch_ids.is_empty() {
+            break; // candidate list exhausted
+        }
+        let selected = select_reconcile_batch(conn, &scan, &batch_ids, &options)?;
         if selected.jobs.is_empty() {
-            break;
+            // Every id in this batch was filtered (ineligible/already current); keep walking the
+            // rest of the candidate list rather than stopping.
+            continue;
         }
         for job in &selected.jobs {
             processed_ids.insert(job.id);
@@ -1328,6 +1348,92 @@ fn embedding_job_candidates(
     Ok(chunks)
 }
 
+/// Ordered candidate chunk ids for one reconcile run, fetched ONCE (ids only, no text), need-first
+/// exactly like `embedding_job_candidates`. The loop walks this list in batches and loads text per
+/// batch via [`current_chunks_by_ids`], so each chunk's text is read at most once per run. The old
+/// path re-queried *every* candidate's text on *every* batch — O(n²) SQLite work that dominated
+/// reconcile on large repos (it looked like model time but was query/row-materialization CPU).
+fn embedding_candidate_ids(
+    conn: &Connection,
+    model_id: &str,
+    changed_first: bool,
+) -> anyhow::Result<Vec<i64>> {
+    let changed_order = if changed_first {
+        "chunks.source_revision DESC,"
+    } else {
+        "chunks.embedding_priority ASC,"
+    };
+    let sql = format!(
+        "
+        SELECT chunks.id
+        FROM chunks
+        JOIN files ON files.id = chunks.file_id
+        LEFT JOIN chunk_embeddings
+          ON chunk_embeddings.chunk_id = chunks.id
+         AND chunk_embeddings.model_id = ?1
+        WHERE chunks.text IS NOT NULL
+        ORDER BY
+          CASE
+            WHEN chunk_embeddings.chunk_id IS NULL THEN 0
+            WHEN chunk_embeddings.source_text_hash != chunks.text_hash THEN 1
+            WHEN chunk_embeddings.status = 'Failed' THEN 2
+            ELSE 3
+          END,
+          {changed_order}
+          chunks.id
+        "
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let ids = stmt
+        .query_map(params![model_id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Load full chunk rows (with text + embedding metadata) for a specific set of ids, in the given
+/// order. Used per batch so only the chunks about to be considered are materialized.
+fn current_chunks_by_ids(
+    conn: &Connection,
+    model_id: &str,
+    ids: &[i64],
+) -> anyhow::Result<Vec<CurrentChunk>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "
+        SELECT chunks.id, files.path, files.language, files.kind, chunks.chunk_kind,
+               chunks.symbol_path, chunks.text, chunks.text_hash,
+               chunk_embeddings.status, chunk_embeddings.source_text_hash,
+               chunk_embeddings.model_version, chunk_embeddings.embedding_dim,
+               chunk_embeddings.input_hash, chunk_embeddings.embedding_text_version,
+               chunk_embeddings.next_retry_after_ms
+        FROM chunks
+        JOIN files ON files.id = chunks.file_id
+        LEFT JOIN chunk_embeddings
+          ON chunk_embeddings.chunk_id = chunks.id
+         AND chunk_embeddings.model_id = ?1
+        WHERE chunks.id IN ({placeholders})
+        "
+    );
+    let mut bind: Vec<Value> = Vec::with_capacity(ids.len() + 1);
+    bind.push(Value::Text(model_id.to_string()));
+    bind.extend(ids.iter().map(|id| Value::Integer(*id)));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(bind), current_chunk_row)?;
+    let mut by_id: std::collections::HashMap<i64, CurrentChunk> =
+        collect_rows(rows)?.into_iter().map(|chunk| (chunk.id, chunk)).collect();
+    // Mirror embedding_job_candidates: a non-empty model_id means this is a real (non-force) run,
+    // so the default reason is Missing (the precise reason is recomputed in select_reconcile_batch).
+    if !model_id.is_empty() {
+        for chunk in by_id.values_mut() {
+            chunk.reason = ReconcileReason::Missing;
+        }
+    }
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+}
+
 impl CurrentChunk {
     fn reason(
         &self,
@@ -1409,35 +1515,21 @@ fn estimated_reconcile_jobs(
     Ok(u64::try_from(count).unwrap_or(u64::MAX))
 }
 
+/// Build the embedding jobs for one batch of candidate ids. Text is loaded only for `ids` (the
+/// current batch), then the per-chunk policy and freshness filters are applied — the single source
+/// of truth for "does this chunk need embedding" stays in Rust ([`needs_embedding`]).
 fn select_reconcile_batch(
     conn: &Connection,
     scan: &EmbeddingScan<'_>,
-    limit: u32,
+    ids: &[i64],
     options: &ReconcileOptions,
-    processed: &HashSet<i64>,
 ) -> anyhow::Result<SelectedBatch> {
-    let scan_limit = options.limit.unwrap_or(100_000).max(limit);
-    let candidates = if options.force {
-        current_chunks(conn, Some(scan_limit))?
-    } else {
-        embedding_job_candidates(
-            conn,
-            scan.model_id,
-            scan.model_version,
-            scan.dim,
-            Some(scan_limit),
-            options.changed_first,
-        )?
-    };
+    // Under --force the candidate ordering does not reflect embedding state, so the empty model_id
+    // (matching no chunk_embeddings) keeps every chunk's reason as Forced.
+    let model_id = if options.force { "" } else { scan.model_id };
+    let candidates = current_chunks_by_ids(conn, model_id, ids)?;
     let mut jobs = Vec::new();
     for candidate in candidates {
-        // Skip chunks already handled this run. Under --force the candidate ordering does
-        // not reflect embedding state (current_chunks queries with an empty model_id), so
-        // without this the scan returns the same leading chunks every iteration and the run
-        // either spins forever or stops after one batch depending on the batch size.
-        if processed.contains(&candidate.id) {
-            continue;
-        }
         let policy = policy_for_job(&candidate, scan.max_embedding_chars);
         if !policy.eligible {
             continue;
@@ -1470,9 +1562,6 @@ fn select_reconcile_batch(
             priority: policy.priority,
             reason,
         });
-        if jobs.len() >= usize::try_from(limit).unwrap_or(usize::MAX) {
-            break;
-        }
     }
     Ok(SelectedBatch { jobs })
 }
