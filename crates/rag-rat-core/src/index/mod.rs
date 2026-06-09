@@ -322,17 +322,17 @@ impl IndexDatabase {
         db.set_context(&commit_sha, &worktree_id)?;
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
-        // RAM-first bulk build: a full rebuild is one big atomic write, so trade per-write
-        // durability for speed — keep the rollback journal in memory (so ROLLBACK still works and
-        // an interrupted rebuild can't corrupt the index), skip fsyncs, and avoid the WAL
-        // double-write (pages → -wal → checkpoint) by writing pages once. Restored to WAL/NORMAL
-        // after the rebuild closes its transaction. Only `rebuild` uses this; incremental indexing
-        // and the watcher stay on durable WAL.
-        // NB: do NOT touch `temp_store` here — changing it drops all existing temp tables, which
-        // would wipe the `connection_context` overlay table created by `set_context` above.
+        // RAM-first bulk build: a full rebuild is one big atomic write, so skip per-commit fsyncs
+        // (synchronous=OFF) and give SQLite a large page cache. Restored to NORMAL after the
+        // rebuild. Only `rebuild` uses this; incremental indexing and the watcher stay durable.
+        //
+        // NB: stay in WAL — switching journal_mode needs an EXCLUSIVE database lock, which fails
+        // ("database is locked") whenever another connection is open (e.g. the watcher, or a
+        // concurrent reader). `synchronous` and `cache_size` are per-connection and safe under
+        // concurrency. Also do NOT touch `temp_store` — changing it drops the connection_context
+        // overlay temp table created by `set_context` above.
         db.storage.execute_batch(
             "PRAGMA synchronous = OFF;
-             PRAGMA journal_mode = MEMORY;
              PRAGMA cache_size = -262144;",
         )?;
         let result = (|| -> anyhow::Result<()> {
@@ -366,11 +366,9 @@ impl IndexDatabase {
             }
             let _ = db.storage.execute_batch("ROLLBACK");
         }
-        // Restore durable settings now that the rebuild transaction has closed (journal_mode can
-        // only change outside a transaction). cache_size is left bumped — harmless for the short
-        // remaining lifetime of this connection (e.g. the reconcile that follows `init`).
-        let _ =
-            db.storage.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+        // Restore durable fsync behavior for any later writes on this connection (reconcile, etc.).
+        // cache_size is left bumped — harmless for the short remaining lifetime of the connection.
+        let _ = db.storage.execute_batch("PRAGMA synchronous = NORMAL;");
         result?;
         Ok(db)
     }
@@ -2281,24 +2279,15 @@ impl IndexDatabase {
     }
 
     fn rebuild_logical_symbols(&self) -> anyhow::Result<()> {
+        // The insert below re-derives the COMPLETE logical-symbol table from all current symbols,
+        // so clear it entirely first. A member-join "rebuild set" misses logical_symbols whose
+        // members were cascade-deleted with their symbols (clear_full_rebuild_tables deletes
+        // files → symbols → logical_symbol_members via FK, but logical_symbols has no such FK).
+        // Those orphans would then collide with the deterministic stable id on re-insert.
         self.storage.connection().execute_batch(
             "
-            CREATE TEMP TABLE IF NOT EXISTS logical_symbols_to_rebuild(id INTEGER PRIMARY KEY);
-            DELETE FROM temp.logical_symbols_to_rebuild;
-            INSERT OR IGNORE INTO temp.logical_symbols_to_rebuild(id)
-            SELECT logical_symbol_members.logical_symbol_id
-            FROM main.logical_symbol_members
-            JOIN main.symbols ON symbols.id = logical_symbol_members.symbol_id
-            JOIN files ON files.id = symbols.file_id;
-            DELETE FROM main.logical_symbol_members
-            WHERE logical_symbol_id IN (
-                SELECT id FROM temp.logical_symbols_to_rebuild
-            );
-            DELETE FROM main.logical_symbols
-            WHERE id IN (
-                SELECT id FROM temp.logical_symbols_to_rebuild
-            );
-            DELETE FROM temp.logical_symbols_to_rebuild;
+            DELETE FROM main.logical_symbol_members;
+            DELETE FROM main.logical_symbols;
             ",
         )?;
 
