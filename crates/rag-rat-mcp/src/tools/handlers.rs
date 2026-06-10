@@ -170,6 +170,10 @@ pub(crate) fn call_tool_with_db(
             let args: MemoryCreateArgs = serde_json::from_value(arguments)?;
             json!(db.memory_create(args.core())?)
         },
+        "memory_rebind" => {
+            let args: MemoryRebindArgs = serde_json::from_value(arguments)?;
+            json!(db.memory_rebind(&args.memory_id, args.bind.into())?)
+        },
         "memory_update" => {
             let args: MemoryUpdateArgs = serde_json::from_value(arguments)?;
             json!(db.memory_update(args.core())?)

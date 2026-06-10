@@ -155,6 +155,104 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
         }
     }))
 }
+pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
+    let Some(subcommand) = args.get(1).map(String::as_str) else {
+        anyhow::bail!("memory command needs a subcommand (rebind)");
+    };
+    match subcommand {
+        "rebind" => {
+            let Some(memory_id) = args.get(2).cloned() else {
+                anyhow::bail!("memory rebind needs a <memory_id>");
+            };
+            let db = IndexDatabase::open_config(config)?;
+            let bind = if let Some(symbol_name) = option_value(args, "--symbol") {
+                let selector = rag_rat_core::query::symbol::SymbolSelector {
+                    logical_symbol_id: None,
+                    symbol_id: None,
+                    symbol_path: None,
+                    symbol: Some(symbol_name.clone()),
+                    language: None,
+                    allow_ambiguous: false,
+                    limit: 10,
+                };
+                match db.select_symbol(&selector)? {
+                    Ok(Some(hit)) => rag_rat_core::query::memory::RepoMemoryBindTarget {
+                        symbol_id: Some(hit.symbol_id),
+                        logical_symbol_id: hit.logical_symbol_id,
+                        chunk_id: None,
+                        edge_id: None,
+                        path: None,
+                        start_line: None,
+                        end_line: None,
+                        commit_hash: None,
+                        github_owner: None,
+                        github_repo: None,
+                        github_number: None,
+                        start_logical_symbol_id: None,
+                        end_logical_symbol_id: None,
+                        edge_sequence_hash: None,
+                        path_summary: None,
+                    },
+                    Ok(None) => anyhow::bail!("symbol `{symbol_name}` not found"),
+                    Err(disambiguation) => anyhow::bail!(
+                        "symbol `{symbol_name}` is ambiguous — candidates: {}",
+                        disambiguation
+                            .candidates
+                            .iter()
+                            .map(|c| c.qualified_name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            } else if let Some(path) = option_value(args, "--path") {
+                rag_rat_core::query::memory::RepoMemoryBindTarget {
+                    symbol_id: None,
+                    logical_symbol_id: None,
+                    chunk_id: None,
+                    edge_id: None,
+                    path: Some(path),
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
+                }
+            } else if let Some(chunk_id_str) = option_value(args, "--chunk") {
+                let chunk_id: i64 = chunk_id_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--chunk value must be an integer"))?;
+                rag_rat_core::query::memory::RepoMemoryBindTarget {
+                    symbol_id: None,
+                    logical_symbol_id: None,
+                    chunk_id: Some(chunk_id),
+                    edge_id: None,
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
+                }
+            } else {
+                anyhow::bail!(
+                    "memory rebind needs one of --symbol <name>, --path <path>, or --chunk <id>"
+                );
+            };
+            print_json(&db.memory_rebind(&memory_id, bind)?)
+        },
+        other => anyhow::bail!("unknown memory subcommand `{other}`"),
+    }
+}
 pub(crate) fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let Some(subcommand) = args.get(1).map(String::as_str) else {
         anyhow::bail!("github command needs a subcommand");

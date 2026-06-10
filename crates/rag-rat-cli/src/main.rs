@@ -115,6 +115,9 @@ fn main() -> anyhow::Result<()> {
         "mcp" => {
             tokio::runtime::Runtime::new()?.block_on(rag_rat_mcp::server::run_stdio(config))?;
         },
+        "memory" => {
+            memory(&config, &args)?;
+        },
         "github" => {
             github(&config, &args)?;
         },
@@ -192,7 +195,7 @@ pub(crate) struct GitPaths {
 
 fn usage() {
     eprintln!(
-        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|github|hooks|claude-hook|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
+        "usage: rag-rat <init|index|doctor|migrate|query|brief|clusters|mcp|memory|github|hooks|claude-hook|maintenance|models|reconcile|gc|eval|dump-config> [--config <path>] [query]\n\
          default config: rag-rat.toml\n\
          examples:\n\
          rag-rat init\n\
@@ -203,6 +206,9 @@ fn usage() {
          rag-rat index --full\n\
          rag-rat index --watch\n\
          rag-rat migrate --check\n\
+         rag-rat memory rebind <memory_id> --symbol <name>\n\
+         rag-rat memory rebind <memory_id> --path <path>\n\
+         rag-rat memory rebind <memory_id> --chunk <chunk_id>\n\
          rag-rat github sync --from-refs\n\
          rag-rat hooks install\n\
          rag-rat hooks status\n\

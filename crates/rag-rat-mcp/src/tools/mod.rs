@@ -151,6 +151,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "github_sync_status",
     "index_status",
     "memory_create",
+    "memory_rebind",
     "memory_update",
     "memory_search",
     "memory_for_symbol",
@@ -462,6 +463,12 @@ pub struct MemoryCreateArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryRebindArgs {
+    pub memory_id: String,
+    pub bind: MemoryBindArgs,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryUpdateArgs {
     pub memory_id: String,
     pub kind: Option<McpMemoryKind>,
@@ -717,6 +724,11 @@ pub fn description(name: &str) -> &'static str {
              BugPattern / …) bound to a symbol, chunk, path, edge/call-path, commit, or GitHub ref \
              — so the rationale resurfaces for the next agent editing that code. Capture \
              non-obvious invariants and decisions as you discover them.",
+        "memory_rebind" =>
+            "Re-anchor an existing repo memory to a different symbol, chunk, path, or other \
+             source location — use this after a symbol moves or is renamed rather than \
+             obsoleting and recreating the memory. Replaces the binding and refreshes the \
+             source_text_hash so the memory stays current.",
         "memory_update" => "Update a repo memory's text, status, confidence, kind, or tags by id.",
         "memory_search" => "Full-text search across active (or stale) repo memories by keyword.",
         "memory_for_symbol" =>
@@ -755,6 +767,7 @@ pub fn schema(name: &str) -> Value {
         "papertrail_for_commit" => schema_for::<PapertrailCommitArgs>(),
         "heal_index" => schema_for::<HealIndexArgs>(),
         "memory_create" => schema_for::<MemoryCreateArgs>(),
+        "memory_rebind" => schema_for::<MemoryRebindArgs>(),
         "memory_update" => schema_for::<MemoryUpdateArgs>(),
         "memory_search" => schema_for::<MemorySearchArgs>(),
         "memory_for_symbol" => schema_for::<MemoryForSymbolArgs>(),
