@@ -5970,3 +5970,37 @@ fn orientation_composes_read_only() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn orientation_composes_through_read_only_connection() {
+    // Regression guard: the production SessionStart path (claude_hook::session_start) opens the
+    // index via IndexConnection::open_read_only (SQLITE_OPEN_READ_ONLY on the main DB) and then
+    // runs orientation(), which CREATEs a TEMP table + TEMP VIEW.  A read-only main DB still
+    // permits writes to the TEMP database, so this must succeed — prove it here.
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    for name in &["x.rs", "y.rs", "z.rs"] {
+        fs::write(root.join("src/a").join(name), "pub fn ax() {}\n").unwrap();
+        fs::write(root.join("src/b").join(name), "pub fn bx() {}\n").unwrap();
+    }
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let db_path = db.database_path().to_path_buf();
+    // Drop the writable handle so the read-only open is the only live connection.
+    drop(db);
+
+    // Open the SAME on-disk DB read-only, exactly as session_start does.
+    let conn = IndexConnection::open_read_only(&db_path).unwrap();
+    let o = crate::query::orientation::orientation(conn.connection(), &root)
+        .expect("orientation must compose through a read-only main-DB connection");
+
+    // The scope view (TEMP table/view) was created and queried — non-empty tree + 6 files.
+    assert!(!o.tree.nodes.is_empty(), "tree.nodes empty through read-only conn");
+    assert_eq!(o.total_files, 6, "total_files mismatch through read-only conn");
+
+    fs::remove_dir_all(root).unwrap();
+}

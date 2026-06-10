@@ -353,7 +353,7 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
     }
 
     // LAYOUT — directory tree.
-    out.push_str("LAYOUT  (‹…› = directory memory)\n");
+    out.push_str(&format!("LAYOUT  ({} files · ‹…› = directory memory)\n", o.total_files));
     for node in &o.tree.nodes {
         let indent = "  ".repeat(node.depth as usize);
         if let Some(ref title) = node.memory_title {
@@ -710,7 +710,11 @@ mod tests {
             0,
         );
         let s = format_digest(&o, true, true);
-        assert!(s.contains("LAYOUT"), "missing LAYOUT header");
+        // LAYOUT header renders the scoped file count (make_orientation sets total_files = 42).
+        assert!(
+            s.contains("LAYOUT  (42 files · ‹…› = directory memory)"),
+            "LAYOUT header missing file count; got:\n{s}"
+        );
         // depth-0 node: no indentation.
         assert!(s.contains("\nsrc\n"), "depth-0 node should not be indented");
         // depth-1 node with memory: indented 2 spaces + label + title.
