@@ -35,7 +35,17 @@ impl IndexDatabase {
         };
         let row = self.file_row(path)?;
         let full_path = root.join(path);
-        let text = fs::read_to_string(&full_path)?;
+        let text = match fs::read_to_string(&full_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File deleted on disk since indexing — drop it from the index rather than
+                // hard-erroring the whole search. The caller (search_with_heal) re-runs
+                // search without it. Mirrors read_chunk_current's deletion handling.
+                self.mark_file_deleted(path)?;
+                return Ok(());
+            },
+            Err(e) => return Err(e.into()),
+        };
 
         let changes = git_changed_paths(root).unwrap_or_default();
         let is_dirty = changes.changed.contains(path);

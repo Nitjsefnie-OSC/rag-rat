@@ -762,7 +762,23 @@ mod tests {
     #[test]
     fn eval_suite_reports_search_quality_and_current_source_safety() {
         let root = fixture_root();
-        let config = Config::load(root.join("rag-rat.toml")).unwrap();
+        let mut config = Config::load(root.join("rag-rat.toml")).unwrap();
+        // The fixture lives INSIDE this git repo, so the fixture's relative `database`
+        // path resolves through shared_db_base to the enclosing repo's own self-index
+        // (<repo>/.rag-rat/index.sqlite). Left alone, the test would both clobber the
+        // live self-index and break: config.root (the fixture) would no longer match
+        // the indexed content (rag-rat's real source). Redirect the DB to a unique temp
+        // path while keeping config.root on the fixture so its source files resolve.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut db_dir = std::env::temp_dir();
+        db_dir.push(format!(
+            "rag-rat-eval-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        config.database = db_dir.join("index.sqlite");
+
         IndexDatabase::rebuild(&config).unwrap();
         let report = run(&config, &EvalOptions {
             queries_path: workspace_root().join("evals/queries.toml"),
@@ -773,6 +789,9 @@ mod tests {
         assert_eq!(report.metrics.stale_current_source_violations, 0);
         assert!(report.metrics.mrr_at_10 > 0.0);
         assert!(report.metrics.recall_at_10 > 0.0);
+
+        // Best-effort cleanup; do not fail the test on cleanup error.
+        let _ = std::fs::remove_dir_all(&db_dir);
     }
 
     fn workspace_root() -> PathBuf {

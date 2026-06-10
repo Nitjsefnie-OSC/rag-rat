@@ -3244,6 +3244,33 @@ fn search_returns_needs_reindex_when_heal_cap_is_exceeded() {
 }
 
 #[test]
+fn search_drops_deleted_file_instead_of_erroring() {
+    // Invariant: when a search hit references a source file that was deleted on disk
+    // since indexing, heal_file treats the missing file as a DELETION (mark_file_deleted)
+    // rather than propagating a raw ENOENT. search_with_heal then re-searches without it,
+    // so search returns Ok with the surviving file only — never Err(NotFound).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("keep.md"), "shared marker token\n").unwrap();
+    fs::write(docs.join("drop.md"), "shared marker token\n").unwrap();
+    let config = markdown_config_for_root(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let initial = db.search("marker", 10, false).unwrap();
+    assert_eq!(initial.len(), 2);
+
+    fs::remove_file(docs.join("drop.md")).unwrap();
+
+    let hits = db.search("marker", 10, false).unwrap();
+    assert!(hits.iter().all(|hit| !hit.path.ends_with("drop.md")), "{hits:?}");
+    assert!(hits.iter().any(|hit| hit.path.ends_with("keep.md")), "{hits:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn heal_index_limit_does_not_warn_when_only_fresh_files_are_skipped() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
