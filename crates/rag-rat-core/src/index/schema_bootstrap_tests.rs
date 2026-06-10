@@ -5562,6 +5562,93 @@ fn dir_tree_builds_annotated_layout() {
     fs::remove_dir_all(root).unwrap();
 }
 
+// ─── Bug fix: children of collapsed node must use leaf labels ─────────────────
+
+#[test]
+fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
+    // Fixture:
+    //   top/          — single included child (mid), no direct files, no memory → collapses
+    //   top/mid/      — has two included children (x, y); files only in x/* and y/*
+    //   top/mid/x/    — 3 files (qualifies on its own)
+    //   top/mid/y/    — 3 files (qualifies on its own)
+    //
+    // After collapse: one displayed node anchored at `top` with label "top/mid" (relative to
+    // root display parent ""). Its children x and y must be labelled "x" and "y" (relative to
+    // the chain-end "top/mid"), NOT "mid/x" / "mid/y" (which would be wrong — relative to the
+    // anchor "top").
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("top/mid/x")).unwrap();
+    fs::create_dir_all(root.join("top/mid/y")).unwrap();
+    for name in &["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.join("top/mid/x").join(name), "pub fn fx() {}\n").unwrap();
+        fs::write(root.join("top/mid/y").join(name), "pub fn fy() {}\n").unwrap();
+    }
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from(".")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts { max_depth: 6, min_files: 3, max_nodes: 30 };
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    let node_labels: Vec<(&str, &str, u8)> = tree
+        .nodes
+        .iter()
+        .map(|n| (n.path.as_str(), n.label.as_str(), n.depth))
+        .collect();
+
+    // The collapsed node: anchor at "top", label "top/mid", depth 0.
+    let collapsed = tree
+        .nodes
+        .iter()
+        .find(|n| n.path == "top")
+        .unwrap_or_else(|| panic!("no collapsed node at 'top'; nodes: {node_labels:?}"));
+    assert_eq!(collapsed.label, "top/mid", "collapsed node label; nodes: {node_labels:?}");
+    let collapsed_depth = collapsed.depth;
+
+    // Children must be labelled by leaf segment only (not "mid/x" / "mid/y").
+    let x = tree
+        .nodes
+        .iter()
+        .find(|n| n.path == "top/mid/x")
+        .unwrap_or_else(|| panic!("no node for top/mid/x; nodes: {node_labels:?}"));
+    assert_eq!(x.label, "x", "top/mid/x label must be leaf 'x'; nodes: {node_labels:?}");
+    assert_eq!(
+        x.depth,
+        collapsed_depth + 1,
+        "top/mid/x depth must be parent+1; nodes: {node_labels:?}"
+    );
+
+    let y = tree
+        .nodes
+        .iter()
+        .find(|n| n.path == "top/mid/y")
+        .unwrap_or_else(|| panic!("no node for top/mid/y; nodes: {node_labels:?}"));
+    assert_eq!(y.label, "y", "top/mid/y label must be leaf 'y'; nodes: {node_labels:?}");
+    assert_eq!(
+        y.depth,
+        collapsed_depth + 1,
+        "top/mid/y depth must be parent+1; nodes: {node_labels:?}"
+    );
+
+    assert_eq!(tree.truncated, 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn table_count(db: &IndexDatabase, table: &str) -> i64 {
     db.storage
         .connection()

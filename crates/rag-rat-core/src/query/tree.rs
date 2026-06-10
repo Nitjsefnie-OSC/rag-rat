@@ -131,8 +131,13 @@ pub fn dir_tree(conn: &Connection, opts: &TreeOpts) -> anyhow::Result<DirTree> {
     // label_map: anchor dir path -> label string (path relative to displayed parent, computed
     // after collapse).
     let mut label_map: HashMap<String, String> = HashMap::new();
-    // display_parent_map: anchor dir path -> the path of its displayed parent (or "" for root).
+    // display_parent_map: anchor dir path -> the ANCHOR path of its displayed parent (or "" for
+    // root). Used by compute_display_depths which keys depths by anchor.
     let mut display_parent_map: HashMap<String, String> = HashMap::new();
+    // chain_end_map: anchor dir path -> chain-end path (deepest absorbed dir in the collapsed
+    // chain). For non-collapsed nodes anchor == chain-end. Used to compute relative labels for
+    // children: a child must strip the parent's chain-end prefix, not the anchor prefix.
+    let mut chain_end_map: HashMap<String, String> = HashMap::new();
 
     for dir in &included_vec {
         if absorbed.contains(dir) {
@@ -153,12 +158,20 @@ pub fn dir_tree(conn: &Connection, opts: &TreeOpts) -> anyhow::Result<DirTree> {
             chain_end = child.clone();
         }
         // Compute the displayed parent: the nearest non-absorbed ancestor of `dir` in the
-        // included set (after collapse, so also non-absorbed themselves).
-        let display_parent = displayed_parent(dir, &included_vec, &absorbed);
-        display_parent_map.insert(dir.clone(), display_parent.clone());
+        // included set (after collapse, so also non-absorbed themselves). Returns the anchor
+        // path of that ancestor (or "" for root-level nodes).
+        let display_parent_anchor = displayed_parent(dir, &included_vec, &absorbed);
+        display_parent_map.insert(dir.clone(), display_parent_anchor.clone());
+        chain_end_map.insert(dir.clone(), chain_end.clone());
 
-        // Compute label: `chain_end` path relative to the display parent's path.
-        let label = relative_label(&chain_end, &display_parent);
+        // Compute label: `chain_end` path relative to the display parent's CHAIN-END path.
+        // The display parent's chain-end is the deepest segment it absorbed; children must
+        // strip that prefix (not the anchor prefix) to get a single leaf label.
+        let display_parent_chain_end = chain_end_map
+            .get(&display_parent_anchor)
+            .cloned()
+            .unwrap_or_else(|| display_parent_anchor.clone());
+        let label = relative_label(&chain_end, &display_parent_chain_end);
         label_map.insert(dir.clone(), label);
     }
 
