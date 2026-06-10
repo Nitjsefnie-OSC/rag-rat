@@ -1294,4 +1294,8 @@ impl IndexDatabase {
     ) -> anyhow::Result<crate::query::memory::RepoMemoryValidationReport> {
         crate::query::memory::validate_memories(self.storage.connection())
     }
+
+    pub fn memory_doctor(&self) -> anyhow::Result<Vec<crate::query::memory::MemoryDoctorEntry>> {
+        crate::query::memory::doctor_report(self.storage.connection())
+    }
 }

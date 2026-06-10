@@ -157,9 +157,52 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
 }
 pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let Some(subcommand) = args.get(1).map(String::as_str) else {
-        anyhow::bail!("memory command needs a subcommand (rebind)");
+        anyhow::bail!("memory command needs a subcommand (doctor, rebind)");
     };
     match subcommand {
+        "doctor" => {
+            let db = IndexDatabase::open_config(config)?;
+            let entries = db.memory_doctor()?;
+            if has_flag(args, "--json") {
+                print_json(&entries)?;
+                let any_gone = entries.iter().any(|e| e.anchor_status == "gone");
+                if any_gone {
+                    anyhow::bail!("one or more memories have gone anchors");
+                }
+                return Ok(());
+            }
+            if entries.is_empty() {
+                eprintln!("All active memory anchors are current.");
+                return Ok(());
+            }
+            let mut any_gone = false;
+            for entry in &entries {
+                eprintln!("[{}] {} ({})", entry.anchor_status, entry.title, entry.memory_id);
+                eprintln!("  binding: {} {}", entry.binding_kind, entry.binding_id);
+                if entry.candidates.is_empty() {
+                    if entry.anchor_status == "gone" {
+                        eprintln!(
+                            "  -> code appears deleted; rag-rat memory mark-obsolete {}",
+                            entry.memory_id
+                        );
+                    }
+                } else {
+                    for candidate in &entry.candidates {
+                        eprintln!(
+                            "  rag-rat memory rebind {} --symbol {}",
+                            entry.memory_id, candidate
+                        );
+                    }
+                }
+                if entry.anchor_status == "gone" {
+                    any_gone = true;
+                }
+            }
+            if any_gone {
+                anyhow::bail!("one or more memories have gone anchors");
+            }
+            Ok(())
+        },
         "rebind" => {
             let Some(memory_id) = args.get(2).cloned() else {
                 anyhow::bail!("memory rebind needs a <memory_id>");
@@ -250,7 +293,7 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
             };
             print_json(&db.memory_rebind(&memory_id, bind)?)
         },
-        other => anyhow::bail!("unknown memory subcommand `{other}`"),
+        other => anyhow::bail!("unknown memory subcommand `{other}`; use doctor or rebind"),
     }
 }
 pub(crate) fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {

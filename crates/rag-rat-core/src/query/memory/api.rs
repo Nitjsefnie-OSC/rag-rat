@@ -389,6 +389,142 @@ pub(crate) fn rebind_memory(
         .ok_or_else(|| anyhow::anyhow!("rebound memory `{memory_id}` could not be read back"))
 }
 
+/// An active memory whose binding anchor is `gone` or `stale`, together with ranked live
+/// candidates that the user can rebind to.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryDoctorEntry {
+    pub memory_id: String,
+    pub title: String,
+    pub binding_kind: String,
+    pub binding_id: String,
+    pub anchor_status: String,
+    /// Qualified names of live same-name symbols, best matches first (kind + signature_hash
+    /// agreement ranks higher than bare-name-only hits).
+    pub candidates: Vec<String>,
+}
+
+/// Read-only report: active memories with `gone | stale` bindings plus live rebind candidates.
+///
+/// Invariant: this function is purely READ — it never writes to the database.
+pub(crate) fn doctor_report(conn: &Connection) -> anyhow::Result<Vec<MemoryDoctorEntry>> {
+    // Query bindings whose anchor_status is non-current, restricted to active memories.
+    // Mirrors the column list used by validate_memories / binding_row.
+    let mut stmt = conn.prepare(
+        "
+        SELECT b.memory_id, b.binding_kind, b.binding_id, b.path,
+               b.symbol_kind, b.signature_hash, b.anchor_status,
+               m.title
+        FROM repo_memory_bindings AS b
+        JOIN repo_memories AS m ON m.id = b.memory_id
+        WHERE m.status = 'active'
+          AND b.anchor_status IN ('gone', 'stale')
+        ORDER BY b.memory_id, b.binding_kind, b.binding_id
+        ",
+    )?;
+
+    struct RawRow {
+        memory_id: String,
+        binding_kind: String,
+        binding_id: String,
+        path: Option<String>,
+        symbol_kind: Option<String>,
+        signature_hash: Option<String>,
+        anchor_status: String,
+        title: String,
+    }
+
+    let rows = stmt.query_map([], |row| {
+        Ok(RawRow {
+            memory_id: row.get(0)?,
+            binding_kind: row.get(1)?,
+            binding_id: row.get(2)?,
+            path: row.get(3)?,
+            symbol_kind: row.get(4)?,
+            signature_hash: row.get(5)?,
+            anchor_status: row.get(6)?,
+            title: row.get(7)?,
+        })
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        let r = row?;
+        let candidates = live_symbol_candidates(
+            conn,
+            &r.binding_id,
+            r.path.as_deref(),
+            r.symbol_kind.as_deref(),
+            r.signature_hash.as_deref(),
+        );
+        entries.push(MemoryDoctorEntry {
+            memory_id: r.memory_id,
+            title: r.title,
+            binding_kind: r.binding_kind,
+            binding_id: r.binding_id,
+            anchor_status: r.anchor_status,
+            candidates,
+        });
+    }
+    Ok(entries)
+}
+
+/// Compute live candidate qualified_names for a non-current symbol/logical binding.
+/// For path/chunk/edge/commit/github bindings there are no computable candidates (empty).
+/// Candidates are ranked: same `symbol_kind` AND `signature_hash` match first, then
+/// same `symbol_kind` only, then bare-name-only hits last.
+fn live_symbol_candidates(
+    conn: &Connection,
+    binding_id: &str,
+    path: Option<&str>,
+    stored_kind: Option<&str>,
+    stored_sig: Option<&str>,
+) -> Vec<String> {
+    let short = short_symbol_name(binding_id, path);
+    // Run the same bare-name query as relocate_symbol_by_name, but WITHOUT the hash filter —
+    // we want all live symbols with this name, ranked by quality, not filtered by content.
+    let mut stmt = match conn.prepare(
+        "
+        SELECT symbols.qualified_name AS qualified_name,
+               symbols.kind           AS kind,
+               symbols.signature      AS signature
+        FROM symbols
+        JOIN files ON files.id = symbols.file_id
+        WHERE symbols.name = ?1
+        ORDER BY symbols.qualified_name
+        ",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([short], |row| {
+        Ok((
+            row.get::<_, String>("qualified_name")?,
+            row.get::<_, String>("kind")?,
+            row.get::<_, Option<String>>("signature")?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    // Collect with a rank so we can sort: 0 = best (kind+sig), 1 = kind only, 2 = name only.
+    let mut ranked: Vec<(u8, String)> = Vec::new();
+    for row in rows.flatten() {
+        let (qname, kind, signature) = row;
+        let sig_hash = signature.map(|s| hex_sha256(s.trim().as_bytes()));
+        let kind_match = stored_kind.is_some_and(|k| k == kind);
+        let sig_match = stored_sig.is_some() && sig_hash.as_deref() == stored_sig;
+        let rank = match (kind_match, sig_match) {
+            (true, true) => 0,
+            (true, false) => 1,
+            _ => 2,
+        };
+        ranked.push((rank, qname));
+    }
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    ranked.into_iter().map(|(_, qname)| qname).collect()
+}
+
 pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidationReport> {
     let mut stmt = conn.prepare(
         "

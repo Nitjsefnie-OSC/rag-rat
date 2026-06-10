@@ -4431,6 +4431,96 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
 }
 
 #[test]
+fn memory_doctor_lists_gone_and_suggests_candidates() {
+    // Bind a memory to `fn doctor_src` in a.rs. Delete a.rs and add `fn doctor_src` to b.rs
+    // with a different body (so content-hash relocation does NOT fire and the binding stays
+    // gone). Then call `memory_doctor`: the entry must appear with anchor_status == "gone"
+    // and a non-empty candidate list (the same-named fn in b.rs).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn doctor_src() -> u32 {\n    1\n}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let src_symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("doctor_src".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("doctor_src in a.rs");
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "doctor test memory".to_string(),
+        body: "This memory is bound to a symbol that will become gone.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(src_symbol.symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+        },
+    })
+    .unwrap();
+
+    // Remove a.rs and add b.rs with the same-named fn but a different body (hash mismatch
+    // intentional — content relocation must NOT fire, leaving the binding gone).
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn doctor_src() -> u32 {\n    99\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let validate_report = db.memory_validate().unwrap();
+    assert_eq!(
+        validate_report.gone, 1,
+        "binding must be gone after removing a.rs: {validate_report:?}"
+    );
+
+    // Now run memory_doctor and verify the entry is present with a candidate.
+    let entries = db.memory_doctor().unwrap();
+    assert_eq!(entries.len(), 1, "doctor should return exactly one entry: {entries:?}");
+    let entry = &entries[0];
+    assert_eq!(entry.title, "doctor test memory");
+    assert!(
+        entry.anchor_status == "gone" || entry.anchor_status == "stale",
+        "anchor_status should be gone or stale, got: {}",
+        entry.anchor_status
+    );
+    // The same-named fn in b.rs must appear as a candidate.
+    assert!(
+        !entry.candidates.is_empty(),
+        "doctor entry must have at least one candidate for the same-named fn in b.rs: {entry:?}"
+    );
+    assert!(
+        entry.candidates.iter().any(|c| c.contains("doctor_src")),
+        "candidate must contain 'doctor_src': {:?}",
+        entry.candidates
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn repo_brief_ranks_churn_and_god_module_candidates() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

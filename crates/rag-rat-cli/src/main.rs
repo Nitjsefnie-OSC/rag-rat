@@ -206,6 +206,8 @@ fn usage() {
          rag-rat index --full\n\
          rag-rat index --watch\n\
          rag-rat migrate --check\n\
+         rag-rat memory doctor\n\
+         rag-rat memory doctor --json\n\
          rag-rat memory rebind <memory_id> --symbol <name>\n\
          rag-rat memory rebind <memory_id> --path <path>\n\
          rag-rat memory rebind <memory_id> --chunk <chunk_id>\n\
