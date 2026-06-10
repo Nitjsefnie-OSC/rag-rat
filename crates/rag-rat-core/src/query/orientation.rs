@@ -3,6 +3,11 @@ use rusqlite::Connection;
 use crate::index::AnchorHealth;
 use crate::query::tree::DirTree;
 
+/// How many active non-dir memory titles are fetched and rendered in the digest.
+/// Single source of truth for the display cap — the `(+N more)` overflow note is
+/// computed against [`Orientation::active_memory_total`], not this cap.
+const MEMORY_TITLES_SHOWN: usize = 3;
+
 /// Flat, owned session-start digest — composed read-only from the indexed database.
 ///
 /// Invariant: `orientation` never writes to the database.  It installs the per-connection
@@ -19,8 +24,11 @@ pub struct Orientation {
     /// Empty when git history is not indexed.
     pub hot_files: Vec<String>,
     /// Titles of active repo memories that are NOT bound to a directory (i.e. not already
-    /// annotated in the tree), newest first, capped at 5.
+    /// annotated in the tree), newest first, capped at `MEMORY_TITLES_SHOWN` (3).
     pub active_memory_titles: Vec<String>,
+    /// Total count of active non-dir memories — used for the `(+N more)` overflow note;
+    /// may exceed `active_memory_titles.len()`.
+    pub active_memory_total: u32,
     /// HEAD commit hash reported by git (live).
     pub head: String,
     /// HEAD commit hash recorded in the git-history index.
@@ -55,8 +63,10 @@ pub fn orientation(conn: &Connection, root: &std::path::Path) -> anyhow::Result<
     let recent_commits = recent_commit_subjects(conn, 5)?;
     let hot_files = recently_changed_source_files(conn, 3)?;
 
-    // Step 5: active non-dir memory titles, newest first, capped at 5.
-    let active_memory_titles = active_non_dir_memory_titles(conn, 5)?;
+    // Step 5: active non-dir memory titles, newest first, capped at the display cap;
+    // plus the true total count for the overflow note.
+    let active_memory_titles = active_non_dir_memory_titles(conn, MEMORY_TITLES_SHOWN)?;
+    let active_memory_total = active_non_dir_memory_count(conn)?;
 
     // Step 6: git-history index status (live HEAD + indexed HEAD).
     let git_status = crate::index::git_history::status(conn, root)?;
@@ -76,6 +86,7 @@ pub fn orientation(conn: &Connection, root: &std::path::Path) -> anyhow::Result<
         recent_commits,
         hot_files,
         active_memory_titles,
+        active_memory_total,
         head,
         indexed_head,
         anchor,
@@ -185,6 +196,30 @@ fn active_non_dir_memory_titles(conn: &Connection, limit: usize) -> anyhow::Resu
         out.push(row?);
     }
     Ok(out)
+}
+
+/// READ: total count of active repo memories NOT bound to a directory.
+///
+/// Invariant: purely READ — no writes.  Uses the SAME predicate as
+/// [`active_non_dir_memory_titles`] (active + excludes `binding_kind='dir'`) so the
+/// `(+N more)` overflow note reflects the true total, not the truncated title list.
+fn active_non_dir_memory_count(conn: &Connection) -> anyhow::Result<u32> {
+    let count: i64 = conn.query_row(
+        "-- Total active memories not bound to a directory (mirrors the titles query).
+         -- Invariant: excludes binding_kind='dir' rows so the count matches what the
+         -- titles list draws from; only the LIMIT/ORDER differ.
+         SELECT COUNT(*)
+         FROM repo_memories AS m
+         WHERE m.status = 'active'
+           AND m.id NOT IN (
+               SELECT b.memory_id
+               FROM repo_memory_bindings AS b
+               WHERE b.binding_kind = 'dir'
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
 }
 
 /// READ: count of non-generated files in the active scope.

@@ -391,11 +391,11 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
         }
     }
 
-    // Active non-dir memory titles — capped at 3 with an overflow note.
+    // Active non-dir memory titles — the list is already truncated to the display cap by
+    // the query; the overflow note reflects the TRUE total, not the truncated list length.
     if !o.active_memory_titles.is_empty() {
-        let shown = &o.active_memory_titles[..o.active_memory_titles.len().min(3)];
-        let mut mem_line = shown.join(" · ");
-        let extra = o.active_memory_titles.len().saturating_sub(3);
+        let mut mem_line = o.active_memory_titles.join(" · ");
+        let extra = (o.active_memory_total as usize).saturating_sub(o.active_memory_titles.len());
         if extra > 0 {
             mem_line.push_str(&format!(" (+{extra} more)"));
         }
@@ -606,6 +606,9 @@ mod tests {
             load_bearing: load_bearing.into_iter().map(|(p, fi)| (p.to_string(), fi)).collect(),
             recent_commits: recent.into_iter().map(str::to_string).collect(),
             hot_files: hot.into_iter().map(str::to_string).collect(),
+            // Default the total to the shown-title count (no overflow). Tests exercising the
+            // `(+N more)` note override `active_memory_total` after construction.
+            active_memory_total: memory_titles.len() as u32,
             active_memory_titles: memory_titles.into_iter().map(str::to_string).collect(),
             head: head.to_string(),
             indexed_head: indexed_head.to_string(),
@@ -777,9 +780,11 @@ mod tests {
     }
 
     #[test]
-    fn format_digest_memories_capped_at_three() {
-        let titles: Vec<&str> = vec!["alpha", "beta", "gamma", "delta", "epsilon"];
-        let o = make_orientation(
+    fn format_digest_memories_overflow_uses_true_total() {
+        // The query truncates to 3 titles, but the repo has 9 active non-dir memories.
+        // The overflow note must report the honest remainder (9 - 3 = 6), not 5 - 3 = 2.
+        let titles: Vec<&str> = vec!["alpha", "beta", "gamma"];
+        let mut o = make_orientation(
             None,
             vec![],
             0,
@@ -792,16 +797,14 @@ mod tests {
             healthy_anchor(),
             0,
         );
+        o.active_memory_total = 9;
         let s = format_digest(&o, true, true);
-        // First 3 titles must appear.
+        // All 3 shown titles must appear.
         assert!(s.contains("alpha"), "first memory title missing");
         assert!(s.contains("beta"), "second memory title missing");
         assert!(s.contains("gamma"), "third memory title missing");
-        // Overflow note must be present (5 - 3 = 2 more).
-        assert!(s.contains("(+2 more)"), "overflow note missing; got:\n{s}");
-        // Titles beyond the first 3 must not appear directly.
-        assert!(!s.contains("delta"), "fourth title should not appear directly");
-        assert!(!s.contains("epsilon"), "fifth title should not appear directly");
+        // Overflow note reflects the true total (9 - 3 = 6 more).
+        assert!(s.contains("(+6 more)"), "overflow note must use true total; got:\n{s}");
     }
 
     #[test]
