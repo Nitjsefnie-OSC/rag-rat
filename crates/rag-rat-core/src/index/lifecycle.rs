@@ -79,44 +79,52 @@ impl IndexDatabase {
     pub fn set_context(&mut self, commit_sha: &str, worktree_id: &str) -> anyhow::Result<()> {
         self.active_commit_sha = commit_sha.to_string();
         self.active_worktree_id = worktree_id.to_string();
+        install_scope_view(self.storage.connection(), commit_sha, worktree_id)?;
+        Ok(())
+    }
+}
 
-        let conn = self.storage.connection();
-        conn.execute_batch(
-            "
+/// Installs the per-connection commit/worktree scoping view; callers query `files` afterward and
+/// see only the active context.
+pub(crate) fn install_scope_view(
+    conn: &rusqlite::Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
             CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);
         ",
-        )?;
+    )?;
 
-        let mut stmt = conn.prepare(
-            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)",
-        )?;
-        stmt.execute(params!["commit_sha", commit_sha])?;
-        stmt.execute(params!["worktree_id", worktree_id])?;
+    let mut stmt =
+        conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
+    stmt.execute(params!["commit_sha", commit_sha])?;
+    stmt.execute(params!["worktree_id", worktree_id])?;
 
-        conn.execute_batch(
-            "
+    conn.execute_batch(
+        "
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-             indexed_revision, commit_sha, worktree_id
+         indexed_revision, commit_sha, worktree_id
             FROM main.files
             WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-             'worktree_id') AND worktree_id != '' AND kind != 'deleted'
+         'worktree_id') AND worktree_id != '' AND kind != 'deleted'
             UNION ALL
             SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-             indexed_revision, commit_sha, worktree_id
+         indexed_revision, commit_sha, worktree_id
             FROM main.files
             WHERE commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
               AND commit_sha != ''
               AND path NOT IN (
-                  SELECT path FROM main.files 
+                  SELECT path FROM main.files
                   WHERE worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-             'worktree_id')
+         'worktree_id')
                     AND worktree_id != ''
               );
         ",
-        )?;
+    )?;
 
-        Ok(())
-    }
+    Ok(())
 }
