@@ -255,7 +255,9 @@ fn session_start(input: &HookInput) -> anyhow::Result<()> {
         return Ok(());
     }
     // Open read-only; compose the orientation; print the digest.
-    // Any error (locked, corrupt, etc.) ⇒ silent return.
+    // Any error (locked, corrupt, etc.) propagates via `?` to run_inner, which run() swallows
+    // (`let _ = run_inner()`) — so the hook stays silent and never blocks session start. Do NOT
+    // add error prints here: this branch's stdout is injected as model context.
     let conn = IndexConnection::open_read_only(&config.database)?;
     let root = Path::new(&input.cwd);
     let o = rag_rat_core::query::orientation::orientation(conn.connection(), root)?;
