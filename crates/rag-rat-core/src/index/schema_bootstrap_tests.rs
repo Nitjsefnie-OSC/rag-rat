@@ -5006,6 +5006,114 @@ fn dir_memory_validation_current_and_gone() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn list_memories_returns_summaries_and_filters_by_binding_kind() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn list_anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let dir_bind = |dir: Option<String>| crate::query::memory::RepoMemoryBindTarget {
+        logical_symbol_id: None,
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        path: None,
+        start_line: None,
+        end_line: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        start_logical_symbol_id: None,
+        end_logical_symbol_id: None,
+        edge_sequence_hash: None,
+        path_summary: None,
+        dir,
+    };
+    let path_bind = |path: String| crate::query::memory::RepoMemoryBindTarget {
+        logical_symbol_id: None,
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        path: Some(path),
+        start_line: None,
+        end_line: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        start_logical_symbol_id: None,
+        end_logical_symbol_id: None,
+        edge_sequence_hash: None,
+        path_summary: None,
+        dir: None,
+    };
+
+    // Create a dir-scoped memory.
+    let dir_result = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "src is the library root".to_string(),
+            body: "Core library lives under src/.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: dir_bind(Some("src".to_string())),
+        })
+        .unwrap();
+
+    // Create a path-scoped memory.
+    let path_result = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "lib.rs exports the public surface".to_string(),
+            body: "All public symbols are re-exported from lib.rs.".to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: path_bind("src/lib.rs".to_string()),
+        })
+        .unwrap();
+
+    let conn = db.storage.connection();
+
+    // list_memories(None) returns both memories.
+    let all = crate::query::memory::list_memories(conn, None).unwrap();
+    assert_eq!(all.len(), 2, "expected 2 summaries, got: {all:?}");
+
+    // The dir memory is present with correct summary fields.
+    let dir_summary = all.iter().find(|s| s.memory_id == dir_result.memory.memory_id).unwrap();
+    assert_eq!(dir_summary.kind, "Decision");
+    assert_eq!(dir_summary.title, "src is the library root");
+    assert_eq!(dir_summary.status, "active");
+    assert_eq!(dir_summary.binding_kind, "dir");
+    assert_eq!(dir_summary.binding_id, "src");
+
+    // The path memory is present with correct summary fields.
+    let path_summary = all.iter().find(|s| s.memory_id == path_result.memory.memory_id).unwrap();
+    assert_eq!(path_summary.kind, "Invariant");
+    assert_eq!(path_summary.binding_kind, "path");
+    assert_eq!(path_summary.binding_id, "src/lib.rs");
+
+    // list_memories(Some("dir")) returns only the dir-scoped memory.
+    let dir_only = crate::query::memory::list_memories(conn, Some("dir")).unwrap();
+    assert_eq!(dir_only.len(), 1, "expected 1 dir-kind summary, got: {dir_only:?}");
+    assert_eq!(dir_only[0].binding_kind, "dir");
+    assert_eq!(dir_only[0].memory_id, dir_result.memory.memory_id);
+
+    // list_memories(Some("path")) returns only the path-scoped memory.
+    let path_only = crate::query::memory::list_memories(conn, Some("path")).unwrap();
+    assert_eq!(path_only.len(), 1, "expected 1 path-kind summary, got: {path_only:?}");
+    assert_eq!(path_only[0].binding_kind, "path");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn table_count(db: &IndexDatabase, table: &str) -> i64 {
     db.storage
         .connection()

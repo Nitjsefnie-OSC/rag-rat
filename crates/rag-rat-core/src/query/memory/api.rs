@@ -389,6 +389,84 @@ pub(crate) fn rebind_memory(
         .ok_or_else(|| anyhow::anyhow!("rebound memory `{memory_id}` could not be read back"))
 }
 
+/// Flat summary of one repo memory — boundary DTO for the CLI `memory list` surface.
+///
+/// One row per memory; the binding fields reflect the first/primary binding row
+/// (ORDER BY binding_kind, binding_id LIMIT 1 per memory).
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySummary {
+    pub memory_id: String,
+    pub kind: String,
+    pub title: String,
+    pub status: String,
+    pub binding_kind: String,
+    pub binding_id: String,
+}
+
+/// Read-only list of active+stale memories, optionally filtered by binding_kind.
+///
+/// Invariant: purely READ — never writes to the database.
+/// Each memory appears once; the primary binding is the first row when bindings are
+/// ordered by (binding_kind, binding_id) — stable and deterministic.
+pub(crate) fn list_memories(
+    conn: &Connection,
+    kind: Option<&str>,
+) -> anyhow::Result<Vec<MemorySummary>> {
+    // Use a subquery to pick the first binding per memory (stable tie-break).
+    // The outer WHERE on m.status restricts to non-obsolete memories, matching
+    // the memory_search / memories_for_* convention.
+    let rows: Vec<MemorySummary> = if let Some(binding_kind) = kind {
+        let mut stmt = conn.prepare(
+            "
+            SELECT m.id AS memory_id, m.kind, m.title, m.status,
+                   b.binding_kind, b.binding_id
+            FROM repo_memories AS m
+            JOIN repo_memory_bindings AS b ON b.memory_id = m.id
+            WHERE m.status IN ('active', 'stale')
+              AND b.binding_kind = ?1
+              AND b.rowid = (
+                  SELECT b2.rowid FROM repo_memory_bindings AS b2
+                  WHERE b2.memory_id = m.id
+                  ORDER BY b2.binding_kind, b2.binding_id
+                  LIMIT 1
+              )
+            ORDER BY m.updated_at_ms DESC
+            ",
+        )?;
+        stmt.query_map([binding_kind], memory_summary_row)?.collect::<Result<_, _>>()?
+    } else {
+        let mut stmt = conn.prepare(
+            "
+            SELECT m.id AS memory_id, m.kind, m.title, m.status,
+                   b.binding_kind, b.binding_id
+            FROM repo_memories AS m
+            JOIN repo_memory_bindings AS b ON b.memory_id = m.id
+            WHERE m.status IN ('active', 'stale')
+              AND b.rowid = (
+                  SELECT b2.rowid FROM repo_memory_bindings AS b2
+                  WHERE b2.memory_id = m.id
+                  ORDER BY b2.binding_kind, b2.binding_id
+                  LIMIT 1
+              )
+            ORDER BY m.updated_at_ms DESC
+            ",
+        )?;
+        stmt.query_map([], memory_summary_row)?.collect::<Result<_, _>>()?
+    };
+    Ok(rows)
+}
+
+fn memory_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySummary> {
+    Ok(MemorySummary {
+        memory_id: row.get(0)?,
+        kind: row.get(1)?,
+        title: row.get(2)?,
+        status: row.get(3)?,
+        binding_kind: row.get(4)?,
+        binding_id: row.get(5)?,
+    })
+}
+
 /// An active memory whose binding anchor is `gone` or `stale`, together with ranked live
 /// candidates that the user can rebind to.
 #[derive(Debug, Clone, Serialize)]

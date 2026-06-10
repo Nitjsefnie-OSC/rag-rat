@@ -1306,4 +1306,21 @@ impl IndexDatabase {
     pub fn memory_doctor(&self) -> anyhow::Result<Vec<crate::query::memory::MemoryDoctorEntry>> {
         crate::query::memory::doctor_report(self.storage.connection())
     }
+
+    /// Read-only list of active+stale memories, optionally filtered by binding_kind.
+    /// `kind` filters by binding kind (e.g. `Some("dir")`); `None` returns all.
+    pub fn memory_list(
+        &self,
+        kind: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::query::memory::MemorySummary>> {
+        crate::query::memory::list_memories(self.storage.connection(), kind)
+    }
+
+    /// Fetch a single memory by id, returning `None` when not found.
+    pub fn memory_get(
+        &self,
+        memory_id: &str,
+    ) -> anyhow::Result<Option<crate::query::memory::RepoMemory>> {
+        crate::query::memory::memory_by_id(self.storage.connection(), memory_id)
+    }
 }

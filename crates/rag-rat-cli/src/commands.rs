@@ -164,7 +164,7 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
 }
 pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
     let Some(subcommand) = args.get(1).map(String::as_str) else {
-        anyhow::bail!("memory command needs a subcommand (doctor, rebind)");
+        anyhow::bail!("memory command needs a subcommand (list, show, doctor, rebind)");
     };
     match subcommand {
         "doctor" => {
@@ -303,7 +303,52 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
             };
             print_json(&db.memory_rebind(&memory_id, bind)?)
         },
-        other => anyhow::bail!("unknown memory subcommand `{other}`; use doctor or rebind"),
+        "list" => {
+            let kind = option_value(args, "--kind");
+            let db = IndexDatabase::open_config(config)?;
+            let summaries = db.memory_list(kind.as_deref())?;
+            if summaries.is_empty() {
+                eprintln!("No memories found.");
+                return Ok(());
+            }
+            for s in &summaries {
+                println!(
+                    "{}  [{}/{}]  {}  ({}:{})",
+                    s.memory_id,
+                    s.kind,
+                    s.status,
+                    s.title,
+                    s.binding_kind,
+                    s.binding_id
+                );
+            }
+            Ok(())
+        },
+        "show" => {
+            let Some(memory_id) = args.get(2).map(String::as_str) else {
+                anyhow::bail!("memory show needs a <memory_id>");
+            };
+            let db = IndexDatabase::open_config(config)?;
+            let Some(memory) = db.memory_get(memory_id)? else {
+                anyhow::bail!("memory `{memory_id}` not found");
+            };
+            println!("Title:      {}", memory.title);
+            println!("Kind:       {} / {} / {}", memory.kind, memory.status, memory.confidence);
+            println!();
+            println!("{}", memory.body);
+            if !memory.bindings.is_empty() {
+                println!();
+                println!("Bindings:");
+                for b in &memory.bindings {
+                    println!(
+                        "  {} {} [{}]",
+                        b.binding_kind, b.binding_id, b.anchor_status
+                    );
+                }
+            }
+            Ok(())
+        },
+        other => anyhow::bail!("unknown memory subcommand `{other}`; use list, show, doctor, or rebind"),
     }
 }
 pub(crate) fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {
