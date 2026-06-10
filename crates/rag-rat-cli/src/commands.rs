@@ -314,12 +314,7 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
             for s in &summaries {
                 println!(
                     "{}  [{}/{}]  {}  ({}:{})",
-                    s.memory_id,
-                    s.kind,
-                    s.status,
-                    s.title,
-                    s.binding_kind,
-                    s.binding_id
+                    s.memory_id, s.kind, s.status, s.title, s.binding_kind, s.binding_id
                 );
             }
             Ok(())
@@ -340,15 +335,13 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
                 println!();
                 println!("Bindings:");
                 for b in &memory.bindings {
-                    println!(
-                        "  {} {} [{}]",
-                        b.binding_kind, b.binding_id, b.anchor_status
-                    );
+                    println!("  {} {} [{}]", b.binding_kind, b.binding_id, b.anchor_status);
                 }
             }
             Ok(())
         },
-        other => anyhow::bail!("unknown memory subcommand `{other}`; use list, show, doctor, or rebind"),
+        other =>
+            anyhow::bail!("unknown memory subcommand `{other}`; use list, show, doctor, or rebind"),
     }
 }
 pub(crate) fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {

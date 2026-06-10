@@ -447,7 +447,8 @@ pub struct MemoryBindArgs {
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,
-    /// Directory path relative to the repo root (e.g. `"src/actors"`); empty string anchors to the repo root.
+    /// Directory path relative to the repo root (e.g. `"src/actors"`); empty string anchors to the
+    /// repo root.
     pub dir: Option<String>,
 }
 
