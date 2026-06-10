@@ -1,5 +1,15 @@
 use super::*;
 
+/// Identity of the file whose chunks are being inserted — passed from the caller (which just
+/// inserted the file row) so `insert_chunks` doesn't re-`SELECT` it per file (#57).
+struct ChunkInsertFile<'a> {
+    file_id: i64,
+    path: &'a str,
+    language: &'a str,
+    kind: &'a str,
+    source_revision: &'a str,
+}
+
 impl IndexDatabase {
     pub fn rebuild_fts(&self) -> anyhow::Result<()> {
         schema::rebuild_fts(self.storage.connection())?;
@@ -119,7 +129,17 @@ impl IndexDatabase {
             } else {
                 symbols::symbols_for_file(path, language, text)
             };
-        self.insert_chunks(file_id, &sha256, &chunks, text)?;
+        self.insert_chunks(
+            ChunkInsertFile {
+                file_id,
+                path: &path_string(path),
+                language: language.as_str(),
+                kind: kind.as_str(),
+                source_revision: &sha256,
+            },
+            &chunks,
+            text,
+        )?;
         self.insert_symbols(file_id, language, &symbols)?;
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
@@ -143,26 +163,44 @@ impl IndexDatabase {
         if let Some(message) = &prepared.parser_failure {
             self.insert_parser_failure(&file.relative_path, file.language, message)?;
         }
-        let file_id = self.storage.connection().query_row(
-            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             RETURNING id",
-            params![
-                path_string(&file.relative_path),
-                file.language.as_str(),
-                file.kind.as_str(),
-                prepared.sha256,
-                prepared.modified_at_ms,
-                matches!(file.kind, TargetKind::Generated),
-                now_ms(),
-                prepared.sha256,
-                file.commit_sha,
-                file.worktree_id,
-            ],
-            |row| row.get::<_, i64>(0),
+        let path = path_string(&file.relative_path);
+        // prepare_cached so the per-file/-chunk/-symbol INSERTs compile once per connection and
+        // are reused across the whole rebuild instead of re-parsing the SQL on every row (#57).
+        let file_id = self
+            .storage
+            .connection()
+            .prepare_cached(
+                "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 RETURNING id",
+            )?
+            .query_row(
+                params![
+                    path,
+                    file.language.as_str(),
+                    file.kind.as_str(),
+                    prepared.sha256,
+                    prepared.modified_at_ms,
+                    matches!(file.kind, TargetKind::Generated),
+                    now_ms(),
+                    prepared.sha256,
+                    file.commit_sha,
+                    file.worktree_id,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?;
+        self.insert_chunks(
+            ChunkInsertFile {
+                file_id,
+                path: &path,
+                language: file.language.as_str(),
+                kind: file.kind.as_str(),
+                source_revision: &prepared.sha256,
+            },
+            &prepared.chunks,
+            &prepared.text,
         )?;
-        self.insert_chunks(file_id, &prepared.sha256, &prepared.chunks, &prepared.text)?;
         self.insert_symbols(file_id, file.language, &prepared.symbols)?;
         if file.kind != TargetKind::Generated && prepared.text.len() <= edges::MAX_GRAPH_PARSE_BYTES
         {
@@ -180,31 +218,28 @@ impl IndexDatabase {
 
     fn insert_chunks(
         &self,
-        file_id: i64,
-        source_revision: &str,
+        file: ChunkInsertFile<'_>,
         chunks: &[Chunk],
         full_text: &str,
     ) -> anyhow::Result<()> {
-        let (path, language, kind) = self.storage.connection().query_row(
-            "SELECT path, language, kind FROM main.files WHERE id = ?1",
-            [file_id],
-            |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            },
-        )?;
+        // `path`/`language`/`kind` come from the caller (the file we just inserted), so we no
+        // longer re-`SELECT` them per file. Both INSERTs are `prepare_cached` so the statement
+        // is compiled once and stepped per row across the rebuild (#57).
+        let ChunkInsertFile { file_id, path, language, kind, source_revision } = file;
+        let conn = self.storage.connection();
         for chunk in chunks {
             let anchor =
                 anchors::anchor_for_text(&chunk.text, chunk.start_line, chunk.end_line, full_text);
             let embedding_policy = ai::embedding_policy_for_chunk(
-                Path::new(&path),
-                &language,
-                &kind,
+                Path::new(path),
+                language,
+                kind,
                 chunk.kind,
                 chunk.symbol_path.as_deref(),
                 &chunk.text,
                 ai::DEFAULT_MAX_EMBEDDING_CHARS,
             );
-            self.storage.connection().execute(
+            conn.prepare_cached(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
                  start_line, end_line, text, text_hash,
                                     source_revision, anchor_version, normalized_hash, \
@@ -213,34 +248,31 @@ impl IndexDatabase {
                  embedding_policy, embedding_priority)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
                  ?17, ?18, ?19)",
-                params![
-                    file_id,
-                    chunk.kind,
-                    chunk.symbol_path,
-                    i64::try_from(chunk.start_byte)?,
-                    i64::try_from(chunk.end_byte)?,
-                    i64::try_from(chunk.start_line)?,
-                    i64::try_from(chunk.end_line)?,
-                    chunk.text,
-                    hex_sha256(chunk.text.as_bytes()),
-                    source_revision,
-                    anchor.version,
-                    anchor.normalized_hash,
-                    anchor.start_boundary_hash,
-                    anchor.end_boundary_hash,
-                    anchor.start_context_hash,
-                    anchor.end_context_hash,
-                    anchor.context_radius,
-                    embedding_policy.policy,
-                    embedding_policy.priority,
-                ],
-            )?;
-            let chunk_id = self.storage.connection().last_insert_rowid();
-            self.storage
-                .connection()
-                .execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", params![
-                    chunk_id, chunk.text
-                ])?;
+            )?
+            .execute(params![
+                file_id,
+                chunk.kind,
+                chunk.symbol_path,
+                i64::try_from(chunk.start_byte)?,
+                i64::try_from(chunk.end_byte)?,
+                i64::try_from(chunk.start_line)?,
+                i64::try_from(chunk.end_line)?,
+                chunk.text,
+                hex_sha256(chunk.text.as_bytes()),
+                source_revision,
+                anchor.version,
+                anchor.normalized_hash,
+                anchor.start_boundary_hash,
+                anchor.end_boundary_hash,
+                anchor.start_context_hash,
+                anchor.end_context_hash,
+                anchor.context_radius,
+                embedding_policy.policy,
+                embedding_policy.priority,
+            ])?;
+            let chunk_id = conn.last_insert_rowid();
+            conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
+                .execute(params![chunk_id, chunk.text])?;
         }
         Ok(())
     }
@@ -251,30 +283,31 @@ impl IndexDatabase {
         language: Language,
         symbols: &[Symbol],
     ) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
         for symbol in symbols {
-            self.storage.connection().execute(
+            conn.prepare_cached(
                 "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
                  end_byte, signature, docs)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    file_id,
-                    language.as_str(),
-                    symbol.name,
-                    symbol.qualified_name,
-                    symbol.kind,
-                    i64::try_from(symbol.start_byte)?,
-                    i64::try_from(symbol.end_byte)?,
-                    symbol.signature,
-                    symbol.docs,
-                ],
-            )?;
-            let symbol_id = self.storage.connection().last_insert_rowid();
+            )?
+            .execute(params![
+                file_id,
+                language.as_str(),
+                symbol.name,
+                symbol.qualified_name,
+                symbol.kind,
+                i64::try_from(symbol.start_byte)?,
+                i64::try_from(symbol.end_byte)?,
+                symbol.signature,
+                symbol.docs,
+            ])?;
+            let symbol_id = conn.last_insert_rowid();
             for fact in &symbol.facts {
-                self.storage.connection().execute(
+                conn.prepare_cached(
                     "INSERT OR IGNORE INTO symbol_facts(symbol_id, fact_kind, fact_value)
                      VALUES (?1, ?2, ?3)",
-                    params![symbol_id, fact.kind, fact.value],
-                )?;
+                )?
+                .execute(params![symbol_id, fact.kind, fact.value])?;
             }
         }
         Ok(())
