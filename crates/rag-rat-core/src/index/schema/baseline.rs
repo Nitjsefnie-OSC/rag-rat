@@ -494,15 +494,54 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub(crate) fn rebuild_fts(conn: &Connection) -> anyhow::Result<()> {
+    // `chunk_fts` / `commit_fts` are external-content FTS5 tables (content='chunks' /
+    // content='git_commits'). The canonical way to rebuild an external-content index is the
+    // built-in 'rebuild' command, which re-reads the content table. An unqualified
+    // `DELETE FROM <table>` on an external-content FTS5 table corrupts the index when the FTS
+    // and content tables are out of sync (`database disk image is malformed`, SQLite 11/267) —
+    // see #51. 'rebuild' is desync-safe.
     conn.execute_batch(
         "
-        DELETE FROM chunk_fts;
-        INSERT INTO chunk_fts(rowid, text)
-        SELECT id, text FROM chunks;
-        DELETE FROM commit_fts;
-        INSERT INTO commit_fts(rowid, subject, body)
-        SELECT rowid, subject, body FROM git_commits;
+        INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild');
+        INSERT INTO commit_fts(commit_fts) VALUES('rebuild');
         ",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod rebuild_fts_tests {
+    use rusqlite::Connection;
+
+    // Reproduces #51: chunks present that were never inserted into the external-content
+    // `chunk_fts`. The old `DELETE FROM chunk_fts` rebuild corrupts the index on this desync;
+    // the 'rebuild' command recovers it and indexes the content.
+    #[test]
+    fn rebuild_fts_recovers_a_desynced_external_content_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // Seed a chunk WITHOUT a matching chunk_fts row — the out-of-sync state from #51.
+        conn.execute(
+            "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
+                                start_line, end_line, text, text_hash)
+             VALUES (1, 'symbol', 'alpha', 0, 10, 1, 5, 'fn alpha() { beta() }', 'th')",
+            [],
+        )
+        .unwrap();
+
+        super::rebuild_fts(&conn).unwrap();
+
+        let hits: i64 = conn
+            .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(hits, 1, "rebuilt FTS index must be queryable and contain the chunk");
+    }
 }

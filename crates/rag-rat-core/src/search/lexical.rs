@@ -592,9 +592,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // Populate the FTS index directly — content tables in FTS5 need an explicit INSERT
-        // on the FTS virtual table to build shadow-table entries; rebuild_fts's DELETE approach
-        // is unreliable on fresh in-memory connections.
+        // Populate the FTS index directly — external-content FTS5 tables need an explicit
+        // INSERT on the FTS virtual table to build shadow-table entries (or a 'rebuild', as
+        // schema::rebuild_fts now does). A direct INSERT keeps this seed self-contained.
         conn.execute(
             "INSERT INTO chunk_fts(rowid, text)
              VALUES (?1, 'fn watcher_main() { /* election retry loop */ }')",
