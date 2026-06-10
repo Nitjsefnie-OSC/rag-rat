@@ -348,6 +348,14 @@ pub(crate) fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Resul
     Ok(())
 }
 
+pub(crate) fn apply_memory_binding_signals(conn: &Connection) -> rusqlite::Result<()> {
+    // Durable corroboration signals for cross-file relocation: a moved symbol keeps its
+    // kind + signature even when its path-qualified name (and rowids) change.
+    add_column_if_missing(conn, "repo_memory_bindings", "symbol_kind", "TEXT")?;
+    add_column_if_missing(conn, "repo_memory_bindings", "signature_hash", "TEXT")?;
+    Ok(())
+}
+
 pub(crate) fn apply_graph_file_lookup_indexes(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges", "source_file_id", "INTEGER")?;
     conn.execute_batch(
@@ -434,6 +442,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_011_ID => Some(11),
             MIGRATION_012_ID => Some(12),
             MIGRATION_013_ID => Some(13),
+            MIGRATION_014_ID => Some(14),
             _ => None,
         })
         .max()
@@ -456,6 +465,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_011_ID
             | MIGRATION_012_ID
             | MIGRATION_013_ID
+            | MIGRATION_014_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -475,6 +485,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_011_ID => migration.checksum != MIGRATION_011_CHECKSUM,
         MIGRATION_012_ID => migration.checksum != MIGRATION_012_CHECKSUM,
         MIGRATION_013_ID => migration.checksum != MIGRATION_013_CHECKSUM,
+        MIGRATION_014_ID => migration.checksum != MIGRATION_014_CHECKSUM,
         _ => false,
     }
 }
