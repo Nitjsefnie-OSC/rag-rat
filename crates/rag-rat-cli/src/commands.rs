@@ -462,11 +462,11 @@ pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> a
             }))
         },
         "status" => {
-            let (grep, bash) = claude_settings::hook_status(&settings);
+            let status = claude_settings::hook_status(&settings);
             print_json(&serde_json::json!({
                 "settings_path": path,
-                "grep_matcher_installed": grep,
-                "bash_matcher_installed": bash,
+                "pretooluse_installed": status.pretooluse,
+                "session_start_installed": status.session_start,
             }))
         },
         other => anyhow::bail!("unknown hooks subcommand `{other}`"),

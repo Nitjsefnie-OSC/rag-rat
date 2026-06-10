@@ -1,5 +1,5 @@
-//! Claude Code settings.json management for the grep-augment PreToolUse hook
-//! (`rag-rat hooks install|uninstall|status --claude [--global]`).
+//! Claude Code settings.json management for the grep-augment PreToolUse hook and the
+//! SessionStart orientation hook (`rag-rat hooks install|uninstall|status --claude [--global]`).
 //!
 //! Edits are additive and marker-aware: our entries are recognized by `HOOK_COMMAND`;
 //! everything else in the file is preserved byte-for-byte at the JSON level (read → modify
@@ -11,26 +11,51 @@ use serde_json::{Value, json};
 
 pub const HOOK_COMMAND: &str = "rag-rat claude-hook";
 const MATCHERS: &[&str] = &["Grep", "Bash"];
+const SESSION_START_MATCHER: &str = "startup|clear|compact";
+const SESSION_START_TIMEOUT: u64 = 5;
 
-fn our_entry(matcher: &str) -> Value {
+/// Named status returned by [`hook_status`].
+pub struct HookStatus {
+    pub pretooluse: bool,
+    pub session_start: bool,
+}
+
+fn our_pretooluse_entry(matcher: &str) -> Value {
     json!({
         "matcher": matcher,
         "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 10}]
     })
 }
 
+fn our_session_start_entry() -> Value {
+    json!({
+        "matcher": SESSION_START_MATCHER,
+        "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": SESSION_START_TIMEOUT}]
+    })
+}
+
+/// True if this hook-array entry contains our command in any of its hooks.
 fn is_ours(entry: &Value) -> bool {
     entry["hooks"]
         .as_array()
         .is_some_and(|hooks| hooks.iter().any(|h| h["command"] == HOOK_COMMAND))
 }
 
-/// The `hooks.PreToolUse` array, the single place both install and uninstall navigate to.
-/// With `create`, missing `hooks`/`PreToolUse` containers are inserted (install path); without
-/// it, a missing or malformed path yields `None` (uninstall/read path). Returns `None` rather
-/// than panicking whenever `hooks` or `PreToolUse` exists but is the wrong JSON type — a user's
-/// hand-edited settings.json must never crash `rag-rat hooks`.
-fn pretooluse_array_mut(settings: &mut Value, create: bool) -> Option<&mut Vec<Value>> {
+// ---------------------------------------------------------------------------
+// Event-array helpers (parameterised by event name)
+// ---------------------------------------------------------------------------
+
+/// Return a mutable reference to the array at `settings.hooks.<event_name>`.
+///
+/// When `create` is true, missing `hooks`/`<event_name>` containers are inserted (install
+/// path). Without it, a missing or malformed path yields `None` (uninstall/read path).
+/// Returns `None` rather than panicking whenever `hooks` or the event array exists but is
+/// the wrong JSON type — a user's hand-edited settings.json must never crash `rag-rat hooks`.
+fn event_array_mut<'a>(
+    settings: &'a mut Value,
+    event_name: &str,
+    create: bool,
+) -> Option<&'a mut Vec<Value>> {
     if create {
         if !settings.is_object() {
             *settings = json!({});
@@ -41,10 +66,36 @@ fn pretooluse_array_mut(settings: &mut Value, create: bool) -> Option<&mut Vec<V
             .entry("hooks")
             .or_insert_with(|| json!({}));
         if hooks.is_object() {
-            hooks.as_object_mut().unwrap().entry("PreToolUse").or_insert_with(|| json!([]));
+            hooks.as_object_mut().unwrap().entry(event_name).or_insert_with(|| json!([]));
         }
     }
-    settings.get_mut("hooks").and_then(|h| h.get_mut("PreToolUse")).and_then(Value::as_array_mut)
+    settings.get_mut("hooks").and_then(|h| h.get_mut(event_name)).and_then(Value::as_array_mut)
+}
+
+/// Prune `hooks.<event_name>` and the `hooks` container itself when they become empty.
+fn prune_empty_event(settings: &mut Value, event_name: &str) {
+    // Check if the event array is empty; if so, remove it.
+    let event_empty = settings["hooks"][event_name].as_array().is_some_and(|a| a.is_empty());
+    if event_empty && let Some(hooks_obj) = settings.get_mut("hooks").and_then(Value::as_object_mut)
+    {
+        hooks_obj.remove(event_name);
+    }
+    // If `hooks` itself is now an empty object, remove it too.
+    if settings["hooks"].as_object().is_some_and(serde_json::Map::is_empty)
+        && let Some(root) = settings.as_object_mut()
+    {
+        root.remove("hooks");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PreToolUse (per-matcher semantics — Grep + Bash each get their own entry)
+// ---------------------------------------------------------------------------
+
+/// The `hooks.PreToolUse` array. Kept for backwards-compat surface; delegates to
+/// [`event_array_mut`].
+fn pretooluse_array_mut(settings: &mut Value, create: bool) -> Option<&mut Vec<Value>> {
+    event_array_mut(settings, "PreToolUse", create)
 }
 
 /// Add missing Grep/Bash entries. Returns true when the document changed.
@@ -57,40 +108,83 @@ pub fn merge_hook_entries(settings: &mut Value) -> bool {
     for matcher in MATCHERS {
         let present = entries.iter().any(|e| e["matcher"] == *matcher && is_ours(e));
         if !present {
-            entries.push(our_entry(matcher));
+            entries.push(our_pretooluse_entry(matcher));
             changed = true;
         }
     }
-    changed
+    // SessionStart: single is-ours entry; replace if matcher/timeout drifted.
+    changed | merge_session_start(settings)
 }
 
-/// Remove our entries; prune `PreToolUse`/`hooks` containers that end up empty.
+/// Ensure exactly one is-ours SessionStart entry with the canonical matcher+timeout.
+/// Replaces a drifted entry; no-ops when already correct. Returns true if changed.
+fn merge_session_start(settings: &mut Value) -> bool {
+    let Some(entries) = event_array_mut(settings, "SessionStart", true) else { return false };
+
+    // Find any existing is-ours entry.
+    let ours_pos = entries.iter().position(is_ours);
+
+    match ours_pos {
+        Some(pos) => {
+            let entry = &entries[pos];
+            // Check whether matcher and timeout already match.
+            let matcher_ok = entry["matcher"] == SESSION_START_MATCHER;
+            let timeout_ok = entry["hooks"][0]["timeout"] == SESSION_START_TIMEOUT;
+            if matcher_ok && timeout_ok {
+                false // already correct, no-op
+            } else {
+                entries[pos] = our_session_start_entry();
+                true
+            }
+        },
+        None => {
+            entries.push(our_session_start_entry());
+            true
+        },
+    }
+}
+
+/// Remove our entries from both PreToolUse and SessionStart; prune empty containers.
 pub fn remove_hook_entries(settings: &mut Value) -> bool {
-    let Some(entries) = pretooluse_array_mut(settings, false) else {
-        return false;
-    };
-    let before = entries.len();
-    entries.retain(|e| !is_ours(e));
-    let changed = entries.len() != before;
-    if entries.is_empty() {
-        // Both unwraps are safe: we only reach here because get_mut("hooks") succeeded
-        // (meaning "hooks" key exists and is an object) and "PreToolUse" was present.
-        settings["hooks"].as_object_mut().unwrap().remove("PreToolUse");
+    let mut changed = false;
+
+    // --- PreToolUse ---
+    if let Some(entries) = pretooluse_array_mut(settings, false) {
+        let before = entries.len();
+        entries.retain(|e| !is_ours(e));
+        if entries.len() != before {
+            changed = true;
+        }
     }
-    if settings["hooks"].as_object().is_some_and(serde_json::Map::is_empty) {
-        settings.as_object_mut().unwrap().remove("hooks");
+    prune_empty_event(settings, "PreToolUse");
+
+    // --- SessionStart ---
+    if let Some(entries) = event_array_mut(settings, "SessionStart", false) {
+        let before = entries.len();
+        entries.retain(|e| !is_ours(e));
+        if entries.len() != before {
+            changed = true;
+        }
     }
+    prune_empty_event(settings, "SessionStart");
+
     changed
 }
 
-/// (grep_installed, bash_installed) for `hooks status --claude`.
-pub fn hook_status(settings: &Value) -> (bool, bool) {
-    let installed = |matcher: &str| {
-        settings["hooks"]["PreToolUse"]
+/// Named status for `hooks status --claude`.
+pub fn hook_status(settings: &Value) -> HookStatus {
+    let installed_in = |event: &str, matcher: &str| {
+        settings["hooks"][event]
             .as_array()
             .is_some_and(|entries| entries.iter().any(|e| e["matcher"] == matcher && is_ours(e)))
     };
-    (installed("Grep"), installed("Bash"))
+    let session_start_installed = settings["hooks"]["SessionStart"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(is_ours));
+    HookStatus {
+        pretooluse: installed_in("PreToolUse", "Grep") && installed_in("PreToolUse", "Bash"),
+        session_start: session_start_installed,
+    }
 }
 
 /// Project `.claude/settings.json` or, with `--global`, `~/.claude/settings.json`.
@@ -121,6 +215,10 @@ pub fn write_settings(path: &Path, settings: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // PreToolUse (existing semantics preserved)
+    // -----------------------------------------------------------------------
 
     #[test]
     fn install_into_empty_settings_creates_both_matchers() {
@@ -174,8 +272,113 @@ mod tests {
     #[test]
     fn status_reports_per_matcher_presence() {
         let mut settings = serde_json::json!({});
-        assert_eq!(hook_status(&settings), (false, false));
+        let s = hook_status(&settings);
+        assert!(!s.pretooluse && !s.session_start);
         merge_hook_entries(&mut settings);
-        assert_eq!(hook_status(&settings), (true, true));
+        let s = hook_status(&settings);
+        assert!(s.pretooluse && s.session_start);
+    }
+
+    // -----------------------------------------------------------------------
+    // SessionStart — new behaviour
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn install_writes_session_start_entry() {
+        let mut settings = serde_json::json!({});
+        merge_hook_entries(&mut settings);
+
+        let ss = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1, "exactly one SessionStart entry");
+        assert_eq!(ss[0]["matcher"], SESSION_START_MATCHER);
+        let hook = &ss[0]["hooks"][0];
+        assert_eq!(hook["command"], HOOK_COMMAND);
+        assert_eq!(hook["timeout"], SESSION_START_TIMEOUT);
+    }
+
+    #[test]
+    fn install_session_start_is_idempotent() {
+        let mut settings = serde_json::json!({});
+        merge_hook_entries(&mut settings);
+        let changed = merge_hook_entries(&mut settings);
+        assert!(!changed, "re-install must be a no-op");
+
+        let ss = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1, "no duplicate SessionStart entry");
+    }
+
+    #[test]
+    fn install_replaces_drifted_session_start_matcher() {
+        // Pre-existing is-ours SessionStart entry with a different matcher.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 5}]
+                    }
+                ]
+            }
+        });
+        let changed = merge_hook_entries(&mut settings);
+        assert!(changed, "drifted matcher must trigger a change");
+
+        let ss = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1, "old drifted entry replaced, not duplicated");
+        assert_eq!(ss[0]["matcher"], SESSION_START_MATCHER);
+    }
+
+    #[test]
+    fn uninstall_removes_both_events_and_prunes() {
+        let mut settings = serde_json::json!({});
+        merge_hook_entries(&mut settings);
+        let changed = remove_hook_entries(&mut settings);
+        assert!(changed);
+        assert!(settings.get("hooks").is_none(), "hooks container pruned when empty");
+    }
+
+    #[test]
+    fn uninstall_preserves_foreign_session_start_entry() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [{"type": "command", "command": "some-other-tool", "timeout": 5}]
+                    }
+                ]
+            }
+        });
+        merge_hook_entries(&mut settings);
+        remove_hook_entries(&mut settings);
+
+        // Foreign SessionStart entry must survive.
+        let ss = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(ss.len(), 1, "foreign SessionStart entry preserved");
+        assert_eq!(ss[0]["hooks"][0]["command"], "some-other-tool");
+    }
+
+    #[test]
+    fn status_reflects_both_events_after_install_and_uninstall() {
+        let mut settings = serde_json::json!({});
+        merge_hook_entries(&mut settings);
+        let s = hook_status(&settings);
+        assert!(s.pretooluse, "pretooluse installed");
+        assert!(s.session_start, "session_start installed");
+
+        remove_hook_entries(&mut settings);
+        let s = hook_status(&settings);
+        assert!(!s.pretooluse, "pretooluse uninstalled");
+        assert!(!s.session_start, "session_start uninstalled");
+    }
+
+    #[test]
+    fn garbage_hooks_value_does_not_panic() {
+        // `hooks` is a string instead of an object — must never panic.
+        let mut settings = serde_json::json!({"hooks": "not-an-object"});
+        // All three operations must survive without panicking.
+        let _ = merge_hook_entries(&mut settings);
+        let _ = remove_hook_entries(&mut settings);
+        let _ = hook_status(&settings);
     }
 }
