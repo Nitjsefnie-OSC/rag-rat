@@ -29,14 +29,41 @@ Why this beats grep here:
 - Results carry **provenance**: confidence labels, coverage warnings, and raw evidence, so you can
   judge them rather than trust them blindly.
 - **Drive-by memories**: a function may carry an `Invariant`/`Decision`/`Risk` memory that explains
-  a non-obvious constraint. Grep can't show you that; the MCP tools attach it automatically. When
-  you discover a durable invariant or rationale, record it with `memory_create` so the next agent
-  gets it for free.
+  a non-obvious constraint. Grep can't show you that; the MCP tools attach it automatically. See
+  *Record durable learnings as rag-rat memories* below — capturing these is part of the job.
 - The index is **kept fresh by git hooks** (see below), so what the MCP returns matches HEAD.
 
 Fall back to direct file reads/edits for the actual *writing* of code, and to confirm exact text
 before an `Edit`. Use the MCP to *find and understand*; use the file tools to *change*. (The MCP
 server is read-only on source — it never edits files; it writes only its own SQLite index.)
+
+## Record durable learnings as rag-rat memories
+
+**This is required, not optional.** When you discover something durable and non-obvious — a
+load-bearing invariant, a decision + its rationale, a risk/footgun that cost you time, a perf
+characteristic, a "do not do X because Y" — record it with `memory_create` **before you finish the
+task**. If you had to read three files and reason for ten minutes to learn it, the next agent should
+get it in one MCP call. Don't let hard-won context evaporate.
+
+**Why rag-rat and not your own notes:** rag-rat memories live in this repo's shared index, so they
+surface for **every** agent that uses the rag-rat MCP — Claude Code, Codex, and any future tool —
+not just the one that wrote them. An agent's private/session memory (e.g. Claude Code's file memory,
+Codex's own store) is invisible to the others. rag-rat is the **cross-agent memory layer**; put
+anything another agent would benefit from here.
+
+How to do it well:
+- **Anchor to the tightest stable target.** Prefer a `symbol_id`/`logical_symbol_id` binding (these
+  now self-heal across cross-file moves — see the relocation engine); fall back to a `path` binding
+  for file/area-level notes, or a commit/GitHub ref for historical rationale.
+- **Pick the right `kind`:** `Invariant` (must stay true), `Decision`/`RejectedAlternative` (why it's
+  this way / why not the other), `Risk` / `BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
+  `FFIBoundary`. Write a concrete title, and a body with the *why* and *how to apply* — not just *what*.
+- **`memory_search` first** to avoid duplicates; **`memory_update` / `memory_mark_obsolete`** when a
+  memory is wrong or superseded (don't leave stale guidance).
+- **After large refactors**, run `rag-rat memory doctor` and re-anchor anything it flags `gone`
+  (`rag-rat memory rebind <id> --symbol <name>`); content-confirmed moves re-anchor automatically.
+- This works the same from any agent: Claude Code calls the MCP `memory_create` tool; the `rag-rat`
+  CLI exposes the equivalents — use whichever your harness has.
 
 If the MCP returns empty results, the self-index may be stale or pointed at the wrong root —
 `rag-rat index --discover` then `rag-rat reconcile` refreshes it.
