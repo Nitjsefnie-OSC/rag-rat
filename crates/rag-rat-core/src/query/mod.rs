@@ -6,6 +6,7 @@ pub mod impact;
 pub mod memory;
 pub mod repo_brief;
 pub mod symbol;
+pub mod tree;
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;

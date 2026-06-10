@@ -16,6 +16,9 @@ mod query_api;
 mod rebuild;
 
 #[cfg(test)]
+pub(crate) use lifecycle::install_scope_view;
+
+#[cfg(test)]
 mod anchor_tests;
 #[cfg(test)]
 mod parser_tests;

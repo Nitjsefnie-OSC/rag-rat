@@ -5114,6 +5114,454 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
     fs::remove_dir_all(root).unwrap();
 }
 
+// ─── dir_tree tests ──────────────────────────────────────────────────────────
+
+/// Shared helper: build a dir-only `RepoMemoryBindTarget`.
+fn dir_bind_target(dir: Option<String>) -> crate::query::memory::RepoMemoryBindTarget {
+    crate::query::memory::RepoMemoryBindTarget {
+        logical_symbol_id: None,
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        path: None,
+        start_line: None,
+        end_line: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        start_logical_symbol_id: None,
+        end_logical_symbol_id: None,
+        edge_sequence_hash: None,
+        path_summary: None,
+        dir,
+    }
+}
+
+/// Shared helper: create a minimal "dir" memory attached to the given directory path.
+fn create_dir_memory(db: &IndexDatabase, title: &str, dir: Option<String>) {
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: title.to_string(),
+        body: format!("Memory for {dir:?}."),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: dir_bind_target(dir),
+    })
+    .unwrap();
+}
+
+/// Shared helper: install the scope view on `conn` for the repo at `root`.
+fn install_scope(conn: &rusqlite::Connection, root: &Path) {
+    let (commit_sha, worktree_id) = resolve_git_context(root);
+    crate::index::install_scope_view(conn, &commit_sha, &worktree_id).unwrap();
+}
+
+// ─── Fix 1: label/depth contract ─────────────────────────────────────────────
+
+#[test]
+fn dir_tree_label_depth_flat_siblings() {
+    // Fixture: src/a (3 files), src/b (3 files).
+    // Expected display tree (formatter indents by depth, prints label):
+    //   src      (depth 0, label "src")
+    //     a      (depth 1, label "a")
+    //     b      (depth 1, label "b")
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    for name in &["x.rs", "y.rs", "z.rs"] {
+        fs::write(root.join("src/a").join(name), "pub fn f() {}\n").unwrap();
+        fs::write(root.join("src/b").join(name), "pub fn g() {}\n").unwrap();
+    }
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts::default();
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    let find = |p: &str| {
+        tree.nodes.iter().find(|n| n.path == p).unwrap_or_else(|| {
+            panic!(
+                "no node for {p}; nodes: {:?}",
+                tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+            )
+        })
+    };
+
+    let src = find("src");
+    assert_eq!(src.depth, 0, "src depth");
+    assert_eq!(src.label, "src", "src label");
+
+    let a = find("src/a");
+    assert_eq!(a.depth, 1, "src/a depth");
+    assert_eq!(a.label, "a", "src/a label");
+
+    let b = find("src/b");
+    assert_eq!(b.depth, 1, "src/b depth");
+    assert_eq!(b.label, "b", "src/b label");
+
+    assert_eq!(tree.truncated, 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dir_tree_label_depth_collapse_single_child_chain() {
+    // Fixture: pkg/inner/deep with 3 files only at `deep` — no files in pkg or inner.
+    // pkg → inner (single child, no files, no memory) → deep (3 files).
+    // After collapse: one node with path="pkg", label="pkg/inner/deep", depth=0.
+    // (The chain anchor is `pkg`; it collapses into `inner` then into `deep`.)
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/pkg/inner/deep")).unwrap();
+    for name in &["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.join("src/pkg/inner/deep").join(name), "pub fn f() {}\n").unwrap();
+    }
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["src/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    // max_depth must be deep enough to reach depth 4 (src/pkg/inner/deep).
+    let opts = crate::query::tree::TreeOpts { max_depth: 5, min_files: 3, max_nodes: 25 };
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    // The chain src → pkg → inner collapses; the one visible node for the pkg subtree
+    // anchors at `src/pkg` (or `src`) and spans through to `deep`.  What matters:
+    // (a) exactly one node has path == "src/pkg/inner/deep" OR the chain ends there,
+    // (b) that node's label spans the collapsed segments relative to its display parent,
+    // (c) its depth reflects only displayed ancestors.
+    //
+    // With src having only one included child (src/pkg), and src/pkg only one included child
+    // (src/pkg/inner), etc., the whole chain from `src` collapses into a single anchor node
+    // at `src` with label "src/pkg/inner/deep" (full path, display parent = "").
+    let collapsed = tree.nodes.iter().find(|n| n.path == "src");
+    assert!(
+        collapsed.is_some(),
+        "expected a collapsed node anchored at 'src'; nodes: {:?}",
+        tree.nodes.iter().map(|n| (&n.path, &n.label, n.depth)).collect::<Vec<_>>()
+    );
+    let collapsed = collapsed.unwrap();
+    assert_eq!(collapsed.label, "src/pkg/inner/deep", "collapsed label must span full chain");
+    assert_eq!(collapsed.depth, 0, "collapsed chain anchor must be depth 0");
+    assert_eq!(collapsed.file_count, 0, "file_count on chain anchor is 0 (files live at deep)");
+
+    // No other node should appear (the entire tree collapses).
+    assert_eq!(
+        tree.nodes.len(),
+        1,
+        "only one node after full collapse; got: {:?}",
+        tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+    );
+    assert_eq!(tree.truncated, 0);
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ─── Fix 1 + memory-only inclusion ───────────────────────────────────────────
+
+#[test]
+fn dir_tree_memory_only_dir_appears_without_min_files() {
+    // A dir with a "dir" memory but fewer than min_files direct files still appears.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    // Only 1 file in src/a — below default min_files=3.
+    fs::write(root.join("src/a/only.rs"), "pub fn only() {}\n").unwrap();
+    // src/b gets 3 files so it qualifies on its own (ensures src is pulled in as ancestor).
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    for name in &["p.rs", "q.rs", "r.rs"] {
+        fs::write(root.join("src/b").join(name), "pub fn f() {}\n").unwrap();
+    }
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Anchor a dir memory on src/a.
+    create_dir_memory(&db, "sparse subsystem", Some("src/a".to_string()));
+
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts::default();
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    let node_a = tree.nodes.iter().find(|n| n.path == "src/a").unwrap_or_else(|| {
+        panic!(
+            "src/a missing from tree; nodes: {:?}",
+            tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(node_a.file_count, 1, "src/a file_count");
+    assert_eq!(node_a.memory_title.as_deref(), Some("sparse subsystem"), "src/a memory_title");
+    assert_eq!(node_a.depth, 1, "src/a depth");
+    assert_eq!(node_a.label, "a", "src/a label");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ─── Fix 2: generated exclusion ──────────────────────────────────────────────
+
+#[test]
+fn dir_tree_excludes_generated_files_from_count() {
+    // A dir whose only files are generated=1 must not become a qualifying node (file_count
+    // must not include generated files).
+    //
+    // Layout: src/gen (3 generated files), src/real (3 real files), src/also (3 real files).
+    // Two real siblings prevent src from collapsing into a single-child chain so that
+    // src/real and src/also appear as their own nodes.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/gen")).unwrap();
+    fs::create_dir_all(root.join("src/real")).unwrap();
+    fs::create_dir_all(root.join("src/also")).unwrap();
+    // Real files — indexed with generated=0.
+    for name in &["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.join("src/real").join(name), "pub fn f() {}\n").unwrap();
+        fs::write(root.join("src/also").join(name), "pub fn g() {}\n").unwrap();
+    }
+    // Generated files — write them so the indexer picks them up, then flip generated=1.
+    for name in &["g1.rs", "g2.rs", "g3.rs"] {
+        fs::write(root.join("src/gen").join(name), "// generated\npub fn gen() {}\n").unwrap();
+    }
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Mark all files under src/gen as generated after indexing.
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET generated = 1 WHERE path LIKE 'src/gen/%'", [])
+        .unwrap();
+
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts::default();
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    // src/gen must either be absent (did not qualify) or have file_count == 0.
+    if let Some(gen_node) = tree.nodes.iter().find(|n| n.path == "src/gen") {
+        assert_eq!(
+            gen_node.file_count,
+            0,
+            "generated dir must have file_count=0; got {}: {:?}",
+            gen_node.file_count,
+            tree.nodes.iter().map(|n| (&n.path, n.file_count)).collect::<Vec<_>>()
+        );
+    }
+    // src/real must appear with file_count == 3 (only non-generated files counted).
+    let real_node = tree.nodes.iter().find(|n| n.path == "src/real").unwrap_or_else(|| {
+        panic!(
+            "src/real missing; nodes: {:?}",
+            tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(real_node.file_count, 3, "src/real file_count must be 3 (non-generated only)");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ─── Fix 3: real multi-context scoping ───────────────────────────────────────
+
+#[test]
+fn dir_tree_scope_excludes_other_worktree_files() {
+    // Two worktree contexts share the same main.files table.  Scoping to one context must
+    // not inflate file_count with the other worktree's rows.
+    //
+    // Arrangement: the primary build indexes src/a/{a,b,c}.rs AND src/b/{p,q,r}.rs.
+    // Two sibling dirs prevent src from collapsing so src/a appears as its own node.
+    // We then INSERT three extra files under src/a with a different worktree_id.
+    // After scoping to the primary context, src/a must report file_count == 3, not 6.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    for name in &["a.rs", "b.rs", "c.rs"] {
+        fs::write(root.join("src/a").join(name), "pub fn f() {}\n").unwrap();
+    }
+    for name in &["p.rs", "q.rs", "r.rs"] {
+        fs::write(root.join("src/b").join(name), "pub fn g() {}\n").unwrap();
+    }
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Insert extra files belonging to a different worktree (same path prefix, different
+    // worktree_id).
+    let conn = db.storage.connection();
+    for name in &["x.rs", "y.rs", "z.rs"] {
+        conn.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated,
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+             VALUES (?1, 'rust', 'source', 'sha-other', 0, 0, 0, 'rev-other', '', 'other-worktree')",
+            [format!("src/a/{name}")],
+        )
+        .unwrap();
+    }
+
+    // Scope to the primary worktree only.
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts::default();
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    let node_a = tree.nodes.iter().find(|n| n.path == "src/a").unwrap_or_else(|| {
+        panic!("src/a missing; nodes: {:?}", tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>())
+    });
+    assert_eq!(
+        node_a.file_count, 3,
+        "file_count must not be inflated by other-worktree rows; got {}",
+        node_a.file_count
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ─── Fix 3: max_nodes cap ────────────────────────────────────────────────────
+
+#[test]
+fn dir_tree_truncates_at_max_nodes() {
+    // Create enough dirs to exceed max_nodes=3.  We use min_files=1 so every dir with a file
+    // qualifies, giving us 5 leaf dirs + ancestor nodes.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    for i in 0..5u8 {
+        let dir = root.join(format!("pkg{i}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
+    }
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from(".")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts { max_depth: 2, min_files: 1, max_nodes: 3 };
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    assert!(tree.nodes.len() <= 3, "nodes.len()={} must be <= max_nodes=3", tree.nodes.len());
+    assert!(tree.truncated > 0, "truncated must be >0 when nodes were dropped");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ─── original integration test (extended) ────────────────────────────────────
+
+#[test]
+fn dir_tree_builds_annotated_layout() {
+    // Index six files: three in src/a/ and three in src/b/.  Both dirs meet min_files (3),
+    // so both appear in the tree.  A "dir" memory is anchored to src/a with title "alpha core"
+    // and a root memory (dir:"") is anchored to the repo with title "the repo".
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    for name in &["x.rs", "y.rs", "z.rs"] {
+        fs::write(root.join("src/a").join(name), "pub fn ax() {}\n").unwrap();
+        fs::write(root.join("src/b").join(name), "pub fn bx() {}\n").unwrap();
+    }
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    create_dir_memory(&db, "alpha core", Some("src/a".to_string()));
+    create_dir_memory(&db, "the repo", Some("".to_string()));
+
+    let conn = db.storage.connection();
+    install_scope(conn, &root);
+
+    let opts = crate::query::tree::TreeOpts::default(); // max_depth=3, min_files=3, max_nodes=25
+    let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
+
+    // Root memory must be present.
+    assert_eq!(
+        tree.root_memory_title.as_deref(),
+        Some("the repo"),
+        "root_memory_title mismatch; got: {:?}",
+        tree.root_memory_title
+    );
+
+    // src must be an intermediate node (pulled in as ancestor).
+    let src = tree.nodes.iter().find(|n| n.path == "src");
+    assert!(
+        src.is_some(),
+        "no node for src; nodes: {:?}",
+        tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+    );
+    let src = src.unwrap();
+    assert_eq!(src.depth, 0, "src depth");
+    assert_eq!(src.label, "src", "src label");
+
+    // src/a must appear with correct label/depth, file_count==3 and memory_title.
+    let node_a = tree.nodes.iter().find(|n| n.path == "src/a");
+    assert!(
+        node_a.is_some(),
+        "no node for src/a; nodes: {:?}",
+        tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+    );
+    let node_a = node_a.unwrap();
+    assert_eq!(node_a.file_count, 3, "src/a file_count");
+    assert_eq!(node_a.depth, 1, "src/a depth");
+    assert_eq!(node_a.label, "a", "src/a label");
+    assert_eq!(
+        node_a.memory_title.as_deref(),
+        Some("alpha core"),
+        "src/a memory_title mismatch: {:?}",
+        node_a.memory_title
+    );
+
+    // src/b must appear with correct label/depth and file_count==3.
+    let node_b = tree.nodes.iter().find(|n| n.path == "src/b");
+    assert!(
+        node_b.is_some(),
+        "no node for src/b; nodes: {:?}",
+        tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+    );
+    let node_b = node_b.unwrap();
+    assert_eq!(node_b.file_count, 3, "src/b file_count");
+    assert_eq!(node_b.depth, 1, "src/b depth");
+    assert_eq!(node_b.label, "b", "src/b label");
+
+    // No truncation.
+    assert_eq!(tree.truncated, 0, "unexpected truncation");
+
+    // Scoping invariant: re-installing the same scope view and re-querying must not change
+    // counts (guards against the view accumulating duplicate rows on reinstall).
+    install_scope(conn, &root);
+    let tree2 = crate::query::tree::dir_tree(conn, &opts).unwrap();
+    let node_a2 = tree2.nodes.iter().find(|n| n.path == "src/a").unwrap();
+    assert_eq!(node_a2.file_count, 3, "file_count changed after scope reinstall");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn table_count(db: &IndexDatabase, table: &str) -> i64 {
     db.storage
         .connection()
