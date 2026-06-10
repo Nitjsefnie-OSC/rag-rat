@@ -3676,6 +3676,485 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
 }
 
 #[test]
+fn memory_relocates_when_symbol_moves_to_another_file() {
+    // Bind a memory to `fn target` in a.rs; move `fn target` verbatim to b.rs; reindex.
+    // The cross-file bare-name + content-hash fallback must fire: relocated == 1, gone == 0,
+    // and the persisted binding path is now b.rs.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Write the symbol in a.rs; keep b.rs present but empty so the indexer knows about it.
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "// placeholder\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("target symbol in a.rs");
+    assert!(symbol.path.contains("a.rs"), "initial path should be a.rs: {}", symbol.path);
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "target returns 42".to_string(),
+            body: "This memory must follow target across a file move.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+    assert_eq!(created.memory.bindings[0].binding_kind, "symbol");
+
+    // Move `fn target` verbatim to b.rs; remove it from a.rs.
+    fs::write(root.join("src/a.rs"), "// target moved to b.rs\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.relocated, 1, "expected 1 relocated binding, report: {report:?}");
+    assert_eq!(report.gone, 0, "expected 0 gone bindings, report: {report:?}");
+
+    // The binding must now point at b.rs.
+    let binding = &db
+        .memory_for_symbol(
+            &db.select_symbol(&crate::query::symbol::SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: None,
+                symbol: Some("target".to_string()),
+                language: Some(Language::Rust),
+                allow_ambiguous: false,
+                limit: 10,
+            })
+            .unwrap()
+            .unwrap()
+            .expect("target in b.rs"),
+            10,
+        )
+        .unwrap()[0]
+        .bindings[0]
+        .clone();
+    let path = binding.path.as_deref().unwrap_or("");
+    assert!(path.contains("b.rs"), "binding path should be b.rs after relocation: {path}");
+    assert_ne!(binding.anchor_status, "gone");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_relocation_is_durable_across_a_second_reindex() {
+    // After a cross-file move+relocate, a subsequent reindex (with an unrelated edit to b.rs)
+    // must resolve via the rewritten qualified_name directly — not fall back to the bare-name
+    // relocation path again. The binding_id must equal b.rs::target (not the old a.rs::target).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "// placeholder\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("target in a.rs");
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "target durable across reindex".to_string(),
+        body: "After relocation the binding must stay stable on a second reindex.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(symbol.symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+        },
+    })
+    .unwrap();
+
+    // First reindex: move target verbatim from a.rs to b.rs.
+    fs::write(root.join("src/a.rs"), "// moved\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let report1 = db.memory_validate().unwrap();
+    assert_eq!(report1.relocated, 1, "first validate should relocate: {report1:?}");
+
+    // Second reindex: add an unrelated symbol to b.rs, leaving target's body unchanged.
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn target() -> u32 {\n    42\n}\npub fn unrelated() {}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let report2 = db.memory_validate().unwrap();
+    // Must NOT be gone — resolves via the rewritten binding_id (b.rs::target).
+    assert_eq!(report2.gone, 0, "binding should not be gone after second reindex: {report2:?}");
+
+    // Confirm binding_id now points at b.rs (the relocation was persisted).
+    let binding = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT binding_id FROM repo_memory_bindings WHERE binding_kind = 'symbol' LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(
+        binding.contains("b.rs"),
+        "binding_id should be the new b.rs qualified_name after relocation, got: {binding}"
+    );
+    assert!(!binding.contains("a.rs"), "binding_id must not still reference a.rs: {binding}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_stays_gone_when_moved_symbol_body_changed() {
+    // Move `fn target` to b.rs but change its body so the chunk text hash differs.
+    // Content-hash mismatch → no silent relocate → gone.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "// placeholder\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("target in a.rs");
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Risk".to_string(),
+        title: "target body changed guard".to_string(),
+        body: "A hash-changed move must not silently relocate.".to_string(),
+        confidence: "medium".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(symbol.symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+        },
+    })
+    .unwrap();
+
+    // Move target to b.rs but rewrite the body (hash differs).
+    fs::write(root.join("src/a.rs"), "// moved\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn target() -> u32 {\n    99\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.gone, 1, "changed body must not trigger relocate, expected gone: {report:?}");
+    assert_eq!(report.relocated, 0, "must not relocate when body changed: {report:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_stays_gone_when_two_files_define_the_same_name() {
+    // Two files define `fn target` with identical bodies. The bound symbol's file (a.rs) is
+    // deleted, making the anchor gone. With >=2 content-hash matches the result is ambiguous,
+    // so the binding must stay gone rather than picking the wrong file.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // a.rs is the bound file; b.rs already has an identical `fn target`.
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    fs::write(root.join("src/c.rs"), "// unrelated\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Bind to the a.rs instance specifically.
+    let candidates = db
+        .symbol_candidates(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap();
+    let a_symbol = candidates
+        .candidates
+        .iter()
+        .find(|c| c.path.contains("a.rs"))
+        .expect("a.rs target candidate");
+    let symbol_id = a_symbol.symbol_id;
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "target ambiguous guard".to_string(),
+        body: "Two identical bodies must block silent relocation.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+        },
+    })
+    .unwrap();
+
+    // Remove a.rs so the anchor is gone; b.rs still carries the identical body.
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let _report = db.memory_validate().unwrap();
+    // >=2 content-hash matches → ambiguous → gone (not a wrong relocate to b.rs).
+    // Note: after a.rs removal only b.rs has the symbol — but the qualified_name lookup
+    // for the old "src/a.rs::target" fails, and relocate_symbol_by_name returns Some(b.rs).
+    // The single-match case means relocated == 1 is also valid here per the relocate logic,
+    // so the real guard this test exercises is: we do NOT silently pick the wrong file when
+    // two identical bodies co-exist BEFORE deletion (the >=2 ambiguity path).
+    // Re-run with b.rs also having the body so both are present on disk:
+    // We need to re-assert: after deletion of a.rs, only b.rs has the symbol, so this
+    // is actually an unambiguous relocate (1 candidate). The ambiguity test requires both
+    // a.rs and b.rs to be present but the stored anchor (a.rs::target) to be stale.
+    // Arrange: keep a.rs but corrupt its symbol so the stored symbol_id is gone.
+    drop(db);
+    // Restore a.rs and rebuild so both exist, then corrupt the stored symbol_id row.
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Null out the symbol_id so the exact-id check misses, and corrupt binding_id to an
+    // impossible qualified_name so the qualified_name lookup also misses — leaving only
+    // the bare-name+hash path, which must return None (>=2 candidates).
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE repo_memory_bindings SET symbol_id = NULL, binding_id = 'src/gone.rs::target'",
+            [],
+        )
+        .unwrap();
+
+    let report = db.memory_validate().unwrap();
+    assert_eq!(
+        report.gone, 1,
+        "ambiguous dual-body candidates must not trigger relocate, expected gone: {report:?}"
+    );
+    assert_eq!(
+        report.relocated, 0,
+        "must not relocate when two identical bodies exist: {report:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn memory_logical_binding_relocates_across_files() {
+    // Bind a memory via logical_symbol_id to a symbol in a.rs, then move it verbatim to b.rs.
+    // Because logical_symbol ids are content-derived they survive the move, so the first validate
+    // arm (exact id lookup) resolves directly. To specifically exercise the bare-name+hash
+    // fallback path on the logical_symbol binding kind, we corrupt the stored logical_symbol_id
+    // to an impossible value AND corrupt the binding_id to an impossible qualified_name, then
+    // rebuild. The fallback must recover the binding from b.rs via bare name + chunk text hash.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A single-variant function so chunk_for_logical_symbol gives a stable, non-null hash.
+    fs::write(root.join("src/a.rs"), "pub fn logical_target() -> u32 {\n    77\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "// placeholder\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("logical_target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("logical_target in a.rs");
+    let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "logical_target must follow logical binding".to_string(),
+            body: "Logical-symbol binding must relocate via name+hash fallback.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: Some(logical_symbol_id),
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+    assert_eq!(created.memory.bindings[0].binding_kind, "logical_symbol");
+    // Confirm a non-null source_text_hash was stored (required for fallback to work).
+    let stored_hash: Option<String> = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT source_text_hash FROM repo_memories WHERE id = ?1",
+            [&created.memory.memory_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored_hash.is_some(),
+        "source_text_hash must be non-null for the relocation fallback to work"
+    );
+
+    // Move the function verbatim to b.rs; rebuild.
+    fs::write(root.join("src/a.rs"), "// logical_target moved\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn logical_target() -> u32 {\n    77\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Corrupt both fast-path identifiers so only the bare-name+hash fallback can recover the
+    // binding. The binding_id keeps "logical_target" as the bare name (after rsplit "::").
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE repo_memory_bindings
+             SET logical_symbol_id = -9999,
+                 binding_id        = 'src/gone.rs::logical_target'
+             WHERE binding_kind = 'logical_symbol'",
+            [],
+        )
+        .unwrap();
+
+    let report = db.memory_validate().unwrap();
+    assert_eq!(
+        report.relocated, 1,
+        "logical binding must relocate via name+hash fallback: {report:?}"
+    );
+    assert_eq!(report.gone, 0, "logical binding must not be gone after relocation: {report:?}");
+
+    // The binding path must now reference b.rs.
+    let path = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT path FROM repo_memory_bindings WHERE binding_kind = 'logical_symbol' LIMIT 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        path.contains("b.rs"),
+        "logical binding path should be b.rs after relocation, got: {path}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn repo_brief_ranks_churn_and_god_module_candidates() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
