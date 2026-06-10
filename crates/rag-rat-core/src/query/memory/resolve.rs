@@ -111,16 +111,13 @@ pub(crate) fn symbol_signal(
     symbol_id: i64,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
     let row = conn
-        .query_row(
-            "SELECT kind, signature FROM symbols WHERE id = ?1",
-            [symbol_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
+        .query_row("SELECT kind, signature FROM symbols WHERE id = ?1", [symbol_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
         .optional()?;
     Ok(match row {
-        Some((kind, signature)) => {
-            (Some(kind), signature.map(|sig| hex_sha256(sig.trim().as_bytes())))
-        }
+        Some((kind, signature)) =>
+            (Some(kind), signature.map(|sig| hex_sha256(sig.trim().as_bytes()))),
         None => (None, None),
     })
 }
@@ -619,7 +616,8 @@ pub(crate) fn relocate_symbol_by_name(
 ) -> anyhow::Result<Option<RelocateMatch>> {
     let mut stmt = conn.prepare(
         // Content-hash confirmation is mandatory for a silent cross-file relocate.
-        // The join on `files` keeps this context-scoped, matching the qualified_name fallback above.
+        // The join on `files` keeps this context-scoped, matching the qualified_name fallback
+        // above.
         "
         SELECT symbols.id AS symbol_id, symbols.qualified_name AS qualified_name,
                files.path AS path, symbols.kind AS kind, symbols.signature AS signature
@@ -661,6 +659,30 @@ pub(crate) fn relocate_symbol_by_name(
         });
     }
     Ok(matched)
+}
+
+/// Find the unique live chunk whose text_hash matches `source_text_hash`.
+/// Content-hash match is mandatory; two or more matches (>=2) → `None` (ambiguous → stay gone).
+pub(crate) fn relocate_chunk_by_hash(
+    conn: &Connection,
+    source_text_hash: &str,
+) -> anyhow::Result<Option<ChunkAnchor>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT chunks.id AS chunk_id, files.path AS path, chunks.start_line AS start_line,
+               chunks.end_line AS end_line, chunks.symbol_path AS symbol_path,
+               chunks.text_hash AS text_hash, NULL AS symbol_id
+        FROM chunks JOIN files ON files.id = chunks.file_id
+        WHERE chunks.text_hash = ?1
+        ",
+    )?;
+    let mut rows = stmt.query_map([source_text_hash], chunk_anchor_row)?;
+    let Some(first) = rows.next() else { return Ok(None) };
+    let first = first?;
+    if rows.next().is_some() {
+        return Ok(None); // >=2 -> ambiguous -> stay gone
+    }
+    Ok(Some(first))
 }
 
 /// Strip the persisted `"{path}::"` prefix from a path-qualified `binding_id`.

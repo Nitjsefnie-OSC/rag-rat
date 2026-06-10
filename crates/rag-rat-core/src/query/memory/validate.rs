@@ -127,7 +127,22 @@ pub(crate) fn validate_chunk_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    validate_bound_chunk(conn, binding)
+    let status = validate_bound_chunk(conn, binding)?;
+    if status != "gone" {
+        return Ok(status);
+    }
+    let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? else {
+        return Ok("gone".to_string());
+    };
+    let Some(chunk) = relocate_chunk_by_hash(conn, &hash)? else {
+        return Ok("gone".to_string());
+    };
+    binding.binding_id = chunk.chunk_id.to_string();
+    binding.chunk_id = Some(chunk.chunk_id);
+    binding.path = Some(chunk.path);
+    binding.start_line = Some(chunk.start_line);
+    binding.end_line = Some(chunk.end_line);
+    Ok("relocated".to_string())
 }
 pub(crate) fn validate_edge_binding(
     conn: &Connection,

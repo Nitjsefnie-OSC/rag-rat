@@ -368,7 +368,8 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
                logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, github_owner,
-               github_repo, github_number, symbol_kind, signature_hash, anchor_status, created_at_ms
+               github_repo, github_number, symbol_kind, signature_hash, anchor_status, \
+         created_at_ms
         FROM repo_memory_bindings
         ",
     )?;
@@ -396,15 +397,25 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
             WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
             ",
             params![
-                binding.memory_id, binding.binding_kind, status,
-                binding.logical_symbol_id, binding.symbol_id, binding.chunk_id, binding.edge_id,
-                binding.path, binding.start_line, binding.end_line,
-                binding.binding_id, binding.symbol_kind, binding.signature_hash,
+                binding.memory_id,
+                binding.binding_kind,
+                status,
+                binding.logical_symbol_id,
+                binding.symbol_id,
+                binding.chunk_id,
+                binding.edge_id,
+                binding.path,
+                binding.start_line,
+                binding.end_line,
+                binding.binding_id,
+                binding.symbol_kind,
+                binding.signature_hash,
                 original_binding_id
             ],
         )?;
-        // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind, binding_id)
-        // PK, the rewrite is a no-op rather than a crash. Drop the now-duplicate stale row.
+        // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind,
+        // binding_id) PK, the rewrite is a no-op rather than a crash. Drop the
+        // now-duplicate stale row.
         if updated == 0 && binding.binding_id != original_binding_id {
             conn.execute(
                 "DELETE FROM repo_memory_bindings

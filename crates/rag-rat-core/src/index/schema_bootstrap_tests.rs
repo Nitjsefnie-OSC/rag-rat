@@ -4155,6 +4155,129 @@ fn memory_logical_binding_relocates_across_files() {
 }
 
 #[test]
+fn memory_chunk_binding_relocates_by_hash() {
+    // Bind a memory directly to a chunk id. After a full rebuild the chunk rows are DELETE-cascaded
+    // and re-inserted with fresh AUTOINCREMENT rowids, so the stored chunk_id is gone. Because
+    // `source_text_hash` still matches the live chunk's text_hash, `relocate_chunk_by_hash` must
+    // find the unique match and update the binding — relocated == 1, gone == 0.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two files so that on the second rebuild the file order may differ, exercising that the
+    // relocation finds the right chunk by content-hash rather than order.
+    let target_src = "pub fn chunk_anchor_target() -> u32 {\n    999\n}\n";
+    fs::write(root.join("src/target.rs"), target_src).unwrap();
+    fs::write(root.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Locate the chunk that covers `chunk_anchor_target`.
+    let chunk_id = db
+        .storage
+        .connection()
+        .query_row(
+            "
+            SELECT chunks.id
+            FROM chunks
+            JOIN files ON files.id = chunks.file_id
+            WHERE files.path LIKE '%target.rs'
+              AND chunks.symbol_path LIKE '%chunk_anchor_target%'
+            LIMIT 1
+            ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "chunk_anchor_target must return 999".to_string(),
+            body: "This chunk binding must survive a rowid change via content-hash relocation."
+                .to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: None,
+                symbol_id: None,
+                chunk_id: Some(chunk_id),
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+    assert_eq!(created.memory.bindings[0].binding_kind, "chunk");
+    assert_eq!(created.memory.bindings[0].chunk_id, Some(chunk_id));
+
+    // Confirm a source_text_hash was stored (prerequisite for relocation).
+    let stored_hash: Option<String> = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT source_text_hash FROM repo_memories WHERE id = ?1",
+            [&created.memory.memory_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(stored_hash.is_some(), "source_text_hash must be non-null for chunk relocation");
+
+    // Full rebuild: SQLite replaces all chunk rows, so rowids change. `target.rs` is untouched so
+    // its chunk text_hash remains identical to the stored source_text_hash. `other.rs` gets a
+    // different text_hash, so the content-exact match remains unique.
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // The old chunk_id must no longer exist.
+    let old_exists: i64 = db
+        .storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM chunks WHERE id = ?1", [chunk_id], |row| row.get(0))
+        .unwrap();
+    assert_eq!(old_exists, 0, "old chunk_id should be gone after rebuild");
+
+    let report = db.memory_validate().unwrap();
+    assert_eq!(
+        report.relocated, 1,
+        "chunk binding must relocate via content-hash after rowid change: {report:?}"
+    );
+    assert_eq!(
+        report.gone, 0,
+        "chunk binding must not be gone after content-hash relocation: {report:?}"
+    );
+
+    // Binding must now point at the live chunk.
+    let binding = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT chunk_id, path FROM repo_memory_bindings WHERE memory_id = ?1 LIMIT 1",
+            [&created.memory.memory_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap();
+    let (new_chunk_id, binding_path) = binding;
+    assert!(new_chunk_id.is_some(), "binding chunk_id must be non-null after relocation");
+    assert_ne!(new_chunk_id, Some(chunk_id), "binding must point at the new (different) chunk_id");
+    assert!(
+        binding_path.as_deref().unwrap_or("").contains("target.rs"),
+        "binding path must reference target.rs: {binding_path:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn repo_brief_ranks_churn_and_god_module_candidates() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
