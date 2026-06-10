@@ -32,7 +32,7 @@ pub(crate) fn install_hook(hooks_dir: &Path, hook: &str) -> anyhow::Result<()> {
             path.display()
         );
     }
-    fs::write(&path, hook_script(hook))?;
+    write_atomic(&path, hook_script(hook).as_bytes())?;
     make_executable(&path)?;
     Ok(())
 }

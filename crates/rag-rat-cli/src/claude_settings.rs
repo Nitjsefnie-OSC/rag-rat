@@ -205,11 +205,10 @@ pub fn read_settings(path: &Path) -> anyhow::Result<Value> {
 }
 
 pub fn write_settings(path: &Path, settings: &Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(settings)?))?;
-    Ok(())
+    // settings.json is user-authored and not regenerable — write it atomically so an
+    // interrupted write can't truncate it (#52). write_atomic creates the parent dir.
+    let body = format!("{}\n", serde_json::to_string_pretty(settings)?);
+    crate::write_atomic(path, body.as_bytes())
 }
 
 #[cfg(test)]

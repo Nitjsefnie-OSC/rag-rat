@@ -1,4 +1,5 @@
 mod commands;
+mod fs_atomic;
 mod hooks_support;
 mod render;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use std::time::Instant;
 use std::{env, fs};
 
 pub(crate) use commands::*;
+pub(crate) use fs_atomic::*;
 pub(crate) use hooks_support::*;
 use rag_rat_core::config::EmbeddingRuntimeConfig;
 use rag_rat_core::index::IndexProgress;
