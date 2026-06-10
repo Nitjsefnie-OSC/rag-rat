@@ -1281,6 +1281,14 @@ impl IndexDatabase {
         )
     }
 
+    pub fn memory_rebind(
+        &self,
+        memory_id: &str,
+        bind: crate::query::memory::RepoMemoryBindTarget,
+    ) -> anyhow::Result<crate::query::memory::RepoMemory> {
+        crate::query::memory::rebind_memory(self.storage.connection(), memory_id, bind)
+    }
+
     pub fn memory_validate(
         &self,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryValidationReport> {

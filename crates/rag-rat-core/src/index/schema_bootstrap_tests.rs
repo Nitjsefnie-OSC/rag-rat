@@ -4278,6 +4278,159 @@ fn memory_chunk_binding_relocates_by_hash() {
 }
 
 #[test]
+fn memory_rebind_reanchors_and_refreshes_hash() {
+    // Create a memory bound to `fn rebind_src` in a.rs, then delete the symbol so the binding
+    // goes `gone`. Call `memory_rebind` targeting a new live symbol (`fn rebind_dst` in b.rs).
+    // After rebind:
+    //   - returned binding has anchor_status == "current"
+    //   - memory.source_text_hash == the new chunk's text_hash
+    //   - a follow-up memory_validate does NOT flip the binding to stale/gone
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn rebind_src() -> u32 {\n    1\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn rebind_dst() -> u32 {\n    2\n}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Bind a memory to rebind_src in a.rs.
+    let src_symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("rebind_src".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("rebind_src symbol");
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "rebind test memory".to_string(),
+            body: "This memory will be explicitly rebound to a new symbol.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(src_symbol.symbol_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+    let memory_id = created.memory.memory_id.clone();
+
+    // Delete rebind_src so the binding goes gone.
+    fs::write(root.join("src/a.rs"), "// rebind_src removed\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.gone, 1, "binding should be gone after removing symbol: {report:?}");
+
+    // Locate rebind_dst in b.rs (the target of the explicit rebind).
+    let dst_symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("rebind_dst".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("rebind_dst symbol");
+
+    // Fetch the text_hash of rebind_dst's chunk so we can assert it matches after rebind.
+    let dst_chunk_text_hash: String = db
+        .storage
+        .connection()
+        .query_row(
+            "
+            SELECT chunks.text_hash
+            FROM chunks
+            JOIN files ON files.id = chunks.file_id
+            WHERE files.path LIKE '%b.rs'
+              AND chunks.symbol_path LIKE '%rebind_dst%'
+            LIMIT 1
+            ",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // Perform the explicit rebind.
+    let rebound = db
+        .memory_rebind(&memory_id, crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(dst_symbol.symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+        })
+        .unwrap();
+
+    // The returned binding must be current and the memory hash must match the new chunk.
+    assert_eq!(rebound.bindings.len(), 1);
+    assert_eq!(
+        rebound.bindings[0].anchor_status, "current",
+        "rebound binding must be current, got: {}",
+        rebound.bindings[0].anchor_status
+    );
+    assert_eq!(
+        rebound.source_text_hash.as_deref(),
+        Some(dst_chunk_text_hash.as_str()),
+        "memory source_text_hash must equal the new chunk's text_hash after rebind"
+    );
+
+    // A follow-up validate must NOT flip the binding to stale or gone.
+    let post_rebind_report = db.memory_validate().unwrap();
+    assert_eq!(
+        post_rebind_report.gone, 0,
+        "validate after rebind must not report gone: {post_rebind_report:?}"
+    );
+    assert_eq!(
+        post_rebind_report.stale, 0,
+        "validate after rebind must not report stale: {post_rebind_report:?}"
+    );
+    assert_eq!(
+        post_rebind_report.current + post_rebind_report.relocated,
+        1,
+        "binding must be current or relocated after validate: {post_rebind_report:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn repo_brief_ranks_churn_and_god_module_candidates() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

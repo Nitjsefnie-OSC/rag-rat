@@ -363,6 +363,32 @@ pub(crate) fn memory_search(
         stmt.query_map(params![query, i64::from(limit)], |row| row.get("memory_id"))?,
     )
 }
+
+pub(crate) fn rebind_memory(
+    conn: &Connection,
+    memory_id: &str,
+    bind: RepoMemoryBindTarget,
+) -> anyhow::Result<RepoMemory> {
+    if memory_by_id(conn, memory_id)?.is_none() {
+        anyhow::bail!("memory `{memory_id}` not found");
+    }
+    // Resolve inside the transaction so the stamped source_text_hash is consistent with the
+    // bindings written in the same atomic unit.
+    let tx = conn.unchecked_transaction()?;
+    let binding = resolve_binding(conn, &bind)?;
+    conn.execute("DELETE FROM repo_memory_bindings WHERE memory_id = ?1", [memory_id])?;
+    conn.execute("DELETE FROM repo_memory_call_paths WHERE memory_id = ?1", [memory_id])?;
+    let now = now_ms();
+    insert_binding(conn, memory_id, &binding, now)?;
+    conn.execute(
+        "UPDATE repo_memories SET source_text_hash = ?2, updated_at_ms = ?3 WHERE id = ?1",
+        params![memory_id, binding.source_text_hash, now],
+    )?;
+    tx.commit()?;
+    memory_by_id(conn, memory_id)?
+        .ok_or_else(|| anyhow::anyhow!("rebound memory `{memory_id}` could not be read back"))
+}
+
 pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidationReport> {
     let mut stmt = conn.prepare(
         "
