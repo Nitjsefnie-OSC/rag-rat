@@ -3897,6 +3897,145 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
 }
 
 #[test]
+fn relocation_persists_refreshed_symbol_and_logical_ids() {
+    // #50 (problem 1): a relocated symbol binding must rewrite the stored symbol_id /
+    // logical_symbol_id to the current index generation — not leave them pointing at a
+    // pre-rebuild row. The qualified-name join still surfaces the memory either way, but a
+    // logical-id / symbol-id-keyed lookup (memory_for_call_path, binding↔symbol matching) misses
+    // a stale id.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "// placeholder\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let select = |db: &IndexDatabase| {
+        db.select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("target symbol present")
+    };
+
+    let original = select(&db);
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "ids refreshed on relocate".to_string(),
+        body: "The persisted symbol_id/logical_symbol_id must follow the live symbol.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(original.symbol_id),
+            logical_symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+            dir: None,
+        },
+    })
+    .unwrap();
+
+    // Move target to b.rs and rebuild — reassigns symbol and chunk ids.
+    fs::write(root.join("src/a.rs"), "// moved\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.relocated, 1, "expected a relocation: {report:?}");
+
+    let current = select(&db);
+    assert_ne!(
+        current.symbol_id, original.symbol_id,
+        "the rebuild must have reassigned the symbol id for this test to be meaningful"
+    );
+
+    let (persisted_symbol_id, persisted_logical_id): (Option<i64>, Option<i64>) = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT symbol_id, logical_symbol_id FROM repo_memory_bindings WHERE binding_kind = \
+             'symbol' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        persisted_symbol_id,
+        Some(current.symbol_id),
+        "binding.symbol_id must be refreshed to the live symbol (was stale at {})",
+        original.symbol_id
+    );
+    assert_eq!(
+        persisted_logical_id, current.logical_symbol_id,
+        "binding.logical_symbol_id must match the live symbol"
+    );
+    // The persisted id must actually resolve in the current generation.
+    assert!(
+        crate::query::symbol::lookup_by_id(db.storage.connection(), persisted_symbol_id.unwrap())
+            .unwrap()
+            .is_some(),
+        "persisted symbol_id must resolve to a live symbol row"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn full_rebuild_leaves_no_orphan_symbol_rows_for_a_path() {
+    // #50 (problem 2): a full rebuild must clear the active context's prior-generation rows
+    // before reinserting — repeated rebuilds of the same path must not accumulate orphan symbol
+    // rows that would strand a symbol-id-keyed binding.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    42\n}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+
+    let count_targets = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM symbols WHERE name = 'target'", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(count_targets(&db), 1, "one target after the first rebuild");
+    // Rebuild twice more with edits that force new chunk/symbol ids each time.
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    43\n}\n").unwrap();
+    let _ = IndexDatabase::rebuild(&config).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn target() -> u32 {\n    44\n}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(
+        count_targets(&db),
+        1,
+        "repeated full rebuilds must not accumulate orphan symbol rows for the same path"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_stays_gone_when_moved_symbol_body_changed() {
     // Move `fn target` to b.rs but change its body so the chunk text hash differs.
     // Content-hash mismatch → no silent relocate → gone.
