@@ -5,18 +5,18 @@ use rusqlite::Connection;
 /// Options controlling the annotated directory tree builder.
 #[derive(Debug, Clone)]
 pub struct TreeOpts {
-    /// Maximum depth from the repo root (0 = root only; default 3).
+    /// Maximum depth from the repo root (0 = root only; default 6).
     pub max_depth: u8,
     /// A directory is included if its direct non-generated file count reaches this threshold
     /// (default 3).
     pub min_files: u32,
-    /// Hard cap on the number of `TreeNode`s returned (default 25).
+    /// Hard cap on the number of `TreeNode`s returned (default 30).
     pub max_nodes: usize,
 }
 
 impl Default for TreeOpts {
     fn default() -> Self {
-        Self { max_depth: 3, min_files: 3, max_nodes: 25 }
+        Self { max_depth: 6, min_files: 3, max_nodes: 30 }
     }
 }
 

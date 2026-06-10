@@ -327,6 +327,20 @@ const ATTRIBUTION_HEADER: &str = "\
 
 // ─── Digest formatting ────────────────────────────────────────────────────────
 
+/// Strip a leading `crates/<crate>/src/` prefix from a repo-relative path.
+///
+/// Converts e.g. `crates/rag-rat-core/src/index/mod.rs` → `index/mod.rs`.
+/// Paths that do not match the three-segment `crates/<anything>/src/` prefix are returned
+/// unchanged.
+pub fn short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.splitn(4, '/').collect();
+    if parts.len() == 4 && parts[0] == "crates" && parts[2] == "src" {
+        parts[3].to_string()
+    } else {
+        p.to_string()
+    }
+}
+
 /// Render the full orientation digest as a plain-text string.
 ///
 /// `live` = watcher election lock is currently held; `enabled` = watch is configured on.
@@ -357,10 +371,13 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
         out.push_str(&format!("  … (+{} more)\n", o.tree.truncated));
     }
 
-    // Load-bearing files.
+    // Load-bearing files (paths shortened: crates/<crate>/src/X → X).
     if !o.load_bearing.is_empty() {
-        let parts: Vec<String> =
-            o.load_bearing.iter().map(|(p, fi)| format!("{} (fan_in {})", p, fi)).collect();
+        let parts: Vec<String> = o
+            .load_bearing
+            .iter()
+            .map(|(p, fi)| format!("{} (fan_in {})", short_path(p), fi))
+            .collect();
         out.push_str(&format!("load-bearing: {}\n", parts.join(" · ")));
     }
 
@@ -371,16 +388,23 @@ pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
             line_parts.push(format!("recent: {}", o.recent_commits.join(" · ")));
         }
         if !o.hot_files.is_empty() {
-            line_parts.push(format!("hot: {}", o.hot_files.join(", ")));
+            let short_hot: Vec<String> = o.hot_files.iter().map(|p| short_path(p)).collect();
+            line_parts.push(format!("hot: {}", short_hot.join(", ")));
         }
         if !line_parts.is_empty() {
             out.push_str(&format!("{}\n", line_parts.join(" · ")));
         }
     }
 
-    // Active non-dir memory titles.
+    // Active non-dir memory titles — capped at 3 with an overflow note.
     if !o.active_memory_titles.is_empty() {
-        out.push_str(&format!("memories: {}\n", o.active_memory_titles.join(" · ")));
+        let shown = &o.active_memory_titles[..o.active_memory_titles.len().min(3)];
+        let mut mem_line = shown.join(" · ");
+        let extra = o.active_memory_titles.len().saturating_sub(3);
+        if extra > 0 {
+            mem_line.push_str(&format!(" (+{extra} more)"));
+        }
+        out.push_str(&format!("memories: {mem_line}\n"));
     }
 
     // Watcher-aware health line.
@@ -732,7 +756,11 @@ mod tests {
             None,
             vec![],
             0,
-            vec![("src/database.rs", 2286), ("src/main.rs", 42)],
+            vec![
+                ("crates/rag-rat-core/src/index/mod.rs", 2286),
+                ("crates/rag-rat-core/src/main.rs", 42),
+                ("src/database.rs", 999),
+            ],
             vec![],
             vec![],
             vec![],
@@ -743,7 +771,91 @@ mod tests {
         );
         let s = format_digest(&o, true, true);
         assert!(s.contains("load-bearing:"), "missing load-bearing prefix");
-        assert!(s.contains("src/database.rs (fan_in 2286)"), "missing fan_in entry");
+        // crates/.../src/ prefix must be stripped.
+        assert!(
+            s.contains("index/mod.rs (fan_in 2286)"),
+            "crates path not shortened; got:\n{s}"
+        );
+        assert!(
+            s.contains("main.rs (fan_in 42)"),
+            "crates path not shortened for main.rs; got:\n{s}"
+        );
+        // Path without the crates prefix stays unchanged.
+        assert!(s.contains("src/database.rs (fan_in 999)"), "non-crates path changed; got:\n{s}");
+    }
+
+    #[test]
+    fn format_digest_memories_capped_at_three() {
+        let titles: Vec<&str> = vec!["alpha", "beta", "gamma", "delta", "epsilon"];
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            titles,
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        // First 3 titles must appear.
+        assert!(s.contains("alpha"), "first memory title missing");
+        assert!(s.contains("beta"), "second memory title missing");
+        assert!(s.contains("gamma"), "third memory title missing");
+        // Overflow note must be present (5 - 3 = 2 more).
+        assert!(s.contains("(+2 more)"), "overflow note missing; got:\n{s}");
+        // Titles beyond the first 3 must not appear directly.
+        assert!(!s.contains("delta"), "fourth title should not appear directly");
+        assert!(!s.contains("epsilon"), "fifth title should not appear directly");
+    }
+
+    #[test]
+    fn format_digest_memories_no_overflow_when_three_or_fewer() {
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec!["alpha", "beta", "gamma"],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("alpha · beta · gamma"), "three titles should be shown");
+        assert!(!s.contains("more)"), "no overflow note when ≤3 titles");
+    }
+
+    #[test]
+    fn short_path_strips_crates_prefix() {
+        assert_eq!(
+            short_path("crates/rag-rat-core/src/index/mod.rs"),
+            "index/mod.rs",
+            "three-segment crates prefix should be stripped"
+        );
+        assert_eq!(
+            short_path("crates/rag-rat-mcp/src/server.rs"),
+            "server.rs",
+            "single-file under src should be stripped"
+        );
+    }
+
+    #[test]
+    fn short_path_leaves_non_crates_paths_unchanged() {
+        assert_eq!(short_path("src/database.rs"), "src/database.rs");
+        assert_eq!(short_path("crates/only-two"), "crates/only-two");
+        assert_eq!(
+            short_path("crates/foo/not-src/bar.rs"),
+            "crates/foo/not-src/bar.rs",
+            "second segment is 'not-src', must not strip"
+        );
+        assert_eq!(short_path(""), "");
     }
 
     // ─── Health line table test ───────────────────────────────────────────────

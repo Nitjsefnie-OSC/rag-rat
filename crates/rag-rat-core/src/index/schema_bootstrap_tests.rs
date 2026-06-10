@@ -5497,7 +5497,7 @@ fn dir_tree_builds_annotated_layout() {
     let conn = db.storage.connection();
     install_scope(conn, &root);
 
-    let opts = crate::query::tree::TreeOpts::default(); // max_depth=3, min_files=3, max_nodes=25
+    let opts = crate::query::tree::TreeOpts::default(); // max_depth=6, min_files=3, max_nodes=30
     let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
 
     // Root memory must be present.
