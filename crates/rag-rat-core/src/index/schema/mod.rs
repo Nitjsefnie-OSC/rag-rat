@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 14;
+pub const LATEST_SCHEMA_VERSION: u32 = 15;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -64,6 +64,10 @@ const MIGRATION_014_ID: &str = "014_repo_memory_binding_signals";
 const MIGRATION_014_CHECKSUM: &str = "sha256:rag-rat-repo-memory-binding-signals-v14";
 const MIGRATION_014_DESCRIPTION: &str =
     "Add symbol_kind + signature_hash to repo_memory_bindings for durable cross-file relocation";
+const MIGRATION_015_ID: &str = "015_repo_memory_call_path_edges";
+const MIGRATION_015_CHECKSUM: &str = "sha256:rag-rat-repo-memory-call-path-edges-v15";
+const MIGRATION_015_DESCRIPTION: &str =
+    "Add ordered edge fingerprints behind server-derived call-path hashes for validation";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +148,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     record_migration(conn, MIGRATION_013_ID, MIGRATION_013_CHECKSUM, MIGRATION_013_DESCRIPTION)?;
     apply_memory_binding_signals(conn)?;
     record_migration(conn, MIGRATION_014_ID, MIGRATION_014_CHECKSUM, MIGRATION_014_DESCRIPTION)?;
+    apply_repo_memory_call_path_edges(conn)?;
+    record_migration(conn, MIGRATION_015_ID, MIGRATION_015_CHECKSUM, MIGRATION_015_DESCRIPTION)?;
     Ok(())
 }
 

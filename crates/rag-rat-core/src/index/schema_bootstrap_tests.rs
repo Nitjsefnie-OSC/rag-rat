@@ -3394,6 +3394,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -3471,6 +3472,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -3561,6 +3563,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -3647,6 +3650,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -3695,6 +3699,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
                 end_logical_symbol_id: target.logical_symbol_id,
                 edge_sequence_hash: Some("edge-sequence-test-hash".to_string()),
                 path_summary: Some("caller_edge -> target_edge".to_string()),
+                edge_path: None,
                 dir: None,
             },
         })
@@ -3703,6 +3708,110 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
     assert_eq!(call_path.len(), 1);
     assert_eq!(call_path[0].memory_id, call_path_memory.memory.memory_id);
     assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
+    // #38: bind a call-path memory by ordered edge ids — the server derives the authoritative
+    // edge_sequence_hash from edge fingerprints. A full rebuild reassigns edge row ids, but the
+    // hash (built from row-id-independent fingerprints) is unchanged and validation stays
+    // "current". Deleting the call site makes the path "gone".
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn caller() {\n    callee();\n}\npub fn callee() {}\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edge_id = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT id FROM edges WHERE to_name LIKE '%callee%' ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("caller->callee edge present")
+    };
+    let call_path_status = |db: &IndexDatabase| -> String {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT anchor_status FROM repo_memory_bindings WHERE binding_kind = 'call_path' \
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "why callee is invoked here".to_string(),
+            body: "This call path is load-bearing.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: None,
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                edge_path: Some(vec![edge_id(&db)]),
+                dir: None,
+            },
+        })
+        .unwrap();
+
+    // The stored binding_id is the server-derived hash, and it created at "current".
+    let hash: String = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT binding_id FROM repo_memory_bindings WHERE binding_kind = 'call_path' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(call_path_status(&db), "current");
+    // memory_for_call_path resolves the server hash.
+    let found = db.memory_for_call_path_hash(&hash, 10).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].memory_id, created.memory.memory_id);
+
+    // Rebuild reassigns edge row ids; the fingerprint-derived hash and "current" status survive.
+    let old_edge = edge_id(&db);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_ne!(
+        edge_id(&db),
+        old_edge,
+        "rebuild must reassign the edge row id for a real churn test"
+    );
+    db.memory_validate().unwrap();
+    assert_eq!(call_path_status(&db), "current", "server hash survives edge row-id churn");
+    assert_eq!(db.memory_for_call_path_hash(&hash, 10).unwrap().len(), 1);
+
+    // Remove the call site → the edge is gone → the call path is gone.
+    fs::write(root.join("src/lib.rs"), "pub fn caller() {}\npub fn callee() {}\n").unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(call_path_status(&db), "gone", "deleting the call site makes the path gone");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -3761,6 +3870,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -3854,6 +3964,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         },
     })
@@ -3951,6 +4062,7 @@ fn relocation_persists_refreshed_symbol_and_logical_ids() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         },
     })
@@ -4085,6 +4197,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         },
     })
@@ -4160,6 +4273,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         },
     })
@@ -4266,6 +4380,7 @@ fn memory_logical_binding_relocates_across_files() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -4391,6 +4506,7 @@ fn memory_chunk_binding_relocates_by_hash() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -4510,6 +4626,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: None,
             },
         })
@@ -4573,6 +4690,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         })
         .unwrap();
@@ -4655,6 +4773,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
         path_summary: None,
+        edge_path: None,
         dir: None,
     };
 
@@ -4744,6 +4863,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         },
     })
@@ -5080,6 +5200,7 @@ fn dir_memory_binds_to_a_directory() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                edge_path: None,
                 dir: Some("src".to_string()),
             },
         })
@@ -5121,6 +5242,7 @@ fn dir_memory_validation_current_and_gone() {
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
         path_summary: None,
+        edge_path: None,
         dir,
     };
 
@@ -5197,6 +5319,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
         path_summary: None,
+        edge_path: None,
         dir,
     };
     let path_bind = |path: String| crate::query::memory::RepoMemoryBindTarget {
@@ -5215,6 +5338,7 @@ fn list_memories_returns_summaries_and_filters_by_binding_kind() {
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
         path_summary: None,
+        edge_path: None,
         dir: None,
     };
 
@@ -5300,6 +5424,7 @@ fn dir_bind_target(dir: Option<String>) -> crate::query::memory::RepoMemoryBindT
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
         path_summary: None,
+        edge_path: None,
         dir,
     }
 }
@@ -6065,6 +6190,7 @@ fn orientation_composes_read_only() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            edge_path: None,
             dir: None,
         },
     })

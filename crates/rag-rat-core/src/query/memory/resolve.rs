@@ -16,6 +16,10 @@ pub(crate) fn resolve_binding(
     if let Some(edge_id) = bind.edge_id {
         return resolve_edge_binding(conn, edge_id);
     }
+    // Server-derived call path (preferred): compute the authoritative hash from the edges.
+    if let Some(edge_path) = bind.edge_path.as_deref() {
+        return resolve_call_path_from_edges(conn, bind, edge_path);
+    }
     if let Some(edge_sequence_hash) = bind.edge_sequence_hash.as_deref() {
         return resolve_call_path_binding(conn, bind, edge_sequence_hash);
     }
@@ -299,6 +303,8 @@ pub(crate) fn resolve_call_path_binding(
             end_logical_symbol_id: bind.end_logical_symbol_id,
             edge_sequence_hash: edge_sequence_hash.to_string(),
             path_summary: path_summary.to_string(),
+            // Client-supplied hash: no server-resolved edges to persist, so it stays unverified.
+            edges: Vec::new(),
         }),
         source_text_hash: None,
         anchor_status: "unverified".to_string(),
@@ -579,6 +585,163 @@ pub(crate) fn edge_fingerprint(parts: EdgeFingerprintParts<'_>) -> String {
         .as_bytes(),
     )
 }
+/// Hash-algorithm version prefix for server-derived call-path hashes. Bump if the input
+/// composition changes so old hashes never silently collide with a new scheme (#38).
+pub(crate) const CALL_PATH_HASH_VERSION: &str = "cp1";
+/// Cap on edges in one call path — bounds the bind payload and the validation scan.
+const MAX_CALL_PATH_EDGES: usize = 64;
+
+/// Authoritative edge-sequence hash: versioned SHA-256 over the ordered edge fingerprints.
+/// Built from `edge_fingerprint` (row-id-independent), so it survives reindexing and edge row
+/// churn as long as the call sites' content is unchanged.
+pub(crate) fn compute_edge_sequence_hash<'a>(
+    fingerprints: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut buf = String::from(CALL_PATH_HASH_VERSION);
+    for fingerprint in fingerprints {
+        buf.push('\n');
+        buf.push_str(fingerprint);
+    }
+    hex_sha256(buf.as_bytes())
+}
+
+/// Read one edge's fingerprint + loose identity by row id. The fingerprint is computed exactly
+/// as `edge_anchor_row` does (same columns, same Option handling) so it matches
+/// `edge_by_fingerprint` during validation.
+pub(crate) fn call_path_edge_by_id(
+    conn: &Connection,
+    edge_id: i64,
+) -> anyhow::Result<Option<CallPathEdge>> {
+    conn.query_row(
+        "
+        SELECT files.path AS path,
+               COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1) \
+         AS end_line,
+               edges.from_name AS from_name,
+               edges.to_name AS to_name,
+               edges.edge_kind AS edge_kind,
+               edges.target_qualified_name AS target_qualified_name,
+               edges.receiver_hint AS receiver_hint
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.id = ?1
+        ",
+        [edge_id],
+        |row| {
+            let path: String = row.get("path")?;
+            let start_line: i64 = row.get("start_line")?;
+            let end_line: i64 = row.get("end_line")?;
+            let from_name: Option<String> = row.get("from_name")?;
+            let to_name: Option<String> = row.get("to_name")?;
+            let edge_kind: String = row.get("edge_kind")?;
+            let target_qualified_name: Option<String> = row.get("target_qualified_name")?;
+            let receiver_hint: Option<String> = row.get("receiver_hint")?;
+            let fingerprint = edge_fingerprint(EdgeFingerprintParts {
+                path: &path,
+                start_line,
+                end_line,
+                from_name: from_name.as_deref(),
+                to_name: to_name.as_deref(),
+                edge_kind: &edge_kind,
+                target_qualified_name: target_qualified_name.as_deref(),
+                receiver_hint: receiver_hint.as_deref(),
+            });
+            Ok(CallPathEdge {
+                fingerprint,
+                from_name,
+                to_name,
+                edge_kind,
+                target_qualified_name,
+                receiver_hint,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Resolve a server-derived call-path binding from ordered edge ids: look each edge up, compute
+/// the authoritative `edge_sequence_hash` from their fingerprints, and carry the ordered edges so
+/// `insert_binding` can persist them for validation. `anchor_status` is `current` (the edges all
+/// resolve right now). A client-supplied `edge_sequence_hash`, if any, is ignored in favor of the
+/// server-derived one.
+pub(crate) fn resolve_call_path_from_edges(
+    conn: &Connection,
+    bind: &RepoMemoryBindTarget,
+    edge_ids: &[i64],
+) -> anyhow::Result<ResolvedBinding> {
+    if edge_ids.is_empty() {
+        anyhow::bail!("call-path binding requires at least one edge id in edge_path");
+    }
+    if edge_ids.len() > MAX_CALL_PATH_EDGES {
+        anyhow::bail!("call path has {} edges; the limit is {MAX_CALL_PATH_EDGES}", edge_ids.len());
+    }
+    let mut edges = Vec::with_capacity(edge_ids.len());
+    for &edge_id in edge_ids {
+        let edge = call_path_edge_by_id(conn, edge_id)?.ok_or_else(|| {
+            anyhow::anyhow!("edge_path references edge {edge_id}, which is not in the index")
+        })?;
+        edges.push(edge);
+    }
+    let hash = compute_edge_sequence_hash(edges.iter().map(|edge| edge.fingerprint.as_str()));
+
+    if let Some(start_id) = bind.start_logical_symbol_id {
+        ensure_logical_symbol_exists(conn, start_id)?;
+    }
+    if let Some(end_id) = bind.end_logical_symbol_id {
+        ensure_logical_symbol_exists(conn, end_id)?;
+    }
+
+    // Prefer the caller's summary; otherwise synthesize a readable "a -> b -> c" from the edge
+    // target names so the stored row is never empty.
+    let path_summary = match bind.path_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(summary) => summary.to_string(),
+        None => default_path_summary(&edges),
+    };
+    validate_len("path_summary", &path_summary, 500)?;
+
+    Ok(ResolvedBinding {
+        binding_kind: "call_path".to_string(),
+        binding_id: hash.clone(),
+        path: None,
+        start_line: None,
+        end_line: None,
+        logical_symbol_id: bind.start_logical_symbol_id.or(bind.end_logical_symbol_id),
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        symbol_kind: None,
+        signature_hash: None,
+        call_path: Some(ResolvedCallPath {
+            start_logical_symbol_id: bind.start_logical_symbol_id,
+            end_logical_symbol_id: bind.end_logical_symbol_id,
+            edge_sequence_hash: hash,
+            path_summary,
+            edges,
+        }),
+        source_text_hash: None,
+        anchor_status: "current".to_string(),
+    })
+}
+
+/// `"caller -> a -> b"` from the ordered edges, capped to fit `path_summary`'s 500-char limit.
+fn default_path_summary(edges: &[CallPathEdge]) -> String {
+    let mut parts = Vec::with_capacity(edges.len() + 1);
+    if let Some(from) = edges.first().and_then(|edge| edge.from_name.as_deref()) {
+        parts.push(from.to_string());
+    }
+    for edge in edges {
+        parts.push(edge.to_name.clone().unwrap_or_else(|| "?".to_string()));
+    }
+    let summary = parts.join(" -> ");
+    summary.chars().take(500).collect()
+}
+
 pub(crate) fn ensure_logical_symbol_exists(
     conn: &Connection,
     logical_symbol_id: i64,
@@ -642,6 +805,30 @@ pub(crate) fn insert_binding(
                 now
             ],
         )?;
+        // Persist the ordered edges behind a server-derived hash so validation can re-check them
+        // (#38). A legacy client-supplied hash carries no edges and stays unverified.
+        for (ordinal, edge) in call_path.edges.iter().enumerate() {
+            conn.execute(
+                "
+                INSERT INTO repo_memory_call_path_edges(
+                    memory_id, edge_sequence_hash, ordinal, edge_fingerprint, from_name, to_name,
+                    edge_kind, target_qualified_name, receiver_hint
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    memory_id,
+                    call_path.edge_sequence_hash,
+                    ordinal as i64,
+                    edge.fingerprint,
+                    edge.from_name,
+                    edge.to_name,
+                    edge.edge_kind,
+                    edge.target_qualified_name,
+                    edge.receiver_hint,
+                ],
+            )?;
+        }
     }
     Ok(())
 }

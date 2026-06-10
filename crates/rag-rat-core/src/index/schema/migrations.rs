@@ -348,6 +348,34 @@ pub(crate) fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Resul
     Ok(())
 }
 
+pub(crate) fn apply_repo_memory_call_path_edges(conn: &Connection) -> rusqlite::Result<()> {
+    // The ordered edges behind a server-derived call-path hash (#38). `edge_fingerprint` is the
+    // exact, row-id-independent identity (path+lines+names+kind+target); the looser
+    // from/to/kind/target columns let validation re-find an edge that moved lines (relocated)
+    // rather than reporting the whole path gone. One row per edge, ordered by `ordinal`.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS repo_memory_call_path_edges(
+            memory_id TEXT NOT NULL,
+            edge_sequence_hash TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            edge_fingerprint TEXT NOT NULL,
+            from_name TEXT,
+            to_name TEXT NOT NULL,
+            edge_kind TEXT NOT NULL,
+            target_qualified_name TEXT,
+            receiver_hint TEXT,
+            PRIMARY KEY(memory_id, edge_sequence_hash, ordinal),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_path_edges_hash
+            ON repo_memory_call_path_edges(edge_sequence_hash);
+        ",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn apply_memory_binding_signals(conn: &Connection) -> rusqlite::Result<()> {
     // Durable corroboration signals for cross-file relocation: a moved symbol keeps its
     // kind + signature even when its path-qualified name (and rowids) change.
@@ -443,6 +471,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_012_ID => Some(12),
             MIGRATION_013_ID => Some(13),
             MIGRATION_014_ID => Some(14),
+            MIGRATION_015_ID => Some(15),
             _ => None,
         })
         .max()
@@ -466,6 +495,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_012_ID
             | MIGRATION_013_ID
             | MIGRATION_014_ID
+            | MIGRATION_015_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -486,6 +516,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_012_ID => migration.checksum != MIGRATION_012_CHECKSUM,
         MIGRATION_013_ID => migration.checksum != MIGRATION_013_CHECKSUM,
         MIGRATION_014_ID => migration.checksum != MIGRATION_014_CHECKSUM,
+        MIGRATION_015_ID => migration.checksum != MIGRATION_015_CHECKSUM,
         _ => false,
     }
 }

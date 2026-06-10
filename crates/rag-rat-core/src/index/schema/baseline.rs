@@ -489,6 +489,7 @@ pub(crate) fn apply_baseline(conn: &Connection) -> rusqlite::Result<()> {
     apply_symbol_facts(conn)?;
     apply_repo_memories(conn)?;
     apply_repo_memory_call_paths(conn)?;
+    apply_repo_memory_call_path_edges(conn)?;
     apply_graph_file_lookup_indexes(conn)?;
     Ok(())
 }

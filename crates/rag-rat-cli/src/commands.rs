@@ -317,6 +317,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                         end_logical_symbol_id: None,
                         edge_sequence_hash: None,
                         path_summary: None,
+                        edge_path: None,
                         dir: None,
                     },
                     Ok(None) => anyhow::bail!("symbol `{symbol_name}` not found"),
@@ -347,6 +348,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                     end_logical_symbol_id: None,
                     edge_sequence_hash: None,
                     path_summary: None,
+                    edge_path: None,
                     dir: None,
                 }
             } else if let Some(chunk_id) = chunk {
@@ -366,6 +368,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                     end_logical_symbol_id: None,
                     edge_sequence_hash: None,
                     path_summary: None,
+                    edge_path: None,
                     dir: None,
                 }
             } else {

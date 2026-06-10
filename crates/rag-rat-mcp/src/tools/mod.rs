@@ -447,6 +447,10 @@ pub struct MemoryBindArgs {
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,
+    /// Ordered edge ids (e.g. from `find_callers`/`trace_callees`) for a server-derived call-path
+    /// binding. The server computes the authoritative `edge_sequence_hash` from these edges —
+    /// preferred over passing `edge_sequence_hash` directly.
+    pub edge_path: Option<Vec<i64>>,
     /// Directory path relative to the repo root (e.g. `"src/actors"`); empty string anchors to the
     /// repo root.
     pub dir: Option<String>,
@@ -630,6 +634,7 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             end_logical_symbol_id: args.end_logical_symbol_id,
             edge_sequence_hash: args.edge_sequence_hash,
             path_summary: args.path_summary,
+            edge_path: args.edge_path,
             dir: args.dir,
         }
     }

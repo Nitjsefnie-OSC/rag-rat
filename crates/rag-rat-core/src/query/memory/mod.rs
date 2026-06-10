@@ -119,6 +119,10 @@ pub struct RepoMemoryBindTarget {
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,
+    /// Ordered edge ids for a server-derived call-path binding (#38). When set, the server
+    /// computes the authoritative `edge_sequence_hash` from these edges' fingerprints and stores
+    /// them for validation — preferred over a client-supplied `edge_sequence_hash`.
+    pub edge_path: Option<Vec<i64>>,
     /// Directory anchor: a repo-root-relative directory path, or `""` for the repo root.
     /// Normalized on resolve (trim, drop leading `./`, strip trailing `/`).
     pub dir: Option<String>,
@@ -180,6 +184,21 @@ struct ResolvedCallPath {
     end_logical_symbol_id: Option<i64>,
     edge_sequence_hash: String,
     path_summary: String,
+    /// Ordered edges behind a server-derived hash (#38). Empty for a legacy client-supplied
+    /// `edge_sequence_hash` (which stays `unverified` — no edges to re-check).
+    edges: Vec<CallPathEdge>,
+}
+
+/// One edge in a server-derived call path: its exact `edge_fingerprint` plus the looser
+/// identity (names/kind/target) that lets validation re-find it after a line move (#38).
+#[derive(Debug, Clone)]
+pub(crate) struct CallPathEdge {
+    pub(crate) fingerprint: String,
+    pub(crate) from_name: Option<String>,
+    pub(crate) to_name: Option<String>,
+    pub(crate) edge_kind: String,
+    pub(crate) target_qualified_name: Option<String>,
+    pub(crate) receiver_hint: Option<String>,
 }
 
 #[derive(Debug)]

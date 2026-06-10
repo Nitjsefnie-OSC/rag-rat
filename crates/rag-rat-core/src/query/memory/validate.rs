@@ -184,16 +184,95 @@ pub(crate) fn validate_call_path_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
-    let exists = conn.query_row(
+    // Re-check each stored edge behind the server-derived hash (#38). Exact-fingerprint match →
+    // the edge is unchanged; loose name/kind/target match → it moved lines (relocated); neither →
+    // that edge is gone.
+    let mut stmt = conn.prepare(
+        "
+        SELECT edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name
+        FROM repo_memory_call_path_edges
+        WHERE memory_id = ?1 AND edge_sequence_hash = ?2
+        ORDER BY ordinal
+        ",
+    )?;
+    let edges = stmt
+        .query_map(params![binding.memory_id, binding.binding_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if edges.is_empty() {
+        // Legacy client-supplied hash with no stored edges — honest-but-weak: current only as a
+        // row, never verifiable against the graph.
+        let exists = conn.query_row(
+            "SELECT COUNT(*) FROM repo_memory_call_paths
+             WHERE memory_id = ?1 AND edge_sequence_hash = ?2",
+            params![binding.memory_id, binding.binding_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        return Ok(if exists > 0 { "unverified" } else { "gone" }.to_string());
+    }
+
+    let total = edges.len();
+    let mut relocated = 0usize;
+    let mut gone = 0usize;
+    for (fingerprint, from_name, to_name, edge_kind, target) in &edges {
+        if edge_by_fingerprint(conn, fingerprint)?.is_some() {
+            continue;
+        }
+        if call_path_edge_relocatable(
+            conn,
+            from_name.as_deref(),
+            to_name.as_deref(),
+            edge_kind,
+            target.as_deref(),
+        )? {
+            relocated += 1;
+        } else {
+            gone += 1;
+        }
+    }
+
+    Ok(if gone == total {
+        "gone"
+    } else if gone > 0 {
+        "stale"
+    } else if relocated > 0 {
+        "relocated"
+    } else {
+        "current"
+    }
+    .to_string())
+}
+
+/// Is there still an edge matching this one's loose identity (names/kind/target), ignoring line
+/// numbers? Used to call a call-path edge `relocated` (moved) rather than `gone` (#38).
+fn call_path_edge_relocatable(
+    conn: &Connection,
+    from_name: Option<&str>,
+    to_name: Option<&str>,
+    edge_kind: &str,
+    target_qualified_name: Option<&str>,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
         "
         SELECT COUNT(*)
-        FROM repo_memory_call_paths
-        WHERE memory_id = ?1 AND edge_sequence_hash = ?2
+        FROM edges
+        WHERE edge_kind = ?3
+          AND COALESCE(from_name, '') = COALESCE(?1, '')
+          AND COALESCE(to_name, '') = COALESCE(?2, '')
+          AND COALESCE(target_qualified_name, '') = COALESCE(?4, '')
         ",
-        params![binding.memory_id, binding.binding_id],
-        |row| row.get::<_, i64>(0),
+        params![from_name, to_name, edge_kind, target_qualified_name],
+        |row| row.get(0),
     )?;
-    Ok(if exists > 0 { "unverified" } else { "gone" }.to_string())
+    Ok(count > 0)
 }
 pub(crate) fn validate_bound_edge_source_hash(
     conn: &Connection,
