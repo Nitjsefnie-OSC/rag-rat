@@ -74,7 +74,14 @@ pub(crate) fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> 
         max_embedding_chars,
         intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
     };
-    print_json(&db.reconcile_with_options_progress(options, render_reconcile_progress)?)
+    let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
+    // After reconciling, surface non-current memory anchors so they don't rot silently.
+    // Read-only count from persisted anchor_status; does not call memory_validate.
+    let non_current = db.memory_anchor_health().map(|h| h.stale + h.gone).unwrap_or(0);
+    if non_current > 0 {
+        eprintln!("⚠ {non_current} repo memories need re-anchoring — run 'rag-rat memory doctor'");
+    }
+    print_json(&report)
 }
 pub(crate) fn run_watch(config: Config) -> anyhow::Result<()> {
     let Some(_watcher) = rag_rat_core::watch::Watcher::spawn(config.clone()) else {

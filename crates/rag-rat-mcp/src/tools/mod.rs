@@ -725,10 +725,10 @@ pub fn description(name: &str) -> &'static str {
              — so the rationale resurfaces for the next agent editing that code. Capture \
              non-obvious invariants and decisions as you discover them.",
         "memory_rebind" =>
-            "Re-anchor an existing repo memory to a different symbol, chunk, path, or other \
-             source location — use this after a symbol moves or is renamed rather than \
-             obsoleting and recreating the memory. Replaces the binding and refreshes the \
-             source_text_hash so the memory stays current.",
+            "Re-anchor an existing repo memory to a different symbol, chunk, path, or other source \
+             location — use this after a symbol moves or is renamed rather than obsoleting and \
+             recreating the memory. Replaces the binding and refreshes the source_text_hash so the \
+             memory stays current.",
         "memory_update" => "Update a repo memory's text, status, confidence, kind, or tags by id.",
         "memory_search" => "Full-text search across active (or stale) repo memories by keyword.",
         "memory_for_symbol" =>

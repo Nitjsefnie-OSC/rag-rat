@@ -131,6 +131,17 @@ pub struct IndexStatus {
     pub git_history: GitHistoryIndexStatus,
     pub github: GitHubStatus,
     pub local_ai: LocalAiStatus,
+    pub anchor_health: AnchorHealth,
+}
+
+/// READ-only counts of active repo-memory bindings grouped by `anchor_status`.
+/// Computed by a single GROUP BY query; does not run `memory_validate` or write anything.
+#[derive(Debug, Default, Serialize)]
+pub struct AnchorHealth {
+    pub current: u64,
+    pub relocated: u64,
+    pub stale: u64,
+    pub gone: u64,
 }
 
 #[derive(Debug, Serialize)]

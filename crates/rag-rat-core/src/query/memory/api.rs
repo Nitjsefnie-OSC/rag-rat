@@ -525,6 +525,36 @@ fn live_symbol_candidates(
     ranked.into_iter().map(|(_, qname)| qname).collect()
 }
 
+/// READ-only; counts persisted anchor_status over active memories' bindings, does not re-validate.
+/// Returns counts grouped by anchor_status for active repo memories.
+pub(crate) fn anchor_health_counts(
+    conn: &Connection,
+) -> anyhow::Result<crate::index::AnchorHealth> {
+    let mut health = crate::index::AnchorHealth::default();
+    let mut stmt = conn.prepare(
+        "
+        SELECT b.anchor_status, COUNT(*) AS cnt
+        FROM repo_memory_bindings AS b
+        JOIN repo_memories AS m ON m.id = b.memory_id
+        WHERE m.status = 'active'
+        GROUP BY b.anchor_status
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (status, count) = row?;
+        let n = u64::try_from(count).unwrap_or(0);
+        match status.as_str() {
+            "current" => health.current += n,
+            "relocated" => health.relocated += n,
+            "stale" => health.stale += n,
+            "gone" => health.gone += n,
+            _ => {},
+        }
+    }
+    Ok(health)
+}
+
 pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryValidationReport> {
     let mut stmt = conn.prepare(
         "

@@ -58,6 +58,15 @@ fn main() -> anyhow::Result<()> {
                 if let Err(err) = db.memory_validate() {
                     eprintln!("warning: repo-memory re-validation failed: {err}");
                 }
+                // After validate has refreshed anchor_status values, count non-current anchors
+                // with a read-only query (doctor_report reads persisted values; no re-validation).
+                let doctor_count = db.memory_doctor().map(|entries| entries.len()).unwrap_or(0);
+                if doctor_count > 0 {
+                    eprintln!(
+                        "⚠ {doctor_count} repo memories need re-anchoring — run 'rag-rat memory \
+                         doctor'"
+                    );
+                }
                 print_json(&db.status(&config.database)?)?;
             }
         },
