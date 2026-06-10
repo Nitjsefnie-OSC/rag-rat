@@ -270,19 +270,92 @@ pub fn memory_evidence_for_symbol(
     limit: u32,
 ) -> anyhow::Result<RepoMemoryEvidence> {
     let (direct, stale) = split_active_stale(memories_for_symbol(conn, symbol, limit)?);
-    Ok(RepoMemoryEvidence { direct, path_crossed: Vec::new(), stale })
+    Ok(RepoMemoryEvidence {
+        direct,
+        path_crossed: Vec::new(),
+        call_path_crossed: Vec::new(),
+        stale,
+    })
 }
 pub(crate) fn memory_evidence_for_symbol_and_edges(
     conn: &Connection,
     symbol: &crate::query::symbol::SymbolHit,
-    edge_ids: &[i64],
+    caller_edge_ids: &[i64],
+    callee_edge_ids: &[i64],
     limit: u32,
 ) -> anyhow::Result<RepoMemoryEvidence> {
     let (direct, mut stale) = split_active_stale(memories_for_symbol(conn, symbol, limit)?);
+    let mut all_edges = caller_edge_ids.to_vec();
+    all_edges.extend_from_slice(callee_edge_ids);
     let (path_crossed, crossed_stale) =
-        split_active_stale(memories_for_edges(conn, edge_ids, limit)?);
+        split_active_stale(memories_for_edges(conn, &all_edges, limit)?);
     stale.extend(crossed_stale);
-    Ok(RepoMemoryEvidence { direct, path_crossed, stale })
+    let (call_path_crossed, call_path_stale) = split_active_stale(call_path_memories_for_crossed(
+        conn,
+        caller_edge_ids,
+        callee_edge_ids,
+        limit,
+    )?);
+    stale.extend(call_path_stale);
+    Ok(RepoMemoryEvidence { direct, path_crossed, call_path_crossed, stale })
+}
+/// Surface call-path memories whose server-derived hash this traversal crossed: compute the
+/// single-edge hash for every crossed edge and the two-edge `caller -> callee` hash for each
+/// caller/callee pairing through the focus symbol, then look them up. Both sides are capped so
+/// the pairing stays bounded; non-matching hashes simply find nothing (no false positives — the
+/// hash is content-derived). (#38)
+pub(crate) fn call_path_memories_for_crossed(
+    conn: &Connection,
+    caller_edge_ids: &[i64],
+    callee_edge_ids: &[i64],
+    limit: u32,
+) -> anyhow::Result<Vec<RepoMemory>> {
+    const MAX_SIDE: usize = 16;
+    let fingerprints = |ids: &[i64]| -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for &edge_id in ids.iter().take(MAX_SIDE) {
+            if let Some(edge) = call_path_edge_by_id(conn, edge_id)? {
+                out.push(edge.fingerprint);
+            }
+        }
+        Ok(out)
+    };
+    let caller_fps = fingerprints(caller_edge_ids)?;
+    let callee_fps = fingerprints(callee_edge_ids)?;
+
+    let mut hashes = std::collections::BTreeSet::new();
+    for fingerprint in caller_fps.iter().chain(callee_fps.iter()) {
+        hashes.insert(compute_edge_sequence_hash([fingerprint.as_str()]));
+    }
+    for caller_fp in &caller_fps {
+        for callee_fp in &callee_fps {
+            hashes.insert(compute_edge_sequence_hash([caller_fp.as_str(), callee_fp.as_str()]));
+        }
+    }
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", hashes.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "
+        SELECT DISTINCT repo_memories.id AS memory_id
+        FROM repo_memories
+        JOIN repo_memory_call_paths ON repo_memory_call_paths.memory_id = repo_memories.id
+        WHERE repo_memories.status IN ('active', 'stale')
+          AND repo_memory_call_paths.edge_sequence_hash IN ({placeholders})
+        ORDER BY repo_memories.updated_at_ms DESC
+        LIMIT ?
+        "
+    );
+    let mut values =
+        hashes.iter().map(|hash| rusqlite::types::Value::Text(hash.clone())).collect::<Vec<_>>();
+    values.push(rusqlite::types::Value::Integer(i64::from(limit)));
+    let mut stmt = conn.prepare(&sql)?;
+    ids_to_memories(
+        conn,
+        stmt.query_map(rusqlite::params_from_iter(values), |row| row.get("memory_id"))?,
+    )
 }
 pub(crate) fn memories_for_edges(
     conn: &Connection,

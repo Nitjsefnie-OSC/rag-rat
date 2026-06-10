@@ -153,6 +153,10 @@ pub struct RepoMemoryValidationReport {
 pub struct RepoMemoryEvidence {
     pub direct: Vec<RepoMemory>,
     pub path_crossed: Vec<RepoMemory>,
+    /// Memories bound to a server-derived call path whose computed hash this traversal crossed —
+    /// i.e. a `caller -> symbol -> callee` (or single-edge) path through the focus symbol (#38).
+    #[serde(default)]
+    pub call_path_crossed: Vec<RepoMemory>,
     pub stale: Vec<RepoMemory>,
 }
 

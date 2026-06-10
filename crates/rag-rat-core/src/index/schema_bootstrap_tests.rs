@@ -3807,11 +3807,116 @@ fn server_derived_call_path_hash_is_stable_and_validates_through_edge_churn() {
     assert_eq!(call_path_status(&db), "current", "server hash survives edge row-id churn");
     assert_eq!(db.memory_for_call_path_hash(&hash, 10).unwrap().len(), 1);
 
+    // Move the call site down a line: the source line (and thus the exact fingerprint) changes,
+    // but the edge's loose identity (caller -> callee) still matches → relocated, not gone.
+    fs::write(
+        root.join("src/lib.rs"),
+        "// shift\n\npub fn caller() {\n    callee();\n}\npub fn callee() {}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.memory_validate().unwrap();
+    assert_eq!(call_path_status(&db), "relocated", "a moved call site relocates the path");
+
     // Remove the call site → the edge is gone → the call path is gone.
     fs::write(root.join("src/lib.rs"), "pub fn caller() {}\npub fn callee() {}\n").unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
     db.memory_validate().unwrap();
     assert_eq!(call_path_status(&db), "gone", "deleting the call site makes the path gone");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn impact_surface_surfaces_call_path_memory_when_path_crossed() {
+    // #38 (acceptance #1 + #3): a call-path memory bound to the server-derived hash of
+    // a -> b -> c surfaces in impact_surface(b).repo_memories.call_path_crossed, because the
+    // traversal crosses the caller edge (a -> b) and the callee edge (b -> c).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn a() {\n    b();\n}\npub fn b() {\n    c();\n}\npub fn c() {}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edge_to = |name: &str| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT id FROM edges WHERE to_name = ?1 ORDER BY id LIMIT 1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| panic!("edge to `{name}` present: {e}"))
+    };
+    let caller_edge = edge_to("b"); // a -> b
+    let callee_edge = edge_to("c"); // b -> c
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "a -> b -> c is the hot path".to_string(),
+        body: "Why this two-hop path matters.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            logical_symbol_id: None,
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            path: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+            edge_path: Some(vec![caller_edge, callee_edge]),
+            dir: None,
+        },
+    })
+    .unwrap();
+
+    let symbol_b = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: Some("src/lib.rs::b".to_string()),
+            symbol: None,
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("symbol b");
+
+    let report = crate::query::impact::impact_surface_report_for_symbol(
+        db.storage.connection(),
+        &symbol_b,
+        10,
+        &crate::query::impact::ImpactSurfaceOptions::default(),
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .repo_memories
+            .call_path_crossed
+            .iter()
+            .any(|memory| memory.title == "a -> b -> c is the hot path"),
+        "call-path memory should surface in impact_surface(b); got call_path_crossed = {:?}",
+        report.repo_memories.call_path_crossed.iter().map(|m| &m.title).collect::<Vec<_>>()
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

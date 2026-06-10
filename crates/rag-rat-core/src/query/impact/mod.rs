@@ -147,14 +147,24 @@ pub fn impact_surface_report_for_symbol(
         Vec::new()
     };
     let repo_memories = if options.include_memories {
-        let crossed_edge_ids = direct_semantic_callers
-            .iter()
-            .chain(direct_semantic_callees.iter())
-            .map(|hop| hop.edge_id)
-            .collect::<Vec<_>>();
-        memory::memory_evidence_for_symbol_and_edges(conn, symbol, &crossed_edge_ids, limit)?
+        let caller_edge_ids =
+            direct_semantic_callers.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
+        let callee_edge_ids =
+            direct_semantic_callees.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
+        memory::memory_evidence_for_symbol_and_edges(
+            conn,
+            symbol,
+            &caller_edge_ids,
+            &callee_edge_ids,
+            limit,
+        )?
     } else {
-        RepoMemoryEvidence { direct: Vec::new(), path_crossed: Vec::new(), stale: Vec::new() }
+        RepoMemoryEvidence {
+            direct: Vec::new(),
+            path_crossed: Vec::new(),
+            call_path_crossed: Vec::new(),
+            stale: Vec::new(),
+        }
     };
     let mut caveats = vec![
         "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.".to_string(),
@@ -190,7 +200,9 @@ pub fn impact_surface_report_for_symbol(
             stale_files: 0,
             memory_status: ImpactMemoryStatus {
                 active: u64::try_from(
-                    repo_memories.direct.len() + repo_memories.path_crossed.len(),
+                    repo_memories.direct.len()
+                        + repo_memories.path_crossed.len()
+                        + repo_memories.call_path_crossed.len(),
                 )
                 .unwrap_or(u64::MAX),
                 stale: u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX),

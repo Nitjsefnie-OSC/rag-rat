@@ -283,8 +283,16 @@ pub(crate) fn graph_tool(
                     .flatten()
                     .filter_map(|hop| hop.get("edge_id").and_then(Value::as_i64))
                     .collect::<Vec<_>>();
-                value["repo_memories"] =
-                    json!(db.memory_evidence_for_symbol_and_edges(&symbol, &edge_ids, 10)?);
+                // find_callers crosses caller edges (X -> symbol); trace_callees crosses callee
+                // edges (symbol -> X). Pass the correct side so call-path hashes line up (#38).
+                let (caller_edge_ids, callee_edge_ids): (&[i64], &[i64]) =
+                    if reverse { (&edge_ids, &[]) } else { (&[], &edge_ids) };
+                value["repo_memories"] = json!(db.memory_evidence_for_symbol_and_edges(
+                    &symbol,
+                    caller_edge_ids,
+                    callee_edge_ids,
+                    10
+                )?);
             }
             Ok(value)
         },

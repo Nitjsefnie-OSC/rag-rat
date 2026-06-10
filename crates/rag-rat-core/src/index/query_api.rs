@@ -1266,13 +1266,15 @@ impl IndexDatabase {
     pub fn memory_evidence_for_symbol_and_edges(
         &self,
         symbol: &crate::query::symbol::SymbolHit,
-        edge_ids: &[i64],
+        caller_edge_ids: &[i64],
+        callee_edge_ids: &[i64],
         limit: u32,
     ) -> anyhow::Result<crate::query::memory::RepoMemoryEvidence> {
         crate::query::memory::memory_evidence_for_symbol_and_edges(
             self.storage.connection(),
             symbol,
-            edge_ids,
+            caller_edge_ids,
+            callee_edge_ids,
             limit,
         )
     }
