@@ -2,8 +2,8 @@
 //!
 //! Reads the hook JSON from stdin and branches on `hook_event_name`:
 //! - `"SessionStart"`: injects a read-only repo orientation digest into the model context.
-//! - anything else (or absent): the PreToolUse grep-augmentation path — asks the elected
-//!   listener or falls back to a direct read-only query, prints `additionalContext` JSON.
+//! - anything else (or absent): the PreToolUse grep-augmentation path — asks the elected listener
+//!   or falls back to a direct read-only query, prints `additionalContext` JSON.
 //!
 //! Exit 0 on every path — the hook must never block a tool call or session start.
 //! Specs:
@@ -292,10 +292,7 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
 /// One-liner shown when the DB file is absent (no config directory walk — `find_config` already
 /// succeeded, so we know we're in a rag-rat repo; the DB just hasn't been built yet).
 fn db_absent_notice() -> String {
-    format!(
-        "{}\nindex not built — run 'rag-rat index'\n",
-        ATTRIBUTION_HEADER.trim_end()
-    )
+    format!("{}\nindex not built — run 'rag-rat index'\n", ATTRIBUTION_HEADER.trim_end())
 }
 
 /// Probe whether the per-worktree watcher election lock is currently held (i.e. a watcher is live).
@@ -305,13 +302,9 @@ fn db_absent_notice() -> String {
 /// - `Ok(Some(_))` → we acquired it (no holder); release immediately → not live.
 /// - `Err(_)` → treat as not live (conservative).
 pub fn watcher_state(config: &Config) -> (bool /* live */, bool /* enabled */) {
-    let enabled =
-        config.watch.enabled && std::env::var_os("RAG_RAT_NO_WATCH").is_none();
-    let base_dir = config
-        .database
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| config.root.clone());
+    let enabled = config.watch.enabled && std::env::var_os("RAG_RAT_NO_WATCH").is_none();
+    let base_dir =
+        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
     let election_path = locks::election_lock_path(&base_dir, &config.root);
     // try_acquire: Ok(None) means the lock is held (watcher is live).
     let live = matches!(locks::FileLock::try_acquire(&election_path), Ok(None));
@@ -609,11 +602,7 @@ mod tests {
         parser_failures: u64,
     ) -> Orientation {
         Orientation {
-            tree: DirTree {
-                nodes,
-                root_memory_title: root_title.map(str::to_string),
-                truncated,
-            },
+            tree: DirTree { nodes, root_memory_title: root_title.map(str::to_string), truncated },
             load_bearing: load_bearing.into_iter().map(|(p, fi)| (p.to_string(), fi)).collect(),
             recent_commits: recent.into_iter().map(str::to_string).collect(),
             hot_files: hot.into_iter().map(str::to_string).collect(),
@@ -774,10 +763,7 @@ mod tests {
         let s = format_digest(&o, true, true);
         assert!(s.contains("load-bearing:"), "missing load-bearing prefix");
         // crates/.../src/ prefix must be stripped.
-        assert!(
-            s.contains("index/mod.rs (fan_in 2286)"),
-            "crates path not shortened; got:\n{s}"
-        );
+        assert!(s.contains("index/mod.rs (fan_in 2286)"), "crates path not shortened; got:\n{s}");
         assert!(
             s.contains("main.rs (fan_in 42)"),
             "crates path not shortened for main.rs; got:\n{s}"
