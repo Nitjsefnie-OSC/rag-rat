@@ -373,6 +373,7 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
         ",
     )?;
     let rows = stmt.query_map([], binding_row)?;
+    let tx = conn.unchecked_transaction()?;
     let mut report = RepoMemoryValidationReport {
         checked: 0,
         current: 0,
@@ -383,35 +384,34 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
     };
     for row in rows {
         let mut binding = row?;
+        let original_binding_id = binding.binding_id.clone();
         report.checked += 1;
         let status = validate_binding(conn, &mut binding)?;
-        conn.execute(
+        let updated = conn.execute(
             "
-            UPDATE repo_memory_bindings
-            SET anchor_status = ?3,
-                logical_symbol_id = ?4,
-                symbol_id = ?5,
-                chunk_id = ?6,
-                edge_id = ?7,
-                path = ?8,
-                start_line = ?9,
-                end_line = ?10
-            WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?11
+            UPDATE OR IGNORE repo_memory_bindings
+            SET anchor_status = ?3, logical_symbol_id = ?4, symbol_id = ?5, chunk_id = ?6,
+                edge_id = ?7, path = ?8, start_line = ?9, end_line = ?10,
+                binding_id = ?11, symbol_kind = ?12, signature_hash = ?13
+            WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?14
             ",
             params![
-                binding.memory_id,
-                binding.binding_kind,
-                status,
-                binding.logical_symbol_id,
-                binding.symbol_id,
-                binding.chunk_id,
-                binding.edge_id,
-                binding.path,
-                binding.start_line,
-                binding.end_line,
-                binding.binding_id
+                binding.memory_id, binding.binding_kind, status,
+                binding.logical_symbol_id, binding.symbol_id, binding.chunk_id, binding.edge_id,
+                binding.path, binding.start_line, binding.end_line,
+                binding.binding_id, binding.symbol_kind, binding.signature_hash,
+                original_binding_id
             ],
         )?;
+        // UPDATE OR IGNORE: if a sibling binding already holds the new (memory_id, kind, binding_id)
+        // PK, the rewrite is a no-op rather than a crash. Drop the now-duplicate stale row.
+        if updated == 0 && binding.binding_id != original_binding_id {
+            conn.execute(
+                "DELETE FROM repo_memory_bindings
+                 WHERE memory_id = ?1 AND binding_kind = ?2 AND binding_id = ?3",
+                params![binding.memory_id, binding.binding_kind, original_binding_id],
+            )?;
+        }
         match status.as_str() {
             "current" => report.current += 1,
             "relocated" => report.relocated += 1,
@@ -420,5 +420,6 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
             _ => report.unverified += 1,
         }
     }
+    tx.commit()?;
     Ok(report)
 }
