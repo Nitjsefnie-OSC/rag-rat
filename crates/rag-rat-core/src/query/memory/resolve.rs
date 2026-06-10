@@ -19,6 +19,9 @@ pub(crate) fn resolve_binding(
     if let Some(edge_sequence_hash) = bind.edge_sequence_hash.as_deref() {
         return resolve_call_path_binding(conn, bind, edge_sequence_hash);
     }
+    if let Some(dir) = bind.dir.as_deref() {
+        return resolve_dir_binding(conn, dir);
+    }
     if let Some(path) = bind.path.as_deref() {
         return resolve_path_binding(conn, path, bind.start_line, bind.end_line);
     }
@@ -73,6 +76,56 @@ pub(crate) fn resolve_binding(
          path/span, commit_hash, or github ref binding"
     )
 }
+
+/// Normalize a directory anchor: trim, drop a leading `./`, strip a trailing `/`.
+/// The repo root is the empty string.
+pub(crate) fn normalize_dir(dir: &str) -> String {
+    dir.trim().trim_start_matches("./").trim_end_matches('/').to_string()
+}
+
+/// Resolve a `dir` bind target: `binding_kind="dir"`, `binding_id`=normalized dir,
+/// `anchor_status`="current" iff at least one indexed file lives at or under the dir,
+/// else "gone". The repo root (empty string) is current whenever any file is indexed.
+pub(crate) fn resolve_dir_binding(conn: &Connection, dir: &str) -> anyhow::Result<ResolvedBinding> {
+    let dir = normalize_dir(dir);
+    let exists = dir_has_files(conn, &dir)?;
+    Ok(ResolvedBinding {
+        binding_kind: "dir".to_string(),
+        binding_id: dir.clone(),
+        path: Some(dir),
+        start_line: None,
+        end_line: None,
+        logical_symbol_id: None,
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        symbol_kind: None,
+        signature_hash: None,
+        call_path: None,
+        source_text_hash: None,
+        anchor_status: if exists { "current" } else { "gone" }.to_string(),
+    })
+}
+
+/// Read: are there indexed files at or under `dir`?
+/// Root (`""`) matches any indexed file.
+pub(crate) fn dir_has_files(conn: &Connection, dir: &str) -> anyhow::Result<bool> {
+    let n: i64 = if dir.is_empty() {
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM files)", [], |r| r.get(0))?
+    } else {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 OR path LIKE ?1 || '/%')",
+            [dir],
+            |r| r.get(0),
+        )?
+    };
+    Ok(n != 0)
+}
+
 pub(crate) fn resolve_logical_symbol_binding(
     conn: &Connection,
     logical_symbol_id: i64,

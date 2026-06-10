@@ -547,6 +547,7 @@ mod tests {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -749,6 +750,7 @@ mod tests {
                     end_logical_symbol_id: None,
                     edge_sequence_hash: None,
                     path_summary: None,
+                    dir: None,
                 },
             })
             .unwrap();

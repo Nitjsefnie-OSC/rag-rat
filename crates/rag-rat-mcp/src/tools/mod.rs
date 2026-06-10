@@ -627,6 +627,7 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             end_logical_symbol_id: args.end_logical_symbol_id,
             edge_sequence_hash: args.edge_sequence_hash,
             path_summary: args.path_summary,
+            dir: None,
         }
     }
 }

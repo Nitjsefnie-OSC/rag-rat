@@ -119,6 +119,9 @@ pub struct RepoMemoryBindTarget {
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,
+    /// Directory anchor: a repo-root-relative directory path, or `""` for the repo root.
+    /// Normalized on resolve (trim, drop leading `./`, strip trailing `/`).
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

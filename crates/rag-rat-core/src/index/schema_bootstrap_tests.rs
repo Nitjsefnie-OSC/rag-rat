@@ -3367,6 +3367,7 @@ fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -3443,6 +3444,7 @@ fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -3532,6 +3534,7 @@ fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -3617,6 +3620,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -3664,6 +3668,7 @@ fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
                 end_logical_symbol_id: target.logical_symbol_id,
                 edge_sequence_hash: Some("edge-sequence-test-hash".to_string()),
                 path_summary: Some("caller_edge -> target_edge".to_string()),
+                dir: None,
             },
         })
         .unwrap();
@@ -3729,6 +3734,7 @@ fn memory_relocates_when_symbol_moves_to_another_file() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -3821,6 +3827,7 @@ fn memory_relocation_is_durable_across_a_second_reindex() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            dir: None,
         },
     })
     .unwrap();
@@ -3912,6 +3919,7 @@ fn memory_stays_gone_when_moved_symbol_body_changed() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            dir: None,
         },
     })
     .unwrap();
@@ -3986,6 +3994,7 @@ fn memory_stays_gone_when_two_files_define_the_same_name() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            dir: None,
         },
     })
     .unwrap();
@@ -4091,6 +4100,7 @@ fn memory_logical_binding_relocates_across_files() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -4215,6 +4225,7 @@ fn memory_chunk_binding_relocates_by_hash() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -4333,6 +4344,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
                 end_logical_symbol_id: None,
                 edge_sequence_hash: None,
                 path_summary: None,
+                dir: None,
             },
         })
         .unwrap();
@@ -4395,6 +4407,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            dir: None,
         })
         .unwrap();
 
@@ -4476,6 +4489,7 @@ fn anchor_health_counts_tallies_persisted_statuses() {
         end_logical_symbol_id: None,
         edge_sequence_hash: None,
         path_summary: None,
+        dir: None,
     };
 
     db.memory_create(crate::query::memory::RepoMemoryCreate {
@@ -4564,6 +4578,7 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
             end_logical_symbol_id: None,
             edge_sequence_hash: None,
             path_summary: None,
+            dir: None,
         },
     })
     .unwrap();
@@ -4861,6 +4876,55 @@ fn rebuild_restores_durable_wal_after_bulk_build() {
     assert_eq!(synchronous, 1, "synchronous must be restored to NORMAL (=1)");
     // The index is intact and queryable after the bulk build.
     assert!(!db.symbols("alpha", Some(Language::Rust), 10).unwrap().is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dir_memory_binds_to_a_directory() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn dir_anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Decision".to_string(),
+            title: "src holds the core library".to_string(),
+            body: "All Rust source lives under src/.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec![],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: None,
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+                dir: Some("src".to_string()),
+            },
+        })
+        .unwrap();
+
+    assert!(!created.duplicate);
+    assert_eq!(created.memory.bindings.len(), 1);
+    let binding = &created.memory.bindings[0];
+    assert_eq!(binding.binding_kind, "dir");
+    assert_eq!(binding.binding_id, "src");
+    assert_eq!(binding.anchor_status, "current");
 
     fs::remove_dir_all(root).unwrap();
 }
