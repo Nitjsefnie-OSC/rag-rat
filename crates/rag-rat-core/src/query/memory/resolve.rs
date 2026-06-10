@@ -37,6 +37,8 @@ pub(crate) fn resolve_binding(
             github_owner: None,
             github_repo: None,
             github_number: None,
+            symbol_kind: None,
+            signature_hash: None,
             call_path: None,
             source_text_hash: None,
             anchor_status: "unverified".to_string(),
@@ -59,6 +61,8 @@ pub(crate) fn resolve_binding(
             github_owner: Some(owner.to_string()),
             github_repo: Some(repo.to_string()),
             github_number: Some(number),
+            symbol_kind: None,
+            signature_hash: None,
             call_path: None,
             source_text_hash: None,
             anchor_status: "unverified".to_string(),
@@ -76,6 +80,11 @@ pub(crate) fn resolve_logical_symbol_binding(
     let logical = crate::query::symbol::lookup_logical_by_id(conn, logical_symbol_id)?
         .ok_or_else(|| anyhow::anyhow!("logical_symbol_id {logical_symbol_id} not found"))?;
     let chunk = chunk_for_logical_symbol(conn, logical_symbol_id)?;
+    let member_symbol_id = chunk.as_ref().and_then(|c| c.symbol_id);
+    let (kind, sig_hash) = match member_symbol_id {
+        Some(sid) => symbol_signal(conn, sid)?,
+        None => (None, None),
+    };
     Ok(ResolvedBinding {
         binding_kind: "logical_symbol".to_string(),
         binding_id: logical.qualified_name,
@@ -83,16 +92,36 @@ pub(crate) fn resolve_logical_symbol_binding(
         start_line: chunk.as_ref().map(|chunk| chunk.start_line),
         end_line: chunk.as_ref().map(|chunk| chunk.end_line),
         logical_symbol_id: Some(logical_symbol_id),
-        symbol_id: chunk.as_ref().and_then(|chunk| chunk.symbol_id),
+        symbol_id: member_symbol_id,
         chunk_id: chunk.as_ref().map(|chunk| chunk.chunk_id),
         edge_id: None,
         commit_hash: None,
         github_owner: None,
         github_repo: None,
         github_number: None,
+        symbol_kind: kind,
+        signature_hash: sig_hash,
         call_path: None,
         source_text_hash: chunk.map(|chunk| chunk.text_hash),
         anchor_status: "current".to_string(),
+    })
+}
+pub(crate) fn symbol_signal(
+    conn: &Connection,
+    symbol_id: i64,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let row = conn
+        .query_row(
+            "SELECT kind, signature FROM symbols WHERE id = ?1",
+            [symbol_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((kind, signature)) => {
+            (Some(kind), signature.map(|sig| hex_sha256(sig.trim().as_bytes())))
+        }
+        None => (None, None),
     })
 }
 pub(crate) fn resolve_symbol_binding(
@@ -102,6 +131,7 @@ pub(crate) fn resolve_symbol_binding(
     let symbol = crate::query::symbol::lookup_by_id(conn, symbol_id)?
         .ok_or_else(|| anyhow::anyhow!("symbol_id {symbol_id} not found"))?;
     let chunk = chunk_for_symbol(conn, symbol_id, &symbol.qualified_name)?;
+    let (kind, sig_hash) = symbol_signal(conn, symbol_id)?;
     Ok(ResolvedBinding {
         binding_kind: "symbol".to_string(),
         binding_id: symbol.qualified_name,
@@ -116,6 +146,8 @@ pub(crate) fn resolve_symbol_binding(
         github_owner: None,
         github_repo: None,
         github_number: None,
+        symbol_kind: kind,
+        signature_hash: sig_hash,
         call_path: None,
         source_text_hash: chunk.map(|chunk| chunk.text_hash),
         anchor_status: "current".to_string(),
@@ -143,6 +175,8 @@ pub(crate) fn resolve_chunk_binding(
         github_owner: None,
         github_repo: None,
         github_number: None,
+        symbol_kind: None,
+        signature_hash: None,
         call_path: None,
         source_text_hash: Some(chunk.text_hash),
         anchor_status: "current".to_string(),
@@ -168,6 +202,8 @@ pub(crate) fn resolve_edge_binding(
         github_owner: None,
         github_repo: None,
         github_number: None,
+        symbol_kind: None,
+        signature_hash: None,
         call_path: None,
         source_text_hash: Some(edge.source_hash),
         anchor_status: "current".to_string(),
@@ -206,6 +242,8 @@ pub(crate) fn resolve_call_path_binding(
         github_owner: None,
         github_repo: None,
         github_number: None,
+        symbol_kind: None,
+        signature_hash: None,
         call_path: Some(ResolvedCallPath {
             start_logical_symbol_id: bind.start_logical_symbol_id,
             end_logical_symbol_id: bind.end_logical_symbol_id,
@@ -246,6 +284,8 @@ pub(crate) fn resolve_path_binding(
         github_owner: None,
         github_repo: None,
         github_number: None,
+        symbol_kind: None,
+        signature_hash: None,
         call_path: None,
         source_text_hash: file_hash,
         anchor_status: "current".to_string(),
@@ -509,9 +549,9 @@ pub(crate) fn insert_binding(
         INSERT INTO repo_memory_bindings(
             memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
             symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo, github_number,
-            anchor_status, created_at_ms
+            symbol_kind, signature_hash, anchor_status, created_at_ms
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ",
         params![
             memory_id,
@@ -528,6 +568,8 @@ pub(crate) fn insert_binding(
             binding.github_owner,
             binding.github_repo,
             binding.github_number,
+            binding.symbol_kind,
+            binding.signature_hash,
             binding.anchor_status,
             now
         ],
@@ -642,6 +684,8 @@ pub(crate) fn binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemor
         github_owner: row.get("github_owner")?,
         github_repo: row.get("github_repo")?,
         github_number: row.get("github_number")?,
+        symbol_kind: row.get("symbol_kind")?,
+        signature_hash: row.get("signature_hash")?,
         anchor_status: row.get("anchor_status")?,
         created_at_ms: row.get("created_at_ms")?,
     })
@@ -654,7 +698,7 @@ pub(crate) fn attach_memory_children(
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line, logical_symbol_id,
                symbol_id, chunk_id, edge_id, commit_hash, github_owner, github_repo,
-               github_number, anchor_status, created_at_ms
+               github_number, symbol_kind, signature_hash, anchor_status, created_at_ms
         FROM repo_memory_bindings
         WHERE memory_id = ?1
         ORDER BY binding_kind, binding_id

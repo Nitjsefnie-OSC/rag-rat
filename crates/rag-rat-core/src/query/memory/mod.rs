@@ -63,6 +63,10 @@ pub struct RepoMemoryBinding {
     pub github_repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub github_number: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_hash: Option<String>,
     pub anchor_status: String,
     pub created_at_ms: i64,
 }
@@ -160,6 +164,8 @@ pub(crate) struct ResolvedBinding {
     github_owner: Option<String>,
     github_repo: Option<String>,
     github_number: Option<i64>,
+    symbol_kind: Option<String>,
+    signature_hash: Option<String>,
     call_path: Option<ResolvedCallPath>,
     source_text_hash: Option<String>,
     anchor_status: String,

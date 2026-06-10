@@ -368,7 +368,7 @@ pub(crate) fn validate_memories(conn: &Connection) -> anyhow::Result<RepoMemoryV
         "
         SELECT memory_id, binding_kind, binding_id, path, start_line, end_line,
                logical_symbol_id, symbol_id, chunk_id, edge_id, commit_hash, github_owner,
-               github_repo, github_number, anchor_status, created_at_ms
+               github_repo, github_number, symbol_kind, signature_hash, anchor_status, created_at_ms
         FROM repo_memory_bindings
         ",
     )?;
