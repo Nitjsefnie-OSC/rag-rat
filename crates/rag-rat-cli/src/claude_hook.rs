@@ -1,9 +1,14 @@
-//! `rag-rat claude-hook`: the Claude Code PreToolUse hook client.
+//! `rag-rat claude-hook`: the Claude Code hook client (PreToolUse + SessionStart).
 //!
-//! Reads the hook JSON from stdin, asks the elected listener (or falls back to a direct
-//! read-only query), and prints `additionalContext` JSON. Exit 0 on every path — the hook
-//! augments greps and must never block one. Spec:
-//! `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`.
+//! Reads the hook JSON from stdin and branches on `hook_event_name`:
+//! - `"SessionStart"`: injects a read-only repo orientation digest into the model context.
+//! - anything else (or absent): the PreToolUse grep-augmentation path — asks the elected
+//!   listener or falls back to a direct read-only query, prints `additionalContext` JSON.
+//!
+//! Exit 0 on every path — the hook must never block a tool call or session start.
+//! Specs:
+//!   `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`
+//!   `docs/plans/2026-06-10-sessionstart-orientation-hook-design.md`
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -12,16 +17,28 @@ use std::time::Duration;
 use rag_rat_core::config::Config;
 use rag_rat_core::locks;
 use rag_rat_core::query::grep_augment;
+use rag_rat_core::query::orientation::Orientation;
 use rag_rat_core::storage::IndexConnection;
 use serde::Deserialize;
 
 const SOCKET_BUDGET: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Deserialize)]
+/// Parsed hook input.  Fields absent on `SessionStart` (`tool_name`, `tool_input`) are
+/// `#[serde(default)]` so deserialization succeeds for every event type.
+#[derive(Debug, Default, Deserialize)]
 pub struct HookInput {
+    #[serde(default)]
     pub session_id: String,
+    #[serde(default)]
     pub cwd: String,
+    /// `"PreToolUse"`, `"SessionStart"`, etc. — absent on some older hook payloads.
+    pub hook_event_name: Option<String>,
+    /// `"startup"` | `"resume"` | `"clear"` | `"compact"` (SessionStart only).
+    pub source: Option<String>,
+    /// Present on PreToolUse only.
+    #[serde(default)]
     pub tool_name: String,
+    /// Present on PreToolUse only.
     #[serde(default)]
     pub tool_input: serde_json::Value,
 }
@@ -215,8 +232,41 @@ pub fn run() -> anyhow::Result<()> {
 fn run_inner() -> anyhow::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
-    let input: HookInput = serde_json::from_str(&raw)?;
-    let Some(search) = extract_search(&input) else { return Ok(()) };
+    // Tolerant parse: missing fields use Default so both PreToolUse and SessionStart succeed.
+    let input: HookInput = serde_json::from_str(&raw).unwrap_or_default();
+    match input.hook_event_name.as_deref() {
+        Some("SessionStart") => session_start(&input),
+        _ => pretooluse(&input),
+    }
+}
+
+/// SessionStart path: inject a read-only repo orientation digest as plain stdout.
+/// Every error path prints nothing and returns Ok — never block session start.
+fn session_start(input: &HookInput) -> anyhow::Result<()> {
+    // Allowlist: only fire for meaningful session triggers, not resume.
+    match input.source.as_deref() {
+        Some("startup") | Some("clear") | Some("compact") => {},
+        _ => return Ok(()),
+    }
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+    // If the DB file does not exist, print a minimal nudge and exit — do NOT open/create it.
+    if !config.database.is_file() {
+        print!("{}", db_absent_notice());
+        return Ok(());
+    }
+    // Open read-only; compose the orientation; print the digest.
+    // Any error (locked, corrupt, etc.) ⇒ silent return.
+    let conn = IndexConnection::open_read_only(&config.database)?;
+    let root = Path::new(&input.cwd);
+    let o = rag_rat_core::query::orientation::orientation(conn.connection(), root)?;
+    let (live, enabled) = watcher_state(&config);
+    print!("{}", format_digest(&o, live, enabled));
+    Ok(())
+}
+
+/// PreToolUse path (grep augmentation).
+fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
+    let Some(search) = extract_search(input) else { return Ok(()) };
     let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
 
     let context = ask_listener(&config, &input.session_id, &search)
@@ -235,6 +285,128 @@ fn run_inner() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// One-liner shown when the DB file is absent (no config directory walk — `find_config` already
+/// succeeded, so we know we're in a rag-rat repo; the DB just hasn't been built yet).
+fn db_absent_notice() -> String {
+    format!(
+        "{}\nindex not built — run 'rag-rat index'\n",
+        ATTRIBUTION_HEADER.trim_end()
+    )
+}
+
+/// Probe whether the per-worktree watcher election lock is currently held (i.e. a watcher is live).
+///
+/// Algorithm: try to acquire the election lock non-blocking.
+/// - `Ok(None)` → lock is held by another process → watcher is live.
+/// - `Ok(Some(_))` → we acquired it (no holder); release immediately → not live.
+/// - `Err(_)` → treat as not live (conservative).
+pub fn watcher_state(config: &Config) -> (bool /* live */, bool /* enabled */) {
+    let enabled =
+        config.watch.enabled && std::env::var_os("RAG_RAT_NO_WATCH").is_none();
+    let base_dir = config
+        .database
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| config.root.clone());
+    let election_path = locks::election_lock_path(&base_dir, &config.root);
+    // try_acquire: Ok(None) means the lock is held (watcher is live).
+    let live = matches!(locks::FileLock::try_acquire(&election_path), Ok(None));
+    (live, enabled)
+}
+
+// ─── Attribution header ───────────────────────────────────────────────────────
+
+const ATTRIBUTION_HEADER: &str = "\
+▶ rag-rat repo intelligence — injected by the rag-rat MCP server (prefer it over grep/cat)
+  concept → semantic_search · callers/callees → find_callers/trace_callees
+  before editing a symbol → impact_surface · exact symbol → symbol_lookup
+  why/rationale → repo memories ride along; memory_search to dig
+";
+
+// ─── Digest formatting ────────────────────────────────────────────────────────
+
+/// Render the full orientation digest as a plain-text string.
+///
+/// `live` = watcher election lock is currently held; `enabled` = watch is configured on.
+pub fn format_digest(o: &Orientation, live: bool, enabled: bool) -> String {
+    let mut out = String::with_capacity(2048);
+
+    // Attribution + capability nudge.
+    out.push_str(ATTRIBUTION_HEADER);
+    out.push('\n');
+
+    // Purpose line (root dir memory title) — omit entirely if absent.
+    if let Some(ref title) = o.tree.root_memory_title {
+        out.push_str(title);
+        out.push('\n');
+    }
+
+    // LAYOUT — directory tree.
+    out.push_str("LAYOUT  (‹…› = directory memory)\n");
+    for node in &o.tree.nodes {
+        let indent = "  ".repeat(node.depth as usize);
+        if let Some(ref title) = node.memory_title {
+            out.push_str(&format!("{}{}  ‹{}›\n", indent, node.label, title));
+        } else {
+            out.push_str(&format!("{}{}\n", indent, node.label));
+        }
+    }
+    if o.tree.truncated > 0 {
+        out.push_str(&format!("  … (+{} more)\n", o.tree.truncated));
+    }
+
+    // Load-bearing files.
+    if !o.load_bearing.is_empty() {
+        let parts: Vec<String> =
+            o.load_bearing.iter().map(|(p, fi)| format!("{} (fan_in {})", p, fi)).collect();
+        out.push_str(&format!("load-bearing: {}\n", parts.join(" · ")));
+    }
+
+    // Recent activity.
+    {
+        let mut line_parts: Vec<String> = Vec::new();
+        if !o.recent_commits.is_empty() {
+            line_parts.push(format!("recent: {}", o.recent_commits.join(" · ")));
+        }
+        if !o.hot_files.is_empty() {
+            line_parts.push(format!("hot: {}", o.hot_files.join(", ")));
+        }
+        if !line_parts.is_empty() {
+            out.push_str(&format!("{}\n", line_parts.join(" · ")));
+        }
+    }
+
+    // Active non-dir memory titles.
+    if !o.active_memory_titles.is_empty() {
+        out.push_str(&format!("memories: {}\n", o.active_memory_titles.join(" · ")));
+    }
+
+    // Watcher-aware health line.
+    let fresh = o.head == o.indexed_head || o.head.is_empty() || o.indexed_head.is_empty();
+    let health_status = match (live, enabled, fresh) {
+        (true, _, true) => "index fresh (watcher live)".to_string(),
+        (true, _, false) => "index syncing (watcher live)".to_string(),
+        (false, true, false) => "index stale — start the rag-rat MCP server".to_string(),
+        (false, false, false) => "watcher off; index stale — run 'rag-rat index'".to_string(),
+        _ => "index fresh".to_string(),
+    };
+    let active = o.anchor.current + o.anchor.relocated;
+    let mut health = format!("health: {} · memories {} active", health_status, active);
+    if o.anchor.stale > 0 {
+        health.push_str(&format!("/{} stale", o.anchor.stale));
+    }
+    if o.anchor.gone > 0 {
+        health.push_str(&format!(" · {} gone → run 'rag-rat memory doctor'", o.anchor.gone));
+    }
+    if o.parser_failures > 0 {
+        health.push_str(&format!(" · parser failures: {}", o.parser_failures));
+    }
+    out.push_str(&health);
+    out.push('\n');
+
+    out
 }
 
 /// Walk up from the hook's cwd to the nearest rag-rat.toml. `None` ⇒ not a rag-rat repo ⇒
@@ -309,7 +481,27 @@ fn fallback_compose(config: &Config, search: &Search) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_core::index::AnchorHealth;
+    use rag_rat_core::query::orientation::Orientation;
+    use rag_rat_core::query::tree::{DirTree, TreeNode};
+
     use super::*;
+
+    // ─── HookInput parsing ────────────────────────────────────────────────────
+
+    #[test]
+    fn session_start_json_without_tool_fields_deserializes() {
+        // SessionStart payloads have no tool_name / tool_input — must still parse.
+        let json =
+            r#"{"hook_event_name":"SessionStart","source":"startup","cwd":"/x","session_id":"s"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.hook_event_name.as_deref(), Some("SessionStart"));
+        assert_eq!(input.source.as_deref(), Some("startup"));
+        assert_eq!(input.cwd, "/x");
+        // tool_name and tool_input default (empty / null).
+        assert!(input.tool_name.is_empty());
+        assert!(input.tool_input.is_null());
+    }
 
     #[test]
     fn parses_grep_tool_input() {
@@ -372,5 +564,319 @@ mod tests {
             "tool_name":"Read","tool_input":{"path":"/x"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert!(extract_search(&input).is_none());
+    }
+
+    // ─── format_digest ────────────────────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_orientation(
+        root_title: Option<&str>,
+        nodes: Vec<TreeNode>,
+        truncated: u32,
+        load_bearing: Vec<(&str, u64)>,
+        recent: Vec<&str>,
+        hot: Vec<&str>,
+        memory_titles: Vec<&str>,
+        head: &str,
+        indexed_head: &str,
+        anchor: AnchorHealth,
+        parser_failures: u64,
+    ) -> Orientation {
+        Orientation {
+            tree: DirTree {
+                nodes,
+                root_memory_title: root_title.map(str::to_string),
+                truncated,
+            },
+            load_bearing: load_bearing.into_iter().map(|(p, fi)| (p.to_string(), fi)).collect(),
+            recent_commits: recent.into_iter().map(str::to_string).collect(),
+            hot_files: hot.into_iter().map(str::to_string).collect(),
+            active_memory_titles: memory_titles.into_iter().map(str::to_string).collect(),
+            head: head.to_string(),
+            indexed_head: indexed_head.to_string(),
+            anchor,
+            total_files: 42,
+            parser_failures,
+        }
+    }
+
+    fn healthy_anchor() -> AnchorHealth {
+        AnchorHealth { current: 3, relocated: 1, stale: 0, gone: 0 }
+    }
+
+    fn node(depth: u8, label: &str, path: &str, file_count: u32, title: Option<&str>) -> TreeNode {
+        TreeNode {
+            depth,
+            label: label.to_string(),
+            path: path.to_string(),
+            file_count,
+            memory_title: title.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn format_digest_contains_attribution_header() {
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("▶ rag-rat repo intelligence"), "missing attribution header");
+        assert!(s.contains("semantic_search"), "missing tool nudge");
+    }
+
+    #[test]
+    fn format_digest_purpose_line_when_root_title_present() {
+        let o = make_orientation(
+            Some("My project — does amazing things"),
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("My project — does amazing things"), "missing purpose line");
+    }
+
+    #[test]
+    fn format_digest_no_purpose_line_when_root_title_absent() {
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        // No stray purpose-like line should appear (hard to assert absence of arbitrary content,
+        // but the relevant sentinel is not there).
+        assert!(!s.contains("does amazing things"));
+    }
+
+    #[test]
+    fn format_digest_layout_indents_and_annotates_tree() {
+        let nodes = vec![
+            node(0, "src", "src", 5, None),
+            node(1, "actors", "src/actors", 8, Some("per-domain actors")),
+            node(1, "data", "src/data", 3, None),
+        ];
+        let o = make_orientation(
+            None,
+            nodes,
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("LAYOUT"), "missing LAYOUT header");
+        // depth-0 node: no indentation.
+        assert!(s.contains("\nsrc\n"), "depth-0 node should not be indented");
+        // depth-1 node with memory: indented 2 spaces + label + title.
+        assert!(
+            s.contains("  actors  ‹per-domain actors›"),
+            "depth-1 node with title missing or malformed"
+        );
+        // depth-1 node without memory: indented 2 spaces.
+        assert!(s.contains("  data\n"), "depth-1 node without title missing");
+    }
+
+    #[test]
+    fn format_digest_truncated_note() {
+        let o = make_orientation(
+            None,
+            vec![node(0, "src", "src", 5, None)],
+            7,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("… (+7 more)"), "missing truncated note");
+    }
+
+    #[test]
+    fn format_digest_load_bearing_fan_in() {
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![("src/database.rs", 2286), ("src/main.rs", 42)],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("load-bearing:"), "missing load-bearing prefix");
+        assert!(s.contains("src/database.rs (fan_in 2286)"), "missing fan_in entry");
+    }
+
+    // ─── Health line table test ───────────────────────────────────────────────
+
+    struct HealthCase {
+        live: bool,
+        enabled: bool,
+        head: &'static str,
+        indexed: &'static str,
+        expected: &'static str,
+    }
+
+    #[test]
+    fn format_digest_health_watcher_combinations() {
+        let cases = [
+            HealthCase {
+                live: true,
+                enabled: true,
+                head: "aaa",
+                indexed: "aaa",
+                expected: "index fresh (watcher live)",
+            },
+            HealthCase {
+                live: true,
+                enabled: true,
+                head: "aaa",
+                indexed: "bbb",
+                expected: "index syncing (watcher live)",
+            },
+            HealthCase {
+                live: false,
+                enabled: true,
+                head: "aaa",
+                indexed: "bbb",
+                expected: "index stale — start the rag-rat MCP server",
+            },
+            HealthCase {
+                live: false,
+                enabled: false,
+                head: "aaa",
+                indexed: "bbb",
+                expected: "watcher off; index stale — run 'rag-rat index'",
+            },
+            HealthCase {
+                live: false,
+                enabled: true,
+                head: "aaa",
+                indexed: "aaa",
+                expected: "index fresh",
+            },
+        ];
+        for case in &cases {
+            let o = make_orientation(
+                None,
+                vec![],
+                0,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                case.head,
+                case.indexed,
+                healthy_anchor(),
+                0,
+            );
+            let s = format_digest(&o, case.live, case.enabled);
+            assert!(
+                s.contains(case.expected),
+                "health line mismatch for live={} enabled={} head={}: expected {:?}, got:\n{}",
+                case.live,
+                case.enabled,
+                case.head,
+                case.expected,
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn format_digest_gone_adds_doctor_nudge() {
+        let anchor = AnchorHealth { current: 2, relocated: 0, stale: 1, gone: 3 };
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            anchor,
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("3 gone → run 'rag-rat memory doctor'"), "missing gone nudge");
+    }
+
+    #[test]
+    fn format_digest_no_doctor_nudge_when_gone_is_zero() {
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            0,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(!s.contains("memory doctor"), "unexpected doctor nudge when gone=0");
+    }
+
+    #[test]
+    fn format_digest_parser_failures_shown_when_nonzero() {
+        let o = make_orientation(
+            None,
+            vec![],
+            0,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            "abc",
+            "abc",
+            healthy_anchor(),
+            5,
+        );
+        let s = format_digest(&o, true, true);
+        assert!(s.contains("parser failures: 5"), "missing parser failures note");
     }
 }
