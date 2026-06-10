@@ -223,6 +223,10 @@ fn usage() {
          rag-rat github sync --from-refs\n\
          rag-rat hooks install\n\
          rag-rat hooks status\n\
+         rag-rat hooks install --claude          # Claude Code grep-augment + SessionStart orientation digest\n\
+         rag-rat hooks install --claude --global # ~/.claude/settings.json instead of ./.claude\n\
+         rag-rat hooks status --claude\n\
+         rag-rat hooks uninstall --claude\n\
          rag-rat maintenance --trigger post-checkout --max-seconds 30\n\
          rag-rat models list\n\
          rag-rat models install embedding-hash\n\
