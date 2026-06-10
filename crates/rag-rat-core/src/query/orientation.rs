@@ -102,9 +102,8 @@ fn spine_load_bearing(conn: &Connection, limit: usize) -> anyhow::Result<Vec<(St
          ORDER BY fan_in DESC, files.path ASC
          LIMIT ?1",
     )?;
-    let rows = stmt.query_map([limit as i64], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
+    let rows = stmt
+        .query_map([limit as i64], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
     let mut out = Vec::new();
     for row in rows {
         let (path, fan_in) = row?;

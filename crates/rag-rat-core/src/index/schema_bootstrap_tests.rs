@@ -5605,11 +5605,8 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
     let opts = crate::query::tree::TreeOpts { max_depth: 6, min_files: 3, max_nodes: 30 };
     let tree = crate::query::tree::dir_tree(conn, &opts).unwrap();
 
-    let node_labels: Vec<(&str, &str, u8)> = tree
-        .nodes
-        .iter()
-        .map(|n| (n.path.as_str(), n.label.as_str(), n.depth))
-        .collect();
+    let node_labels: Vec<(&str, &str, u8)> =
+        tree.nodes.iter().map(|n| (n.path.as_str(), n.label.as_str(), n.depth)).collect();
 
     // The collapsed node: anchor at "top", label "top/mid", depth 0.
     let collapsed = tree
@@ -5925,11 +5922,7 @@ fn orientation_composes_read_only() {
     );
 
     // load_bearing: at most 5, each entry is (path, fan_in).
-    assert!(
-        o1.load_bearing.len() <= 5,
-        "load_bearing len {} > 5",
-        o1.load_bearing.len()
-    );
+    assert!(o1.load_bearing.len() <= 5, "load_bearing len {} > 5", o1.load_bearing.len());
     // Each entry must be a non-empty path with u64 fan_in (value may be 0 if graph not built).
     for (path, _fan_in) in &o1.load_bearing {
         assert!(!path.is_empty(), "load_bearing path is empty");
@@ -5968,11 +5961,7 @@ fn orientation_composes_read_only() {
         Some("root purpose"),
         "second call: root_memory_title changed"
     );
-    assert_eq!(
-        o2.tree.nodes.len(),
-        o1.tree.nodes.len(),
-        "second call: node count changed"
-    );
+    assert_eq!(o2.tree.nodes.len(), o1.tree.nodes.len(), "second call: node count changed");
     assert_eq!(
         o2.active_memory_titles, o1.active_memory_titles,
         "second call: active_memory_titles changed"
