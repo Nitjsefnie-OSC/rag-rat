@@ -11,9 +11,20 @@ pub(crate) fn validate_binding(
         "edge" => validate_edge_binding(conn, binding),
         "call_path" => validate_call_path_binding(conn, binding),
         "path" => validate_path_binding(conn, binding),
+        "dir" => validate_dir_binding(conn, binding),
         "commit" | "github" => Ok("unverified".to_string()),
         _ => Ok("unverified".to_string()),
     }
+}
+/// Validate a `dir` binding: current while at least one indexed file lives at or under the
+/// directory, gone otherwise. Dir bindings are descriptive anchors with no `source_text_hash`
+/// — they never go stale, only current or gone.
+pub(crate) fn validate_dir_binding(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+) -> anyhow::Result<String> {
+    let dir = binding.path.clone().unwrap_or_else(|| binding.binding_id.clone());
+    Ok(if dir_has_files(conn, &dir)? { "current" } else { "gone" }.to_string())
 }
 pub(crate) fn validate_logical_symbol_binding(
     conn: &Connection,

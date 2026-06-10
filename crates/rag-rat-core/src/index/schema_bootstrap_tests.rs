@@ -4929,6 +4929,83 @@ fn dir_memory_binds_to_a_directory() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn dir_memory_validation_current_and_gone() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn dir_validate_anchor() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Helper: build a dir bind target with only `dir` set.
+    let dir_bind = |dir: Option<String>| crate::query::memory::RepoMemoryBindTarget {
+        logical_symbol_id: None,
+        symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        path: None,
+        start_line: None,
+        end_line: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        start_logical_symbol_id: None,
+        end_logical_symbol_id: None,
+        edge_sequence_hash: None,
+        path_summary: None,
+        dir,
+    };
+
+    // Case 1: memory on a populated directory ("src") -> validates current.
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "src dir is the library root".to_string(),
+        body: "All source lives under src/.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: dir_bind(Some("src".to_string())),
+    })
+    .unwrap();
+
+    // Case 2: memory on a directory with no indexed files -> resolves gone at bind time, and
+    // memory_validate leaves it gone.
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "nonexistent dir has no files".to_string(),
+        body: "This directory does not exist in the index.".to_string(),
+        confidence: "low".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: dir_bind(Some("does/not/exist".to_string())),
+    })
+    .unwrap();
+
+    // Case 3: root memory (dir:"") -> current whenever any file is indexed.
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "repo root anchors the whole index".to_string(),
+        body: "The entire repo is indexed.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: dir_bind(Some("".to_string())),
+    })
+    .unwrap();
+
+    let report = db.memory_validate().unwrap();
+    // "src" + "" both current, "does/not/exist" gone -> current==2, gone==1.
+    assert_eq!(report.current, 2, "expected 2 current dir bindings");
+    assert_eq!(report.gone, 1, "expected 1 gone dir binding");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn table_count(db: &IndexDatabase, table: &str) -> i64 {
     db.storage
         .connection()
