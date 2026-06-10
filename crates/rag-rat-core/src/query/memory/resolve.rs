@@ -595,6 +595,86 @@ pub(crate) fn insert_binding(
     }
     Ok(())
 }
+pub(crate) struct RelocateMatch {
+    pub(crate) binding_id: String,
+    pub(crate) symbol_id: i64,
+    pub(crate) logical_symbol_id: Option<i64>,
+    pub(crate) path: String,
+    pub(crate) chunk_id: Option<i64>,
+    pub(crate) start_line: Option<i64>,
+    pub(crate) end_line: Option<i64>,
+    pub(crate) symbol_kind: Option<String>,
+    pub(crate) signature_hash: Option<String>,
+}
+
+/// Find the unique moved home of a symbol whose stored anchor is gone.
+/// `short_name` = the symbol name with its old `"{path}::"` prefix stripped.
+/// Relocation requires a content-hash match (`chunk.text_hash == source_text_hash`);
+/// kind/signature corroborate, never override. Returns `Some` only when exactly one
+/// candidate content-matches; two or more → `None` (ambiguous → stay gone).
+pub(crate) fn relocate_symbol_by_name(
+    conn: &Connection,
+    short_name: &str,
+    source_text_hash: &str,
+) -> anyhow::Result<Option<RelocateMatch>> {
+    let mut stmt = conn.prepare(
+        // Content-hash confirmation is mandatory for a silent cross-file relocate.
+        // The join on `files` keeps this context-scoped, matching the qualified_name fallback above.
+        "
+        SELECT symbols.id AS symbol_id, symbols.qualified_name AS qualified_name,
+               files.path AS path, symbols.kind AS kind, symbols.signature AS signature
+        FROM symbols
+        JOIN files ON files.id = symbols.file_id
+        WHERE symbols.name = ?1
+        ",
+    )?;
+    let rows = stmt.query_map([short_name], |row| {
+        Ok((
+            row.get::<_, i64>("symbol_id")?,
+            row.get::<_, String>("qualified_name")?,
+            row.get::<_, String>("path")?,
+            row.get::<_, String>("kind")?,
+            row.get::<_, Option<String>>("signature")?,
+        ))
+    })?;
+    let mut matched: Option<RelocateMatch> = None;
+    for row in rows {
+        let (symbol_id, qualified_name, path, kind, signature) = row?;
+        let chunk = chunk_for_symbol(conn, symbol_id, &qualified_name)?;
+        let text_hash = chunk.as_ref().map(|c| c.text_hash.as_str());
+        if text_hash != Some(source_text_hash) {
+            continue; // content-hash is required for a silent relocate
+        }
+        if matched.is_some() {
+            return Ok(None); // >=2 content matches -> ambiguous -> stay gone
+        }
+        matched = Some(RelocateMatch {
+            binding_id: qualified_name,
+            symbol_id,
+            logical_symbol_id: logical_symbol_id_for_symbol(conn, symbol_id)?,
+            path,
+            chunk_id: chunk.as_ref().map(|c| c.chunk_id),
+            start_line: chunk.as_ref().map(|c| c.start_line),
+            end_line: chunk.as_ref().map(|c| c.end_line),
+            symbol_kind: Some(kind),
+            signature_hash: signature.map(|s| hex_sha256(s.trim().as_bytes())),
+        });
+    }
+    Ok(matched)
+}
+
+/// Strip the persisted `"{path}::"` prefix from a path-qualified `binding_id`.
+/// Falls back to last-`::` split only when `path` is absent or not a prefix of `binding_id`.
+pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> &'a str {
+    if let Some(path) = path
+        && let Some(rest) = binding_id.strip_prefix(path)
+        && let Some(name) = rest.strip_prefix("::")
+    {
+        return name;
+    }
+    binding_id.rsplit("::").next().unwrap_or(binding_id)
+}
+
 pub(crate) fn duplicate_memory_id(
     conn: &Connection,
     title: &str,

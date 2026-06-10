@@ -36,18 +36,38 @@ pub(crate) fn validate_logical_symbol_binding(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some((id, path)) = relocated else {
-        return Ok("gone".to_string());
-    };
-    binding.logical_symbol_id = Some(id);
-    binding.path = Some(path);
-    if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
-        binding.symbol_id = chunk.symbol_id;
-        binding.chunk_id = Some(chunk.chunk_id);
-        binding.start_line = Some(chunk.start_line);
-        binding.end_line = Some(chunk.end_line);
+    if let Some((id, path)) = relocated {
+        binding.logical_symbol_id = Some(id);
+        binding.path = Some(path);
+        if let Some(chunk) = chunk_for_logical_symbol(conn, id)? {
+            binding.symbol_id = chunk.symbol_id;
+            binding.chunk_id = Some(chunk.chunk_id);
+            binding.start_line = Some(chunk.start_line);
+            binding.end_line = Some(chunk.end_line);
+        }
+        return Ok("relocated".to_string());
     }
-    Ok("relocated".to_string())
+    // Cross-file move: bare name + content hash fallback (same path as symbol binding).
+    if let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? {
+        let short = short_symbol_name(&binding.binding_id, binding.path.as_deref()).to_string();
+        if let Some(m) = relocate_symbol_by_name(conn, &short, &hash)? {
+            // binding_id becomes the relocated member symbol's qualified_name, not a
+            // logical_symbols.qualified_name. The stable logical_symbol_id arm re-matches on the
+            // next reindex; if that ever goes stale this bare-name fallback recovers it — the
+            // logical-qualified-name arm above intentionally won't re-match this binding again.
+            binding.binding_id = m.binding_id;
+            binding.logical_symbol_id = m.logical_symbol_id;
+            binding.symbol_id = Some(m.symbol_id);
+            binding.path = Some(m.path);
+            binding.chunk_id = m.chunk_id;
+            binding.start_line = m.start_line;
+            binding.end_line = m.end_line;
+            binding.symbol_kind = m.symbol_kind;
+            binding.signature_hash = m.signature_hash;
+            return Ok("relocated".to_string());
+        }
+    }
+    Ok("gone".to_string())
 }
 pub(crate) fn validate_symbol_binding(
     conn: &Connection,
@@ -71,18 +91,37 @@ pub(crate) fn validate_symbol_binding(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some((id, path)) = relocated else {
-        return Ok("gone".to_string());
-    };
-    binding.symbol_id = Some(id);
-    binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
-    binding.path = Some(path);
-    if let Some(chunk) = chunk_for_symbol(conn, id, &binding.binding_id)? {
-        binding.chunk_id = Some(chunk.chunk_id);
-        binding.start_line = Some(chunk.start_line);
-        binding.end_line = Some(chunk.end_line);
+    if let Some((id, path)) = relocated {
+        binding.symbol_id = Some(id);
+        binding.logical_symbol_id = logical_symbol_id_for_symbol(conn, id)?;
+        binding.path = Some(path);
+        if let Some(chunk) = chunk_for_symbol(conn, id, &binding.binding_id)? {
+            binding.chunk_id = Some(chunk.chunk_id);
+            binding.start_line = Some(chunk.start_line);
+            binding.end_line = Some(chunk.end_line);
+        }
+        let (kind, sig) = symbol_signal(conn, id)?;
+        binding.symbol_kind = kind;
+        binding.signature_hash = sig;
+        return Ok("relocated".to_string());
     }
-    Ok("relocated".to_string())
+    // Cross-file move: qualified_name changed with the path. Match by bare name + content hash.
+    if let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? {
+        let short = short_symbol_name(&binding.binding_id, binding.path.as_deref()).to_string();
+        if let Some(m) = relocate_symbol_by_name(conn, &short, &hash)? {
+            binding.binding_id = m.binding_id;
+            binding.symbol_id = Some(m.symbol_id);
+            binding.logical_symbol_id = m.logical_symbol_id;
+            binding.path = Some(m.path);
+            binding.chunk_id = m.chunk_id;
+            binding.start_line = m.start_line;
+            binding.end_line = m.end_line;
+            binding.symbol_kind = m.symbol_kind;
+            binding.signature_hash = m.signature_hash;
+            return Ok("relocated".to_string());
+        }
+    }
+    Ok("gone".to_string())
 }
 pub(crate) fn validate_chunk_binding(
     conn: &Connection,
