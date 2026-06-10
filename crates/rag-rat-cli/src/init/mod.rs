@@ -21,7 +21,6 @@ use crate::{
     apply_embedding_runtime_env, git_paths, render_index_progress, render_reconcile_progress,
 };
 
-const CONFIG_FILE: &str = "rag-rat.toml";
 const DEFAULT_DATABASE: &str = ".rag-rat/index.sqlite";
 const SKIPPED_DIRS: &[&str] = &[
     ".git",
@@ -61,15 +60,13 @@ pub(crate) struct RepoScan {
 }
 
 impl InitOptions {
-    fn from_args(args: &[String]) -> anyhow::Result<Self> {
-        Ok(Self {
-            yes: has_flag(args, "--yes") || has_flag(args, "-y"),
-            dry_run: has_flag(args, "--dry-run"),
-            force: has_flag(args, "--force"),
-            config_path: option_value(args, "--config")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(CONFIG_FILE)),
-        })
+    fn from_args(args: &crate::cli::InitArgs, config_path: &str) -> Self {
+        Self {
+            yes: args.yes,
+            dry_run: args.dry_run,
+            force: args.force,
+            config_path: PathBuf::from(config_path),
+        }
     }
 }
 

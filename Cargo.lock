@@ -2879,6 +2879,7 @@ name = "rag-rat"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "clap",
  "dialoguer",
  "libc",
  "rag-rat-core",

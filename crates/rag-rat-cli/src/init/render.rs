@@ -60,9 +60,3 @@ pub(crate) fn display_rel(path: &Path) -> String {
 pub(crate) fn supported_languages() -> Vec<Language> {
     Language::all().to_vec()
 }
-pub(crate) fn option_value(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|window| window[0] == name).map(|window| window[1].clone())
-}
-pub(crate) fn has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| arg == name)
-}

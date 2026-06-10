@@ -1,17 +1,116 @@
 use super::*;
+use crate::cli::{
+    BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs, IndexArgs,
+    MaintenanceArgs, MemoryArgs, MemoryCommand, MigrateArgs, ModelsArgs, ModelsCommand, QueryArgs,
+    ReconcileArgs,
+};
 
-pub(crate) fn eval(config: &Config, args: &[String]) -> anyhow::Result<()> {
+pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
+    if args.watch {
+        return run_watch(config.clone());
+    }
+    // Serialize with the background watcher / other writers (busy_timeout backstops any heal on
+    // the query path).
+    let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
+        &rag_rat_core::locks::write_lock_path(&config.database),
+    )?;
+    let db = if args.full {
+        IndexDatabase::rebuild_with_progress(config, render_index_progress)?
+    } else if args.discover {
+        IndexDatabase::index_discover_with_progress(config, render_index_progress)?
+    } else {
+        IndexDatabase::index_changed_with_progress(config, render_index_progress)?
+    };
+    // Re-anchor repo memories against the freshly indexed symbols/chunks so a moved or renamed
+    // binding relocates (or is flagged) instead of silently pointing at a stale row. Memory rows
+    // themselves are never deleted by indexing.
+    if let Err(err) = db.memory_validate() {
+        eprintln!("warning: repo-memory re-validation failed: {err}");
+    }
+    // After validate has refreshed anchor_status values, count non-current anchors with a
+    // read-only query (doctor reads persisted values; no re-validation).
+    let doctor_count = db.memory_doctor().map(|entries| entries.len()).unwrap_or(0);
+    if doctor_count > 0 {
+        eprintln!("⚠ {doctor_count} repo memories need re-anchoring — run 'rag-rat memory doctor'");
+    }
+    print_json(&db.status(&config.database)?)
+}
+pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
+    let query = args.query.join(" ");
+    if query.trim().is_empty() {
+        anyhow::bail!("query command needs a search string");
+    }
+    let db = open_index(config)?;
+    if args.explain {
+        print_query_explain(&db.search_explain(&query, 10, false)?);
+        return Ok(());
+    }
+    print_json(&db.search(&query, 10, false)?)
+}
+pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    let mode = rag_rat_core::query::repo_brief::RepoBriefMode::parse(args.mode.as_deref())?;
+    print_json(&db.repo_brief(rag_rat_core::query::repo_brief::RepoBriefOptions {
+        mode,
+        limit: args.limit.unwrap_or(10),
+        include_generated: args.include_generated,
+        include_memories: !args.no_memories,
+    })?)
+}
+pub(crate) fn clusters(config: &Config, args: &ClustersArgs) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    print_json(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
+        limit: args.limit.unwrap_or(10),
+        include_generated: args.include_generated,
+        include_memories: !args.no_memories,
+        min_cluster_size: args.min_cluster_size.unwrap_or(2),
+    })?)
+}
+pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
+    let targets = config
+        .targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "name": target.name,
+                "language": target.language.as_str(),
+                "directories": target.directories,
+                "include": target.include,
+                "exclude": target.exclude,
+                "kind": target.kind.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    print_json(&serde_json::json!({
+        "root": config.root,
+        "database": config.database,
+        "local_ai": {
+            "embedding": {
+                "runtime": {
+                    "batch_size": config.local_ai.embedding.runtime.batch_size,
+                    "ort_threads": config.local_ai.embedding.runtime.ort_threads,
+                    "omp_threads": config.local_ai.embedding.runtime.omp_threads,
+                    "max_embedding_chars": config.local_ai.embedding.runtime.max_embedding_chars,
+                }
+            }
+        },
+        "targets": targets,
+    }))
+}
+pub(crate) fn eval(config: &Config, args: &EvalArgs) -> anyhow::Result<()> {
     let options = rag_rat_core::eval::EvalOptions {
-        queries_path: option_value(args, "--queries")
-            .map(Into::into)
+        queries_path: args
+            .queries
+            .clone()
             .unwrap_or_else(|| default_eval_path(config, "queries.toml")),
-        expected_path: option_value(args, "--expected")
-            .map(Into::into)
+        expected_path: args
+            .expected
+            .clone()
             .unwrap_or_else(|| default_eval_path(config, "expected_hits.toml")),
-        update_baseline: has_flag(args, "--update-baseline"),
+        update_baseline: args.update_baseline,
     };
     let report = rag_rat_core::eval::run(config, &options)?;
-    if has_flag(args, "--json") || options.update_baseline {
+    if args.json || options.update_baseline {
         print_json(&report)?;
     } else {
         print_eval_summary(&report);
@@ -28,50 +127,34 @@ pub(crate) fn eval(config: &Config, args: &[String]) -> anyhow::Result<()> {
 pub(crate) fn default_eval_path(config: &Config, file_name: &str) -> PathBuf {
     config.root.join("evals").join(file_name)
 }
-pub(crate) fn models(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let db = IndexDatabase::open_config(config)?;
-    match args.get(1).map(String::as_str) {
-        Some("list") | None => print_json(&db.list_models()?),
-        Some("install") => {
-            let Some(model_id) = args.get(2) else {
-                anyhow::bail!("models install needs a model id");
-            };
-            print_json(&db.install_model(model_id)?)
-        },
-        Some(other) => anyhow::bail!("unknown models subcommand `{other}`"),
+pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    match &args.command {
+        None | Some(ModelsCommand::List) => print_json(&db.list_models()?),
+        Some(ModelsCommand::Install { model_id }) => print_json(&db.install_model(model_id)?),
     }
 }
-pub(crate) fn reconcile(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let db = IndexDatabase::open_config(config)?;
-    if has_flag(args, "--plan") {
+pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    if args.plan {
         let plan = db.reconcile_plan()?;
-        if has_flag(args, "--json") {
-            print_json(&plan)
+        if args.json {
+            print_json(&plan)?;
         } else {
             print_reconcile_plan(&plan);
-            Ok(())
-        }?;
+        }
         return Ok(());
     }
-    let limit = option_value(args, "--limit").map(|value| value.parse()).transpose()?;
-    let batch_size = option_value(args, "--batch-size")
-        .map(|value| value.parse())
-        .transpose()?
-        .or(Some(config.local_ai.embedding.runtime.batch_size));
-    let force = has_flag(args, "--force");
-    let max_seconds = option_value(args, "--max-seconds").map(|value| value.parse()).transpose()?;
-    let max_embedding_chars = option_value(args, "--max-embedding-chars")
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(config.local_ai.embedding.runtime.max_embedding_chars);
     let options = rag_rat_core::index::ai::ReconcileOptions {
-        limit,
-        batch_size,
-        force,
-        until_clean: has_flag(args, "--until-clean"),
-        changed_first: has_flag(args, "--changed-first"),
-        max_seconds,
-        max_embedding_chars,
+        limit: args.limit,
+        batch_size: args.batch_size.or(Some(config.local_ai.embedding.runtime.batch_size)),
+        force: args.force,
+        until_clean: args.until_clean,
+        changed_first: args.changed_first,
+        max_seconds: args.max_seconds,
+        max_embedding_chars: args
+            .max_embedding_chars
+            .unwrap_or(config.local_ai.embedding.runtime.max_embedding_chars),
         intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
     };
     let report = db.reconcile_with_options_progress(options, render_reconcile_progress)?;
@@ -114,16 +197,14 @@ pub(crate) fn set_env_if_absent(key: &str, value: Option<u32>) {
         env::set_var(key, value.to_string());
     }
 }
-pub(crate) fn migrate(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let status = if has_flag(args, "--check") {
+pub(crate) fn migrate(config: &Config, args: &MigrateArgs) -> anyhow::Result<()> {
+    let status = if args.check {
         IndexDatabase::migration_check(&config.database)?
     } else {
         IndexDatabase::migrate(&config.database)?
     };
     print_json(&status)?;
-    if has_flag(args, "--check")
-        && status.state != rag_rat_core::index::schema::SchemaState::Compatible
-    {
+    if args.check && status.state != rag_rat_core::index::schema::SchemaState::Compatible {
         anyhow::bail!("{}", status.message);
     }
     Ok(())
@@ -162,15 +243,12 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
         }
     }))
 }
-pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let Some(subcommand) = args.get(1).map(String::as_str) else {
-        anyhow::bail!("memory command needs a subcommand (list, show, doctor, rebind)");
-    };
-    match subcommand {
-        "doctor" => {
-            let db = IndexDatabase::open_config(config)?;
+pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
+    match &args.command {
+        MemoryCommand::Doctor { json } => {
+            let db = open_index(config)?;
             let entries = db.memory_doctor()?;
-            if has_flag(args, "--json") {
+            if *json {
                 print_json(&entries)?;
                 let any_gone = entries.iter().any(|e| e.anchor_status == "gone");
                 if any_gone {
@@ -210,12 +288,9 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        "rebind" => {
-            let Some(memory_id) = args.get(2).cloned() else {
-                anyhow::bail!("memory rebind needs a <memory_id>");
-            };
-            let db = IndexDatabase::open_config(config)?;
-            let bind = if let Some(symbol_name) = option_value(args, "--symbol") {
+        MemoryCommand::Rebind { memory_id, symbol, path, chunk } => {
+            let db = open_index(config)?;
+            let bind = if let Some(symbol_name) = symbol {
                 let selector = rag_rat_core::query::symbol::SymbolSelector {
                     logical_symbol_id: None,
                     symbol_id: None,
@@ -255,13 +330,13 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
                             .join(", ")
                     ),
                 }
-            } else if let Some(path) = option_value(args, "--path") {
+            } else if let Some(path) = path {
                 rag_rat_core::query::memory::RepoMemoryBindTarget {
                     symbol_id: None,
                     logical_symbol_id: None,
                     chunk_id: None,
                     edge_id: None,
-                    path: Some(path),
+                    path: Some(path.clone()),
                     start_line: None,
                     end_line: None,
                     commit_hash: None,
@@ -274,14 +349,11 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
                     path_summary: None,
                     dir: None,
                 }
-            } else if let Some(chunk_id_str) = option_value(args, "--chunk") {
-                let chunk_id: i64 = chunk_id_str
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("--chunk value must be an integer"))?;
+            } else if let Some(chunk_id) = chunk {
                 rag_rat_core::query::memory::RepoMemoryBindTarget {
                     symbol_id: None,
                     logical_symbol_id: None,
-                    chunk_id: Some(chunk_id),
+                    chunk_id: Some(*chunk_id),
                     edge_id: None,
                     path: None,
                     start_line: None,
@@ -301,11 +373,10 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
                     "memory rebind needs one of --symbol <name>, --path <path>, or --chunk <id>"
                 );
             };
-            print_json(&db.memory_rebind(&memory_id, bind)?)
+            print_json(&db.memory_rebind(memory_id, bind)?)
         },
-        "list" => {
-            let kind = option_value(args, "--kind");
-            let db = IndexDatabase::open_config(config)?;
+        MemoryCommand::List { kind } => {
+            let db = open_index(config)?;
             let summaries = db.memory_list(kind.as_deref())?;
             if summaries.is_empty() {
                 eprintln!("No memories found.");
@@ -319,11 +390,8 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        "show" => {
-            let Some(memory_id) = args.get(2).map(String::as_str) else {
-                anyhow::bail!("memory show needs a <memory_id>");
-            };
-            let db = IndexDatabase::open_config(config)?;
+        MemoryCommand::Show { memory_id } => {
+            let db = open_index(config)?;
             let Some(memory) = db.memory_get(memory_id)? else {
                 anyhow::bail!("memory `{memory_id}` not found");
             };
@@ -340,40 +408,30 @@ pub(crate) fn memory(config: &Config, args: &[String]) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        other =>
-            anyhow::bail!("unknown memory subcommand `{other}`; use list, show, doctor, or rebind"),
     }
 }
-pub(crate) fn github(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let Some(subcommand) = args.get(1).map(String::as_str) else {
-        anyhow::bail!("github command needs a subcommand");
-    };
-    match subcommand {
-        "sync" => {
-            let db = IndexDatabase::open_config(config)?;
-            let offline = has_flag(args, "--offline");
-            let report = if let Some(issue) = option_value(args, "--issue") {
-                db.github_sync_issue(&issue, offline)?
-            } else if has_flag(args, "--from-refs") {
-                db.github_sync_from_refs_with_progress(offline, render_github_sync_progress)?
+pub(crate) fn github(config: &Config, args: &GithubArgs) -> anyhow::Result<()> {
+    match &args.command {
+        GithubCommand::Sync { from_refs, issue, offline } => {
+            let db = open_index(config)?;
+            let report = if let Some(issue) = issue {
+                db.github_sync_issue(issue, *offline)?
+            } else if *from_refs {
+                db.github_sync_from_refs_with_progress(*offline, render_github_sync_progress)?
             } else {
                 anyhow::bail!("github sync needs --from-refs or --issue <owner/repo#number>");
             };
             print_json(&report)
         },
-        other => anyhow::bail!("unknown github subcommand `{other}`"),
     }
 }
-pub(crate) fn hooks(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let Some(subcommand) = args.get(1).map(String::as_str) else {
-        anyhow::bail!("hooks command needs install, uninstall, or status");
-    };
-    if args.iter().any(|a| a == "--claude") {
-        return claude_hooks(config, subcommand, args.iter().any(|a| a == "--global"));
+pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
+    if args.claude {
+        return claude_hooks(config, args.action.as_str(), args.global);
     }
     let git = git_paths(&config.root)?;
-    match subcommand {
-        "install" => {
+    match args.action {
+        HookAction::Install => {
             fs::create_dir_all(&git.hooks_dir)?;
             let mut installed = Vec::new();
             for hook in MANAGED_HOOKS {
@@ -389,7 +447,7 @@ pub(crate) fn hooks(config: &Config, args: &[String]) -> anyhow::Result<()> {
                 "hooks": installed,
             }))
         },
-        "uninstall" => {
+        HookAction::Uninstall => {
             let mut removed = Vec::new();
             let mut kept = Vec::new();
             for hook in MANAGED_HOOKS {
@@ -411,7 +469,7 @@ pub(crate) fn hooks(config: &Config, args: &[String]) -> anyhow::Result<()> {
                 "kept_unmanaged": kept,
             }))
         },
-        "status" => {
+        HookAction::Status => {
             let hooks = MANAGED_HOOKS
                 .iter()
                 .map(|hook| {
@@ -433,7 +491,6 @@ pub(crate) fn hooks(config: &Config, args: &[String]) -> anyhow::Result<()> {
                 "hooks": hooks,
             }))
         },
-        other => anyhow::bail!("unknown hooks subcommand `{other}`"),
     }
 }
 pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> anyhow::Result<()> {
@@ -472,15 +529,12 @@ pub(crate) fn claude_hooks(config: &Config, subcommand: &str, global: bool) -> a
         other => anyhow::bail!("unknown hooks subcommand `{other}`"),
     }
 }
-pub(crate) fn maintenance(config: &Config, args: &[String]) -> anyhow::Result<()> {
-    let trigger = option_value(args, "--trigger").unwrap_or_else(|| "manual".to_string());
-    let max_seconds = option_value(args, "--max-seconds")
-        .map(|value| value.parse())
-        .transpose()?
-        .unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
-    let branch_checkout = option_value(args, "--branch-checkout");
-    let old_head = option_value(args, "--old-head");
-    let new_head = option_value(args, "--new-head");
+pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Result<()> {
+    let trigger = args.trigger.clone().unwrap_or_else(|| "manual".to_string());
+    let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
+    let branch_checkout = args.branch_checkout.clone();
+    let old_head = args.old_head.clone();
+    let new_head = args.new_head.clone();
     let started = Instant::now();
 
     if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {

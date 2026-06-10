@@ -1,7 +1,7 @@
 use super::*;
 
-pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
-    let options = InitOptions::from_args(args)?;
+pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Result<()> {
+    let options = InitOptions::from_args(args, config_path);
     let _terminal_reset = TerminalResetGuard::install_if_interactive(!options.yes)?;
     let root = env::current_dir()?.canonicalize()?;
     let scan = scan_repo(&root)?;
