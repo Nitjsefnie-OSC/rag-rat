@@ -4431,6 +4431,89 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
 }
 
 #[test]
+fn anchor_health_counts_tallies_persisted_statuses() {
+    // Exercise the GROUP BY query in anchor_health_counts and the active-only filter.
+    // Create two memories bound to real symbols; after memory_validate they should both be
+    // "current". Assert memory_anchor_health() returns current >= 2 and gone == 0.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn health_alpha() {}\npub fn health_beta() {}\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let sym = |name: &str| {
+        db.select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some(name.to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("symbol must exist")
+    };
+    let alpha = sym("health_alpha");
+    let beta = sym("health_beta");
+
+    let bind_target = |symbol_id| crate::query::memory::RepoMemoryBindTarget {
+        symbol_id: Some(symbol_id),
+        logical_symbol_id: None,
+        chunk_id: None,
+        edge_id: None,
+        path: None,
+        start_line: None,
+        end_line: None,
+        commit_hash: None,
+        github_owner: None,
+        github_repo: None,
+        github_number: None,
+        start_logical_symbol_id: None,
+        end_logical_symbol_id: None,
+        edge_sequence_hash: None,
+        path_summary: None,
+    };
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "health alpha invariant".to_string(),
+        body: "Anchor health test — alpha binding.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: bind_target(alpha.symbol_id),
+    })
+    .unwrap();
+
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "health beta decision".to_string(),
+        body: "Anchor health test — beta binding.".to_string(),
+        confidence: "medium".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: bind_target(beta.symbol_id),
+    })
+    .unwrap();
+
+    // Validate so bindings get their anchor_status written to "current".
+    db.memory_validate().unwrap();
+
+    let health = db.memory_anchor_health().unwrap();
+    assert!(health.current >= 2, "expected at least 2 current bindings, got {health:?}");
+    assert_eq!(health.gone, 0, "expected no gone bindings, got {health:?}");
+    assert_eq!(health.stale, 0, "expected no stale bindings, got {health:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn memory_doctor_lists_gone_and_suggests_candidates() {
     // Bind a memory to `fn doctor_src` in a.rs. Delete a.rs and add `fn doctor_src` to b.rs
     // with a different body (so content-hash relocation does NOT fire and the binding stays
