@@ -4,7 +4,7 @@
 files read-only, writes only its configured SQLite database, and exposes current source, graph,
 git, GitHub papertrail, local-AI artifact status, and source-anchored repo memories as evidence.
 
-Current release: `v0.3.1`.
+Current release: `v0.3.2`.
 
 ```mermaid
 sequenceDiagram
