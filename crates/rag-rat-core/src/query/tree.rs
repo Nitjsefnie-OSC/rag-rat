@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 
 /// Options controlling the annotated directory tree builder.
+#[derive(Debug, Clone)]
 pub struct TreeOpts {
     /// Maximum depth from the repo root (0 = root only; default 3).
     pub max_depth: u8,
@@ -20,6 +21,7 @@ impl Default for TreeOpts {
 }
 
 /// A single node in the annotated directory tree.
+#[derive(Debug)]
 pub struct TreeNode {
     /// Display nesting level: 0 for top-level displayed nodes; a node's children are always
     /// `parent.depth + 1`. This is the **displayed** ancestor count, not the filesystem depth.
@@ -39,6 +41,7 @@ pub struct TreeNode {
 }
 
 /// The annotated directory tree returned by [`dir_tree`].
+#[derive(Debug)]
 pub struct DirTree {
     /// Included nodes, ordered by path, capped at [`TreeOpts::max_nodes`].
     pub nodes: Vec<TreeNode>,

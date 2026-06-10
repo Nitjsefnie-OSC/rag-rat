@@ -4,6 +4,7 @@ pub mod graph_meta;
 pub mod grep_augment;
 pub mod impact;
 pub mod memory;
+pub mod orientation;
 pub mod repo_brief;
 pub mod symbol;
 pub mod tree;

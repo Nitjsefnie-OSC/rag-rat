@@ -5766,3 +5766,131 @@ impl github::GitHubClient for PartiallyFailingGitHubClient {
         MockGitHubClient.pull_review_comments(owner, repo, number)
     }
 }
+
+// ─── Phase C1: orientation composer ──────────────────────────────────────────
+
+#[test]
+fn orientation_composes_read_only() {
+    // Build a temp index with files in two dirs, a root dir memory, and one non-dir
+    // (path-bound) active memory.  Verify the Orientation struct is fully populated and
+    // that running orientation twice yields identical results (no writes).
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::create_dir_all(root.join("src/b")).unwrap();
+    for name in &["x.rs", "y.rs", "z.rs"] {
+        fs::write(root.join("src/a").join(name), "pub fn ax() {}\n").unwrap();
+        fs::write(root.join("src/b").join(name), "pub fn bx() {}\n").unwrap();
+    }
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Root dir memory (binding_kind='dir', binding_id="").
+    create_dir_memory(&db, "root purpose", Some("".to_string()));
+
+    // Non-dir memory bound to a specific path — should appear in active_memory_titles.
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "path memory title".to_string(),
+        body: "bound to src/a/x.rs".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            path: Some("src/a/x.rs".to_string()),
+            logical_symbol_id: None,
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            start_line: None,
+            end_line: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            start_logical_symbol_id: None,
+            end_logical_symbol_id: None,
+            edge_sequence_hash: None,
+            path_summary: None,
+            dir: None,
+        },
+    })
+    .unwrap();
+
+    // orientation installs its own scope view — pass the raw connection.
+    let conn = db.storage.connection();
+    let o1 = crate::query::orientation::orientation(conn, &root).unwrap();
+
+    // tree: root memory must be set; nodes must be non-empty.
+    assert_eq!(
+        o1.tree.root_memory_title.as_deref(),
+        Some("root purpose"),
+        "root_memory_title wrong: {:?}",
+        o1.tree.root_memory_title
+    );
+    assert!(
+        !o1.tree.nodes.is_empty(),
+        "tree.nodes should be non-empty; got {:?}",
+        o1.tree.nodes.iter().map(|n| &n.path).collect::<Vec<_>>()
+    );
+
+    // load_bearing: at most 5, each entry is (path, fan_in).
+    assert!(
+        o1.load_bearing.len() <= 5,
+        "load_bearing len {} > 5",
+        o1.load_bearing.len()
+    );
+    // Each entry must be a non-empty path with u64 fan_in (value may be 0 if graph not built).
+    for (path, _fan_in) in &o1.load_bearing {
+        assert!(!path.is_empty(), "load_bearing path is empty");
+    }
+
+    // active_memory_titles: the path-bound memory must appear; the dir memory must NOT.
+    assert!(
+        o1.active_memory_titles.contains(&"path memory title".to_string()),
+        "path memory not in active_memory_titles: {:?}",
+        o1.active_memory_titles
+    );
+    assert!(
+        !o1.active_memory_titles.contains(&"root purpose".to_string()),
+        "dir memory should not appear in active_memory_titles: {:?}",
+        o1.active_memory_titles
+    );
+
+    // head/indexed_head: strings (may be empty when not in a git repo; that's fine for a temp dir).
+    // Just assert they're present as fields (no panic).
+    let _ = &o1.head;
+    let _ = &o1.indexed_head;
+
+    // anchor counts must be present (counts are non-negative; checked via Debug).
+    let _ = format!("{:?}", o1.anchor);
+
+    // total_files: 6 non-generated source files indexed.
+    assert_eq!(o1.total_files, 6, "total_files mismatch");
+
+    // parser_failures: a non-panicking u64.
+    let _ = o1.parser_failures;
+
+    // Idempotency: run orientation a second time — must succeed with same key results.
+    let o2 = crate::query::orientation::orientation(conn, &root).unwrap();
+    assert_eq!(
+        o2.tree.root_memory_title.as_deref(),
+        Some("root purpose"),
+        "second call: root_memory_title changed"
+    );
+    assert_eq!(
+        o2.tree.nodes.len(),
+        o1.tree.nodes.len(),
+        "second call: node count changed"
+    );
+    assert_eq!(
+        o2.active_memory_titles, o1.active_memory_titles,
+        "second call: active_memory_titles changed"
+    );
+    assert_eq!(o2.total_files, o1.total_files, "second call: total_files changed");
+
+    fs::remove_dir_all(root).unwrap();
+}
