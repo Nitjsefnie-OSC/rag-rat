@@ -302,7 +302,9 @@ The MCP surface includes:
 `semantic_search` ranking is hybrid: BM25 lexical recall plus vector cosine similarity, blended into
 one `score`, with stale-hit validation. Vector recall is model-dependent — it contributes only when
 a local embedding model is installed (see `local_ai_status`), and the tool degrades to BM25-only
-otherwise. Pass `explain=true` to see the BM25/vector/symbol/graph/git/github score components.
+otherwise. Every hit carries `retrieval_mode` (`lexical`, `vector`, or `hybrid`) so you can tell
+whether embeddings contributed without `explain` — it is `lexical` for every hit when no model is
+active. Pass `explain=true` to see the BM25/vector/symbol/graph/git/github score components.
 
 ### Git And GitHub Evidence
 

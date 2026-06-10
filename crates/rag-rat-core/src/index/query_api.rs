@@ -1133,6 +1133,7 @@ impl IndexDatabase {
                     end_line: row.get(5)?,
                     symbol_path: row.get(6)?,
                     score: 1.0,
+                    retrieval_mode: "lexical".to_string(),
                     summary: bounded_summary(&text),
                     graph: None,
                     score_components: None,

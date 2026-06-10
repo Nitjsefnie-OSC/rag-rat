@@ -23,6 +23,11 @@ pub struct SearchHit {
     pub end_line: i64,
     pub symbol_path: Option<String>,
     pub score: f64,
+    /// Which retrieval modes found this hit: "lexical" (BM25 only), "vector" (embedding cosine
+    /// only), or "hybrid" (both). Always present, so an agent knows whether embeddings
+    /// contributed without passing explain=true (#41). "lexical" whenever no embedding model is
+    /// active.
+    pub retrieval_mode: String,
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph: Option<GraphEvidence>,
@@ -202,6 +207,15 @@ impl RankedHit {
                 + self.components.git
                 + self.components.github,
         );
+        // Always state how this hit was retrieved (#41): a hit enters `ranked` via the BM25 and/or
+        // the vector candidate pass, so its mode follows which of those components scored.
+        self.hit.retrieval_mode =
+            match (self.components.bm25 > 0.0, self.components.vector > 0.0) {
+                (true, true) => "hybrid",
+                (false, true) => "vector",
+                _ => "lexical",
+            }
+            .to_string();
         if explain {
             if !vector_available {
                 self.components.vector_note =
@@ -258,6 +272,8 @@ fn bm25_candidates(
             end_line: row.get(5)?,
             symbol_path: row.get(6)?,
             score: row.get(7)?,
+            // Placeholder — RankedHit::finish sets the real mode from the scored components.
+            retrieval_mode: String::new(),
             summary: snippet(&text, query),
             graph: None,
             score_components: None,
@@ -323,6 +339,9 @@ fn vector_candidates(
                     end_line: row.get(5)?,
                     symbol_path: row.get(6)?,
                     score: 0.0,
+                    // Placeholder — RankedHit::finish sets the real mode from the scored
+                    // components.
+                    retrieval_mode: String::new(),
                     summary: snippet(&text, query),
                     graph: None,
                     score_components: None,
@@ -611,5 +630,17 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "src/watch.rs");
         // No model is configured in this DB; reaching here without error proves no embed path ran.
+        // retrieval_mode is always present and states the mode without needing explain (#41).
+        assert_eq!(hits[0].retrieval_mode, "lexical");
+    }
+
+    #[test]
+    fn retrieval_mode_is_lexical_when_no_embedding_model() {
+        let conn = seeded_conn();
+        // The default search path embeds the query, but with no model it falls back to BM25 —
+        // every hit must be labeled "lexical", never an empty string or an overclaimed mode.
+        let hits = search(&conn, "election retry", 5, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].retrieval_mode, "lexical");
     }
 }

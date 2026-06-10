@@ -151,6 +151,10 @@ from an outdated FTS table.
 - `explain`: include score components (`bm25`, `vector`, `symbol`, `graph`, `git`, `github`).
   Default is `false`.
 
+Every hit also carries `retrieval_mode` (`lexical`, `vector`, or `hybrid`) — always present, so a
+caller knows whether embeddings contributed without setting `explain`. It is `lexical` for every
+hit when no embedding model is active.
+
 Graph tools are backed by tree-sitter-derived syntax edges. Edge kinds are `imports`, `exports`,
 `calls_name`, `constructs`, `uses_macro`, `references_type`, `implements`, and `contains`; confidence is reported as
 `edge_confidence` (`confidence` is retained as the compatibility alias) with values `Exact`,

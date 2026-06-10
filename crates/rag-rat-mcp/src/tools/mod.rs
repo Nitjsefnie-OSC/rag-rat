@@ -645,8 +645,10 @@ pub fn description(name: &str) -> &'static str {
         "semantic_search" =>
             "Search indexed source and docs. `score` is a blended relevance score combining BM25 \
              lexical rank and (when an embedding model is installed) vector cosine similarity; \
-             pass explain=true for the per-component breakdown. Hits are validated against current \
-             source. Falls back to BM25-only when no embedding model is present.",
+             pass explain=true for the per-component breakdown. Each hit carries `retrieval_mode` \
+             ('lexical', 'vector', or 'hybrid') so you can tell whether embeddings contributed \
+             without explain. Hits are validated against current source. Falls back to BM25-only \
+             (every hit 'lexical') when no embedding model is present.",
         "symbol_lookup" =>
             "Resolve a symbol name (or symbol_path/id) to its definition(s) in Rust, TypeScript, \
              Kotlin, C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
