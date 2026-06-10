@@ -1,4 +1,5 @@
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
+use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::Serialize;
@@ -19,7 +20,8 @@ impl RepoBriefMode {
             "god_modules" => Ok(Self::GodModules),
             "refactor_candidates" => Ok(Self::RefactorCandidates),
             other => anyhow::bail!(
-                "unknown repo brief mode `{other}`; expected spine, churn, god_modules, or refactor_candidates"
+                "unknown repo brief mode `{other}`; expected spine, churn, god_modules, or \
+                 refactor_candidates"
             ),
         }
     }
@@ -258,28 +260,24 @@ fn score_for(mode: RepoBriefMode, row: &FileBriefRow) -> f64 {
     let papertrail = capped(row.github_ref_count as f64 / 8.0);
 
     let score = match mode {
-        RepoBriefMode::Spine => {
+        RepoBriefMode::Spine =>
             coupling * 0.35
                 + symbols * 0.18
                 + size * 0.12
                 + churn * 0.15
                 + memories * 0.15
-                + papertrail * 0.05
-        },
-        RepoBriefMode::Churn => {
-            churn * 0.65 + coupling * 0.15 + size * 0.10 + memories * 0.07 + papertrail * 0.03
-        },
-        RepoBriefMode::GodModules => {
-            size * 0.30 + symbols * 0.25 + coupling * 0.25 + churn * 0.12 + memories * 0.08
-        },
-        RepoBriefMode::RefactorCandidates => {
+                + papertrail * 0.05,
+        RepoBriefMode::Churn =>
+            churn * 0.65 + coupling * 0.15 + size * 0.10 + memories * 0.07 + papertrail * 0.03,
+        RepoBriefMode::GodModules =>
+            size * 0.30 + symbols * 0.25 + coupling * 0.25 + churn * 0.12 + memories * 0.08,
+        RepoBriefMode::RefactorCandidates =>
             size * 0.20
                 + symbols * 0.18
                 + coupling * 0.25
                 + churn * 0.25
                 + memories * 0.09
-                + papertrail * 0.03
-        },
+                + papertrail * 0.03,
     };
 
     let score = if row.generated { score * 0.25 } else { score };
@@ -320,22 +318,20 @@ fn category_for(
     metrics: &RepoBriefMetrics,
 ) -> &'static str {
     match mode {
-        RepoBriefMode::Spine => {
+        RepoBriefMode::Spine =>
             if metrics.fan_in + metrics.fan_out >= 25 {
                 "central_coupling_point"
             } else if metrics.memories.active > 0 {
                 "source_anchored_context"
             } else {
                 "structural_spine"
-            }
-        },
-        RepoBriefMode::Churn => {
+            },
+        RepoBriefMode::Churn =>
             if metrics.recent_touch_count >= 2 {
                 "recent_churn_hotspot"
             } else {
                 "historical_churn_hotspot"
-            }
-        },
+            },
         RepoBriefMode::GodModules => {
             if row.symbol_count >= 40 && row.fan_in > 0 && row.fan_out > 0 {
                 "large_mixed_module"
@@ -400,9 +396,8 @@ fn why_for(
         why.push(match mode {
             RepoBriefMode::Spine => "included by baseline indexed source rank".to_string(),
             RepoBriefMode::Churn => "no indexed churn details available for this file".to_string(),
-            RepoBriefMode::GodModules | RepoBriefMode::RefactorCandidates => {
-                "candidate is weak; inspect before treating it as refactor work".to_string()
-            },
+            RepoBriefMode::GodModules | RepoBriefMode::RefactorCandidates =>
+                "candidate is weak; inspect before treating it as refactor work".to_string(),
         });
     }
     why
@@ -453,11 +448,10 @@ fn next_tools_for(row: &FileBriefRow, include_memories: bool) -> Vec<RepoBriefNe
     // was misleading here; `impact_surface` text-falls-back on a path and surfaces graph, git,
     // papertrail, and the memories crossing it — the right orientation before editing.
     let mut tools = vec![
-        next_tool(
-            "git_history_for_path",
-            "inspect churn and rationale commits",
-            [("path", row.path.clone())],
-        ),
+        next_tool("git_history_for_path", "inspect churn and rationale commits", [(
+            "path",
+            row.path.clone(),
+        )]),
         next_tool(
             "impact_surface",
             "inspect graph, git, papertrail, and repo memories crossing this path",
@@ -491,18 +485,17 @@ fn next_tool<const N: usize>(
 
 fn scoring_note(mode: RepoBriefMode) -> &'static str {
     match mode {
-        RepoBriefMode::Spine => {
-            "weighted evidence score: graph coupling, symbol/line size, churn, memories, and GitHub refs"
-        },
-        RepoBriefMode::Churn => {
-            "weighted churn score: commit touches, recent touches, additions/deletions, with context signals"
-        },
-        RepoBriefMode::GodModules => {
-            "weighted god-module score: size, symbol count, fan-in/fan-out, churn, and memories"
-        },
-        RepoBriefMode::RefactorCandidates => {
-            "weighted refactor score: churn plus coupling and size; treat as triage evidence, not an automatic refactor order"
-        },
+        RepoBriefMode::Spine =>
+            "weighted evidence score: graph coupling, symbol/line size, churn, memories, and \
+             GitHub refs",
+        RepoBriefMode::Churn =>
+            "weighted churn score: commit touches, recent touches, additions/deletions, with \
+             context signals",
+        RepoBriefMode::GodModules =>
+            "weighted god-module score: size, symbol count, fan-in/fan-out, churn, and memories",
+        RepoBriefMode::RefactorCandidates =>
+            "weighted refactor score: churn plus coupling and size; treat as triage evidence, not \
+             an automatic refactor order",
     }
 }
 
@@ -576,7 +569,8 @@ pub(crate) fn file_rows(
         churn AS (
           SELECT git_file_changes.path,
                  COUNT(DISTINCT git_file_changes.commit_hash) AS commit_touch_count,
-                 SUM(CASE WHEN git_commits.authored_at_s >= ?1 THEN 1 ELSE 0 END) AS recent_touch_count,
+                 SUM(CASE WHEN git_commits.authored_at_s >= ?1 THEN 1 ELSE 0 END) AS \
+         recent_touch_count,
                  COALESCE(SUM(git_file_changes.additions), 0) AS additions,
                  COALESCE(SUM(git_file_changes.deletions), 0) AS deletions
           FROM git_file_changes

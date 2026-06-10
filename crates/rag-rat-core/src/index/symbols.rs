@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use crate::{index::parser, language::Language};
+use crate::index::parser;
+use crate::language::Language;
 
 #[derive(Debug, Clone)]
 pub struct SymbolFact {

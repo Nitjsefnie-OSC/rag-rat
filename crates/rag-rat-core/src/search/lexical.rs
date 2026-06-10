@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::{index::ai, query::graph_meta::GraphEvidence};
+use crate::index::ai;
+use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;
 const VECTOR_WEIGHT: f64 = 0.35;
@@ -113,15 +114,10 @@ pub fn search_lexical_only(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    search_with_query_embedding(
-        conn,
-        query,
-        limit,
-        include_generated,
-        None,
-        false,
-        SearchOptions { include_git: false, include_papertrail: false },
-    )
+    search_with_query_embedding(conn, query, limit, include_generated, None, false, SearchOptions {
+        include_git: false,
+        include_papertrail: false,
+    })
 }
 
 pub fn search_with_options(

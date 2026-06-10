@@ -33,23 +33,17 @@ pub use listener::{socket_path_for, spawn_listener};
 
 #[cfg(unix)]
 mod listener {
-    use std::{
-        collections::HashMap,
-        path::PathBuf,
-        time::{Duration, Instant},
-    };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
-    use rag_rat_core::{
-        config::Config,
-        locks::{self, FileLock},
-        query::grep_augment::{self, DedupeFilter},
-        storage::IndexConnection,
-    };
-    use tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::{UnixListener, UnixStream},
-        task::JoinHandle,
-    };
+    use rag_rat_core::config::Config;
+    use rag_rat_core::locks::{self, FileLock};
+    use rag_rat_core::query::grep_augment::{self, DedupeFilter};
+    use rag_rat_core::storage::IndexConnection;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::task::JoinHandle;
 
     use super::{HookRequest, HookResponse, PROTOCOL_VERSION};
 
@@ -185,7 +179,9 @@ mod listener {
 mod listener_tests {
     use std::time::Duration;
 
-    use rag_rat_core::{Config, index::schema, storage::IndexConnection};
+    use rag_rat_core::Config;
+    use rag_rat_core::index::schema;
+    use rag_rat_core::storage::IndexConnection;
 
     use super::*;
 

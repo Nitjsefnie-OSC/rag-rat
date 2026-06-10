@@ -1,16 +1,13 @@
 use rag_rat_core::Config;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::RequestContext;
 #[cfg(not(unix))]
 use rmcp::transport::stdio;
-use rmcp::{
-    ErrorData, RoleServer, ServerHandler, ServiceExt,
-    handler::server::wrapper::Parameters,
-    model::{
-        CallToolResult, Content, Implementation, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo, Tool,
-    },
-    service::RequestContext,
-    tool, tool_handler, tool_router,
-};
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde_json::{Map, Value, json};
 
 use crate::tools::{
@@ -61,7 +58,8 @@ impl RagRatService {
 impl RagRatService {
     #[tool(
         name = "semantic_search",
-        description = "Search indexed source and docs with hybrid BM25/vector/structural ranking; optionally explains score components."
+        description = "Search indexed source and docs with hybrid BM25/vector/structural ranking; \
+                       optionally explains score components."
     )]
     fn semantic_search(
         &self,
@@ -105,7 +103,8 @@ impl RagRatService {
 
     #[tool(
         name = "compare_graph_to_text",
-        description = "Compare graph caller edges for a symbol against regex text hits in indexed source."
+        description = "Compare graph caller edges for a symbol against regex text hits in indexed \
+                       source."
     )]
     fn compare_graph_to_text(
         &self,
@@ -116,7 +115,8 @@ impl RagRatService {
 
     #[tool(
         name = "impact_surface",
-        description = "Graph-backed coding preflight with structural, textual fallback, and papertrail evidence."
+        description = "Graph-backed coding preflight with structural, textual fallback, and \
+                       papertrail evidence."
     )]
     fn impact_surface(
         &self,
@@ -127,7 +127,8 @@ impl RagRatService {
 
     #[tool(
         name = "repo_brief",
-        description = "Orientation-first repo brief with spine, churn, god-module, and refactor-candidate modes."
+        description = "Orientation-first repo brief with spine, churn, god-module, and \
+                       refactor-candidate modes."
     )]
     fn repo_brief(
         &self,
@@ -138,7 +139,8 @@ impl RagRatService {
 
     #[tool(
         name = "repo_clusters",
-        description = "Cheap file-level ownership clusters using path proximity, graph edges, and git co-touches."
+        description = "Cheap file-level ownership clusters using path proximity, graph edges, and \
+                       git co-touches."
     )]
     fn repo_clusters(
         &self,
@@ -327,7 +329,8 @@ impl RagRatService {
 
     #[tool(
         name = "index_status",
-        description = "Report SQLite index freshness, git metadata, parser failures, and file counts."
+        description = "Report SQLite index freshness, git metadata, parser failures, and file \
+                       counts."
     )]
     fn index_status(
         &self,
@@ -338,7 +341,8 @@ impl RagRatService {
 
     #[tool(
         name = "memory_create",
-        description = "Create a source-anchored repo memory bound to a symbol, chunk, path, commit, or GitHub ref."
+        description = "Create a source-anchored repo memory bound to a symbol, chunk, path, \
+                       commit, or GitHub ref."
     )]
     fn memory_create(
         &self,
@@ -427,7 +431,10 @@ impl ServerHandler for RagRatService {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rag-rat", "0.3.1"))
-            .with_instructions("Read-only-source repo intelligence. Index and auto-heal writes are confined to the configured SQLite database.")
+            .with_instructions(
+                "Read-only-source repo intelligence. Index and auto-heal writes are confined to \
+                 the configured SQLite database.",
+            )
     }
 
     async fn list_tools(
@@ -497,9 +504,8 @@ async fn run_stdio_unix(config: Config) -> anyhow::Result<()> {
 
     // Resume (skip `initialize`) iff a predecessor handed off a session we can still honor.
     let running = match upgrade::take_handoff() {
-        Some(handoff) if upgrade::protocol_supported(&handoff.negotiated_protocol_version) => {
-            serve_directly(service, transport, Some(handoff.peer_info))
-        },
+        Some(handoff) if upgrade::protocol_supported(&handoff.negotiated_protocol_version) =>
+            serve_directly(service, transport, Some(handoff.peer_info)),
         Some(handoff) => {
             // The new binary can't honor the negotiated protocol — exit cleanly so the client
             // reconnects and renegotiates rather than resuming on a mismatch.

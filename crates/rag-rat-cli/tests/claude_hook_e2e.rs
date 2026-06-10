@@ -1,11 +1,8 @@
 //! End-to-end tests for `rag-rat claude-hook` (Unix only for socket paths; the no-op
 //! contract tests run everywhere).
 
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
-
+use std::io::Write;
+use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::{
     fs,
@@ -89,8 +86,8 @@ fn socket_path_serves_dedupes_and_falls_back() {
         "listener context must name the indexed symbol and file, got: {context}"
     );
 
-    // 2. Same session s1 again: the listener already injected the symbol, so it dedupes to a
-    //    null context and the client prints nothing at all.
+    // 2. Same session s1 again: the listener already injected the symbol, so it dedupes to a null
+    //    context and the client prints nothing at all.
     let repeat = repo.run_hook_session("s1");
     assert!(
         repeat.is_empty(),
@@ -148,8 +145,8 @@ impl TestRepo {
         let config_path = root.join("rag-rat.toml");
         fs::write(
             &config_path,
-            "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n\
-             [target_bindings]\nrust = [\"src\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \
+             \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = [\"src\"]\n",
         )
         .unwrap();
         let config = rag_rat_core::Config::load(&config_path).unwrap();

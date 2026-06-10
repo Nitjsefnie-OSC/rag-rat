@@ -1,0 +1,580 @@
+use super::*;
+
+pub(crate) fn migrate_files(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "files", "indexed_revision", "TEXT NOT NULL DEFAULT ''")?;
+    conn.execute("UPDATE files SET indexed_revision = sha256 WHERE indexed_revision = ''", [])?;
+    Ok(())
+}
+
+pub(crate) fn migrate_chunks(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "chunks", "source_revision", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "anchor_version", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "chunks", "normalized_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "start_boundary_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "end_boundary_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "start_context_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "end_context_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "chunks", "context_radius", "INTEGER NOT NULL DEFAULT 2")?;
+    add_column_if_missing(conn, "chunks", "embedding_policy", "TEXT NOT NULL DEFAULT 'Embed'")?;
+    add_column_if_missing(conn, "chunks", "embedding_priority", "INTEGER NOT NULL DEFAULT 1")?;
+    conn.execute(
+        "
+        UPDATE chunks
+        SET source_revision = (
+            SELECT files.indexed_revision
+            FROM files
+            WHERE files.id = chunks.file_id
+        )
+        WHERE source_revision = ''
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn migrate_edges(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "source_file_id", "INTEGER")?;
+    add_column_if_missing(conn, "edges", "from_name", "TEXT")?;
+    add_column_if_missing(conn, "edges", "to_name", "TEXT NOT NULL DEFAULT ''")?;
+    apply_edge_source_target_spans(conn)?;
+    apply_edge_evidence_and_resolution(conn)?;
+    conn.execute(
+        "
+        UPDATE edges
+        SET from_name = COALESCE(from_name, (
+                SELECT qualified_name FROM symbols WHERE symbols.id = edges.from_symbol_id
+            )),
+            to_name = CASE
+                WHEN to_name != '' THEN to_name
+                ELSE COALESCE((SELECT qualified_name FROM symbols WHERE symbols.id = \
+         edges.to_symbol_id), '')
+            END
+        ",
+        [],
+    )?;
+    conn.execute("DELETE FROM edges WHERE to_name = ''", [])?;
+    conn.execute(
+        "
+        UPDATE edges
+        SET confidence = 'NameOnly'
+        WHERE confidence NOT IN ('Exact', 'Syntactic', 'NameOnly', 'Ambiguous')
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_edge_source_target_spans(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "source_start_line", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "source_end_line", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "source_start_byte", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "source_end_byte", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "edges", "target_start_line", "INTEGER")?;
+    add_column_if_missing(conn, "edges", "target_end_line", "INTEGER")?;
+    Ok(())
+}
+
+pub(crate) fn apply_edge_evidence_and_resolution(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "target_qualified_name", "TEXT")?;
+    add_column_if_missing(conn, "edges", "evidence", "TEXT")?;
+    add_column_if_missing(conn, "edges", "receiver_hint", "TEXT")?;
+    add_column_if_missing(conn, "edges", "resolution", "TEXT NOT NULL DEFAULT 'unresolved'")?;
+    conn.execute(
+        "
+        UPDATE edges
+        SET resolution = CASE
+            WHEN to_symbol_id IS NOT NULL AND confidence = 'Exact' THEN 'exact'
+            WHEN to_symbol_id IS NOT NULL AND confidence = 'Syntactic' THEN 'syntactic'
+            WHEN to_symbol_id IS NOT NULL AND confidence = 'Ambiguous' THEN 'ambiguous'
+            WHEN to_symbol_id IS NOT NULL THEN 'name_fallback'
+            ELSE COALESCE(NULLIF(resolution, ''), 'unresolved')
+        END
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_embedding_vector_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "ai_models", "embedding_dim", "INTEGER")?;
+    add_column_if_missing(conn, "ai_models", "runtime", "TEXT NOT NULL DEFAULT 'local'")?;
+    add_column_if_missing(conn, "chunk_embeddings", "embedding_dim", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute(
+        "
+        UPDATE ai_models
+        SET embedding_dim = CASE
+                WHEN capability = 'embedding' THEN COALESCE(embedding_dim, 384)
+                ELSE embedding_dim
+            END,
+            runtime = COALESCE(runtime, 'local')
+        ",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_derived_artifact_reconcile_metadata(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "chunk_embeddings", "model_version", "TEXT NOT NULL DEFAULT 'v1'")?;
+    add_column_if_missing(conn, "chunk_embeddings", "attempt_count", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "chunk_embeddings", "last_error_class", "TEXT")?;
+    add_column_if_missing(conn, "chunk_embeddings", "next_retry_after_ms", "INTEGER")?;
+    add_column_if_missing(conn, "chunk_embeddings", "computed_at_ms", "INTEGER")?;
+    conn.execute(
+        "
+        UPDATE chunk_embeddings
+        SET model_version = CASE
+                WHEN model_id = 'embedding-hash' AND model_version = 'v1' THEN 'hash-v1'
+                WHEN model_id = 'fastembed-all-minilm-l6-v2' AND model_version = 'v1'
+                    THEN 'fastembed-all-minilm-l6-v2-v1'
+                ELSE model_version
+            END,
+            computed_at_ms = COALESCE(computed_at_ms, created_at_ms),
+            attempt_count = CASE
+                WHEN attempt_count = 0 AND status IN ('Current', 'Failed', 'Blocked') THEN 1
+                ELSE attempt_count
+            END,
+            last_error_class = CASE
+                WHEN last_error IS NOT NULL AND last_error_class IS NULL THEN status
+                ELSE last_error_class
+            END
+        ",
+        [],
+    )?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS chunk_summaries(
+            chunk_id INTEGER NOT NULL,
+            model_id TEXT NOT NULL,
+            prompt_version TEXT NOT NULL,
+            input_hash TEXT NOT NULL,
+            text_hash TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error_class TEXT,
+            next_retry_after_ms INTEGER,
+            computed_at_ms INTEGER,
+            PRIMARY KEY(chunk_id, model_id, prompt_version),
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS reconcile_meta(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_embedding_policy_and_input_hash(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "chunks", "embedding_policy", "TEXT NOT NULL DEFAULT 'Embed'")?;
+    add_column_if_missing(conn, "chunks", "embedding_priority", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "chunk_embeddings", "input_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "embedding_text_version",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "embedding_policy",
+        "TEXT NOT NULL DEFAULT 'Embed'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "embedding_priority",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(conn, "chunk_embeddings", "input_chars", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "chunk_embeddings",
+        "input_truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "reconcile_attempts", "elapsed_ms", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "reconcile_attempts", "input_chars", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "reconcile_attempts", "batch_size", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+pub(crate) fn apply_github_ref_sync(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS github_ref_sync(
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            synced_at_ms INTEGER NOT NULL,
+            last_error TEXT,
+            PRIMARY KEY(owner, repo, number)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_symbol_facts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS symbol_facts(
+            symbol_id INTEGER NOT NULL,
+            fact_kind TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            PRIMARY KEY(symbol_id, fact_kind, fact_value),
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_symbol_facts_kind_value
+            ON symbol_facts(fact_kind, fact_value);
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_repo_memories(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS repo_memories(
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_by TEXT,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            source_text_hash TEXT,
+            input_hash TEXT,
+            memory_version TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS repo_memory_bindings(
+            memory_id TEXT NOT NULL,
+            binding_kind TEXT NOT NULL,
+            binding_id TEXT NOT NULL,
+            path TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            logical_symbol_id INTEGER,
+            symbol_id INTEGER,
+            chunk_id INTEGER,
+            edge_id INTEGER,
+            commit_hash TEXT,
+            github_owner TEXT,
+            github_repo TEXT,
+            github_number INTEGER,
+            anchor_status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, binding_kind, binding_id),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS repo_memory_tags(
+            memory_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            PRIMARY KEY(memory_id, tag),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS repo_memory_call_paths(
+            memory_id TEXT NOT NULL,
+            start_logical_symbol_id INTEGER,
+            end_logical_symbol_id INTEGER,
+            edge_sequence_hash TEXT NOT NULL,
+            path_summary TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, edge_sequence_hash),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS repo_memory_fts USING fts5(
+            memory_id UNINDEXED,
+            title,
+            body,
+            kind,
+            tags,
+            tokenize='porter'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_logical_symbol
+            ON repo_memory_bindings(logical_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_symbol
+            ON repo_memory_bindings(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_chunk
+            ON repo_memory_bindings(chunk_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_edge
+            ON repo_memory_bindings(edge_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_path
+            ON repo_memory_bindings(path);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_start
+            ON repo_memory_call_paths(start_logical_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_end
+            ON repo_memory_call_paths(end_logical_symbol_id);
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS repo_memory_call_paths(
+            memory_id TEXT NOT NULL,
+            start_logical_symbol_id INTEGER,
+            end_logical_symbol_id INTEGER,
+            edge_sequence_hash TEXT NOT NULL,
+            path_summary TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(memory_id, edge_sequence_hash),
+            FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_bindings_edge
+            ON repo_memory_bindings(edge_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_start
+            ON repo_memory_call_paths(start_logical_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_repo_memory_call_paths_end
+            ON repo_memory_call_paths(end_logical_symbol_id);
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_graph_file_lookup_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges", "source_file_id", "INTEGER")?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges(source_file_id);
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS logical_symbols(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            language TEXT NOT NULL,
+            path TEXT NOT NULL,
+            logical_name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            variant_count INTEGER NOT NULL,
+            group_reason TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS logical_symbol_members(
+            logical_symbol_id INTEGER NOT NULL,
+            symbol_id INTEGER NOT NULL,
+            cfg_expr TEXT,
+            signature_hash TEXT,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            PRIMARY KEY(logical_symbol_id, symbol_id),
+            FOREIGN KEY(logical_symbol_id) REFERENCES logical_symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_logical_symbols_qualified_name
+            ON logical_symbols(qualified_name);
+        CREATE INDEX IF NOT EXISTS idx_logical_symbol_members_symbol
+            ON logical_symbol_members(symbol_id);
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, applied_at_ms, checksum, description
+        FROM schema_version
+        ORDER BY applied_at_ms, id
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(AppliedMigration {
+            id: row.get(0)?,
+            applied_at_ms: row.get(1)?,
+            checksum: row.get(2)?,
+            description: row.get(3)?,
+        })
+    })?;
+    let mut migrations = Vec::new();
+    for row in rows {
+        migrations.push(row?);
+    }
+    Ok(migrations)
+}
+
+pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
+    migrations
+        .iter()
+        .filter_map(|migration| match migration.id.as_str() {
+            MIGRATION_001_ID => Some(1),
+            MIGRATION_002_ID => Some(2),
+            MIGRATION_003_ID => Some(3),
+            MIGRATION_004_ID => Some(4),
+            MIGRATION_005_ID => Some(5),
+            MIGRATION_006_ID => Some(6),
+            MIGRATION_007_ID => Some(7),
+            MIGRATION_008_ID => Some(8),
+            MIGRATION_009_ID => Some(9),
+            MIGRATION_010_ID => Some(10),
+            MIGRATION_011_ID => Some(11),
+            MIGRATION_012_ID => Some(12),
+            MIGRATION_013_ID => Some(13),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn known_migration(id: &str) -> bool {
+    matches!(
+        id,
+        MIGRATION_001_ID
+            | MIGRATION_002_ID
+            | MIGRATION_003_ID
+            | MIGRATION_004_ID
+            | MIGRATION_005_ID
+            | MIGRATION_006_ID
+            | MIGRATION_007_ID
+            | MIGRATION_008_ID
+            | MIGRATION_009_ID
+            | MIGRATION_010_ID
+            | MIGRATION_011_ID
+            | MIGRATION_012_ID
+            | MIGRATION_013_ID
+            | DIRTY_MIGRATION_ID
+    )
+}
+
+pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool {
+    match migration.id.as_str() {
+        MIGRATION_001_ID => migration.checksum != MIGRATION_001_CHECKSUM,
+        MIGRATION_002_ID => migration.checksum != MIGRATION_002_CHECKSUM,
+        MIGRATION_003_ID => migration.checksum != MIGRATION_003_CHECKSUM,
+        MIGRATION_004_ID => migration.checksum != MIGRATION_004_CHECKSUM,
+        MIGRATION_005_ID => migration.checksum != MIGRATION_005_CHECKSUM,
+        MIGRATION_006_ID => migration.checksum != MIGRATION_006_CHECKSUM,
+        MIGRATION_007_ID => migration.checksum != MIGRATION_007_CHECKSUM,
+        MIGRATION_008_ID => migration.checksum != MIGRATION_008_CHECKSUM,
+        MIGRATION_009_ID => migration.checksum != MIGRATION_009_CHECKSUM,
+        MIGRATION_010_ID => migration.checksum != MIGRATION_010_CHECKSUM,
+        MIGRATION_011_ID => migration.checksum != MIGRATION_011_CHECKSUM,
+        MIGRATION_012_ID => migration.checksum != MIGRATION_012_CHECKSUM,
+        MIGRATION_013_ID => migration.checksum != MIGRATION_013_CHECKSUM,
+        _ => false,
+    }
+}
+
+pub(crate) fn record_migration(
+    conn: &Connection,
+    id: &str,
+    checksum: &str,
+    description: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id, now_ms(), checksum, description],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+pub(crate) fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+}
+
+pub(crate) fn apply_commit_addressable_worktrees(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "files", "commit_sha", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "files", "worktree_id", "TEXT NOT NULL DEFAULT ''")?;
+    rebuild_files_table_for_commit_scopes(conn)?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_files_commit_path ON files(commit_sha, path);
+        CREATE INDEX IF NOT EXISTS idx_files_worktree_path ON files(worktree_id, path);
+        ",
+    )?;
+    Ok(())
+}
+
+pub(crate) fn rebuild_files_table_for_commit_scopes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+
+        CREATE TABLE IF NOT EXISTS files_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            modified_at_ms INTEGER NOT NULL,
+            generated INTEGER NOT NULL DEFAULT 0,
+            indexed_at_ms INTEGER NOT NULL,
+            indexed_revision TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT NOT NULL DEFAULT '',
+            worktree_id TEXT NOT NULL DEFAULT '',
+            UNIQUE(path, commit_sha, worktree_id)
+        );
+
+        INSERT OR IGNORE INTO files_new(
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, commit_sha, worktree_id
+        )
+        SELECT
+            id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+            indexed_revision, COALESCE(commit_sha, ''), COALESCE(worktree_id, '')
+        FROM files;
+
+        DROP TABLE files;
+        ALTER TABLE files_new RENAME TO files;
+
+        PRAGMA foreign_keys = ON;
+        ",
+    )
+}

@@ -1,8 +1,6 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -151,7 +149,8 @@ pub(crate) fn apply_prepared(
 
     for commit in &prepared.commits {
         conn.execute(
-            "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, committed_at_s, subject, body, changed_file_count)
+            "INSERT INTO git_commits(hash, author_name, author_email, authored_at_s, \
+             committed_at_s, subject, body, changed_file_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
             params![
                 commit.hash,
@@ -181,10 +180,9 @@ pub(crate) fn apply_prepared(
         )?;
     }
     for (hash, count) in changed_counts {
-        conn.execute(
-            "UPDATE git_commits SET changed_file_count = ?2 WHERE hash = ?1",
-            params![hash, count],
-        )?;
+        conn.execute("UPDATE git_commits SET changed_file_count = ?2 WHERE hash = ?1", params![
+            hash, count
+        ])?;
     }
 
     conn.execute_batch(
@@ -288,19 +286,16 @@ pub fn commits_touching_query(
 ) -> anyhow::Result<Vec<QueryCommitHit>> {
     let mut combined = BTreeMap::<String, QueryCommitHit>::new();
     for (rank, hit) in commit_search(conn, query, limit)?.into_iter().enumerate() {
-        combined.insert(
-            hit.hash.clone(),
-            QueryCommitHit {
-                hash: hit.hash,
-                author_name: hit.author_name,
-                authored_at_s: hit.authored_at_s,
-                subject: hit.subject,
-                changed_file_count: hit.changed_file_count,
-                evidence: vec!["commit_message".to_string()],
-                score: rank as f64,
-                evidence_kind: "historical",
-            },
-        );
+        combined.insert(hit.hash.clone(), QueryCommitHit {
+            hash: hit.hash,
+            author_name: hit.author_name,
+            authored_at_s: hit.authored_at_s,
+            subject: hit.subject,
+            changed_file_count: hit.changed_file_count,
+            evidence: vec!["commit_message".to_string()],
+            score: rank as f64,
+            evidence_kind: "historical",
+        });
     }
 
     let mut paths = BTreeSet::new();
@@ -435,10 +430,12 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
 }
 
 fn read_commits(root: &Path) -> anyhow::Result<Vec<CommitRecord>> {
-    let Some(output) = git_output(
-        root,
-        &["log", "--format=format:%H%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1f%B%x1e", "--", "."],
-    ) else {
+    let Some(output) = git_output(root, &[
+        "log",
+        "--format=format:%H%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1f%B%x1e",
+        "--",
+        ".",
+    ]) else {
         return Ok(Vec::new());
     };
     Ok(output

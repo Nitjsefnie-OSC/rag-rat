@@ -1,10 +1,8 @@
-use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_core::Config;
 use serde_json::{Value, json};
@@ -20,7 +18,8 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
     fs::write(root.join("src/lib.rs"), "pub fn open_database() {}\n").unwrap();
     fs::write(
         root.join("rag-rat.toml"),
-        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = [\"src\"]\nmarkdown = [\"docs\"]\n",
+        "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = \
+         [\"src\"]\nmarkdown = [\"docs\"]\n",
     )
     .unwrap();
 

@@ -1,9 +1,7 @@
 use std::path::Path;
 
-use crate::{
-    index::parser::{self, ParserKind},
-    language::Language,
-};
+use crate::index::parser::{self, ParserKind};
+use crate::language::Language;
 
 #[test]
 fn extracts_rust_symbols() {

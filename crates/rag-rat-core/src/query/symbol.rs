@@ -112,16 +112,17 @@ pub fn select_one(
 pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<SymbolHit>> {
     let mut hit = conn
         .query_row(
-        "
-        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, symbols.qualified_name,
+            "
+        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
+             symbols.qualified_name,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
         FROM symbols
         JOIN files ON files.id = symbols.file_id
         WHERE symbols.id = ?1
         ",
-        [symbol_id],
-        symbol_hit_row,
-    )
+            [symbol_id],
+            symbol_hit_row,
+        )
         .optional()?;
     if let Some(hit) = hit.as_mut() {
         enrich_symbol_hit(conn, hit)?;
@@ -159,7 +160,8 @@ fn lookup_name(
     limit: u32,
 ) -> anyhow::Result<Vec<SymbolHit>> {
     let mut sql = "
-        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, symbols.qualified_name,
+        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
+                   symbols.qualified_name,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
         FROM symbols
         JOIN files ON files.id = symbols.file_id
@@ -309,7 +311,8 @@ fn lookup_symbol_path(
     limit: u32,
 ) -> anyhow::Result<Vec<SymbolHit>> {
     let mut sql = "
-        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, symbols.qualified_name,
+        SELECT symbols.id, files.id, files.path, files.kind, symbols.language, symbols.name, \
+                   symbols.qualified_name,
                symbols.kind, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.docs
         FROM symbols
         JOIN files ON files.id = symbols.file_id

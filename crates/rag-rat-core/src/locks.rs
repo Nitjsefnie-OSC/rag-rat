@@ -10,11 +10,9 @@
 //! Locks release when the file handle drops (the OS also releases on process death), so there is no
 //! stale-pidfile cleanup. Caveat: file locks are unreliable on NFS and WSL2 `drvfs`/`9p` mounts.
 
-use std::{
-    fs::{self, File, OpenOptions, TryLockError},
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
@@ -47,9 +45,8 @@ impl FileLock {
         match file.try_lock() {
             Ok(()) => Ok(Some(FileLock { _file: file })),
             Err(TryLockError::WouldBlock) => Ok(None),
-            Err(TryLockError::Error(err)) => {
-                Err(anyhow::Error::from(err).context(format!("try-locking {}", path.display())))
-            },
+            Err(TryLockError::Error(err)) =>
+                Err(anyhow::Error::from(err).context(format!("try-locking {}", path.display()))),
         }
     }
 
@@ -100,8 +97,8 @@ fn worktree_hash(worktree_root: &Path) -> String {
 }
 
 /// Per-worktree election lock path, keyed by a hash of the **canonicalized** worktree root —
-/// `canonicalize` resolves symlink aliases (the common way one checkout is reached via two paths) to
-/// one key. We deliberately do **not** case-fold: folding would, on a case-sensitive volume,
+/// `canonicalize` resolves symlink aliases (the common way one checkout is reached via two paths)
+/// to one key. We deliberately do **not** case-fold: folding would, on a case-sensitive volume,
 /// collapse two genuinely-distinct worktrees into one key and leave one permanently un-elected
 /// (silent staleness — the exact failure this design exists to prevent). The remaining edge — the
 /// same checkout reached via differently-cased paths on a case-insensitive FS — merely elects two
@@ -238,7 +235,8 @@ mod tests {
         assert!(socket.extension().is_some_and(|ext| ext == "sock"));
     }
 
-    /// Build a base dir long enough that `<base>/sockets/<hash>.sock` exceeds `MAX_SOCKET_PATH_LEN`.
+    /// Build a base dir long enough that `<base>/sockets/<hash>.sock` exceeds
+    /// `MAX_SOCKET_PATH_LEN`.
     fn long_base_dir() -> PathBuf {
         let mut base = temp_dir();
         // Each push appends ~28 bytes; 12 × 28 = 336, well over the 100-byte budget.

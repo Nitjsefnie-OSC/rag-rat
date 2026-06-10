@@ -9,33 +9,28 @@
 //! This module holds the request-boundary machinery:
 //! - [`GatedStdin`] — an `AsyncRead` that parks at a line boundary once an upgrade is pending, so
 //!   no new request is read past the boundary (zero residue **by construction**: rmcp's transport
-//!   wraps us in its own `BufReader` and `read_until(b'\n')`, so we must never hand it bytes past
-//!   a single `\n` while the gate is closed).
+//!   wraps us in its own `BufReader` and `read_until(b'\n')`, so we must never hand it bytes past a
+//!   single `\n` while the gate is closed).
 //! - [`Inflight`] — counts executing tool calls so teardown can wait for the last one to finish.
 //! - [`HandoffV1`] — the minimal session snapshot carried across `exec` via a temp file.
 
 #![cfg(unix)]
 
-use std::{
-    io,
-    os::unix::{fs::MetadataExt, process::CommandExt},
-    path::{Path, PathBuf},
-    pin::Pin,
-    process::Command,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    task::{Context, Poll, Waker, ready},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker, ready};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rmcp::model::{InitializeRequestParams, ProtocolVersion};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncBufRead, AsyncRead, AsyncWriteExt, BufReader, ReadBuf, Stdin},
-    sync::Notify,
-};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncWriteExt, BufReader, ReadBuf, Stdin};
+use tokio::sync::Notify;
 
 /// How long teardown waits for in-flight tool calls to finish before aborting the upgrade and
 /// staying on the current binary.
@@ -46,8 +41,8 @@ const EXEC_FAILED_EXIT: i32 = 70;
 
 /// Env var naming the absolute path of the installed binary to `exec` on upgrade (e.g.
 /// `~/.cargo/bin/rag-rat`). Unset ⇒ hot-upgrade disabled. Never `/proc/self/exe` (old inode).
-/// Single source of truth in [`rag_rat_core::fleet`], which reads it from other processes' environ
-/// to find hot-upgrade-armed servers.
+/// Single source of truth in [`rag_rat_core::fleet`], which reads it from other processes'
+/// environ to find hot-upgrade-armed servers.
 pub use rag_rat_core::fleet::UPGRADE_BIN_ENV;
 
 /// Env var carrying the handoff temp-file path across `exec`. Set by the old process, consumed
@@ -366,8 +361,9 @@ impl Upgrade {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::io::AsyncReadExt;
+
+    use super::*;
 
     #[test]
     fn protocol_gate_accepts_known_and_rejects_unknown_versions() {

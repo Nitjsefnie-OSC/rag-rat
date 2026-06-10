@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::{query::ReadChunk, search::lexical::SearchHit};
+use crate::query::ReadChunk;
+use crate::search::lexical::SearchHit;
 
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
 
@@ -336,7 +337,8 @@ fn callers(
                source_files.path,
                COALESCE(source_symbols.qualified_name, edges.from_name, source_files.path),
                COALESCE(NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
-               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
+         source_chunks.start_line, 1),
                edges.edge_kind,
                edges.confidence
         FROM edges
@@ -396,7 +398,8 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
                COALESCE(edges.target_start_line, target_chunks.start_line),
                source_files.path,
                COALESCE(NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
-               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), source_chunks.start_line, 1),
+               COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), \
+         source_chunks.start_line, 1),
                edges.edge_kind,
                edges.confidence
         FROM edges

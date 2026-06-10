@@ -72,12 +72,11 @@ pub fn trigger(_install_path: &Path) {}
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::{
-        ffi::OsStr,
-        fs,
-        os::unix::{ffi::OsStrExt, fs::MetadataExt},
-        path::Path,
-    };
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
 
     use super::{ProcInfo, UPGRADE_BIN_ENV};
 

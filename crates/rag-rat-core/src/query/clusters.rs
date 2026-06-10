@@ -167,9 +167,9 @@ pub fn repo_clusters(
             git_file_changes: summary.git_file_changes,
             graph_edges: summary.graph_edges,
             repo_memories: summary.memories,
-            scoring_note:
-                "cheap sparse ownership clustering: path proximity, direct graph edges, bounded git co-touches, churn, and metadata"
-                    .to_string(),
+            scoring_note: "cheap sparse ownership clustering: path proximity, direct graph edges, \
+                           bounded git co-touches, churn, and metadata"
+                .to_string(),
         },
         clusters,
         warnings,
@@ -528,11 +528,10 @@ fn next_tools_for(path: Option<&String>) -> Vec<RepoClusterNextTool> {
             "inspect graph, git, papertrail, and memories for the representative path",
             [("query", path.clone())],
         ),
-        next_tool(
-            "git_history_for_path",
-            "inspect co-touch and churn history",
-            [("path", path.clone())],
-        ),
+        next_tool("git_history_for_path", "inspect co-touch and churn history", [(
+            "path",
+            path.clone(),
+        )]),
     ]
 }
 

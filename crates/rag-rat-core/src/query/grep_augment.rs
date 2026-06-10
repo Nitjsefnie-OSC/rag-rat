@@ -115,10 +115,42 @@ pub fn identifier_candidate(normalized: &str) -> Option<&str> {
 /// Definition/declaration keywords that commonly prefix the symbol in a grep pattern, across the
 /// indexed languages. Stripped when isolating the one identifier a multi-word pattern targets.
 const DEFINITION_KEYWORDS: &[&str] = &[
-    "fn", "pub", "mut", "let", "const", "static", "struct", "enum", "trait", "impl", "type", "mod",
-    "use", "async", "await", "return", "class", "def", "func", "function", "interface", "export",
-    "import", "var", "val", "public", "private", "protected", "final", "override", "suspend",
-    "void", "extern", "unsafe", "where", "dyn",
+    "fn",
+    "pub",
+    "mut",
+    "let",
+    "const",
+    "static",
+    "struct",
+    "enum",
+    "trait",
+    "impl",
+    "type",
+    "mod",
+    "use",
+    "async",
+    "await",
+    "return",
+    "class",
+    "def",
+    "func",
+    "function",
+    "interface",
+    "export",
+    "import",
+    "var",
+    "val",
+    "public",
+    "private",
+    "protected",
+    "final",
+    "override",
+    "suspend",
+    "void",
+    "extern",
+    "unsafe",
+    "where",
+    "dyn",
 ];
 
 /// The single identifier a pattern targets, for the symbol lane. A lone identifier is used
@@ -490,36 +522,33 @@ mod tests {
             [],
         )
         .unwrap();
-        memory::create_memory(
-            &conn,
-            RepoMemoryCreate {
-                kind: "Invariant".to_string(),
-                title: "One watcher per worktree".to_string(),
-                body: "The election lock guarantees a single watcher; never bind without it."
-                    .to_string(),
-                confidence: "high".to_string(),
-                created_by: Some("test".to_string()),
-                source: None,
-                tags: vec![],
-                bind: RepoMemoryBindTarget {
-                    symbol_id: Some(1),
-                    logical_symbol_id: None,
-                    chunk_id: None,
-                    edge_id: None,
-                    path: None,
-                    start_line: None,
-                    end_line: None,
-                    commit_hash: None,
-                    github_owner: None,
-                    github_repo: None,
-                    github_number: None,
-                    start_logical_symbol_id: None,
-                    end_logical_symbol_id: None,
-                    edge_sequence_hash: None,
-                    path_summary: None,
-                },
+        memory::create_memory(&conn, RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "One watcher per worktree".to_string(),
+            body: "The election lock guarantees a single watcher; never bind without it."
+                .to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: None,
+            tags: vec![],
+            bind: RepoMemoryBindTarget {
+                symbol_id: Some(1),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
             },
-        )
+        })
         .unwrap();
         // Sync chunk_fts directly — external-content FTS5 needs explicit INSERT.
         conn.execute(
@@ -567,7 +596,10 @@ mod tests {
         // Definition keywords are stripped, leaving the one target identifier.
         assert_eq!(extract_symbol_identifier("fn watcher_main"), Some("watcher_main"));
         assert_eq!(extract_symbol_identifier("pub struct SymbolIndex"), Some("SymbolIndex"));
-        assert_eq!(extract_symbol_identifier("pub async fn resolve_all_edges"), Some("resolve_all_edges"));
+        assert_eq!(
+            extract_symbol_identifier("pub async fn resolve_all_edges"),
+            Some("resolve_all_edges")
+        );
         // Two real identifiers → ambiguous → lexical lane.
         assert_eq!(extract_symbol_identifier("election retry loop"), None);
         // Free text token (not keyword, not identifier-shaped) → lexical lane.
@@ -693,35 +725,32 @@ mod tests {
 
         let mut created_ids: Vec<String> = Vec::new();
         for title in &titles {
-            let result = memory::create_memory(
-                &conn,
-                RepoMemoryCreate {
-                    kind: "Invariant".to_string(),
-                    title: title.to_string(),
-                    body: long_body.clone(),
-                    confidence: "high".to_string(),
-                    created_by: Some("test".to_string()),
-                    source: None,
-                    tags: vec![],
-                    bind: RepoMemoryBindTarget {
-                        symbol_id: Some(1),
-                        logical_symbol_id: None,
-                        chunk_id: None,
-                        edge_id: None,
-                        path: None,
-                        start_line: None,
-                        end_line: None,
-                        commit_hash: None,
-                        github_owner: None,
-                        github_repo: None,
-                        github_number: None,
-                        start_logical_symbol_id: None,
-                        end_logical_symbol_id: None,
-                        edge_sequence_hash: None,
-                        path_summary: None,
-                    },
+            let result = memory::create_memory(&conn, RepoMemoryCreate {
+                kind: "Invariant".to_string(),
+                title: title.to_string(),
+                body: long_body.clone(),
+                confidence: "high".to_string(),
+                created_by: Some("test".to_string()),
+                source: None,
+                tags: vec![],
+                bind: RepoMemoryBindTarget {
+                    symbol_id: Some(1),
+                    logical_symbol_id: None,
+                    chunk_id: None,
+                    edge_id: None,
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    commit_hash: None,
+                    github_owner: None,
+                    github_repo: None,
+                    github_number: None,
+                    start_logical_symbol_id: None,
+                    end_logical_symbol_id: None,
+                    edge_sequence_hash: None,
+                    path_summary: None,
                 },
-            )
+            })
             .unwrap();
             created_ids.push(result.memory.memory_id);
         }

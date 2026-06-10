@@ -47,13 +47,12 @@ pub enum ParserKind {
 pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
     match language {
         Language::Rust => ParserKind::Rust,
-        Language::TypeScript => {
+        Language::TypeScript =>
             if path.extension().and_then(|ext| ext.to_str()) == Some("tsx") {
                 ParserKind::Tsx
             } else {
                 ParserKind::TypeScript
-            }
-        },
+            },
         Language::Kotlin => ParserKind::Kotlin,
         Language::C => ParserKind::C,
         Language::Cpp => ParserKind::Cpp,
@@ -67,25 +66,21 @@ pub fn parse_symbols(
     text: &str,
 ) -> anyhow::Result<Vec<ParsedSymbol>> {
     match parser_kind(path, language) {
-        ParserKind::Rust => {
-            parse_tree_sitter(path, language, text, tree_sitter_rust::LANGUAGE.into())
-        },
+        ParserKind::Rust =>
+            parse_tree_sitter(path, language, text, tree_sitter_rust::LANGUAGE.into()),
         ParserKind::TypeScript => parse_tree_sitter(
             path,
             language,
             text,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         ),
-        ParserKind::Tsx => {
-            parse_tree_sitter(path, language, text, tree_sitter_typescript::LANGUAGE_TSX.into())
-        },
-        ParserKind::Kotlin => {
-            parse_tree_sitter(path, language, text, tree_sitter_kotlin::LANGUAGE.into())
-        },
+        ParserKind::Tsx =>
+            parse_tree_sitter(path, language, text, tree_sitter_typescript::LANGUAGE_TSX.into()),
+        ParserKind::Kotlin =>
+            parse_tree_sitter(path, language, text, tree_sitter_kotlin::LANGUAGE.into()),
         ParserKind::C => parse_tree_sitter(path, language, text, tree_sitter_c::LANGUAGE.into()),
-        ParserKind::Cpp => {
-            parse_tree_sitter(path, language, text, tree_sitter_cpp::LANGUAGE.into())
-        },
+        ParserKind::Cpp =>
+            parse_tree_sitter(path, language, text, tree_sitter_cpp::LANGUAGE.into()),
         ParserKind::Markdown => Ok(Vec::new()),
     }
 }
@@ -165,9 +160,8 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             _ => None,
         },
         Language::TypeScript => match kind {
-            "function_declaration" | "method_definition" | "generator_function_declaration" => {
-                Some(("function", child_name(node)?))
-            },
+            "function_declaration" | "method_definition" | "generator_function_declaration" =>
+                Some(("function", child_name(node)?)),
             "class_declaration" => Some(("class", child_name(node)?)),
             "interface_declaration" => Some(("interface", child_name(node)?)),
             "type_alias_declaration" => Some(("type", child_name(node)?)),
@@ -179,18 +173,15 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             "object_declaration" => Some(("object", child_name(node)?)),
             "function_declaration" => Some(("function", child_name(node)?)),
             "property_declaration" => Some(("property", kotlin_property_name(node)?)),
-            "companion_object" | "companion_object_declaration" => {
-                Some(("object", companion_name(node).unwrap_or(node)))
-            },
+            "companion_object" | "companion_object_declaration" =>
+                Some(("object", companion_name(node).unwrap_or(node))),
             _ => None,
         },
         Language::C => match kind {
-            "function_definition" => {
-                Some(("function", function_name(node).or_else(|| child_name(node))?))
-            },
-            "declaration" if has_descendant_kind(node, "function_declarator") => {
-                Some(("function", function_name(node).or_else(|| child_name(node))?))
-            },
+            "function_definition" =>
+                Some(("function", function_name(node).or_else(|| child_name(node))?)),
+            "declaration" if has_descendant_kind(node, "function_declarator") =>
+                Some(("function", function_name(node).or_else(|| child_name(node))?)),
             "struct_specifier" => Some(("struct", child_name(node)?)),
             "union_specifier" => Some(("union", child_name(node)?)),
             "enum_specifier" => Some(("enum", child_name(node)?)),
@@ -199,12 +190,10 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
             _ => None,
         },
         Language::Cpp => match kind {
-            "function_definition" => {
-                Some(("function", function_name(node).or_else(|| child_name(node))?))
-            },
-            "declaration" if has_descendant_kind(node, "function_declarator") => {
-                Some(("function", function_name(node).or_else(|| child_name(node))?))
-            },
+            "function_definition" =>
+                Some(("function", function_name(node).or_else(|| child_name(node))?)),
+            "declaration" if has_descendant_kind(node, "function_declarator") =>
+                Some(("function", function_name(node).or_else(|| child_name(node))?)),
             "class_specifier" => Some(("class", child_name(node)?)),
             "struct_specifier" => Some(("struct", child_name(node)?)),
             "union_specifier" => Some(("union", child_name(node)?)),

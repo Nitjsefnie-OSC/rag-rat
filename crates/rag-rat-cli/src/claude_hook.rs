@@ -5,13 +5,14 @@
 //! augments greps and must never block one. Spec:
 //! `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`.
 
-use std::{
-    io::Read as _,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use rag_rat_core::{config::Config, locks, query::grep_augment, storage::IndexConnection};
+use rag_rat_core::config::Config;
+use rag_rat_core::locks;
+use rag_rat_core::query::grep_augment;
+use rag_rat_core::storage::IndexConnection;
 use serde::Deserialize;
 
 const SOCKET_BUDGET: Duration = Duration::from_millis(250);
@@ -187,12 +188,11 @@ fn shell_tokens(segment: &str) -> Option<Vec<String>> {
                 quote = Some(ch);
                 quoted = true;
             },
-            (None, c) if c.is_whitespace() => {
+            (None, c) if c.is_whitespace() =>
                 if !current.is_empty() || quoted {
                     tokens.push(std::mem::take(&mut current));
                     quoted = false;
-                }
-            },
+                },
             (None, c) => current.push(c),
         }
     }
@@ -256,10 +256,8 @@ fn find_config(start: &Path) -> Option<Config> {
 fn ask_listener(config: &Config, session_id: &str, search: &Search) -> Option<Option<String>> {
     #[cfg(unix)]
     {
-        use std::{
-            io::{BufRead, BufReader, Write as _},
-            os::unix::net::UnixStream,
-        };
+        use std::io::{BufRead, BufReader, Write as _};
+        use std::os::unix::net::UnixStream;
         let socket = socket_path(config);
         // SOCKET_BUDGET covers both read and write. Unix-domain connect() completes into
         // the listener's backlog immediately (no network round-trip), so no separate connect

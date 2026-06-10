@@ -3,31 +3,26 @@
 //!
 //! - **One watcher per worktree** via the election lock; **one writer at a time per DB** via the
 //!   write lock (see [`crate::locks`]).
-//! - Watches the configured target *directories* recursively (so **new files** are seen), classifies
-//!   events through the target globs to decide whether to fire, and debounces bursts with a
-//!   max-latency cap so sustained writes can't starve a pass.
+//! - Watches the configured target *directories* recursively (so **new files** are seen),
+//!   classifies events through the target globs to decide whether to fire, and debounces bursts
+//!   with a max-latency cap so sustained writes can't starve a pass.
 //! - Each pass runs the existing pipeline: discover → reconcile → (rate-limited) gc →
 //!   memory_validate. Discover handles additions/edits/deletions; the pass is idempotent.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::RecvTimeoutError,
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 
-use crate::{
-    config::Config,
-    fleet,
-    index::{IndexDatabase, ai::ReconcileOptions, target_for_path},
-    locks::{self, FileLock},
-};
+use crate::config::Config;
+use crate::fleet;
+use crate::index::ai::ReconcileOptions;
+use crate::index::{IndexDatabase, target_for_path};
+use crate::locks::{self, FileLock};
 
 /// Run gc on every Nth watcher pass (deletion reconciliation is already handled by discover, so gc
 /// — which shells to `git worktree list` + a liveness scan — need not run every keystroke burst).

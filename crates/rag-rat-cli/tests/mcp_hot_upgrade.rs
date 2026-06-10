@@ -7,15 +7,14 @@
 
 #![cfg(unix)]
 
-use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
-    os::unix::{fs::PermissionsExt, net::UnixStream},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rag_rat_core::Config;
 use serde_json::{Value, json};
@@ -91,7 +90,8 @@ impl TestEnv {
         let config_path = root.join("rag-rat.toml");
         fs::write(
             &config_path,
-            "[index]\nroot = \".\"\ndatabase = \".rag-rat/index.sqlite\"\n\n[target_bindings]\nmarkdown = [\"docs\"]\n",
+            "[index]\nroot = \".\"\ndatabase = \
+             \".rag-rat/index.sqlite\"\n\n[target_bindings]\nmarkdown = [\"docs\"]\n",
         )
         .unwrap();
         let config = Config::load(&config_path).unwrap();
@@ -235,9 +235,9 @@ impl Session {
 
 /// Connect to the hook socket and exchange one `grep_augment` request/reply, polling until a bound
 /// listener answers (the post-`exec` process must win the socket election before it re-binds, which
-/// the 5s election retry can stretch out). Returns the decoded reply envelope; the caller asserts on
-/// `v`. We deliberately do not couple to the `context` payload — the point is "the socket is alive
-/// and speaks the protocol after exec", not what it found for `pattern`.
+/// the 5s election retry can stretch out). Returns the decoded reply envelope; the caller asserts
+/// on `v`. We deliberately do not couple to the `context` payload — the point is "the socket is
+/// alive and speaks the protocol after exec", not what it found for `pattern`.
 fn hook_roundtrip(socket: &Path, pattern: &str, timeout: Duration) -> Value {
     let deadline = Instant::now() + timeout;
     loop {

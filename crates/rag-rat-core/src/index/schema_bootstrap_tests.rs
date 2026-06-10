@@ -1,0 +1,4143 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::*;
+use crate::config::ResolvedTarget;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "markdown".to_string(),
+            language: Language::Markdown,
+            directories: vec![PathBuf::from("docs")],
+            include: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Docs,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert!(config.database.exists());
+    assert_eq!(table_count(&db, "files"), 1);
+    assert_eq!(table_count(&db, "chunks"), 1);
+    assert_eq!(table_count(&db, "symbols"), 1);
+    assert_eq!(table_count(&db, "parser_failures"), 1);
+    assert_eq!(table_count(&db, "index_meta"), 1);
+    assert_eq!(table_count(&db, "chunk_fts"), 1);
+    assert_eq!(table_count(&db, "git_commits"), 1);
+    assert_eq!(table_count(&db, "git_file_changes"), 1);
+    assert_eq!(table_count(&db, "git_chunk_blame"), 1);
+    assert_eq!(table_count(&db, "commit_fts"), 1);
+    assert_eq!(table_count(&db, "ai_models"), 1);
+    assert_eq!(table_count(&db, "chunk_embeddings"), 1);
+    assert_eq!(table_count(&db, "chunk_summaries"), 1);
+    assert_eq!(table_count(&db, "reconcile_meta"), 1);
+    assert_eq!(table_count(&db, "reconcile_attempts"), 1);
+    assert!(file_columns(&db).contains(&"indexed_revision".to_string()));
+    assert_eq!(indexed_revision_count(&db), 0);
+    assert!(chunk_columns(&db).contains(&"anchor_version".to_string()));
+    assert!(chunk_columns(&db).contains(&"normalized_hash".to_string()));
+    assert!(chunk_columns(&db).contains(&"start_boundary_hash".to_string()));
+    assert!(chunk_columns(&db).contains(&"end_boundary_hash".to_string()));
+    assert!(chunk_columns(&db).contains(&"source_revision".to_string()));
+    let embedding_columns = table_columns(&db, "chunk_embeddings");
+    assert!(embedding_columns.contains(&"model_version".to_string()));
+    assert!(embedding_columns.contains(&"input_hash".to_string()));
+    assert!(embedding_columns.contains(&"embedding_text_version".to_string()));
+    assert!(embedding_columns.contains(&"embedding_policy".to_string()));
+    assert!(embedding_columns.contains(&"embedding_priority".to_string()));
+    assert!(embedding_columns.contains(&"input_chars".to_string()));
+    assert!(embedding_columns.contains(&"input_truncated".to_string()));
+    assert!(embedding_columns.contains(&"attempt_count".to_string()));
+    assert!(embedding_columns.contains(&"next_retry_after_ms".to_string()));
+    assert!(embedding_columns.contains(&"computed_at_ms".to_string()));
+    let edge_columns = table_columns(&db, "edges");
+    assert!(edge_columns.contains(&"source_start_line".to_string()));
+    assert!(edge_columns.contains(&"source_end_line".to_string()));
+    assert!(edge_columns.contains(&"source_start_byte".to_string()));
+    assert!(edge_columns.contains(&"source_end_byte".to_string()));
+    assert!(edge_columns.contains(&"target_start_line".to_string()));
+    assert!(edge_columns.contains(&"target_end_line".to_string()));
+    assert!(edge_columns.contains(&"target_qualified_name".to_string()));
+    assert!(edge_columns.contains(&"evidence".to_string()));
+    assert!(edge_columns.contains(&"receiver_hint".to_string()));
+    assert!(edge_columns.contains(&"resolution".to_string()));
+    let logical_columns = table_columns(&db, "logical_symbols");
+    assert!(logical_columns.contains(&"qualified_name".to_string()));
+    assert!(logical_columns.contains(&"variant_count".to_string()));
+    let member_columns = table_columns(&db, "logical_symbol_members");
+    assert!(member_columns.contains(&"symbol_id".to_string()));
+    assert!(member_columns.contains(&"signature_hash".to_string()));
+    let github_ref_sync_columns = table_columns(&db, "github_ref_sync");
+    assert!(github_ref_sync_columns.contains(&"status".to_string()));
+    assert!(github_ref_sync_columns.contains(&"last_error".to_string()));
+    let symbol_fact_columns = table_columns(&db, "symbol_facts");
+    assert!(symbol_fact_columns.contains(&"fact_kind".to_string()));
+    assert!(symbol_fact_columns.contains(&"fact_value".to_string()));
+    assert_eq!(
+        db.status(&config.database).unwrap().schema.current_version,
+        schema::LATEST_SCHEMA_VERSION
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rebuild_reports_file_preparation_progress() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn exported() {}\n").unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let mut events = Vec::new();
+    IndexDatabase::rebuild_with_progress(&config, |progress| events.push(progress)).unwrap();
+
+    assert!(
+        events.iter().any(|event| matches!(event, IndexProgress::PreparingFile { .. })),
+        "missing preparing progress event: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(event, IndexProgress::IndexingFile { .. })),
+        "missing indexing progress event: {events:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn file_progress_reports_first_final_and_decile_boundaries() {
+    let reported =
+        (1..=100).filter(|current| should_report_file_progress(*current, 100)).collect::<Vec<_>>();
+    assert_eq!(reported, vec![1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+}
+
+#[test]
+fn compatible_open_requires_recorded_schema_version() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".rag-rat")).unwrap();
+    let database = root.join(".rag-rat/index.sqlite");
+    IndexDatabase::migrate(&database).unwrap();
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch("DROP TABLE schema_version;").unwrap();
+    drop(conn);
+
+    let status = IndexDatabase::migration_check(&database).unwrap();
+    assert_eq!(status.state, schema::SchemaState::Older);
+    let err = IndexDatabase::open(&database).unwrap_err().to_string();
+    assert!(err.contains("run `rag-rat migrate`"), "{err}");
+
+    let migrated = IndexDatabase::migrate(&database).unwrap();
+    assert_eq!(migrated.state, schema::SchemaState::Compatible);
+    IndexDatabase::open(&database).unwrap();
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn migrate_adds_edge_name_columns_before_indexing_them() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".rag-rat")).unwrap();
+    let database = root.join(".rag-rat/index.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+            CREATE TABLE files(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                language TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                modified_at_ms INTEGER NOT NULL,
+                generated INTEGER NOT NULL DEFAULT 0,
+                indexed_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE chunks(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                chunk_kind TEXT NOT NULL,
+                symbol_path TEXT,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                text_hash TEXT NOT NULL
+            );
+            CREATE TABLE symbols(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                language TEXT NOT NULL,
+                name TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                start_byte INTEGER NOT NULL,
+                end_byte INTEGER NOT NULL,
+                signature TEXT,
+                docs TEXT
+            );
+            CREATE TABLE edges(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_symbol_id INTEGER,
+                to_symbol_id INTEGER,
+                edge_kind TEXT NOT NULL,
+                confidence TEXT NOT NULL
+            );
+            ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let migrated = IndexDatabase::migrate(&database).unwrap();
+    assert_eq!(migrated.state, schema::SchemaState::Compatible);
+    let db = IndexDatabase::open(&database).unwrap();
+    let columns = table_columns(&db, "edges");
+    assert!(columns.contains(&"from_name".to_string()));
+    assert!(columns.contains(&"to_name".to_string()));
+    assert!(columns.contains(&"source_start_line".to_string()));
+    assert!(columns.contains(&"source_end_line".to_string()));
+    assert!(columns.contains(&"source_start_byte".to_string()));
+    assert!(columns.contains(&"source_end_byte".to_string()));
+    assert!(columns.contains(&"target_start_line".to_string()));
+    assert!(columns.contains(&"target_end_line".to_string()));
+    assert_eq!(table_count(&db, "idx_edges_from_name"), 1);
+    assert_eq!(table_count(&db, "idx_edges_to_name"), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn migrate_preserves_github_papertrail_cache() {
+    let (root, config) =
+        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    github::sync_from_refs(db.storage.connection(), &root, Some(&MockGitHubClient), false).unwrap();
+    assert_eq!(row_count(&db, "github_refs"), 1);
+    assert_eq!(row_count(&db, "github_issues"), 1);
+    assert_eq!(row_count(&db, "github_comments"), 1);
+    assert_eq!(row_count(&db, "github_pull_requests"), 1);
+    assert_eq!(row_count(&db, "github_reviews"), 1);
+    assert_eq!(row_count(&db, "github_review_comments"), 1);
+    assert_eq!(row_count(&db, "github_fts"), 5);
+    db.storage
+        .connection()
+        .execute("DELETE FROM schema_version WHERE id = ?1", ["010_symbol_facts"])
+        .unwrap();
+    drop(db);
+
+    let migrated = IndexDatabase::migrate(&config.database).unwrap();
+    assert_eq!(migrated.state, schema::SchemaState::Compatible);
+    let db = IndexDatabase::open(&config.database).unwrap();
+    assert_eq!(row_count(&db, "github_refs"), 1);
+    assert_eq!(row_count(&db, "github_issues"), 1);
+    assert_eq!(row_count(&db, "github_comments"), 1);
+    assert_eq!(row_count(&db, "github_pull_requests"), 1);
+    assert_eq!(row_count(&db, "github_reviews"), 1);
+    assert_eq!(row_count(&db, "github_review_comments"), 1);
+    assert_eq!(row_count(&db, "github_fts"), 5);
+    let hits = db.github_issue_search("sqlite", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].number, 42);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn full_rebuild_preserves_github_papertrail_cache() {
+    let (root, config) =
+        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    github::sync_from_refs(db.storage.connection(), &root, Some(&MockGitHubClient), false).unwrap();
+    assert_eq!(row_count(&db, "github_issues"), 1);
+    assert_eq!(row_count(&db, "github_fts"), 5);
+    drop(db);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_eq!(row_count(&db, "github_refs"), 1);
+    assert_eq!(row_count(&db, "github_issues"), 1);
+    assert_eq!(row_count(&db, "github_comments"), 1);
+    assert_eq!(row_count(&db, "github_pull_requests"), 1);
+    assert_eq!(row_count(&db, "github_reviews"), 1);
+    assert_eq!(row_count(&db, "github_review_comments"), 1);
+    assert_eq!(row_count(&db, "github_ref_sync"), 1);
+    assert_eq!(row_count(&db, "github_fts"), 5);
+    let hits = db.github_issue_search("sqlite", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].number, 42);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn full_rebuild_preserves_installed_model_manifest() {
+    let (root, config) = markdown_config("alpha token with enough detail for embeddings\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    let before = db.local_ai_status().unwrap();
+    assert_eq!(before.embedding.model_id, ai::HASH_MODEL_ID);
+    assert!(before.embedding.installed);
+    drop(db);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let after = db.local_ai_status().unwrap();
+    assert_eq!(after.embedding.model_id, ai::HASH_MODEL_ID);
+    assert!(after.embedding.installed);
+    assert_eq!(after.embedding.state, "Ready");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn full_rebuild_preserves_other_worktree_contexts() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn current_context() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let other_file_id = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                INSERT INTO main.files(
+                    path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms,
+                    indexed_revision, commit_sha, worktree_id
+                )
+                VALUES ('src/other.rs', 'rust', 'source', 'other-sha', 0, 0, 1, 'other-sha', '', \
+             'other-worktree')
+                RETURNING id
+                ",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let other_chunk_id = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                INSERT INTO main.chunks(
+                    file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line,
+                    text, text_hash, source_revision, anchor_version, normalized_hash,
+                    start_boundary_hash, end_boundary_hash, start_context_hash, end_context_hash,
+                    context_radius, embedding_policy, embedding_priority
+                )
+                VALUES (?1, 'symbol', 'other_context', 0, 12, 1, 1, 'other context', 'other-text',
+                    'other-sha', 1, '', '', '', '', '', 2, 'Embed', 1)
+                RETURNING id
+                ",
+            [other_file_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "
+                INSERT INTO main.symbols(
+                    file_id, language, name, qualified_name, kind, start_byte, end_byte, \
+             signature, docs
+                )
+                VALUES (?1, 'rust', 'other_context', 'other_context', 'function', 0, 12, NULL, \
+             NULL)
+                ",
+            [other_file_id],
+        )
+        .unwrap();
+    db.storage
+        .connection()
+        .execute("INSERT INTO main.chunk_fts(rowid, text) VALUES (?1, 'other context')", [
+            other_chunk_id,
+        ])
+        .unwrap();
+    drop(db);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE worktree_id = 'other-worktree'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.chunks WHERE file_id = ?1",
+                [other_file_id],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.symbols WHERE file_id = ?1",
+                [other_file_id],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.chunk_fts WHERE rowid = ?1",
+                [other_chunk_id],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        1
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn compatible_open_refuses_dirty_and_newer_schema() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join(".rag-rat")).unwrap();
+    let database = root.join(".rag-rat/index.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+            CREATE TABLE schema_version(
+                id TEXT PRIMARY KEY,
+                applied_at_ms INTEGER NOT NULL,
+                checksum TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            INSERT INTO schema_version(id, applied_at_ms, checksum, description)
+            VALUES ('__dirty__', 1, '', 'partial migration in progress');
+            ",
+    )
+    .unwrap();
+    drop(conn);
+
+    let dirty = IndexDatabase::migration_check(&database).unwrap();
+    assert_eq!(dirty.state, schema::SchemaState::Dirty);
+    let err = IndexDatabase::open(&database).unwrap_err().to_string();
+    assert!(err.contains("dirty or partial"), "{err}");
+
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "
+            DELETE FROM schema_version;
+            INSERT INTO schema_version(id, applied_at_ms, checksum, description)
+            VALUES ('999_future_schema', 1, 'sha256:future', 'future schema');
+            ",
+    )
+    .unwrap();
+    drop(conn);
+    let newer = IndexDatabase::migration_check(&database).unwrap();
+    assert_eq!(newer.state, schema::SchemaState::Newer);
+    let err = IndexDatabase::open(&database).unwrap_err().to_string();
+    assert!(err.contains("newer rag-rat"), "{err}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discover_mode_indexes_new_files_and_removes_deleted_files() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn old_symbol() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(db.discovery_status(&config).unwrap().unindexed_source_files, 0);
+
+    fs::write(root.join("src/new.rs"), "pub fn new_symbol() {}\n").unwrap();
+    fs::remove_file(root.join("src/lib.rs")).unwrap();
+    let drift = db.discovery_status(&config).unwrap();
+    assert_eq!(drift.unindexed_source_files, 1);
+    assert_eq!(drift.removed_indexed_files, 1);
+    assert!(drift.warning.as_deref().unwrap().contains("rag-rat index --discover"));
+
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    let fresh = db.discovery_status(&config).unwrap();
+    assert_eq!(fresh.unindexed_source_files, 0);
+    assert_eq!(fresh.removed_indexed_files, 0);
+    assert!(fresh.warning.is_none());
+    assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
+    assert!(db.symbols("old_symbol", Some(Language::Rust), 10).unwrap().is_empty());
+
+    let mut events = Vec::new();
+    let db = IndexDatabase::index_discover_with_progress(&config, |progress| {
+        events.push(progress);
+    })
+    .unwrap();
+    assert!(matches!(events.last(), Some(IndexProgress::Finished { files: 0 })));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            IndexProgress::PreparingFile { .. } | IndexProgress::IndexingFile { .. }
+        )),
+        "no-op discover should not prepare or index files: {events:?}"
+    );
+    assert_eq!(db.symbols("new_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn indexing_skips_symlink_loops() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn loop_safe_symbol() {}\n").unwrap();
+    std::os::unix::fs::symlink(&root, root.join("src/loop")).unwrap();
+
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_eq!(db.symbols("loop_safe_symbol", Some(Language::Rust), 10).unwrap().len(), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dirty_git_files_are_indexed_as_worktree_overlay() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("search.md"), "# Title\nbase token\n").unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &[
+        "-c",
+        "user.name=Rag Rat Test",
+        "-c",
+        "user.email=rag-rat@example.invalid",
+        "commit",
+        "-m",
+        "initial",
+    ]);
+
+    let config = markdown_config_for_root(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(db.search("base", 10, false).unwrap().len(), 1);
+
+    fs::write(docs.join("search.md"), "# Title\noverlay token\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    let scopes = db
+        .storage
+        .connection()
+        .prepare(
+            "
+                SELECT commit_sha != '', worktree_id != ''
+                FROM main.files
+                WHERE path = 'docs/search.md'
+                ORDER BY commit_sha != '' DESC, worktree_id != '' DESC
+                ",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(scopes, vec![(true, false), (false, true)]);
+    assert!(db.search("base", 10, false).unwrap().is_empty());
+    let overlay_hits = db.search("overlay", 10, false).unwrap();
+    assert_eq!(overlay_hits.len(), 1);
+    assert!(overlay_hits[0].summary.contains("overlay token"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rebuild_populates_revision_metadata_and_fresh_fts_state() {
+    let (root, config) = markdown_config("alpha token");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let status = db.status(&config.database).unwrap();
+
+    assert!(!status.content_revision.is_empty());
+    assert_eq!(status.fts_source_revision.as_deref(), Some(status.content_revision.as_str()));
+    assert_eq!(
+        db.meta("content_revision").unwrap().as_deref(),
+        Some(status.content_revision.as_str())
+    );
+    assert!(!status.fts_dirty);
+    assert!(status.fts_fresh);
+    assert!(!status.git_history.available);
+    assert_eq!(status.git_history.commit_count, 0);
+    assert_eq!(status.local_ai.embedding.state, "MissingModel");
+    assert_eq!(status.local_ai.fastembed.backend, "fastembed");
+    assert_eq!(status.local_ai.fastembed.model, ai::FASTEMBED_DISPLAY_MODEL);
+    assert_eq!(status.local_ai.fastembed.dim, ai::FASTEMBED_EMBEDDING_DIM);
+    assert!(!status.local_ai.fastembed.cache.is_empty());
+    assert_eq!(status.local_ai.fastembed.build_feature_enabled, cfg!(feature = "fastembed"));
+    assert_eq!(status.local_ai.artifacts.total_chunks, 1);
+    assert_eq!(
+        status.local_ai.artifacts.eligible_chunks + status.local_ai.artifacts.skipped_chunks,
+        status.local_ai.artifacts.total_chunks
+    );
+    assert_eq!(
+        status.local_ai.fastembed.eligible_embeddings
+            + status.local_ai.fastembed.skipped_embeddings,
+        status.local_ai.artifacts.total_chunks
+    );
+    assert_eq!(indexed_revision_count(&db), 1);
+    assert_eq!(chunk_source_revision_count(&db), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(not(feature = "fastembed"))]
+#[test]
+fn fastembed_missing_feature_reports_rebuild_command() {
+    let (root, config) = markdown_config("alpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let err = db.install_model(ai::FASTEMBED_MODEL_ID).unwrap_err();
+    assert!(err.to_string().contains(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
+
+    let status = db.local_ai_status().unwrap();
+    assert!(!status.fastembed.build_feature_enabled);
+    assert_eq!(status.fastembed.status, "MissingRuntime");
+    assert_eq!(status.fastembed.message.as_deref(), Some(ai::FASTEMBED_MISSING_FEATURE_MESSAGE));
+    assert_eq!(status.fastembed.next.as_deref(), Some("cargo install rag-rat"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
+    let (root, config) = markdown_config(
+        "alpha token\nsecond line with enough detail for the semantic embedding policy to keep \
+         this chunk\nthird line with runtime context\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let chunk_id = first_chunk_id(&db);
+
+    let models = db.list_models().unwrap();
+    let embedding = models.iter().find(|model| model.model_id == ai::HASH_MODEL_ID).unwrap();
+    assert!(!embedding.installed);
+    assert_eq!(embedding.status, "MissingModel");
+
+    let hits = db.search("alpha", 10, false).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].summary.contains("alpha token"));
+
+    let blocked = db.reconcile(Some(1), Some(8)).unwrap();
+    assert_eq!(blocked.processed_chunks, 0);
+    assert_eq!(blocked.embeddings_written, 0);
+    assert_eq!(blocked.blocked_chunks, 0);
+    assert_eq!(blocked.model_id, ai::HASH_MODEL_ID);
+    assert_eq!(blocked.batch_size, 8);
+    assert_eq!(blocked.status, "Blocked");
+
+    let status = db.local_ai_status().unwrap();
+    assert_eq!(status.embedding.state, "MissingModel");
+    assert_eq!(status.embedding.blocked_artifacts, 0);
+
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    let plan = db.reconcile_plan().unwrap();
+    assert_eq!(plan.embeddings.missing, 1);
+    assert_eq!(plan.embeddings.current, 0);
+    let current = db.reconcile(Some(1), Some(8)).unwrap();
+    assert_eq!(current.embeddings_written, 1);
+    assert_eq!(current.model_id, ai::HASH_MODEL_ID);
+    assert_eq!(current.model_version, "hash-v1");
+    assert_eq!(current.embedding_dim, ai::HASH_EMBEDDING_DIM);
+    assert_eq!(current.status, "Current");
+    assert_eq!(current.work_reasons.get("Missing"), Some(&1));
+    let noop = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(noop.processed_chunks, 0);
+    assert_eq!(noop.embeddings_written, 0);
+    let status = db.local_ai_status().unwrap();
+    assert_eq!(status.embedding.state, "Ready");
+    assert_eq!(status.embedding.current_artifacts, 1);
+    let embedding_bytes: i64 = db
+        .storage
+        .connection()
+        .query_row(
+            "SELECT length(vector_blob) FROM chunk_embeddings WHERE chunk_id = ?1 AND status = \
+             'Current'",
+            [chunk_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(embedding_bytes, (ai::HASH_EMBEDDING_DIM * 4) as i64);
+
+    let hits = db.search("alpha", 10, false).unwrap();
+    assert!(hits[0].summary.contains("alpha token"));
+
+    db.storage.connection().execute("DELETE FROM chunk_fts", []).unwrap();
+    let vector_hits = db.search("alpha", 10, false).unwrap();
+    assert_eq!(vector_hits.len(), 1);
+    assert_eq!(vector_hits[0].chunk_id, chunk_id);
+
+    db.storage
+        .connection()
+        .execute("UPDATE chunk_embeddings SET source_text_hash = 'old-hash' WHERE chunk_id = ?1", [
+            chunk_id,
+        ])
+        .unwrap();
+    let plan = db.reconcile_plan().unwrap();
+    assert_eq!(plan.embeddings.current, 0);
+    assert_eq!(plan.embeddings.stale, 1);
+    let refreshed = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(refreshed.processed_chunks, 1);
+    assert_eq!(refreshed.work_reasons.get("SourceChanged"), Some(&1));
+    assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 1);
+    let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
+    assert_eq!(stale_embedding_hits.len(), 1);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed")]
+#[test]
+fn cached_fastembed_model_recovers_ready_state() {
+    let (root, config) = markdown_config("alpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let cache_dir = root.join("models");
+    let revision = "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079";
+    let repo = cache_dir.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+    fs::create_dir_all(repo.join("refs")).unwrap();
+    fs::create_dir_all(repo.join("snapshots").join(revision)).unwrap();
+    fs::write(repo.join("refs").join("main"), revision).unwrap();
+
+    ai::recover_cached_fastembed_model_at(db.storage.connection(), &cache_dir).unwrap();
+
+    let models = db.list_models().unwrap();
+    let fastembed = models.iter().find(|model| model.model_id == ai::FASTEMBED_MODEL_ID).unwrap();
+    assert!(fastembed.installed);
+    assert_eq!(fastembed.status, "Ready");
+    let status = db.local_ai_status().unwrap();
+    assert_eq!(status.fastembed.status, "Ready");
+    assert!(status.fastembed.active);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(feature = "fastembed")]
+#[test]
+fn compatible_migrate_recovers_cached_fastembed_model() {
+    let (root, config) = markdown_config("alpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let cache_dir = root.join("models");
+    let revision = "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079";
+    let repo = cache_dir.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+    fs::create_dir_all(repo.join("refs")).unwrap();
+    fs::create_dir_all(repo.join("snapshots").join(revision)).unwrap();
+    fs::write(repo.join("refs").join("main"), revision).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE ai_models
+                 SET installed = 0, status = 'MissingModel', installed_at_ms = NULL
+                 WHERE model_id = ?1",
+            [ai::FASTEMBED_MODEL_ID],
+        )
+        .unwrap();
+
+    IndexDatabase::migrate_with_fastembed_cache(&config.database, Some(&cache_dir)).unwrap();
+
+    let db = IndexDatabase::open(&config.database).unwrap();
+    let status = db.local_ai_status().unwrap();
+    assert_eq!(status.fastembed.status, "Ready");
+    assert!(status.fastembed.active);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_without_limit_processes_all_chunks() {
+    let (root, config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding \
+         eligibility and useful semantic context\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+    let report = db.reconcile(None, Some(2)).unwrap();
+
+    assert_eq!(report.processed_chunks, 2);
+    assert_eq!(report.embeddings_written, 2);
+    assert_eq!(report.batch_size, 2);
+    assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 2);
+    let second = db.reconcile(None, Some(2)).unwrap();
+    assert_eq!(second.processed_chunks, 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn force_reconcile_processes_each_chunk_once_and_terminates() {
+    // Regression: --force skipped the needs_embedding filter, so select_reconcile_batch
+    // never returned an empty batch and the loop re-embedded the active set forever when
+    // no --limit/--max-seconds was set. A generous finite limit lets this test terminate
+    // either way; the processed/written counts distinguish fixed (==2) from buggy (==50).
+    let (root, config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding \
+         eligibility and useful semantic context\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+    // Two eligible chunks; force with a limit far above the chunk count.
+    let report = db.reconcile_with_progress(Some(50), Some(2), true, |_| {}).unwrap();
+
+    assert_eq!(report.embeddings_written, 2, "force re-embedded chunks: {report:?}");
+    assert_eq!(report.processed_chunks, 2, "force re-processed chunks: {report:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
+    let (root, config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding \
+         eligibility and useful semantic context\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+    // No --limit. max_seconds is only a safety net: if the force loop regressed to
+    // re-embedding forever it would trip max_seconds and report "Partial" rather than
+    // terminating naturally, which this test asserts against (no CI hang on regression).
+    let mut events = Vec::new();
+    let report = db
+        .reconcile_with_options_progress(
+            ai::ReconcileOptions {
+                force: true,
+                batch_size: Some(1),
+                max_seconds: Some(30),
+                ..ai::ReconcileOptions::default()
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+
+    assert_eq!(report.status, "Current", "did not terminate naturally: {report:?}");
+    assert_eq!(report.processed_chunks, 2);
+
+    let started_total = events.iter().find_map(|event| match event {
+        ai::ReconcileProgress::Started { total_chunks, .. } => Some(*total_chunks),
+        _ => None,
+    });
+    assert_eq!(started_total, Some(2), "denominator should equal the eligible set");
+
+    for event in &events {
+        if let ai::ReconcileProgress::Batch { processed_chunks, total_chunks, .. } = event {
+            assert!(
+                processed_chunks <= total_chunks,
+                "progress exceeded 100%: {processed_chunks}/{total_chunks}",
+            );
+        }
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn status_counts_only_active_context_chunks() {
+    let (root, config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding \
+         eligibility and useful semantic context\n",
+    );
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+    let active = db.local_ai_status().unwrap().artifacts.total_chunks;
+    assert!(active > 0, "expected active chunks, got {active}");
+
+    // Point the connection at a context that matches no indexed rows. The active set
+    // (temp.files) is now empty, so status must report 0 chunks. Pre-fix the counts ran
+    // over main.chunks (every indexed commit) and ignored the active context entirely.
+    db.set_context("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "ghost-worktree").unwrap();
+    let scoped = db.local_ai_status().unwrap().artifacts;
+    assert_eq!(scoped.total_chunks, 0, "status ignored active context scope");
+    assert_eq!(scoped.current, 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn watch_maintenance_pass_indexes_new_files() {
+    // A watcher pass must pick up a brand-new (uncommitted) file, not just refresh known ones.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/one.rs"), "pub fn one() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    IndexDatabase::rebuild(&config).unwrap();
+
+    // New file appears after the initial index; a maintenance pass should index it.
+    fs::write(root.join("src/two.rs"), "pub fn newly_added_symbol() {}\n").unwrap();
+    crate::watch::maintenance_pass(&config, false).unwrap();
+
+    let db = IndexDatabase::open_config(&config).unwrap();
+    let hits = db.symbols("newly_added_symbol", Some(Language::Rust), 10).unwrap();
+    assert!(!hits.is_empty(), "watcher pass did not index the new file");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn discover_deletion_is_worktree_scoped() {
+    // Invariant (watcher spec, review item 1): a discover pass run from worktree A must remove
+    // only A's own rows for files missing from A's disk — never another worktree's overlay
+    // rows. Otherwise two watchers on one shared DB delete each other's live overlays.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // A row owned by a *different* worktree, for a path that does not exist on this disk.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated,
+                     indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+                 VALUES ('src/only_in_other.rs','rust','source','h',0,0,0,'rev','',
+                     'other-worktree')",
+            [],
+        )
+        .unwrap();
+    drop(db);
+
+    // This worktree loses a.rs; re-discover as this worktree.
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // The other worktree's overlay row survives untouched.
+    let other: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM main.files WHERE worktree_id = 'other-worktree' AND kind != \
+             'deleted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(other, 1, "this worktree's pass deleted another worktree's row");
+
+    // Deletion still works within this worktree's own scope: a.rs gone from the active view,
+    // b.rs retained.
+    let active = |path: &str| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM files WHERE path = ?1", [path], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(active("src/a.rs"), 0, "deleted file still active in own worktree");
+    assert_eq!(active("src/b.rs"), 1, "live file dropped from own worktree");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn gc_prunes_dead_context_rows_and_keeps_live_ones() {
+    let (root, config) = markdown_config(
+        "# One\nalpha token with enough surrounding detail for embedding eligibility and useful \
+         semantic context\n\n# Two\nbeta token with enough surrounding detail for embedding \
+         eligibility and useful semantic context\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.reconcile(None, Some(8)).unwrap();
+
+    let live_files = table_row_count(db.storage.connection(), "files").unwrap();
+    let live_chunks = table_row_count(db.storage.connection(), "chunks").unwrap();
+    assert!(live_files > 0 && live_chunks > 0);
+
+    // A ghost file from a commit/worktree that is not live.
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated,
+                     indexed_at_ms, indexed_revision, commit_sha, worktree_id)
+                 VALUES ('ghost.md','markdown','source','deadhash',0,0,0,'deadrev',
+                     'deadcommit','dead-worktree')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(table_row_count(db.storage.connection(), "files").unwrap(), live_files + 1);
+
+    // Keep only the active worktree. The ghost's commit and worktree are not live.
+    let live_worktree = db.active_worktree_id.clone();
+    let report = db.prune_to_live(&[], &[live_worktree]).unwrap();
+
+    assert!(!report.skipped);
+    assert_eq!(report.files_pruned, 1, "ghost not pruned: {report:?}");
+    assert_eq!(
+        table_row_count(db.storage.connection(), "files").unwrap(),
+        live_files,
+        "live files were pruned",
+    );
+    assert_eq!(
+        table_row_count(db.storage.connection(), "chunks").unwrap(),
+        live_chunks,
+        "live chunks were pruned",
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn gc_refuses_to_prune_with_no_live_context() {
+    let (root, config) = markdown_config("# Only\nsome content with enough detail for a chunk\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let before = table_row_count(db.storage.connection(), "files").unwrap();
+    assert!(before > 0);
+
+    // Empty live sets must never wipe the index.
+    let report = db.prune_to_live(&[], &[]).unwrap();
+    assert!(report.skipped);
+    assert_eq!(report.files_pruned, 0);
+    assert_eq!(table_row_count(db.storage.connection(), "files").unwrap(), before);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_treats_c_chunks_as_embedding_eligible() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.c"),
+        r#"
+static int read_sensor_value(int baseline)
+{
+    int adjusted = baseline + 42;
+    return adjusted;
+}
+
+int main(void)
+{
+    int sample = read_sensor_value(7);
+    return sample == 49 ? 0 : 1;
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::C);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+    let plan = db.reconcile_plan().unwrap();
+
+    assert_eq!(plan.embeddings.skipped_by_policy.get("SkipLanguageUnsupported"), None);
+    assert!(plan.embeddings.missing > 0, "plan: {:?}", plan.embeddings);
+
+    let report = db.reconcile(None, Some(8)).unwrap();
+    assert!(report.embeddings_written > 0, "report: {report:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_policy_skips_tiny_chunks_before_embedding() {
+    let (root, config) = markdown_config("tiny\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+
+    let plan = db.reconcile_plan().unwrap();
+    assert_eq!(plan.embeddings.missing, 0);
+    assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+
+    let report = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(report.embeddings_written, 0);
+    assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+    assert_eq!(db.current_embedding_count(ai::HASH_MODEL_ID).unwrap(), 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconcile_plan_reports_policy_skips_for_fastembed_model() {
+    let (root, config) = markdown_config("tiny\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE ai_models
+                 SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2
+                 WHERE model_id = ?1",
+            params![ai::FASTEMBED_MODEL_ID, i64::try_from(ai::FASTEMBED_EMBEDDING_DIM).unwrap()],
+        )
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [ai::FASTEMBED_MODEL_ID],
+        )
+        .unwrap();
+
+    let plan = db.reconcile_plan().unwrap();
+
+    assert_eq!(plan.embeddings.model_id, ai::FASTEMBED_MODEL_ID);
+    assert_eq!(plan.embeddings.missing, 0);
+    assert_eq!(plan.embeddings.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(not(feature = "fastembed"))]
+#[test]
+fn blocked_fastembed_reconcile_still_reports_policy_skips() {
+    let (root, config) = markdown_config("tiny\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO index_meta(key, value) VALUES ('active_embedding_model', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [ai::FASTEMBED_MODEL_ID],
+        )
+        .unwrap();
+
+    let report = db.reconcile(None, Some(8)).unwrap();
+
+    assert_eq!(report.status, "Blocked");
+    assert_eq!(report.skipped_by_policy.get("SkipTooSmall"), Some(&1));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_explain_reports_weighted_score_components() {
+    let (root, config) = markdown_config(
+        "alpha runtime shutdown\nsecond line with enough detail for embedding eligibility and \
+         semantic vector scoring\nthird line\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(ai::HASH_MODEL_ID).unwrap();
+    db.reconcile(None, Some(8)).unwrap();
+
+    let hits = db.search_explain("runtime shutdown", 10, false).unwrap();
+
+    assert_eq!(hits.len(), 1);
+    let components = hits[0].score_components.as_ref().unwrap();
+    let component_sum = components.bm25
+        + components.vector
+        + components.symbol
+        + components.graph
+        + components.git
+        + components.github;
+    // `score` is rounded to 4dp for display, so compare against the rounded component sum.
+    assert!((hits[0].score - crate::query::round_score(component_sum)).abs() < 1e-9);
+    assert!(components.bm25 > 0.0);
+    assert!(components.vector > 0.0);
+    assert!(components.vector_note.is_none());
+    assert!(components.bm25 <= 0.45);
+    assert!(components.vector <= 0.35);
+    assert!(components.symbol <= 0.10);
+    assert!(components.graph <= 0.05);
+    assert!(components.git <= 0.03);
+    assert!(components.github <= 0.02);
+    assert!(db.search("runtime shutdown", 10, false).unwrap()[0].score_components.is_none());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_explain_labels_missing_vector_runtime() {
+    let (root, config) = markdown_config(
+        "alpha runtime shutdown\nsecond line with enough detail for lexical search without \
+         embeddings\nthird line\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let hits = db.search_explain("runtime shutdown", 10, false).unwrap();
+
+    assert_eq!(hits.len(), 1);
+    let components = hits[0].score_components.as_ref().unwrap();
+    assert!(components.bm25 > 0.0);
+    assert_eq!(components.vector, 0.0);
+    assert_eq!(
+        components.vector_note.as_deref(),
+        Some("vector search unavailable: no current embedding model")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_history_indexes_commits_paths_queries_and_blame() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+    fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn tracked_symbol() {}\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Add alpha docs"]);
+
+    fs::write(root.join("docs/search.md"), "# Title\nbeta token\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Refresh beta docs"]);
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![
+            ResolvedTarget {
+                name: "markdown".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            },
+            ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            },
+        ],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let status = db.status(&config.database).unwrap();
+    assert!(status.git_history.available);
+    assert!(status.git_history.head.is_some());
+    assert_eq!(status.git_history.indexed_head, status.git_history.head);
+    assert_eq!(status.git_history.commit_count, 2);
+    assert_eq!(status.git_history.file_change_count, 3);
+
+    let commit_hits = db.commit_search("beta", 10).unwrap();
+    assert_eq!(commit_hits.len(), 1);
+    assert_eq!(commit_hits[0].subject, "Refresh beta docs");
+    assert_eq!(commit_hits[0].evidence_kind, "historical");
+    assert!(commit_hits[0].score > 0.0);
+
+    let path_history = db.git_history_for_path("docs/search.md", 10).unwrap();
+    assert_eq!(path_history.len(), 2);
+    assert!(path_history.iter().all(|item| item.evidence_kind == "historical"));
+
+    let symbol_history =
+        db.git_history_for_symbol("tracked_symbol", Some(Language::Rust), 10).unwrap();
+    assert_eq!(symbol_history.len(), 1);
+    assert_eq!(symbol_history[0].path, "src/lib.rs");
+    assert_eq!(symbol_history[0].evidence_kind, "historical");
+    let impact = db.impact_surface("tracked_symbol", 10).unwrap();
+    assert!(impact.iter().any(|item| {
+        item.category == "Direct structural impact" && item.reason == "exact_symbol_definition"
+    }));
+    assert!(impact.iter().any(|item| {
+        item.category == "Historical/papertrail evidence"
+            && item.reason == "git_commit_touched_file"
+    }));
+
+    let query_commits = db.commits_touching_query("beta", 10).unwrap();
+    let beta_commit = query_commits.iter().find(|hit| hit.subject == "Refresh beta docs").unwrap();
+    assert!(beta_commit.evidence.iter().any(|value| value == "commit_message"));
+    assert!(beta_commit.evidence.iter().any(|value| value == "file_change"));
+    assert_eq!(beta_commit.evidence_kind, "historical");
+
+    let chunk_id = first_chunk_id(&db);
+    let blame = db.git_blame_chunk(chunk_id).unwrap().unwrap();
+    assert_eq!(blame.source_text_hash, hex_sha256("# Title\nbeta token\n".as_bytes()));
+    assert_eq!(blame.line_count, 2);
+    assert_eq!(blame.commit_counts.values().sum::<i64>(), 2);
+    assert!(blame.dominant_commit_lines >= 1);
+    assert!(blame.dominant_commit.is_some());
+    assert_eq!(blame.evidence_kind, "historical");
+    let cached = db.git_blame_chunk(chunk_id).unwrap().unwrap();
+    assert_eq!(cached.source_text_hash, blame.source_text_hash);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_rust_graph_edges_from_tree_sitter() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+use crate::worker::Worker;
+mod worker;
+
+trait Service {
+    fn serve(&self);
+}
+
+struct Worker;
+
+impl Service for Worker {
+    fn serve(&self) {
+        helper();
+    }
+}
+
+fn helper() {}
+
+fn caller() {
+    helper();
+    Worker.serve();
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "caller", "helper", "calls_name", "Syntactic");
+    assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
+    assert_edge(&db, "src/lib.rs", "worker", "imports", "Syntactic");
+    let callers = db.find_callers("helper", 10).unwrap();
+    assert!(
+        callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("caller"))
+                && edge.edge_kind == "calls_name"
+        }),
+        "helper callers: {callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ffi_surface_labels_exported_impl_members_separately() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct PhraseRepo;
+
+#[uniffi::export]
+impl PhraseRepo {
+    pub fn children(&self) {}
+    pub fn journal(&self) {}
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(async_runtime = "tokio"))]
+impl Runtime {
+    pub fn route_search_query(&self) {}
+}
+
+pub struct Runtime;
+
+/// Not #[uniffi::export]: this is an internal helper.
+pub fn internal_helper() {}
+
+#[cfg_attr(target_arch = "wasm32", ::uniffi::export)]
+pub fn exported_fn() {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let surface = db.ffi_surface(20).unwrap();
+    assert!(
+        surface.iter().any(|item| {
+            item.reason == "rust_uniffi_export"
+                && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("exported_fn"))
+        }),
+        "direct export should remain direct: {surface:?}"
+    );
+    assert!(
+        surface.iter().any(|item| item.reason == "rust_uniffi_exported_impl"),
+        "exported impl/type surface should be explicit: {surface:?}"
+    );
+    assert!(
+        surface.iter().any(|item| {
+            item.reason == "rust_uniffi_impl_member"
+                && item
+                    .symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.ends_with("route_search_query"))
+        }),
+        "cfg_attr exported impl member should be labeled separately: {surface:?}"
+    );
+    assert!(
+        surface.iter().any(|item| {
+            item.reason == "rust_uniffi_impl_member"
+                && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("children"))
+        }),
+        "impl member should be labeled separately: {surface:?}"
+    );
+    assert!(
+        !surface.iter().any(|item| {
+            item.reason == "rust_uniffi_export"
+                && item.symbol.as_deref().is_some_and(|symbol| {
+                    symbol.ends_with("children") || symbol.ends_with("journal")
+                })
+        }),
+        "impl members must not be reported as direct exports: {surface:?}"
+    );
+    assert!(
+        !surface.iter().any(|item| {
+            item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("internal_helper"))
+        }),
+        "comment-only UniFFI mentions must not create FFI surface rows: {surface:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn find_callers_sees_calls_in_let_bindings() {
+    // Regression for issue #47: calls in `let x = f();` and `let-else` initializers produced
+    // no caller edge, so find_callers reported 0 callers for a function that is called.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn target() -> Option<i32> {\n    Some(1)\n}\n\npub fn via_statement() {\n    \
+         target();\n}\n\npub fn via_let() {\n    let _x = target();\n}\n\npub fn via_let_else() \
+         {\n    let Some(_x) = target() else {\n        return;\n    };\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let callers = db.find_callers("target", 50).unwrap();
+    let names: Vec<String> = callers.iter().filter_map(|hop| hop.from_symbol.clone()).collect();
+    let has = |suffix: &str| names.iter().any(|name| name.ends_with(suffix));
+
+    assert!(has("via_statement"), "missing plain-statement caller; got {names:?}");
+    assert!(has("via_let"), "missing `let x = target()` caller; got {names:?}");
+    assert!(has("via_let_else"), "missing `let-else` caller; got {names:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_and_read_chunk_attach_bounded_graph_evidence() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn helper() {}\n\npub fn caller() {\n    helper();\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let hits = db.search("helper caller", 10, false).unwrap();
+    let helper_hit = hits
+        .iter()
+        .find(|hit| hit.symbol_path.as_deref().is_some_and(|path| path.ends_with("helper")))
+        .expect("helper search hit");
+    let helper_graph = helper_hit.graph.as_ref().expect("helper graph evidence");
+    assert_eq!(helper_graph.caller_count, 1);
+    assert!(helper_graph.top_callers.iter().any(|caller| {
+        caller.symbol_path.ends_with("caller")
+            && caller.callsite.line == 4
+            && caller.callsite.span == [4, 4]
+            && caller.confidence == "syntactic"
+    }));
+    assert!(helper_graph.callers.is_empty(), "search keeps graph compact");
+
+    let caller_hit = hits
+        .iter()
+        .find(|hit| hit.symbol_path.as_deref().is_some_and(|path| path.ends_with("caller")))
+        .expect("caller search hit");
+    let caller_graph = caller_hit.graph.as_ref().expect("caller graph evidence");
+    assert!(caller_graph.top_callees.iter().any(|callee| {
+        callee.target == "helper"
+            && callee.callsite.line == 4
+            && callee.callsite.span == [4, 4]
+            && callee.confidence == "syntactic"
+    }));
+
+    let chunk = db.read_chunk(caller_hit.chunk_id).unwrap().expect("caller chunk");
+    let full_graph = chunk.graph.as_ref().expect("full read_chunk graph");
+    assert!(full_graph.symbol.as_ref().is_some_and(|symbol| symbol.name == "caller"));
+    assert!(
+        full_graph
+            .callees
+            .iter()
+            .any(|callee| callee.target == "helper" && callee.callsite.line == 4)
+    );
+    assert!(full_graph.notes.iter().any(|note| note.contains("tree-sitter/syntactic")));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn graph_exact_mode_requires_verified_symbol_identity() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn helper() {}\n\npub fn caller() {\n    helper();\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let helper = db.symbols("helper", Some(Language::Rust), 10).unwrap().remove(0);
+    let caller = db.symbols("caller", Some(Language::Rust), 10).unwrap().remove(0);
+
+    let bare_exact = db
+        .find_callers_with_options("helper", 10, &crate::query::graph::GraphTraversalOptions {
+            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(bare_exact.is_empty(), "bare exact lookup should not fall back: {bare_exact:?}");
+
+    let exact_callers = db
+        .find_callers_with_options("helper", 10, &crate::query::graph::GraphTraversalOptions {
+            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(helper.symbol_id),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        exact_callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("caller"))
+                && edge.verified_target_symbol
+        }),
+        "exact callers: {exact_callers:?}"
+    );
+    assert!(exact_callers.iter().all(|edge| edge.verified_target_symbol));
+
+    let exact_callees = db
+        .trace_callees_with_options("caller", 10, &crate::query::graph::GraphTraversalOptions {
+            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(caller.symbol_id),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        exact_callees.iter().any(|edge| {
+            edge.target.as_deref() == Some("helper") && edge.verified_target_symbol
+        }),
+        "exact callees: {exact_callees:?}"
+    );
+    assert!(exact_callees.iter().all(|edge| edge.verified_target_symbol));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn symbol_lookup_ranks_type_definitions_before_impl_blocks() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+impl Database {
+    pub fn open() -> Self {
+        Database
+    }
+}
+
+pub struct Database;
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let hits = db.symbols("Database", Some(Language::Rust), 10).unwrap();
+    assert!(hits.len() >= 2, "fixture should expose both impl and struct symbols: {hits:?}");
+    assert_eq!(hits[0].kind, "struct", "Database lookup should prefer type definition");
+    assert!(
+        hits.iter().any(|hit| hit.kind == "impl"),
+        "impl Database should still be available after the struct: {hits:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn distinct_same_named_methods_do_not_merge_and_logical_ids_are_stable() {
+    // Two `new` on different impls share a `qualified_name` (`…lib.rs::new`) but differ in
+    // signature — they must NOT collapse into one "cfg_variant" logical symbol. And the
+    // logical id must be stable across a reindex (it is content-derived, not an autoincrement).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct A;
+pub struct B;
+
+impl A {
+    pub fn new(name: String) -> Self { A }
+}
+
+impl B {
+    pub fn new(count: usize, flag: bool) -> Self { B }
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("new".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: true,
+        limit: 10,
+    };
+    let lookup = db.symbol_candidates(&selector).unwrap();
+    let new_candidates: Vec<_> =
+        lookup.candidates.iter().filter(|candidate| candidate.name == "new").collect();
+    assert_eq!(new_candidates.len(), 2, "both constructors present: {new_candidates:?}");
+    let logical_ids: std::collections::BTreeSet<i64> =
+        new_candidates.iter().filter_map(|candidate| candidate.logical_symbol_id).collect();
+    assert_eq!(logical_ids.len(), 2, "distinct signatures get distinct logical ids");
+    for candidate in &new_candidates {
+        assert_eq!(
+            candidate.logical_group_reason.as_deref(),
+            Some("single"),
+            "differently-signed methods are not cfg variants: {candidate:?}"
+        );
+    }
+
+    // Reindex and confirm the logical ids are unchanged (content-derived, not churned).
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let relookup = db.symbol_candidates(&selector).unwrap();
+    let reindexed_ids: std::collections::BTreeSet<i64> = relookup
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.name == "new")
+        .filter_map(|candidate| candidate.logical_symbol_id)
+        .collect();
+    assert_eq!(reindexed_ids, logical_ids, "logical ids must be stable across reindex");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn logical_symbol_exact_mode_covers_duplicate_rust_variants() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_blocking() {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_blocking() {}
+
+pub fn caller() {
+    spawn_blocking();
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let lookup = db
+        .symbol_candidates(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("spawn_blocking".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap();
+    let logical_symbol_id = lookup.candidates[0].logical_symbol_id.expect("logical id");
+    assert_eq!(lookup.candidates[0].logical_variant_count, Some(2));
+    assert_eq!(lookup.candidates[0].logical_group_reason.as_deref(), Some("cfg_variant"));
+
+    let exact_variant_callers = db
+        .find_callers_with_options(
+            "spawn_blocking",
+            10,
+            &crate::query::graph::GraphTraversalOptions {
+                resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                symbol_id: Some(lookup.candidates[1].symbol_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        exact_variant_callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|symbol| symbol.ends_with("caller"))
+                && edge.target.as_deref() == Some("spawn_blocking")
+                && edge.verified_target_symbol
+        }),
+        "symbol_id exact should include its logical cfg group: {exact_variant_callers:?}"
+    );
+    assert!(exact_variant_callers.iter().all(|edge| edge.verified_target_symbol));
+
+    let exact_logical = db
+        .graph_traversal_report(
+            "find_callers",
+            &lookup.candidates[0],
+            true,
+            10,
+            &crate::query::graph::GraphTraversalOptions {
+                resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                symbol_id: Some(lookup.candidates[0].symbol_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(exact_logical.query.logical_symbol_id, Some(logical_symbol_id));
+    assert_eq!(exact_logical.logical_symbol.as_ref().map(|symbol| symbol.variant_count), Some(2));
+    assert_eq!(exact_logical.variants.len(), 2);
+    assert!(exact_logical.results.iter().all(|edge| edge.verified_target_symbol));
+    assert!(
+        exact_logical.results.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|symbol| symbol.ends_with("caller"))
+                && edge.target.as_deref() == Some("spawn_blocking")
+        }),
+        "logical exact callers: {exact_logical:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_real_world_rust_graph_patterns() {
+    let root = fixture_temp_root("graph-realworld/rust");
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "src/lib.rs", "worker", "imports", "Syntactic");
+    assert_edge(&db, "src/lib.rs", "Worker", "exports", "Syntactic");
+    assert_edge(&db, "entry", "new", "calls_name", "NameOnly");
+    assert_edge(&db, "entry", "Client", "references_type", "Syntactic");
+    assert_edge(&db, "drive", "serve", "calls_name", "NameOnly");
+    assert_edge(&db, "drive", "GenericRunner", "references_type", "Syntactic");
+    assert_edge(&db, "Worker", "Service", "implements", "Syntactic");
+    assert_edge(&db, "generic_call", "T", "references_type", "NameOnly");
+    assert_edge(&db, "entry", "generated_call", "uses_macro", "NameOnly");
+    let syntactic_callers = db.find_callers("serve", 10).unwrap();
+    assert!(
+        syntactic_callers.is_empty(),
+        "syntactic serve callers should avoid receiver/name fallback: {syntactic_callers:?}"
+    );
+    let callers = db
+        .find_callers_with_options("serve", 10, &crate::query::graph::GraphTraversalOptions {
+            resolution_mode: crate::query::graph::GraphResolutionMode::Fuzzy,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        callers.iter().any(|edge| {
+            edge.edge_kind == "calls_name"
+                && edge.edge_confidence == edge.confidence
+                && edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("drive"))
+        }),
+        "serve callers: {callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_typescript_graph_edges_from_tree_sitter() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/helper.ts"),
+        "export function helper() {}\nexport const Card = () => null;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/App.tsx"),
+        r#"
+import { helper, Card } from "./helper";
+
+export function run() {
+  helper();
+  return <Card />;
+}
+
+export const callRun = () => run();
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::TypeScript);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "run", "helper", "calls_name", "Syntactic");
+    assert_edge(&db, "run", "Card", "references_type", "Syntactic");
+    assert_edge(&db, "src/App.tsx", "helper", "imports", "Syntactic");
+    assert_edge(&db, "src/App.tsx", "run", "exports", "Syntactic");
+    let callees = db.trace_callees("callRun", 10).unwrap();
+    assert!(
+        callees.iter().any(|edge| {
+            edge.to_symbol.as_deref().is_some_and(|name| name.ends_with("run"))
+                && edge.confidence == "syntactic"
+        }),
+        "callRun callees: {callees:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_c_graph_edges_from_tree_sitter() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/runtime.c"),
+        r#"
+typedef struct Runtime Runtime;
+
+struct Runtime {
+  int state;
+};
+
+int helper(Runtime *runtime) {
+  return runtime->state;
+}
+
+int runtime_open(Runtime *runtime) {
+  return helper(runtime);
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::C);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "runtime_open", "helper", "calls_name", "Syntactic");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_c_file_scope_macro_regions_for_search() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("drivers/entropy")).unwrap();
+    fs::write(
+        root.join("drivers/entropy/entropy.c"),
+        r#"
+static int entropy_init(const struct device *dev)
+{
+    ARG_UNUSED(dev);
+    return 0;
+}
+
+/* Entropy driver APIs structure */
+static DEVICE_API(entropy, entropy_cryptoacc_trng_api) = {
+    .get_entropy = entropy_cryptoacc_trng_get_entropy,
+};
+
+DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
+                      PRE_KERNEL_1, CONFIG_ENTROPY_INIT_PRIORITY,
+                      &entropy_cryptoacc_trng_api);
+"#,
+    )
+    .unwrap();
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "c".to_string(),
+            language: Language::C,
+            directories: vec![PathBuf::from("drivers/entropy")],
+            include: vec!["**/*.c".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let hits = db.search("DEVICE_API", 5, false).unwrap();
+    assert!(
+        hits.iter().any(|hit| {
+            hit.path == "drivers/entropy/entropy.c" && hit.summary.contains("DEVICE_API")
+        }),
+        "DEVICE_API hits: {hits:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_cpp_graph_edges_from_tree_sitter() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/runtime.cpp"),
+        r#"
+namespace held {
+class Runtime {
+public:
+  void open();
+};
+
+void helper() {}
+
+void Runtime::open() {
+  helper();
+}
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Cpp);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "open", "helper", "calls_name", "Syntactic");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_real_world_typescript_graph_patterns() {
+    let root = fixture_temp_root("graph-realworld/typescript");
+    let config = source_config(root.clone(), Language::TypeScript);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "src/lib.tsx", "DefaultWidget", "imports", "Syntactic");
+    assert_edge(&db, "src/lib.tsx", "WidgetNS", "imports", "NameOnly");
+    assert_edge(&db, "src/lib.tsx", "WidgetProps", "imports", "Syntactic");
+    assert_edge(&db, "src/lib.tsx", "ReExportedWidget", "exports", "NameOnly");
+    assert_edge(&db, "useWidget", "useMemo", "calls_name", "NameOnly");
+    assert_edge(&db, "useWidget", "DefaultWidget", "calls_name", "Syntactic");
+    assert_edge(&db, "Shell", "renderWidget", "calls_name", "NameOnly");
+    assert_edge(&db, "Shell", "WidgetNS", "references_type", "NameOnly");
+    assert_edge(&db, "Shell", "DefaultWidget", "references_type", "Syntactic");
+    assert_edge(&db, "DefaultWidget", "WidgetProps", "references_type", "Syntactic");
+    let callees = db
+        .trace_callees_with_options("Shell", 10, &crate::query::graph::GraphTraversalOptions {
+            include_references: true,
+            edge_kinds: None,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        callees.iter().any(|edge| {
+            edge.edge_kind == "references_type"
+                && edge.edge_confidence == edge.confidence
+                && edge.to_symbol.as_deref().is_some_and(|name| name.ends_with("DefaultWidget"))
+        }),
+        "Shell callees: {callees:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rust_macro_edges_do_not_resolve_to_same_named_modules() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod format;
+
+fn execute_one() {
+    let _value = format!("hello");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/format.rs"), "pub fn helper() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edge = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT edge_kind, to_name, to_symbol_id, confidence, resolution, evidence
+                FROM edges
+                WHERE edge_kind = 'uses_macro'
+                  AND to_name = 'format'
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(edge.0, "uses_macro");
+    assert_eq!(edge.1, "format");
+    assert_eq!(edge.2, None);
+    assert_eq!(edge.3, "NameOnly");
+    assert_eq!(edge.4, "unresolved");
+    assert!(edge.5.as_deref().is_some_and(|value| value.contains("format!")));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn opening_old_graph_policy_rebuilds_stale_macro_edges() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+mod format;
+
+fn execute_one() {
+    let _value = format!("hello");
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/format.rs"), "pub fn helper() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.storage
+        .connection()
+        .execute("UPDATE index_meta SET value = 'old' WHERE key = 'graph_index_version'", [])
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "
+                UPDATE edges
+                SET edge_kind = 'calls_name',
+                    to_symbol_id = (SELECT id FROM symbols WHERE name = 'format' LIMIT 1),
+                    confidence = 'Syntactic',
+                    evidence = NULL,
+                    resolution = 'syntactic'
+                WHERE to_name = 'format'
+                ",
+            [],
+        )
+        .unwrap();
+    drop(db);
+
+    let reopened = IndexDatabase::open(&config.database).unwrap();
+    let edge = reopened
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT edge_kind, to_symbol_id, confidence, resolution, evidence
+                FROM edges
+                WHERE to_name = 'format'
+                  AND edge_kind = 'uses_macro'
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(edge.0, "uses_macro");
+    assert_eq!(edge.1, None);
+    assert_eq!(edge.2, "NameOnly");
+    assert_eq!(edge.3, "unresolved");
+    assert!(edge.4.as_deref().is_some_and(|value| value.contains("format!")));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn qualified_common_member_calls_do_not_resolve_by_short_name() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct AlertsStore;
+
+impl AlertsStore {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+pub fn caller() {
+    let _items: Vec<String> = Vec::new();
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edge = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT to_name, target_qualified_name, to_symbol_id, confidence, resolution
+                FROM edges
+                WHERE from_name LIKE '%caller'
+                  AND edge_kind = 'calls_name'
+                  AND to_name = 'new'
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(edge.0, "new");
+    assert_eq!(edge.1.as_deref(), Some("Vec::new"));
+    assert_eq!(edge.2, None);
+    assert_eq!(edge.3, "NameOnly");
+    assert_eq!(edge.4, "unresolved");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn macro_edges_do_not_resolve_to_same_named_typescript_symbols() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+fn rust_entry() {
+    let _payload = json!({"ok": true});
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/preferences.ts"), "export function json() { return {}; }\n").unwrap();
+    let mut config = source_config(root.clone(), Language::Rust);
+    config.targets.push(ResolvedTarget {
+        name: "typescript".to_string(),
+        language: Language::TypeScript,
+        directories: vec![PathBuf::from("src")],
+        include: vec!["**/*.ts".to_string()],
+        exclude: Vec::new(),
+        kind: TargetKind::Source,
+    });
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edge = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT edge_kind, to_name, to_symbol_id, confidence, resolution, evidence
+                FROM edges
+                WHERE edge_kind = 'uses_macro'
+                  AND to_name = 'json'
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(edge.0, "uses_macro");
+    assert_eq!(edge.1, "json");
+    assert_eq!(edge.2, None);
+    assert_eq!(edge.3, "NameOnly");
+    assert_eq!(edge.4, "unresolved");
+    assert!(edge.5.as_deref().is_some_and(|value| value.contains("json!")));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn qualified_crate_helper_callers_use_name_fallback() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod task_spawn {
+    pub fn spawn_blocking() {}
+}
+
+pub fn first() {
+    crate::task_spawn::spawn_blocking();
+}
+
+pub fn second() {
+    task_spawn::spawn_blocking();
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let callers = db.find_callers("spawn_blocking", 10).unwrap();
+    assert!(
+        callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("first"))
+                && edge.edge_kind == "calls_name"
+                && edge.resolution == "target_name_fallback"
+        }),
+        "spawn_blocking callers: {callers:?}"
+    );
+    assert!(
+        callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("second"))
+                && edge.edge_kind == "calls_name"
+        }),
+        "spawn_blocking callers: {callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn caller_lookup_does_not_match_related_names_or_chain_evidence() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod runtime {
+    pub mod task_spawn {
+        pub fn spawn() {}
+        pub fn spawn_blocking() -> JoinHandle {
+            JoinHandle
+        }
+        pub fn spawn_blocking_handle() {}
+        pub fn spawn_blocking_offload() -> JoinHandle {
+            JoinHandle
+        }
+    }
+}
+
+pub struct JoinHandle;
+
+impl JoinHandle {
+    pub fn map_err(self) {}
+}
+
+pub fn direct() {
+    crate::runtime::task_spawn::spawn_blocking();
+}
+
+pub fn related_handle() {
+    crate::runtime::task_spawn::spawn_blocking_handle();
+}
+
+pub fn related_offload_chain() {
+    crate::runtime::task_spawn::spawn_blocking_offload().map_err();
+}
+
+pub fn related_spawn_with_text() {
+    crate::runtime::task_spawn::spawn();
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let callers = db.find_callers("spawn_blocking", 20).unwrap();
+    assert!(
+        callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("direct"))
+                && edge.target.as_deref() == Some("spawn_blocking")
+                && edge.edge_kind == "calls_name"
+        }),
+        "spawn_blocking callers: {callers:?}"
+    );
+    assert!(
+        callers.iter().all(|edge| {
+            !edge.from_symbol.as_deref().is_some_and(|name| {
+                name.ends_with("related_handle")
+                    || name.ends_with("related_offload_chain")
+                    || name.ends_with("related_spawn_with_text")
+            }) && !matches!(
+                edge.target.as_deref(),
+                Some("spawn_blocking_handle" | "spawn_blocking_offload" | "spawn" | "map_err")
+            )
+        }),
+        "caller lookup leaked related names or chain evidence: {callers:?}"
+    );
+
+    let qualified_callers = db.find_callers("src/lib.rs::spawn_blocking", 20).unwrap();
+    assert!(
+        qualified_callers.iter().any(|edge| {
+            edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("direct"))
+                && edge.target.as_deref() == Some("spawn_blocking")
+                && edge.edge_kind == "calls_name"
+        }),
+        "qualified spawn_blocking callers: {qualified_callers:?}"
+    );
+    assert!(
+        qualified_callers.iter().all(|edge| {
+            !edge.from_symbol.as_deref().is_some_and(|name| {
+                name.ends_with("related_handle")
+                    || name.ends_with("related_offload_chain")
+                    || name.ends_with("related_spawn_with_text")
+            }) && !matches!(
+                edge.target.as_deref(),
+                Some("spawn_blocking_handle" | "spawn_blocking_offload" | "spawn" | "map_err")
+            )
+        }),
+        "qualified caller lookup leaked related names or chain evidence: {qualified_callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn files_past_the_old_structural_cap_still_contribute_symbols_and_edges() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let filler = (0..700).map(|idx| format!("pub fn filler_{idx}() {{}}\n")).collect::<String>();
+    fs::write(
+        root.join("src/lib.rs"),
+        format!(
+            r#"
+pub mod task_spawn {{
+    pub fn spawn_blocking() {{}}
+}}
+
+{filler}
+
+pub fn caller() {{
+    crate::task_spawn::spawn_blocking();
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    assert!(fs::metadata(root.join("src/lib.rs")).unwrap().len() > 10_000);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbols = db.symbols("caller", Some(Language::Rust), 10).unwrap();
+    assert!(symbols.iter().any(|symbol| symbol.name == "caller"), "caller symbols: {symbols:?}");
+    let callers = db.find_callers("spawn_blocking", 10).unwrap();
+    assert!(
+        callers.iter().any(|edge| {
+            edge.edge_kind == "calls_name"
+                && edge.target.as_deref() == Some("spawn_blocking")
+                && edge.callsite.as_ref().is_some_and(|callsite| callsite.line > 700)
+        }),
+        "spawn_blocking callers: {callers:?}"
+    );
+    let impact =
+        db.impact_surface("callers of crate::task_spawn::spawn_blocking in src", 10).unwrap();
+    assert!(
+        impact.iter().any(|item| {
+            item.category == "Direct structural impact" && item.reason == "direct_caller"
+        }),
+        "impact: {impact:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn impact_surface_uses_high_signal_query_symbols_and_call_edges() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod runtime {
+    pub fn unrelated_runtime_symbol() {}
+}
+
+pub mod task_spawn {
+    pub fn spawn_blocking<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        f()
+    }
+}
+
+pub fn caller() {
+    crate::task_spawn::spawn_blocking(|| 1);
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let impact = db
+        .impact_surface(
+            "change runtime task_spawn spawn_blocking wasm inline native blocking pool",
+            20,
+        )
+        .unwrap();
+    assert!(
+        impact.iter().any(|item| {
+            item.category == "Direct structural impact"
+                && item.reason == "direct_caller"
+                && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("caller"))
+        }),
+        "spawn_blocking caller should be present: {impact:?}"
+    );
+    assert!(
+        impact.iter().all(|item| {
+            !(item.reason == "exact_symbol_definition"
+                && item.symbol.as_deref().is_some_and(|symbol| symbol.ends_with("runtime")))
+        }),
+        "broad `runtime` token should not become an exact impact seed: {impact:?}"
+    );
+    assert!(
+        impact.iter().all(|item| {
+            !item.evidence.iter().any(|evidence| evidence.contains("references_type"))
+                && item.symbol.as_deref() != Some("Send")
+        }),
+        "type references should not appear as direct impact: {impact:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn impact_surface_collapses_file_matches_to_one_row_per_file() {
+    // Regression for #48: a file-granularity match (path/chunk text) used to fan out into one
+    // row per symbol in the file. Each such section must now yield at most one row per file.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/widget_store.rs"),
+        "pub fn widget_alpha() {}\npub fn widget_beta() {}\npub fn widget_gamma() {}\npub fn \
+         widget_delta() {}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("widget_alpha".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol");
+    let report = db
+        .impact_surface_report_for_selected_symbol(
+            &symbol,
+            50,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+
+    for section in [
+        &report.text_fallback_hits,
+        &report.tests_touching_symbol_path,
+        &report.docs_mentioning_symbol_path,
+    ] {
+        let total = section.len();
+        let mut paths: Vec<&str> = section.iter().map(|item| item.path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), total, "section must have one row per file: {section:?}");
+
+        // Precedence: a path match must not carry a spurious symbol (a qualified name is
+        // `path::symbol`, so a path needle matches every symbol in the file).
+        for item in section {
+            if item.evidence.iter().any(|evidence| evidence.starts_with("path match")) {
+                assert!(item.symbol.is_none(), "path match must not name a symbol: {item:?}");
+            }
+        }
+    }
+
+    let store_rows = report
+        .text_fallback_hits
+        .iter()
+        .filter(|item| item.path.ends_with("widget_store.rs"))
+        .count();
+    assert_eq!(store_rows, 1, "a file with four symbols collapses to one fallback row");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn docs_for_symbol_prefers_local_source_context_before_broad_markdown() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/runtime")).unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(
+        root.join("src/runtime/task_spawn.rs"),
+        r#"
+pub fn spawn_blocking<F, T>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    f()
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/phrase-persistence.md"),
+        "# Phrase persistence\nUnrelated notes mention spawn_blocking in passing.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("docs/task_spawn.md"),
+        "# task_spawn\nLocal task_spawn notes explain spawn_blocking.\n",
+    )
+    .unwrap();
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![
+            ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            },
+            ResolvedTarget {
+                name: "markdown".to_string(),
+                language: Language::Markdown,
+                directories: vec![PathBuf::from("docs")],
+                include: vec!["**/*.md".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Docs,
+            },
+        ],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);
+    let hits = db.docs_for_selected_symbol(&symbol, 10).unwrap();
+    assert_eq!(hits[0].path, "src/runtime/task_spawn.rs", "docs hits: {hits:?}");
+    let phrase_index = hits.iter().position(|hit| hit.path == "docs/phrase-persistence.md");
+    let task_spawn_index = hits.iter().position(|hit| hit.path == "docs/task_spawn.md");
+    assert!(
+        phrase_index.is_none_or(|phrase| task_spawn_index.is_some_and(|local| local < phrase)),
+        "path-local task_spawn docs should outrank unrelated phrase docs: {hits:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn partial_tree_sitter_trees_still_contribute_valid_symbols_and_edges() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn helper() {}
+
+pub fn caller() {
+    helper();
+}
+
+fn broken( {
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let symbols = db.symbols("caller", Some(Language::Rust), 10).unwrap();
+    assert!(symbols.iter().any(|symbol| symbol.name == "caller"), "caller symbols: {symbols:?}");
+    assert_edge(&db, "caller", "helper", "calls_name", "Syntactic");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn receiver_method_calls_do_not_bind_to_same_named_free_functions() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn spawn_blocking() {}
+
+pub fn caller(joinset: JoinSet) {
+    joinset.spawn_blocking();
+}
+
+pub struct JoinSet;
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edge = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT to_name, target_qualified_name, to_symbol_id, confidence, resolution, \
+             receiver_hint
+                FROM edges
+                WHERE from_name LIKE '%caller'
+                  AND edge_kind = 'calls_name'
+                  AND to_name = 'spawn_blocking'
+                ",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(edge.0, "spawn_blocking");
+    assert_eq!(edge.1.as_deref(), Some("joinset::spawn_blocking"));
+    assert_eq!(edge.2, None);
+    assert_eq!(edge.3, "NameOnly");
+    assert_eq!(edge.4, "unresolved");
+    assert_eq!(edge.5.as_deref(), Some("joinset"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn trace_callees_excludes_type_references_by_default() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub struct JoinError;
+pub enum Result<T, E> { Ok(T), Err(E) }
+pub fn helper() {}
+
+pub fn spawn_blocking<F, T>(f: F) -> Result<T, JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    helper();
+    tokio::task::spawn_blocking(f)
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let default_callees = db.trace_callees("spawn_blocking", 20).unwrap();
+    assert!(
+        default_callees.iter().any(|edge| {
+            edge.edge_kind == "calls_name"
+                && edge.target.as_deref() == Some("helper")
+                && edge.verified_target_symbol
+        }),
+        "default callees: {default_callees:?}"
+    );
+    assert!(
+        default_callees.iter().all(
+            |edge| edge.target_qualified_name.as_deref() != Some("tokio::task::spawn_blocking")
+        ),
+        "default callees leaked unresolved external call: {default_callees:?}"
+    );
+    assert!(
+        default_callees.iter().all(|edge| edge.edge_kind != "references_type"),
+        "default callees leaked type refs: {default_callees:?}"
+    );
+    assert!(
+        default_callees.iter().all(|edge| !matches!(
+            edge.target.as_deref(),
+            Some("F" | "T" | "Send" | "Result" | "JoinError")
+        )),
+        "default callees leaked generic/type targets: {default_callees:?}"
+    );
+
+    let with_refs = db
+        .trace_callees_with_options(
+            "spawn_blocking",
+            20,
+            &crate::query::graph::GraphTraversalOptions {
+                include_references: true,
+                edge_kinds: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        with_refs.iter().any(|edge| edge.edge_kind == "references_type"),
+        "reference-enabled callees: {with_refs:?}"
+    );
+
+    let with_unresolved = db
+        .trace_callees_with_options(
+            "spawn_blocking",
+            20,
+            &crate::query::graph::GraphTraversalOptions {
+                include_unresolved: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        with_unresolved.iter().any(
+            |edge| edge.target_qualified_name.as_deref() == Some("tokio::task::spawn_blocking")
+        ),
+        "unresolved-enabled callees: {with_unresolved:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn trace_callees_defaults_to_repo_relevant_calls() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn repo_helper() {}
+
+pub fn caller(input: Result<String, String>) -> String {
+    repo_helper();
+    let values: Vec<String> = Vec::new();
+    let _ = input.map_err(|error| error.to_string());
+    let _ = Some("value").unwrap_or_else(|| "fallback");
+    let _ = format!("hello");
+    values.get(0).unwrap_or_else(|| "fallback").to_string()
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let default_callees = db.trace_callees("caller", 20).unwrap();
+    assert!(
+        default_callees.iter().any(|edge| edge.target.as_deref() == Some("repo_helper")),
+        "default callees should keep repo-local calls: {default_callees:?}"
+    );
+    assert!(
+        default_callees.iter().all(|edge| {
+            edge.edge_kind != "uses_macro"
+                && !matches!(
+                    edge.target.as_deref(),
+                    Some("new" | "map_err" | "unwrap_or_else" | "to_string" | "format")
+                )
+        }),
+        "default callees leaked low-signal calls: {default_callees:?}"
+    );
+
+    let expanded = db
+        .trace_callees_with_options("caller", 20, &crate::query::graph::GraphTraversalOptions {
+            include_unresolved: true,
+            include_macros: true,
+            include_common_methods: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        expanded.iter().any(|edge| edge.edge_kind == "uses_macro"),
+        "macro-enabled callees: {expanded:?}"
+    );
+    assert!(
+        expanded.iter().any(|edge| edge.target.as_deref() == Some("unwrap_or_else")),
+        "common-method-enabled callees: {expanded:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_kotlin_graph_edges_from_tree_sitter() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/Main.kt"),
+        r#"
+package dev.cq27.test
+
+import dev.cq27.lib.ExternalThing
+
+interface Syncable
+
+class MainBridge : Syncable {
+  suspend fun syncOnce() {
+    helper()
+    ExternalThing()
+  }
+}
+
+fun helper() {}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Kotlin);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "syncOnce", "helper", "calls_name", "Syntactic");
+    assert_edge(&db, "MainBridge", "Syncable", "implements", "Syntactic");
+    assert_edge(&db, "src/Main.kt", "ExternalThing", "imports", "NameOnly");
+    let impact = db.impact_surface("helper", 10).unwrap();
+    assert!(
+        impact.iter().any(|item| {
+            item.category == "Direct structural impact" && item.reason == "direct_caller"
+        }),
+        "impact: {impact:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexes_real_world_kotlin_graph_patterns() {
+    let root = fixture_temp_root("graph-realworld/kotlin");
+    let config = source_config(root.clone(), Language::Kotlin);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    assert_edge(&db, "src/Main.kt", "ExternalFactory", "imports", "NameOnly");
+    assert_edge(&db, "Worker", "companion", "contains", "Exact");
+    assert_edge(&db, "companion", "create", "contains", "Exact");
+    assert_edge(&db, "syncOnce", "create", "calls_name", "Syntactic");
+    assert_edge(&db, "syncOnce", "Worker", "references_type", "Syntactic");
+    assert_edge(&db, "syncOnce", "run", "calls_name", "Syntactic");
+    assert_edge(&db, "syncOnce", "SingletonRunner", "references_type", "Syntactic");
+    assert_edge(&db, "syncOnce", "ExternalFactory", "calls_name", "NameOnly");
+    assert_edge(&db, "syncOnce", "ExternalFactory", "references_type", "NameOnly");
+    assert_edge(&db, "syncOnce", "cleaned", "calls_name", "Syntactic");
+    let callers = db.find_callers("cleaned", 10).unwrap();
+    assert!(
+        callers.iter().any(|edge| {
+            edge.edge_kind == "calls_name"
+                && edge.edge_confidence == edge.confidence
+                && edge.from_symbol.as_deref().is_some_and(|name| name.ends_with("syncOnce"))
+        }),
+        "cleaned callers: {callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn kotlin_caller_lookup_respects_qualified_receivers_for_common_method_names() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/Main.kt"),
+        r#"
+package dev.cq27.test
+
+object WatchProposalBuilder {
+  fun build(): String = "proposal"
+}
+
+class AndroidDialogBuilder {
+  fun build(): String = "dialog"
+}
+
+fun actualCaller() {
+  WatchProposalBuilder.build()
+}
+
+fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
+  dialog.build()
+  AndroidDialogBuilder().build()
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Kotlin);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let target = db
+        .symbols("build", Some(Language::Kotlin), 10)
+        .unwrap()
+        .into_iter()
+        .find(|symbol| symbol.qualified_name.contains("WatchProposalBuilder"))
+        .expect("WatchProposalBuilder.build symbol");
+    let callers = db
+        .find_callers_with_options("build", 20, &crate::query::graph::GraphTraversalOptions {
+            resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+            symbol_id: Some(target.symbol_id),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        callers
+            .iter()
+            .filter(|edge| edge
+                .from_symbol
+                .as_deref()
+                .is_some_and(|name| name.ends_with("actualCaller")))
+            .count(),
+        1,
+        "actual caller should be present once: {callers:?}"
+    );
+    assert!(
+        callers.iter().all(|edge| edge
+            .from_symbol
+            .as_deref()
+            .is_none_or(|name| !name.ends_with("unrelatedBuilderCalls"))),
+        "unrelated builder calls should not resolve to WatchProposalBuilder.build: {callers:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
+    let (root, config) =
+        markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let mock = MockGitHubClient;
+
+    let offline =
+        github::sync_from_refs::<MockGitHubClient>(db.storage.connection(), &root, None, true)
+            .unwrap();
+    assert!(offline.offline);
+    assert_eq!(offline.discovered_refs, 1);
+    assert_eq!(offline.synced_items, 0);
+
+    let report =
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+    assert!(!report.offline);
+    assert_eq!(report.discovered_refs, 1);
+    assert_eq!(report.synced_items, 5);
+    assert_eq!(report.status.issues, 1);
+    assert_eq!(report.status.comments, 1);
+    assert_eq!(report.status.pulls, 1);
+    assert_eq!(report.status.reviews, 1);
+    assert_eq!(report.status.review_comments, 1);
+
+    let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+    assert_eq!(issue_hits.len(), 1);
+    assert_eq!(issue_hits[0].classification, "decision");
+    assert_eq!(issue_hits[0].evidence_kind, "historical_github");
+
+    let refs = db.github_refs_for_path("docs/search.md", 10).unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].source_kind, "file");
+
+    let rationale = db.rationale_search("risk", 10).unwrap();
+    assert!(rationale.iter().any(|item| item.classification == "risk"));
+    let issue_ref_rationale = db.rationale_search("Fixes #42", 10).unwrap();
+    assert_eq!(issue_ref_rationale.first().map(|item| item.number), Some(42));
+    assert_eq!(
+        issue_ref_rationale.first().map(|item| item.evidence_kind),
+        Some("literal_github_ref")
+    );
+    assert_eq!(issue_ref_rationale.first().map(|item| item.score), Some(1.0));
+    assert!(
+        issue_ref_rationale.iter().any(|item| item.number == 42),
+        "issue ref rationale should use structured GitHub refs: {issue_ref_rationale:?}"
+    );
+
+    let chunk_id = first_chunk_id(&db);
+    let papertrail = db.papertrail_for_chunk(chunk_id, 10).unwrap().unwrap();
+    assert!(papertrail.current_source.is_some());
+    assert!(!papertrail.github_evidence.is_empty());
+    assert!(
+        papertrail.github_evidence.iter().all(|item| {
+            matches!(item.evidence_kind, "historical_github" | "literal_github_ref")
+        })
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn papertrail_for_commit_prefers_commit_sourced_github_refs() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("docs")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+    fs::write(root.join("docs/search.md"), "# Decision\nalpha\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Fix search rationale", "-m", "Fixes #42"]);
+
+    let config = markdown_config_for_root(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let commit = db
+        .storage
+        .connection()
+        .query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get::<_, String>(0))
+        .unwrap();
+    let mock = MockGitHubClient;
+    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+
+    let papertrail = db.papertrail_for_commit(&commit[..7], 10).unwrap();
+    assert_eq!(papertrail.github_evidence.first().map(|item| item.number), Some(42));
+    assert_eq!(
+        papertrail.github_evidence.first().map(|item| item.evidence_kind),
+        Some("literal_github_ref")
+    );
+    assert!(
+        papertrail.fallback_github_evidence.is_empty(),
+        "structured commit refs should suppress noisy fallback evidence: {papertrail:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "// First rationale (#42)\n// Second rationale (#42)\npub fn tracked_symbol() {}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let mock = MockGitHubClient;
+    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+    let papertrail = db
+        .papertrail_for_symbol("tracked_symbol", Some(Language::Rust), 10)
+        .unwrap()
+        .expect("tracked symbol papertrail");
+
+    assert_eq!(
+        papertrail
+            .github_evidence
+            .iter()
+            .filter(|item| item.number == 42 && item.item_kind == "issue")
+            .count(),
+        1,
+        "duplicate #42 refs in one file should collapse to one issue evidence row: {papertrail:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
+    let (root, config) = markdown_config(
+        "# Decision\nRefs cq27-dev/rag-rat#42 and cq27-dev/rag-rat#404\nwe will keep sqlite\n",
+    );
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let mock = PartiallyFailingGitHubClient;
+
+    let report =
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+    assert_eq!(report.discovered_refs, 2);
+    assert_eq!(report.synced_items, 5);
+    assert_eq!(report.failed_refs, 1);
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].number, 404);
+    assert_eq!(report.errors[0].status, "not_found");
+
+    let issue_hits = db.github_issue_search("sqlite", 10).unwrap();
+    assert_eq!(issue_hits.len(), 1);
+    assert_eq!(issue_hits[0].number, 42);
+
+    let second =
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+    assert_eq!(second.synced_items, 0);
+    assert_eq!(second.skipped_refs, 2);
+    assert_eq!(second.failed_refs, 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_recovers_when_fts_is_marked_dirty() {
+    let (root, config) = markdown_config("alpha token");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.mark_fts_dirty().unwrap();
+
+    let dirty = db.status(&config.database).unwrap();
+    assert!(dirty.fts_dirty);
+    assert!(!dirty.fts_fresh);
+
+    let hits = db.search("alpha", 10, false).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].summary, "alpha token");
+    let fresh = db.status(&config.database).unwrap();
+    assert!(!fresh.fts_dirty);
+    assert!(fresh.fts_fresh);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn read_chunk_relocates_small_line_drift_to_current_text() {
+    let (root, config) = markdown_config("# Title\nalpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let chunk_id = first_chunk_id(&db);
+    fs::write(root.join("docs/search.md"), "inserted\n# Title\nalpha token\n").unwrap();
+
+    let chunk = db.read_chunk(chunk_id).unwrap().unwrap();
+    assert_eq!(chunk.start_line, 2);
+    assert_eq!(chunk.end_line, 3);
+    assert_eq!(chunk.text, "# Title\nalpha token\n");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn read_chunk_large_drift_reindexes_and_reports_stale_chunk() {
+    let (root, config) = markdown_config("# Title\nalpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let chunk_id = first_chunk_id(&db);
+    fs::write(root.join("docs/search.md"), "# Replacement\nbeta token\n").unwrap();
+
+    let err = db.read_chunk(chunk_id).unwrap_err().to_string();
+    assert!(err.contains("StaleChunk"), "{err}");
+    let hits = db.search("beta", 10, false).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(db.search("alpha", 10, false).unwrap().is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_retries_after_healing_stale_hit() {
+    let (root, config) = markdown_config("# Title\nalpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    fs::write(root.join("docs/search.md"), "# Title\nbeta token\n").unwrap();
+
+    let hits = db.search("alpha", 10, false).unwrap();
+    assert!(hits.is_empty());
+    let beta_hits = db.search("beta", 10, false).unwrap();
+    assert_eq!(beta_hits.len(), 1);
+    assert!(beta_hits[0].summary.contains("beta"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_heals_relocated_hits_before_returning_line_spans() {
+    let (root, config) = markdown_config("# Title\nalpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    fs::write(root.join("docs/search.md"), "inserted\n# Title\nalpha token\n").unwrap();
+
+    let hits = db.search("alpha", 10, false).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].start_line, 2);
+    assert_eq!(hits[0].end_line, 3);
+    assert!(hits[0].summary.contains("alpha"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn read_chunk_deleted_source_reports_gone() {
+    let (root, config) = markdown_config("# Title\nalpha token\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let chunk_id = first_chunk_id(&db);
+    fs::remove_file(root.join("docs/search.md")).unwrap();
+
+    let err = db.read_chunk(chunk_id).unwrap_err().to_string();
+    assert!(err.contains("Gone"), "{err}");
+    assert!(db.search("alpha", 10, false).unwrap().is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_returns_needs_reindex_when_heal_cap_is_exceeded() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    for index in 0..=MAX_AUTO_HEAL_FILES_PER_CALL {
+        fs::write(docs.join(format!("doc-{index}.md")), "common stale token\n").unwrap();
+    }
+    let config = markdown_config_for_root(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    for index in 0..=MAX_AUTO_HEAL_FILES_PER_CALL {
+        fs::write(docs.join(format!("doc-{index}.md")), "fresh replacement token\n").unwrap();
+    }
+
+    let err = db.search("common", 20, false).unwrap_err().to_string();
+    assert!(err.contains("needs_reindex"), "{err}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn heal_index_limit_does_not_warn_when_only_fresh_files_are_skipped() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("one.md"), "one fresh token\n").unwrap();
+    fs::write(docs.join("two.md"), "two fresh token\n").unwrap();
+    let config = markdown_config_for_root(root.clone());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let report = db.heal_index(Some(1)).unwrap();
+
+    assert_eq!(report.healed_files, 0);
+    assert_eq!(report.removed_files, 0);
+    assert_eq!(report.skipped_files, 2);
+    assert_eq!(report.message, None);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_recovers_when_fts_revision_is_stale() {
+    let (root, config) = markdown_config("alpha token");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.set_meta("fts_source_revision", "stale").unwrap();
+
+    let stale = db.status(&config.database).unwrap();
+    assert!(!stale.fts_dirty);
+    assert!(!stale.fts_fresh);
+
+    let hits = db.search("alpha", 10, false).unwrap();
+    assert_eq!(hits.len(), 1);
+    let fresh = db.status(&config.database).unwrap();
+    assert_eq!(fresh.fts_source_revision.as_deref(), Some(fresh.content_revision.as_str()));
+    assert!(fresh.fts_fresh);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parser_failures_report_paths() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("broken.rs"), "pub fn broken(").unwrap();
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let status = db.status(&config.database).unwrap();
+    assert_eq!(status.parser_failures, 1);
+    assert_eq!(status.parser_failure_paths[0].path, "src/broken.rs");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repo_memory_bound_to_logical_symbol_surfaces_in_symbol_chunk_and_impact() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "#[cfg(unix)]\npub fn cfg_helper() {}\n#[cfg(windows)]\npub fn cfg_helper() {}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("cfg_helper".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+    let logical_symbol_id = symbol.logical_symbol_id.expect("logical symbol id");
+
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "Treat cfg helper variants as one logical helper".to_string(),
+            body: "Caller and impact analysis should use the logical symbol, not one cfg body \
+                   variant."
+                .to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec!["cfg".to_string(), "graph".to_string()],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: Some(logical_symbol_id),
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+    assert!(!created.duplicate);
+    assert_eq!(created.memory.bindings[0].binding_kind, "logical_symbol");
+
+    let memories = db.memory_for_symbol(&symbol, 10).unwrap();
+    assert_eq!(memories.len(), 1);
+    assert_eq!(memories[0].kind, "Invariant");
+    let chunk_id = memories[0].bindings[0].chunk_id.expect("bound chunk");
+    let chunk = db.read_chunk(chunk_id).unwrap().expect("memory chunk");
+    assert_eq!(chunk.memories.len(), 1);
+    assert_eq!(chunk.memories[0].memory_id, created.memory.memory_id);
+
+    let impact = db
+        .impact_surface_report_for_selected_symbol(
+            &symbol,
+            10,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(impact.repo_memories.direct.len(), 1);
+    assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
+    assert_eq!(impact.completeness_and_caveats.memory_status.stale, 0);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repo_memory_survives_reindex_and_relocates_when_symbol_moves() {
+    // The user-facing guarantee: a memory is never lost to reindexing (no FK cascade from
+    // symbols/chunks), and a symbol binding re-anchors to the symbol's new location when the
+    // file is edited/moved rather than going stale.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn keystone() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("keystone".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol");
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: "keystone holds an invariant".to_string(),
+            body: "This memory must survive a reindex and follow the symbol when it moves."
+                .to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                symbol_id: Some(symbol.symbol_id),
+                logical_symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+
+    // Edit the file so keystone moves down (new symbol ids on reindex), then rebuild.
+    fs::write(root.join("src/lib.rs"), "pub fn added_above() {}\n\npub fn keystone() {}\n")
+        .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Memory row survives the reindex (no cascade from deleted symbols).
+    assert!(
+        crate::query::memory::memory_by_id(db.storage.connection(), &created.memory.memory_id,)
+            .unwrap()
+            .is_some(),
+        "memory was lost to reindex",
+    );
+
+    // Re-validation re-anchors the binding to keystone's new location, not "gone".
+    db.memory_validate().unwrap();
+    let symbol = db.select_symbol(&selector).unwrap().unwrap().expect("symbol after move");
+    let anchored = db.memory_for_symbol(&symbol, 10).unwrap();
+    assert_eq!(anchored.len(), 1, "memory did not re-anchor to moved symbol");
+    assert_ne!(anchored[0].bindings[0].anchor_status, "gone");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repo_memory_validate_marks_changed_or_missing_anchors_non_current() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchored_memory() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let symbol = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("anchored_memory".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected symbol");
+    let chunk_id = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT chunks.id
+                FROM chunks
+                JOIN files ON files.id = chunks.file_id
+                WHERE files.path = ?1 AND chunks.symbol_path = ?2
+                LIMIT 1
+                ",
+            params![symbol.path, symbol.qualified_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let created = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "Anchor must become stale when source hash changes".to_string(),
+            body: "Validation should separate stale memories from current repo evidence."
+                .to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: None,
+                symbol_id: None,
+                chunk_id: Some(chunk_id),
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+
+    db.storage
+        .connection()
+        .execute("UPDATE chunks SET text_hash = 'changed' WHERE id = ?1", [chunk_id])
+        .unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.stale, 1);
+    let stale = db.memory_for_symbol(&symbol, 10).unwrap();
+    assert_eq!(stale[0].memory_id, created.memory.memory_id);
+    assert_eq!(stale[0].bindings[0].anchor_status, "stale");
+
+    db.storage.connection().execute("DELETE FROM chunks WHERE id = ?1", [chunk_id]).unwrap();
+    let report = db.memory_validate().unwrap();
+    assert_eq!(report.gone, 1);
+    let gone = db.memory_for_symbol(&symbol, 10).unwrap();
+    assert_eq!(gone[0].bindings[0].anchor_status, "gone");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repo_memory_bound_to_edge_surfaces_when_impact_crosses_call_path() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn target_edge() {}\npub fn caller_edge() {\n    target_edge();\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let target = db
+        .select_symbol(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("target_edge".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .unwrap()
+        .expect("selected target");
+    let graph_options = crate::query::graph::GraphTraversalOptions {
+        resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+        symbol_id: Some(target.symbol_id),
+        logical_symbol_id: target.logical_symbol_id,
+        ..Default::default()
+    };
+    let callers =
+        db.graph_traversal_report("find_callers", &target, true, 10, &graph_options).unwrap();
+    let edge_id = callers.results[0].edge_id;
+
+    let edge_memory = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "Risk".to_string(),
+            title: "caller_edge to target_edge must stay synchronous".to_string(),
+            body: "This specific call path is used to prove edge-bound memories surface when \
+                   impact crosses the edge."
+                .to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec!["edge".to_string()],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: None,
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: Some(edge_id),
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: None,
+                end_logical_symbol_id: None,
+                edge_sequence_hash: None,
+                path_summary: None,
+            },
+        })
+        .unwrap();
+    assert_eq!(edge_memory.memory.bindings[0].binding_kind, "edge");
+    assert_eq!(edge_memory.memory.bindings[0].edge_id, Some(edge_id));
+
+    let impact = db
+        .impact_surface_report_for_selected_symbol(
+            &target,
+            10,
+            &crate::query::impact::ImpactSurfaceOptions {
+                resolution_mode: crate::query::graph::GraphResolutionMode::Exact,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(impact.repo_memories.direct.is_empty());
+    assert_eq!(impact.repo_memories.path_crossed.len(), 1);
+    assert_eq!(impact.repo_memories.path_crossed[0].memory_id, edge_memory.memory.memory_id);
+    assert_eq!(impact.completeness_and_caveats.memory_status.active, 1);
+
+    let call_path_memory = db
+        .memory_create(crate::query::memory::RepoMemoryCreate {
+            kind: "TestExpectation".to_string(),
+            title: "caller_edge path hash recall".to_string(),
+            body: "Call-path memories are addressable by a deterministic edge sequence hash."
+                .to_string(),
+            confidence: "medium".to_string(),
+            created_by: Some("test-agent".to_string()),
+            source: Some("agent".to_string()),
+            tags: vec!["call-path".to_string()],
+            bind: crate::query::memory::RepoMemoryBindTarget {
+                logical_symbol_id: None,
+                symbol_id: None,
+                chunk_id: None,
+                edge_id: None,
+                path: None,
+                start_line: None,
+                end_line: None,
+                commit_hash: None,
+                github_owner: None,
+                github_repo: None,
+                github_number: None,
+                start_logical_symbol_id: target.logical_symbol_id,
+                end_logical_symbol_id: target.logical_symbol_id,
+                edge_sequence_hash: Some("edge-sequence-test-hash".to_string()),
+                path_summary: Some("caller_edge -> target_edge".to_string()),
+            },
+        })
+        .unwrap();
+    let call_path = db.memory_for_call_path_hash("edge-sequence-test-hash", 10).unwrap();
+    assert_eq!(call_path.len(), 1);
+    assert_eq!(call_path[0].memory_id, call_path_memory.memory.memory_id);
+    assert_eq!(call_path[0].call_paths[0].path_summary, "caller_edge -> target_edge");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repo_brief_ranks_churn_and_god_module_candidates() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+    fs::write(root.join("src/stable.rs"), "pub fn stable() -> i32 { 1 }\n").unwrap();
+    fs::write(root.join("src/hot.rs"), hot_module_text(0)).unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Add initial modules"]);
+
+    for revision in 1..=3 {
+        fs::write(root.join("src/hot.rs"), hot_module_text(revision)).unwrap();
+        run_git(&root, &["add", "src/hot.rs"]);
+        run_git(&root, &["commit", "-m", "Iterate hot module"]);
+    }
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let churn = db
+        .repo_brief(crate::query::repo_brief::RepoBriefOptions {
+            mode: crate::query::repo_brief::RepoBriefMode::Churn,
+            limit: 1,
+            include_generated: false,
+            include_memories: true,
+        })
+        .unwrap();
+    assert_eq!(churn.candidates[0].path, "src/hot.rs");
+    assert_eq!(churn.candidates[0].category, "recent_churn_hotspot");
+    assert!(churn.candidates[0].score <= 1.0);
+    assert!(churn.candidates[0].metrics.commit_touch_count >= 4);
+    assert!(churn.candidates[0].why.iter().any(|reason| reason.contains("churn")));
+
+    let god_modules = db
+        .repo_brief(crate::query::repo_brief::RepoBriefOptions {
+            mode: crate::query::repo_brief::RepoBriefMode::GodModules,
+            limit: 1,
+            include_generated: false,
+            include_memories: true,
+        })
+        .unwrap();
+    assert_eq!(god_modules.candidates[0].path, "src/hot.rs");
+    assert!(god_modules.candidates[0].score <= 1.0);
+    assert!(god_modules.candidates[0].metrics.symbol_count >= 30);
+    assert!(!god_modules.candidates[0].split_hints.is_empty());
+    assert!(god_modules.candidates[0].next_tools.iter().any(|tool| tool.tool == "impact_surface"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repo_clusters_groups_cotouched_files() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src/sync")).unwrap();
+    fs::create_dir_all(root.join("src/ui")).unwrap();
+    run_git(&root, &["init"]);
+    run_git(&root, &["config", "user.name", "Rag Rat"]);
+    run_git(&root, &["config", "user.email", "rag@example.com"]);
+
+    fs::write(root.join("src/sync/actor.rs"), "pub fn sync_actor() -> i32 { 1 }\n").unwrap();
+    fs::write(root.join("src/sync/msg.rs"), "pub fn sync_msg() -> i32 { 2 }\n").unwrap();
+    fs::write(root.join("src/ui/app.rs"), "pub fn ui_app() -> i32 { 3 }\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Add modules"]);
+
+    for revision in 1..=2 {
+        fs::write(
+            root.join("src/sync/actor.rs"),
+            format!("pub fn sync_actor() -> i32 {{ {revision} }}\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/sync/msg.rs"),
+            format!("pub fn sync_msg() -> i32 {{ {} }}\n", revision + 10),
+        )
+        .unwrap();
+        run_git(&root, &["add", "src/sync/actor.rs", "src/sync/msg.rs"]);
+        run_git(&root, &["commit", "-m", "Iterate sync modules"]);
+    }
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let clusters = db
+        .repo_clusters(crate::query::clusters::RepoClustersOptions {
+            limit: 5,
+            include_generated: false,
+            include_memories: true,
+            min_cluster_size: 2,
+        })
+        .unwrap();
+
+    let sync_cluster =
+        clusters.clusters.iter().find(|cluster| cluster.name == "src/sync").expect("sync cluster");
+    assert!(sync_cluster.representative_paths.contains(&"src/sync/actor.rs".to_string()));
+    assert!(sync_cluster.representative_paths.contains(&"src/sync/msg.rs".to_string()));
+    assert!(sync_cluster.metrics.co_touch_edges >= 2);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn hot_module_text(revision: usize) -> String {
+    let mut text = String::new();
+    text.push_str("pub fn entry() -> i32 {\n");
+    for i in 0..32 {
+        text.push_str(&format!("    helper_{i}() +\n"));
+    }
+    text.push_str(&format!("    {revision}\n}}\n"));
+    for i in 0..32 {
+        text.push_str(&format!("pub fn helper_{i}() -> i32 {{ {i} }}\n"));
+    }
+    text
+}
+
+fn unique_temp_root() -> PathBuf {
+    let mut root = std::env::temp_dir();
+    let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    root.push(format!("rag-rat-schema-test-{}-{}-{suffix}", std::process::id(), now_ms()));
+    root
+}
+
+fn fixture_temp_root(fixture: &str) -> PathBuf {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let fixture_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures").join(fixture);
+    copy_fixture_dir(&fixture_root, &root);
+    root
+}
+
+fn copy_fixture_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let from_path = entry.path();
+        let to_path = to.join(entry.file_name());
+        if from_path.is_dir() {
+            copy_fixture_dir(&from_path, &to_path);
+        } else {
+            fs::copy(&from_path, &to_path).unwrap();
+        }
+    }
+}
+
+fn markdown_config(text: &str) -> (PathBuf, Config) {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("search.md"), text).unwrap();
+    let config = markdown_config_for_root(root.clone());
+    (root, config)
+}
+
+fn markdown_config_for_root(root: PathBuf) -> Config {
+    Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "markdown".to_string(),
+            language: Language::Markdown,
+            directories: vec![PathBuf::from("docs")],
+            include: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Docs,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    }
+}
+
+fn source_config(root: PathBuf, language: Language) -> Config {
+    Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: language.as_str().to_string(),
+            language,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["src/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+    }
+}
+
+fn assert_edge(db: &IndexDatabase, from: &str, to: &str, edge_kind: &str, confidence: &str) {
+    let count = db
+        .storage
+        .connection()
+        .query_row(
+            "
+                SELECT COUNT(*)
+                FROM edges
+                WHERE edge_kind = ?1
+                  AND confidence = ?2
+                  AND COALESCE(from_name, '') LIKE ?3
+                  AND to_name LIKE ?4
+                ",
+            params![edge_kind, confidence, format!("%{from}%"), format!("%{to}%")],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert!(count > 0, "missing edge {from} -[{edge_kind}/{confidence}]-> {to}");
+}
+
+#[test]
+fn rebuild_restores_durable_wal_after_bulk_build() {
+    // The bulk rebuild drops to journal_mode=MEMORY + synchronous=OFF for speed; it MUST
+    // restore durable WAL/NORMAL afterward so later writes (reconcile, the watcher) are safe.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\npub fn beta() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let journal_mode: String =
+        db.storage.connection().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+    assert_eq!(journal_mode.to_lowercase(), "wal", "rebuild must restore WAL durability");
+    let synchronous: i64 =
+        db.storage.connection().query_row("PRAGMA synchronous", [], |row| row.get(0)).unwrap();
+    assert_eq!(synchronous, 1, "synchronous must be restored to NORMAL (=1)");
+    // The index is intact and queryable after the bulk build.
+    assert!(!db.symbols("alpha", Some(Language::Rust), 10).unwrap().is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn table_count(db: &IndexDatabase, table: &str) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", [table], |row| row.get(0))
+        .unwrap()
+}
+
+fn row_count(db: &IndexDatabase, table: &str) -> i64 {
+    db.storage
+        .connection()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+        .unwrap()
+}
+
+fn chunk_columns(db: &IndexDatabase) -> Vec<String> {
+    table_columns(db, "chunks")
+}
+
+fn file_columns(db: &IndexDatabase) -> Vec<String> {
+    table_columns(db, "files")
+}
+
+fn table_columns(db: &IndexDatabase, table: &str) -> Vec<String> {
+    let mut stmt = db.storage.connection().prepare(&format!("PRAGMA table_info({table})")).unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(Result::unwrap).collect()
+}
+
+fn indexed_revision_count(db: &IndexDatabase) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM files WHERE indexed_revision != ''", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn chunk_source_revision_count(db: &IndexDatabase) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT COUNT(*) FROM chunks WHERE source_revision != ''", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn first_chunk_id(db: &IndexDatabase) -> i64 {
+    db.storage
+        .connection()
+        .query_row("SELECT id FROM chunks ORDER BY id LIMIT 1", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = Command::new("git").args(args).current_dir(root).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct MockGitHubClient;
+
+impl github::GitHubClient for MockGitHubClient {
+    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<github::GitHubIssue> {
+        Ok(github::GitHubIssue {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            html_url: format!("https://github.com/{owner}/{repo}/issues/{number}"),
+            state: "open".to_string(),
+            title: "Decision: keep sqlite".to_string(),
+            body: "We decided sqlite is required for binary size.".to_string(),
+            author: Some("octo".to_string()),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            updated_at: Some("2026-01-02T00:00:00Z".to_string()),
+            is_pull_request: true,
+        })
+    }
+
+    fn issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<github::GitHubComment>> {
+        Ok(vec![github::GitHubComment {
+            id: 4201,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            html_url: format!("https://github.com/{owner}/{repo}/issues/{number}#comment-1"),
+            body: "Rejected alternative: duckdb was too large.".to_string(),
+            author: Some("octo".to_string()),
+            created_at: Some("2026-01-01T01:00:00Z".to_string()),
+            updated_at: Some("2026-01-01T01:00:00Z".to_string()),
+        }])
+    }
+
+    fn pull(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Option<github::GitHubPullRequest>> {
+        Ok(Some(github::GitHubPullRequest {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            html_url: format!("https://github.com/{owner}/{repo}/pull/{number}"),
+            state: "open".to_string(),
+            title: "Use sqlite".to_string(),
+            body: "Constraint: normal queries must use cache only.".to_string(),
+            author: Some("octo".to_string()),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            updated_at: Some("2026-01-02T00:00:00Z".to_string()),
+            merged_at: None,
+        }))
+    }
+
+    fn pull_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<github::GitHubReview>> {
+        Ok(vec![github::GitHubReview {
+            id: 4202,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            html_url: Some(format!("https://github.com/{owner}/{repo}/pull/{number}#review")),
+            state: "COMMENTED".to_string(),
+            body: "Risk: live crawling during search would be surprising.".to_string(),
+            author: Some("reviewer".to_string()),
+            submitted_at: Some("2026-01-01T02:00:00Z".to_string()),
+        }])
+    }
+
+    fn pull_review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<github::GitHubReviewComment>> {
+        Ok(vec![github::GitHubReviewComment {
+            id: 4203,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number,
+            path: Some("docs/search.md".to_string()),
+            html_url: format!("https://github.com/{owner}/{repo}/pull/{number}#discussion"),
+            body: "No longer use obsolete duckdb rationale.".to_string(),
+            author: Some("reviewer".to_string()),
+            created_at: Some("2026-01-01T03:00:00Z".to_string()),
+            updated_at: Some("2026-01-01T03:00:00Z".to_string()),
+        }])
+    }
+}
+
+struct PartiallyFailingGitHubClient;
+
+impl github::GitHubClient for PartiallyFailingGitHubClient {
+    fn issue(&self, owner: &str, repo: &str, number: i64) -> anyhow::Result<github::GitHubIssue> {
+        if number == 404 {
+            anyhow::bail!("gh: Not Found (HTTP 404)");
+        }
+        MockGitHubClient.issue(owner, repo, number)
+    }
+
+    fn issue_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<github::GitHubComment>> {
+        MockGitHubClient.issue_comments(owner, repo, number)
+    }
+
+    fn pull(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Option<github::GitHubPullRequest>> {
+        MockGitHubClient.pull(owner, repo, number)
+    }
+
+    fn pull_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<github::GitHubReview>> {
+        MockGitHubClient.pull_reviews(owner, repo, number)
+    }
+
+    fn pull_review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> anyhow::Result<Vec<github::GitHubReviewComment>> {
+        MockGitHubClient.pull_review_comments(owner, repo, number)
+    }
+}

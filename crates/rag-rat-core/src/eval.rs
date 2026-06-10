@@ -1,13 +1,12 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Config, IndexDatabase, index::ai};
+use crate::index::ai;
+use crate::{Config, IndexDatabase};
 
 const TOP_K: usize = 10;
 
@@ -765,14 +764,11 @@ mod tests {
         let root = fixture_root();
         let config = Config::load(root.join("rag-rat.toml")).unwrap();
         IndexDatabase::rebuild(&config).unwrap();
-        let report = run(
-            &config,
-            &EvalOptions {
-                queries_path: workspace_root().join("evals/queries.toml"),
-                expected_path: workspace_root().join("evals/expected_hits.toml"),
-                update_baseline: false,
-            },
-        )
+        let report = run(&config, &EvalOptions {
+            queries_path: workspace_root().join("evals/queries.toml"),
+            expected_path: workspace_root().join("evals/expected_hits.toml"),
+            update_baseline: false,
+        })
         .unwrap();
         assert_eq!(report.metrics.stale_current_source_violations, 0);
         assert!(report.metrics.mrr_at_10 > 0.0);

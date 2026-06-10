@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use crate::{index::parser, language::Language};
+use crate::index::parser;
+use crate::language::Language;
 
 pub const MAX_STRUCTURAL_PARSE_BYTES: usize = 512_000;
 

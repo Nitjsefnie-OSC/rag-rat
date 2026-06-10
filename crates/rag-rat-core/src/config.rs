@@ -1,9 +1,7 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -207,23 +205,14 @@ fn resolve_targets(
         let kind =
             if language == Language::Markdown { TargetKind::Docs } else { TargetKind::Source };
         let name = language.as_str().to_string();
-        push_target(
-            root,
-            &mut names,
-            &mut targets,
-            ResolvedTarget {
-                include: language
-                    .simple_extensions()
-                    .iter()
-                    .map(|ext| format!("**/*.{ext}"))
-                    .collect(),
-                exclude: Vec::new(),
-                name,
-                language,
-                directories: directories.into_iter().map(PathBuf::from).collect(),
-                kind,
-            },
-        )?;
+        push_target(root, &mut names, &mut targets, ResolvedTarget {
+            include: language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect(),
+            exclude: Vec::new(),
+            name,
+            language,
+            directories: directories.into_iter().map(PathBuf::from).collect(),
+            kind,
+        })?;
     }
 
     for target in expanded {
@@ -234,21 +223,16 @@ fn resolve_targets(
             .map(TargetKind::from_str)
             .transpose()?
             .unwrap_or(TargetKind::Source);
-        push_target(
-            root,
-            &mut names,
-            &mut targets,
-            ResolvedTarget {
-                name: target.name,
-                language,
-                directories: target.directories.into_iter().map(PathBuf::from).collect(),
-                include: target.include.unwrap_or_else(|| {
-                    language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect()
-                }),
-                exclude: target.exclude.unwrap_or_default(),
-                kind,
-            },
-        )?;
+        push_target(root, &mut names, &mut targets, ResolvedTarget {
+            name: target.name,
+            language,
+            directories: target.directories.into_iter().map(PathBuf::from).collect(),
+            include: target.include.unwrap_or_else(|| {
+                language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect()
+            }),
+            exclude: target.exclude.unwrap_or_default(),
+            kind,
+        })?;
     }
 
     Ok(targets)
@@ -569,15 +553,12 @@ mod tests {
 
         let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
 
-        assert_eq!(
-            local_ai.embedding.runtime,
-            EmbeddingRuntimeConfig {
-                batch_size: 128,
-                ort_threads: Some(2),
-                omp_threads: Some(1),
-                max_embedding_chars: 5000,
-            }
-        );
+        assert_eq!(local_ai.embedding.runtime, EmbeddingRuntimeConfig {
+            batch_size: 128,
+            ort_threads: Some(2),
+            omp_threads: Some(1),
+            max_embedding_chars: 5000,
+        });
     }
 
     #[test]
@@ -602,15 +583,12 @@ mod tests {
         )
         .unwrap();
         let watch: WatchConfig = raw.watch.into();
-        assert_eq!(
-            watch,
-            WatchConfig {
-                enabled: false,
-                debounce_ms: 750,
-                max_latency_ms: 4000,
-                periodic_sweep_secs: 0,
-            }
-        );
+        assert_eq!(watch, WatchConfig {
+            enabled: false,
+            debounce_ms: 750,
+            max_latency_ms: 4000,
+            periodic_sweep_secs: 0,
+        });
     }
 
     #[test]

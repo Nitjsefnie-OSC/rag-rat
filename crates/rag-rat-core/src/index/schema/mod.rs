@@ -1,0 +1,238 @@
+mod baseline;
+mod migrations;
+pub(crate) use baseline::*;
+pub(crate) use migrations::*;
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+
+pub const LATEST_SCHEMA_VERSION: u32 = 13;
+const DIRTY_MIGRATION_ID: &str = "__dirty__";
+const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
+const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
+const MIGRATION_001_DESCRIPTION: &str =
+    "SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata";
+const MIGRATION_002_ID: &str = "002_embedding_vector_metadata";
+const MIGRATION_002_CHECKSUM: &str = "sha256:rag-rat-embedding-vector-metadata-v2";
+const MIGRATION_002_DESCRIPTION: &str =
+    "Add embedding model dimension metadata and per-vector dimensions for hybrid vector search";
+const MIGRATION_003_ID: &str = "003_derived_artifact_reconcile_metadata";
+const MIGRATION_003_CHECKSUM: &str = "sha256:rag-rat-derived-artifact-reconcile-metadata-v3";
+const MIGRATION_003_DESCRIPTION: &str = "Add model version, retry metadata, summaries, and \
+                                         reconcile meta for diff-based derived artifact \
+                                         reconciliation";
+const MIGRATION_004_ID: &str = "004_edge_source_target_spans";
+const MIGRATION_004_CHECKSUM: &str = "sha256:rag-rat-edge-source-target-spans-v4";
+const MIGRATION_004_DESCRIPTION: &str =
+    "Add exact source call-site spans and resolved target line spans to graph edges";
+const MIGRATION_005_ID: &str = "005_edge_evidence_and_resolution";
+const MIGRATION_005_CHECKSUM: &str = "sha256:rag-rat-edge-evidence-resolution-v5";
+const MIGRATION_005_DESCRIPTION: &str =
+    "Add raw graph edge evidence, receiver hints, qualified targets, and resolution reasons";
+const MIGRATION_006_ID: &str = "006_embedding_policy_and_input_hash";
+const MIGRATION_006_CHECKSUM: &str = "sha256:rag-rat-embedding-policy-input-hash-v6";
+const MIGRATION_006_DESCRIPTION: &str = "Add embedding eligibility policy, priority, bounded \
+                                         input hash, and reconcile throughput metadata";
+const MIGRATION_007_ID: &str = "007_logical_symbol_groups";
+const MIGRATION_007_CHECKSUM: &str = "sha256:rag-rat-logical-symbol-groups-v7";
+const MIGRATION_007_DESCRIPTION: &str =
+    "Add logical symbol groups for cfg variants and duplicate definitions";
+const MIGRATION_008_ID: &str = "008_commit_addressable_worktrees";
+const MIGRATION_008_CHECKSUM: &str = "sha256:rag-rat-commit-addressable-worktrees-v8";
+const MIGRATION_008_DESCRIPTION: &str =
+    "Add commit_sha and worktree_id to files table for multi-worktree / multi-branch support";
+const MIGRATION_009_ID: &str = "009_github_ref_sync_state";
+const MIGRATION_009_CHECKSUM: &str = "sha256:rag-rat-github-ref-sync-state-v9";
+const MIGRATION_009_DESCRIPTION: &str =
+    "Add per-GitHub-ref sync state for resumable papertrail cache updates";
+const MIGRATION_010_ID: &str = "010_symbol_facts";
+const MIGRATION_010_CHECKSUM: &str = "sha256:rag-rat-symbol-facts-v10";
+const MIGRATION_010_DESCRIPTION: &str =
+    "Add normalized symbol facts for parsed language metadata such as Rust attributes";
+const MIGRATION_011_ID: &str = "011_repo_memories";
+const MIGRATION_011_CHECKSUM: &str = "sha256:rag-rat-repo-memories-v11";
+const MIGRATION_011_DESCRIPTION: &str =
+    "Add source-anchored repo memories bound to symbols, chunks, paths, and papertrail refs";
+const MIGRATION_012_ID: &str = "012_repo_memory_call_paths";
+const MIGRATION_012_CHECKSUM: &str = "sha256:rag-rat-repo-memory-call-paths-v12";
+const MIGRATION_012_DESCRIPTION: &str =
+    "Add edge and call-path memory bindings for graph traversal surfacing";
+const MIGRATION_013_ID: &str = "013_graph_file_lookup_indexes";
+const MIGRATION_013_CHECKSUM: &str = "sha256:rag-rat-graph-file-lookup-indexes-v13";
+const MIGRATION_013_DESCRIPTION: &str =
+    "Add graph file lookup indexes for ownership clustering and file-level graph summaries";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaState {
+    Missing,
+    Compatible,
+    Older,
+    Newer,
+    Dirty,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedMigration {
+    pub id: String,
+    pub applied_at_ms: i64,
+    pub checksum: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaStatus {
+    pub state: SchemaState,
+    pub current_version: u32,
+    pub latest_version: u32,
+    pub migrations: Vec<AppliedMigration>,
+    pub message: String,
+}
+
+pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS schema_version(
+            id TEXT PRIMARY KEY,
+            applied_at_ms INTEGER NOT NULL,
+            checksum TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        ",
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_version(id, applied_at_ms, checksum, description)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![DIRTY_MIGRATION_ID, now_ms(), "", "partial migration in progress"],
+    )?;
+    let result = apply_baseline(conn);
+    if let Err(err) = result {
+        let _ = conn.execute("UPDATE schema_version SET description = ?2 WHERE id = ?1", params![
+            DIRTY_MIGRATION_ID,
+            format!("partial migration failed: {err}")
+        ]);
+        return Err(err);
+    }
+    conn.execute("DELETE FROM schema_version WHERE id = ?1", [DIRTY_MIGRATION_ID])?;
+    record_migration(conn, MIGRATION_001_ID, MIGRATION_001_CHECKSUM, MIGRATION_001_DESCRIPTION)?;
+    apply_embedding_vector_metadata(conn)?;
+    record_migration(conn, MIGRATION_002_ID, MIGRATION_002_CHECKSUM, MIGRATION_002_DESCRIPTION)?;
+    apply_derived_artifact_reconcile_metadata(conn)?;
+    record_migration(conn, MIGRATION_003_ID, MIGRATION_003_CHECKSUM, MIGRATION_003_DESCRIPTION)?;
+    apply_edge_source_target_spans(conn)?;
+    record_migration(conn, MIGRATION_004_ID, MIGRATION_004_CHECKSUM, MIGRATION_004_DESCRIPTION)?;
+    apply_edge_evidence_and_resolution(conn)?;
+    record_migration(conn, MIGRATION_005_ID, MIGRATION_005_CHECKSUM, MIGRATION_005_DESCRIPTION)?;
+    apply_embedding_policy_and_input_hash(conn)?;
+    record_migration(conn, MIGRATION_006_ID, MIGRATION_006_CHECKSUM, MIGRATION_006_DESCRIPTION)?;
+    apply_logical_symbol_groups(conn)?;
+    record_migration(conn, MIGRATION_007_ID, MIGRATION_007_CHECKSUM, MIGRATION_007_DESCRIPTION)?;
+    apply_commit_addressable_worktrees(conn)?;
+    record_migration(conn, MIGRATION_008_ID, MIGRATION_008_CHECKSUM, MIGRATION_008_DESCRIPTION)?;
+    apply_github_ref_sync(conn)?;
+    record_migration(conn, MIGRATION_009_ID, MIGRATION_009_CHECKSUM, MIGRATION_009_DESCRIPTION)?;
+    apply_symbol_facts(conn)?;
+    record_migration(conn, MIGRATION_010_ID, MIGRATION_010_CHECKSUM, MIGRATION_010_DESCRIPTION)?;
+    apply_repo_memories(conn)?;
+    record_migration(conn, MIGRATION_011_ID, MIGRATION_011_CHECKSUM, MIGRATION_011_DESCRIPTION)?;
+    apply_repo_memory_call_paths(conn)?;
+    record_migration(conn, MIGRATION_012_ID, MIGRATION_012_CHECKSUM, MIGRATION_012_DESCRIPTION)?;
+    apply_graph_file_lookup_indexes(conn)?;
+    record_migration(conn, MIGRATION_013_ID, MIGRATION_013_CHECKSUM, MIGRATION_013_DESCRIPTION)?;
+    Ok(())
+}
+
+pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
+    if !table_exists(conn, "schema_version")? {
+        let has_legacy_tables = table_exists(conn, "files")? || table_exists(conn, "chunks")?;
+        return Ok(if has_legacy_tables {
+            SchemaStatus {
+                state: SchemaState::Older,
+                current_version: 0,
+                latest_version: LATEST_SCHEMA_VERSION,
+                migrations: Vec::new(),
+                message: "legacy index schema has no schema_version table; run `rag-rat migrate` \
+                          or rebuild the derived index with `rag-rat index --full`"
+                    .to_string(),
+            }
+        } else {
+            SchemaStatus {
+                state: SchemaState::Missing,
+                current_version: 0,
+                latest_version: LATEST_SCHEMA_VERSION,
+                migrations: Vec::new(),
+                message: "index schema is not initialized; run `rag-rat migrate` or build the \
+                          derived index with `rag-rat index --full`"
+                    .to_string(),
+            }
+        });
+    }
+
+    let migrations = applied_migrations(conn)?;
+    if migrations.iter().any(|migration| migration.id == DIRTY_MIGRATION_ID) {
+        return Ok(SchemaStatus {
+            state: SchemaState::Dirty,
+            current_version: known_version(&migrations),
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "dirty or partial schema migration detected; rebuild the derived index with \
+                      `rag-rat index --full`"
+                .to_string(),
+        });
+    }
+    if migrations.iter().any(migration_checksum_mismatch) {
+        return Ok(SchemaStatus {
+            state: SchemaState::Dirty,
+            current_version: known_version(&migrations),
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "schema migration checksum mismatch; refusing to open, rebuild the derived \
+                      index with `rag-rat index --full`"
+                .to_string(),
+        });
+    }
+    if migrations.iter().any(|migration| !known_migration(&migration.id)) {
+        return Ok(SchemaStatus {
+            state: SchemaState::Newer,
+            current_version: known_version(&migrations),
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "index schema was created by a newer rag-rat; refusing to open".to_string(),
+        });
+    }
+    let current_version = known_version(&migrations);
+    if current_version < LATEST_SCHEMA_VERSION {
+        return Ok(SchemaStatus {
+            state: SchemaState::Older,
+            current_version,
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message: "index schema is older than this rag-rat; run `rag-rat migrate` or rebuild \
+                      the derived index with `rag-rat index --full`"
+                .to_string(),
+        });
+    }
+    Ok(SchemaStatus {
+        state: SchemaState::Compatible,
+        current_version,
+        latest_version: LATEST_SCHEMA_VERSION,
+        migrations,
+        message: "schema is compatible".to_string(),
+    })
+}
+
+pub fn check_compatible(conn: &Connection) -> anyhow::Result<()> {
+    let status = status(conn)?;
+    match status.state {
+        SchemaState::Compatible => Ok(()),
+        SchemaState::Missing => {
+            anyhow::bail!(
+                "{}",
+                "index schema is not initialized; run `rag-rat migrate`, `rag-rat index`, or \
+                 `rag-rat index --full`"
+            )
+        },
+        SchemaState::Older => anyhow::bail!("{}", status.message),
+        SchemaState::Newer => anyhow::bail!("{}", status.message),
+        SchemaState::Dirty => anyhow::bail!("{}", status.message),
+    }
+}
