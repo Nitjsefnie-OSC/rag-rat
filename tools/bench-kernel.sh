@@ -69,26 +69,26 @@ print(f"{seconds} {rss_kb}")
 PY
 read -r seconds rss_kb < "$WORK/measure.txt"
 
-# True indexed-file count (what landed in the DB), for throughput.
-files="$(python3 - "$WORK/kernel-index.sqlite" <<'PY'
-import sqlite3, sys
-print(sqlite3.connect(sys.argv[1]).execute("select count(*) from files").fetchone()[0])
-PY
-)"
-
-python3 - "$seconds" "$rss_kb" "$files" "$BMF_OUT" "$KERNEL_TAG" "$KERNEL_SHA" <<'PY'
-import json, sys
-seconds = float(sys.argv[1])
-rss_kb = int(sys.argv[2])
-files = int(sys.argv[3])
-out, tag, sha = sys.argv[4], sys.argv[5], sys.argv[6]
+# Read the extracted-fact counts from the DB and emit the BMF. Capturing symbols/edges/chunks (not
+# just files/s) makes the run comparable per extracted fact, not just per file — different tools
+# compute different products, so throughput alone is mush.
+python3 - "$WORK/kernel-index.sqlite" "$seconds" "$rss_kb" "$BMF_OUT" "$KERNEL_TAG" <<'PY'
+import json, sqlite3, sys
+db, seconds, rss_kb, out, tag = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+conn = sqlite3.connect(db)
+count = lambda table: conn.execute(f"select count(*) from {table}").fetchone()[0]
+files, symbols, edges, chunks = count("files"), count("symbols"), count("edges"), count("chunks")
+resolved = conn.execute("select count(*) from edges where to_symbol_id is not null").fetchone()[0]
 
 bmf = {
     # Benchmark name carries the tag so re-pinning to a newer kernel starts a distinct series.
     f"linux-kernel-{tag}/full-index": {
-        "latency": {"value": seconds * 1e9},      # nanoseconds — shares Bencher's built-in Latency measure
+        "latency": {"value": seconds * 1e9},      # nanoseconds — Bencher's built-in Latency measure
         "throughput": {"value": files / seconds}, # files per second
         "memory": {"value": rss_kb * 1024},       # peak RSS bytes
+        "symbols": {"value": symbols},
+        "edges": {"value": edges},
+        "chunks": {"value": chunks},
     }
 }
 with open(out, "w") as f:
@@ -96,7 +96,8 @@ with open(out, "w") as f:
 
 print(
     f"bench-kernel: indexed {files} files of Linux {tag} in {seconds:.1f}s "
-    f"({files/seconds:.1f} files/s, peak {rss_kb/1024:.0f} MiB) → {out}",
+    f"({files/seconds:.1f} files/s, peak {rss_kb/1024:.0f} MiB) — "
+    f"{symbols} symbols, {edges} edges ({resolved} resolved), {chunks} chunks → {out}",
     file=sys.stderr,
 )
 PY
