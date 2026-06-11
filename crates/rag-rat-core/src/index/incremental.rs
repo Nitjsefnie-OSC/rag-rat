@@ -108,11 +108,12 @@ impl IndexDatabase {
 
         // Process files in WAVES: prepare a wave in parallel, insert it, then drop the wave's
         // prepared output before preparing the next. The previous fan-in barrier materialized the
-        // prepared form (every chunk/symbol/edge-candidate/anchor) of ALL files at once — ~19 GB for
-        // the Linux kernel. Waves cap peak memory at one wave of prepared files + the accumulating
-        // symbol/edge graph (which is needed until resolution but is compact). Files stay in path
-        // order, so symbol/chunk/edge ids are assigned in exactly the same order — byte-identical
-        // output, no id remapping. Wave size is tunable via RAG_RAT_INDEX_WAVE.
+        // prepared form (every chunk/symbol/edge-candidate/anchor) of ALL files at once — ~19 GB
+        // for the Linux kernel. Waves cap peak memory at one wave of prepared files + the
+        // accumulating symbol/edge graph (which is needed until resolution but is compact).
+        // Files stay in path order, so symbol/chunk/edge ids are assigned in exactly the
+        // same order — byte-identical output, no id remapping. Wave size is tunable via
+        // RAG_RAT_INDEX_WAVE.
         let total = files.len();
         let wave_size = index_wave_size();
         let mut graph = edges::FullRebuildGraph::default();
@@ -130,7 +131,8 @@ impl IndexDatabase {
                         kind: prepared_file.file.kind,
                     });
                 }
-                // Full rebuild: skip per-row chunk_fts writes; rebuild_fts repopulates it at the end.
+                // Full rebuild: skip per-row chunk_fts writes; rebuild_fts repopulates it at the
+                // end.
                 self.insert_prepared_file(prepared_file, false, Some(&mut graph))?;
             }
             // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.

@@ -694,8 +694,8 @@ fn index_wave_size() -> usize {
         .unwrap_or(2_000)
 }
 
-/// Prepare a slice of files in parallel. `base` / `grand_total` let a caller that processes files in
-/// waves report progress against the overall total rather than the wave size (a non-waved caller
+/// Prepare a slice of files in parallel. `base` / `grand_total` let a caller that processes files
+/// in waves report progress against the overall total rather than the wave size (a non-waved caller
 /// passes `0` and `files.len()`).
 fn prepare_files_with_progress<F>(
     files: &[IndexFile],
