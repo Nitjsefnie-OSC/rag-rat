@@ -84,10 +84,14 @@ holds the API token. PR runs use `--start-point main --start-point-clone-thresho
 1. **Create the Bencher project.** On [bencher.dev](https://bencher.dev), create a project named
    `rag-rat` (must match `BENCHER_PROJECT` in the workflows). The default `ubuntu-latest` testbed
    matches `BENCHER_TESTBED`.
-2. **Add the API token as a repo secret.** Generate an API token in Bencher
-   (Account → API Tokens) and add it to the GitHub repo as `BENCHER_API_TOKEN`
-   (Settings → Secrets and variables → Actions). All three relevant jobs read it from there;
-   `GITHUB_TOKEN` for PR comments is provided automatically by Actions.
+2. **Add a project key as a repo secret.** In Bencher, create a **project API key** for the
+   `rag-rat` project (a token that starts with `bencher_run_`; project keys are scoped to one
+   project and limited to `bencher run` and other non-destructive commands). Add it to the GitHub
+   repo as the secret `BENCHER_API_TOKEN` (Settings → Secrets and variables → Actions). The
+   workflows surface it to the CLI as **`BENCHER_API_KEY`** — the `--key` auth path. Do *not* use
+   an account API token (a JWT starting with `eyJ`): the CLI would expect that under
+   `BENCHER_API_TOKEN`/`--token` and a project key fails JWT validation there. `GITHUB_TOKEN` for
+   PR comments is provided automatically by Actions.
 3. **Push to `main`.** The first `bench.yml` run seeds the baseline; subsequent PRs are gated
    against it.
 

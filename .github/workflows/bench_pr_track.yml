@@ -16,7 +16,9 @@ permissions:
 env:
   BENCHER_PROJECT: rag-rat
   BENCHER_TESTBED: ubuntu-latest
-  BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+  # The secret holds a Bencher *project key* (`bencher_run_…`) — use the --key auth path
+  # (BENCHER_API_KEY), not the account-JWT path (BENCHER_API_TOKEN). See docs/bencher.md.
+  BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
 
 jobs:
   track:

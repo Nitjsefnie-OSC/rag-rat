@@ -3,7 +3,8 @@ name: bench
 # Continuous benchmarking on main. Tracks two independent signals in Bencher:
 #   - rag_pipeline (iai-callgrind): deterministic CPU instruction counts (index + cold/warm query)
 #   - index_time  (criterion):     wall-clock full-index time
-# Requires repo secret BENCHER_API_TOKEN and a Bencher project named `rag-rat` (see docs/bencher.md).
+# Requires a Bencher project named `rag-rat` and the repo secret BENCHER_API_TOKEN holding a Bencher
+# *project key* (`bencher_run_…`), surfaced to the CLI as BENCHER_API_KEY (see docs/bencher.md).
 
 on:
   push:
@@ -19,7 +20,9 @@ concurrency:
 env:
   BENCHER_PROJECT: rag-rat
   BENCHER_TESTBED: ubuntu-latest
-  BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+  # The secret holds a Bencher *project key* (`bencher_run_…`), so it goes in BENCHER_API_KEY
+  # (the --key auth path), NOT BENCHER_API_TOKEN (which expects an account JWT and rejects a key).
+  BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
   # Must match the iai-callgrind library version in Cargo.toml.
   IAI_RUNNER_VERSION: "0.16.1"
 
