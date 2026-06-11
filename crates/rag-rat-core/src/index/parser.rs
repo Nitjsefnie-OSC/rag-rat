@@ -60,65 +60,76 @@ pub fn parser_kind(path: &Path, language: Language) -> ParserKind {
     }
 }
 
-pub fn parse_symbols(
-    path: &Path,
-    language: Language,
-    text: &str,
-) -> anyhow::Result<Vec<ParsedSymbol>> {
-    match parser_kind(path, language) {
-        ParserKind::Rust =>
-            parse_tree_sitter(path, language, text, tree_sitter_rust::LANGUAGE.into()),
-        ParserKind::TypeScript => parse_tree_sitter(
-            path,
-            language,
-            text,
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        ),
-        ParserKind::Tsx =>
-            parse_tree_sitter(path, language, text, tree_sitter_typescript::LANGUAGE_TSX.into()),
-        ParserKind::Kotlin =>
-            parse_tree_sitter(path, language, text, tree_sitter_kotlin::LANGUAGE.into()),
-        ParserKind::C => parse_tree_sitter(path, language, text, tree_sitter_c::LANGUAGE.into()),
-        ParserKind::Cpp =>
-            parse_tree_sitter(path, language, text, tree_sitter_cpp::LANGUAGE.into()),
-        ParserKind::Markdown => Ok(Vec::new()),
-    }
-}
+const PARSE_ERROR_MESSAGE: &str =
+    "tree-sitter parse produced error nodes; partial structural index was retained";
 
-pub fn parse_error(path: &Path, language: Language, text: &str) -> anyhow::Result<Option<String>> {
-    let grammar = match parser_kind(path, language) {
+fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
+    Some(match kind {
         ParserKind::Rust => tree_sitter_rust::LANGUAGE.into(),
         ParserKind::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         ParserKind::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         ParserKind::Kotlin => tree_sitter_kotlin::LANGUAGE.into(),
         ParserKind::C => tree_sitter_c::LANGUAGE.into(),
         ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        ParserKind::Markdown => return Ok(None),
-    };
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar)?;
-    let tree =
-        parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
-    Ok(tree.root_node().has_error().then(|| {
-        "tree-sitter parse produced error nodes; partial structural index was retained".to_string()
-    }))
+        ParserKind::Markdown => return None,
+    })
 }
 
-fn parse_tree_sitter(
+/// A single tree-sitter parse of a file plus everything derived directly from the tree. The
+/// full-rebuild prepare phase parses each file ONCE through this and feeds the tree to chunking,
+/// symbols, and edges — instead of re-parsing the same file 4× (parse_error + chunker + symbols +
+/// edges). `tree` is kept so callers can walk it (e.g. edge extraction) without re-parsing.
+pub struct ParsedFile {
+    tree: tree_sitter::Tree,
+    pub symbols: Vec<ParsedSymbol>,
+    pub has_error: bool,
+}
+
+impl ParsedFile {
+    pub fn root(&self) -> Node<'_> {
+        self.tree.root_node()
+    }
+
+    /// The parse-error message shape used historically by `parse_error`, or `None` if clean.
+    pub fn parser_failure(&self) -> Option<String> {
+        self.has_error.then(|| PARSE_ERROR_MESSAGE.to_string())
+    }
+}
+
+/// Parse `text` once and collect its symbols. Returns `None` for languages without a structural
+/// grammar (markdown) or if the parse fails outright.
+pub fn parse_file(path: &Path, language: Language, text: &str) -> Option<ParsedFile> {
+    let grammar = grammar_for(parser_kind(path, language))?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(text, None)?;
+    let mut symbols = Vec::new();
+    collect_symbols(path, language, text, tree.root_node(), &mut symbols);
+    symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
+    symbols.dedup_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.name.clone()));
+    let has_error = tree.root_node().has_error();
+    Some(ParsedFile { tree, symbols, has_error })
+}
+
+pub fn parse_symbols(
     path: &Path,
     language: Language,
     text: &str,
-    grammar: tree_sitter::Language,
 ) -> anyhow::Result<Vec<ParsedSymbol>> {
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar)?;
-    let tree =
-        parser.parse(text, None).ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
-    let mut out = Vec::new();
-    collect_symbols(path, language, text, tree.root_node(), &mut out);
-    out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
-    out.dedup_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.name.clone()));
-    Ok(out)
+    match parse_file(path, language, text) {
+        Some(parsed) => Ok(parsed.symbols),
+        // Markdown (no grammar) yields no symbols; a hard parse failure is the error case.
+        None if parser_kind(path, language) == ParserKind::Markdown => Ok(Vec::new()),
+        None => Err(anyhow::anyhow!("tree-sitter parse failed")),
+    }
+}
+
+pub fn parse_error(path: &Path, language: Language, text: &str) -> anyhow::Result<Option<String>> {
+    match parse_file(path, language, text) {
+        Some(parsed) => Ok(parsed.parser_failure()),
+        None if parser_kind(path, language) == ParserKind::Markdown => Ok(None),
+        None => Err(anyhow::anyhow!("tree-sitter parse failed")),
+    }
 }
 
 fn collect_symbols(
@@ -315,8 +326,10 @@ fn make_symbol(
 ) -> ParsedSymbol {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
-    let start_line = byte_to_line(text, start_byte);
-    let end_line = byte_to_line(text, end_byte);
+    // tree-sitter already computed each node's 1-based line span during the parse — read it off the
+    // node (O(1) struct field) instead of rescanning the file text for newlines. `row` is 0-based.
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
     ParsedSymbol {
         qualified_name: format!("{}::{name}", path.to_string_lossy().replace('\\', "/")),
         name,
@@ -380,9 +393,6 @@ fn node_text(node: Node<'_>, text: &str) -> Option<String> {
     node.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned)
 }
 
-fn byte_to_line(text: &str, byte: usize) -> usize {
-    text[..byte.min(text.len())].bytes().filter(|byte| *byte == b'\n').count() + 1
-}
 
 fn signature_for(text: &str, start_byte: usize, end_byte: usize) -> Option<String> {
     text.get(start_byte..end_byte)?

@@ -16,27 +16,36 @@ pub struct Symbol {
     pub kind: String,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
     pub signature: Option<String>,
     pub docs: Option<String>,
     pub facts: Vec<SymbolFact>,
 }
 
 pub fn symbols_for_file(path: &Path, language: Language, text: &str) -> Vec<Symbol> {
-    parser::parse_symbols(path, language, text)
-        .unwrap_or_default()
-        .into_iter()
+    from_parsed(&parser::parse_symbols(path, language, text).unwrap_or_default())
+}
+
+/// Convert parser symbols into index symbols. Shared by `symbols_for_file` (inline path) and the
+/// full-rebuild prepare phase, which already has the parsed symbols from the single shared parse.
+pub fn from_parsed(parsed: &[parser::ParsedSymbol]) -> Vec<Symbol> {
+    parsed
+        .iter()
         .map(|symbol| Symbol {
-            name: symbol.name,
-            qualified_name: symbol.qualified_name,
-            kind: symbol.kind,
+            name: symbol.name.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            kind: symbol.kind.clone(),
             start_byte: symbol.start_byte,
             end_byte: symbol.end_byte,
-            signature: symbol.signature,
-            docs: symbol.docs,
+            start_line: symbol.start_line,
+            end_line: symbol.end_line,
+            signature: symbol.signature.clone(),
+            docs: symbol.docs.clone(),
             facts: symbol
                 .facts
-                .into_iter()
-                .map(|fact| SymbolFact { kind: fact.kind, value: fact.value })
+                .iter()
+                .map(|fact| SymbolFact { kind: fact.kind.clone(), value: fact.value.clone() })
                 .collect(),
         })
         .collect()

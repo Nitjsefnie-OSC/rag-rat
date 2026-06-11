@@ -89,6 +89,82 @@ pub(crate) struct IndexedSymbol {
     end_line: i64,
 }
 
+impl IndexedSymbol {
+    /// Build symbols for the parallel prepare phase, where real DB ids don't exist yet. `id` is the
+    /// symbol's index in the prepared `symbols` vec; edge candidates produced from these carry that
+    /// local index as `from_symbol_id`, which `insert_prepared_file` remaps to the real DB id once
+    /// symbols are inserted. Sorted by (start_byte, end_byte) to match `symbols_for_file`'s ORDER BY
+    /// so containing-symbol tie-breaking is identical to the inline path.
+    pub(crate) fn local_from_prepared(
+        language: Language,
+        symbols: &[crate::index::symbols::Symbol],
+    ) -> Vec<Self> {
+        let mut out = symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, symbol)| IndexedSymbol {
+                id: idx as i64,
+                file_id: 0,
+                language: language.as_str().to_string(),
+                name: symbol.name.clone(),
+                qualified_name: symbol.qualified_name.clone(),
+                kind: symbol.kind.clone(),
+                start_byte: symbol.start_byte,
+                end_byte: symbol.end_byte,
+                start_line: i64::try_from(symbol.start_line).unwrap_or(0),
+                end_line: i64::try_from(symbol.end_line).unwrap_or(0),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
+        out
+    }
+}
+
+impl EdgeCandidate {
+    /// Replace a local `from_symbol_id` (an index into the prepared symbols, as produced by
+    /// [`IndexedSymbol::local_from_prepared`]) with the real DB id from `db_ids`, indexed by the
+    /// prepared symbol's original position. A `None` from_symbol_id (file-level edge) is left alone.
+    pub(crate) fn remap_from_symbol_id(&mut self, db_ids: &[i64]) {
+        if let Some(local) = self.from_symbol_id {
+            self.from_symbol_id =
+                usize::try_from(local).ok().and_then(|index| db_ids.get(index)).copied();
+        }
+    }
+}
+
+impl IndexedSymbol {
+    /// Build an `IndexedSymbol` for a symbol that was just inserted (so it carries its real DB id),
+    /// for the full-rebuild in-memory edge resolution. Same shape `all_symbols` would return.
+    pub(crate) fn from_inserted(
+        id: i64,
+        file_id: i64,
+        language: Language,
+        symbol: &crate::index::symbols::Symbol,
+    ) -> Self {
+        IndexedSymbol {
+            id,
+            file_id,
+            language: language.as_str().to_string(),
+            name: symbol.name.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            kind: symbol.kind.clone(),
+            start_byte: symbol.start_byte,
+            end_byte: symbol.end_byte,
+            start_line: i64::try_from(symbol.start_line).unwrap_or(0),
+            end_line: i64::try_from(symbol.end_line).unwrap_or(0),
+        }
+    }
+}
+
+/// Symbols (with real DB ids) and edge candidates (with their source file id) accumulated across the
+/// full-rebuild insert loop, so edges can be resolved in memory and inserted once, fully resolved —
+/// instead of inserting them unresolved per file and then resolving with a per-edge UPDATE pass.
+#[derive(Default)]
+pub(crate) struct FullRebuildGraph {
+    pub(crate) symbols: Vec<IndexedSymbol>,
+    pub(crate) edges: Vec<(i64, EdgeCandidate)>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EdgeSpan {
     start_line: i64,

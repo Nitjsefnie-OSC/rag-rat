@@ -352,20 +352,6 @@ struct LogicalSymbolMemberRow {
     end_line: i64,
 }
 
-fn symbol_line_for_byte(
-    text: &str,
-    chunk_start_byte: usize,
-    chunk_start_line: i64,
-    byte: usize,
-) -> i64 {
-    if byte <= chunk_start_byte {
-        return chunk_start_line.max(1);
-    }
-    let local = byte.saturating_sub(chunk_start_byte).min(text.len());
-    chunk_start_line
-        + i64::try_from(text[..local].bytes().filter(|byte| *byte == b'\n').count()).unwrap_or(0)
-}
-
 fn graph_only_reason(edge: &crate::query::graph::GraphHop, current_line: Option<&str>) -> String {
     let Some(line) = current_line else {
         return "missing_current_source_line".to_string();
@@ -549,13 +535,62 @@ struct PreparedIndexFile {
     prepared: anyhow::Result<PreparedIndexContent>,
 }
 
+/// A chunk with all of its per-chunk CPU work (text hash, relocation anchor, embedding policy)
+/// precomputed in the parallel prepare phase. The serial insert stage then only steps the INSERT —
+/// no hashing on the single-threaded path.
+#[derive(Debug)]
+struct PreparedChunk {
+    chunk: Chunk,
+    text_hash: String,
+    anchor: anchors::ChunkAnchor,
+    embedding: ai::EmbeddingPolicyDecision,
+}
+
+/// Compute the per-chunk hashes / anchor / embedding policy for a file's chunks. Splits the file's
+/// lines once (anchors only read a few boundary/context lines). Shared by the parallel prepare phase
+/// and the inline incremental path, so both keep this CPU work off the serial insert stage.
+fn prepare_chunks(
+    path: &Path,
+    language: &str,
+    file_kind: &str,
+    chunks: Vec<Chunk>,
+    full_text: &str,
+) -> Vec<PreparedChunk> {
+    let full_lines = full_text.lines().collect::<Vec<_>>();
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let text_hash = hex_sha256(chunk.text.as_bytes());
+            let anchor = anchors::anchor_for_lines(
+                &chunk.text,
+                chunk.start_line,
+                chunk.end_line,
+                &full_lines,
+            );
+            let embedding = ai::embedding_policy_for_chunk(
+                path,
+                language,
+                file_kind,
+                chunk.kind,
+                chunk.symbol_path.as_deref(),
+                &chunk.text,
+                ai::DEFAULT_MAX_EMBEDDING_CHARS,
+            );
+            PreparedChunk { chunk, text_hash, anchor, embedding }
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct PreparedIndexContent {
     modified_at_ms: i64,
-    text: String,
     sha256: String,
-    chunks: Vec<Chunk>,
+    chunks: Vec<PreparedChunk>,
     symbols: Vec<Symbol>,
+    // Graph edge candidates computed here in the parallel prepare phase (their `from_symbol_id`s are
+    // local symbol indices, remapped to DB ids in insert_prepared_file). Empty for generated /
+    // oversized / markdown files. Moving this off the serial insert loop kills the duplicate parse.
+    edge_candidates: Vec<edges::EdgeCandidate>,
     parser_failure: Option<String>,
 }
 
@@ -717,29 +752,71 @@ fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexConten
     let text = fs::read_to_string(&file.full_path)?;
     let modified_at_ms = file_metadata_ms(&file.full_path)?;
     let sha256 = hex_sha256(text.as_bytes());
-    let parser_failure =
-        if file.language != Language::Markdown && file.kind != TargetKind::Generated {
-            if text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
-                None
-            } else {
-                parser::parse_error(&file.relative_path, file.language, &text)
-                    .unwrap_or_else(|err| Some(err.to_string()))
-            }
-        } else {
-            None
-        };
+
+    // ONE tree-sitter parse per file, shared by chunks + symbols + edges + the parser-failure flag,
+    // instead of re-parsing the same file four times. Only for structural (non-generated,
+    // non-markdown) code within the parse-size cap; everything else takes the line-based paths.
+    let structural_eligible = file.kind != TargetKind::Generated
+        && file.language != Language::Markdown
+        && text.len() <= chunker::MAX_STRUCTURAL_PARSE_BYTES;
+    let parsed = structural_eligible
+        .then(|| parser::parse_file(&file.relative_path, file.language, &text))
+        .flatten();
+
+    let symbols = parsed.as_ref().map(|p| symbols::from_parsed(&p.symbols)).unwrap_or_default();
+
+    // Preserve the historical failure signal: a clean parse → None, error nodes → the message, and a
+    // hard parse failure on otherwise-eligible code → an error (matches the old parse_error Err arm).
+    let parser_failure = if structural_eligible {
+        match &parsed {
+            Some(p) => p.parser_failure(),
+            None => Some("tree-sitter parse failed".to_string()),
+        }
+    } else {
+        None
+    };
+
     let chunks = if file.kind == TargetKind::Generated {
         chunker::generated_chunks_for_file(&file.relative_path, &text)
+    } else if let Some(p) = &parsed {
+        chunker::code_chunks_for_symbols(&file.relative_path, &text, &p.symbols)
     } else {
+        // Markdown, oversized, or a hard parse failure: line-based chunking, no shared tree.
         chunker::chunks_for_file(&file.relative_path, file.language, &text)
     };
-    let symbols =
-        if file.kind == TargetKind::Generated || text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
-            Vec::new()
-        } else {
-            symbols::symbols_for_file(&file.relative_path, file.language, &text)
-        };
-    Ok(PreparedIndexContent { modified_at_ms, text, sha256, chunks, symbols, parser_failure })
+    // Precompute per-chunk hashes / anchor / embedding policy here, in parallel.
+    let chunks = prepare_chunks(
+        &file.relative_path,
+        file.language.as_str(),
+        file.kind.as_str(),
+        chunks,
+        &text,
+    );
+
+    // Edge candidates walk the shared tree (no re-parse). from_symbol_id holds a local symbol index,
+    // remapped to the real DB id at insert time. Empty when there's no structural parse.
+    let edge_candidates = match &parsed {
+        Some(p) => {
+            let local = edges::IndexedSymbol::local_from_prepared(file.language, &symbols);
+            edges::edge_candidates_from_root(
+                &file.relative_path,
+                file.language,
+                &text,
+                p.root(),
+                &local,
+            )
+        },
+        None => Vec::new(),
+    };
+
+    Ok(PreparedIndexContent {
+        modified_at_ms,
+        sha256,
+        chunks,
+        symbols,
+        edge_candidates,
+        parser_failure,
+    })
 }
 
 fn discovery_plan(conn: &rusqlite::Connection, config: &Config) -> anyhow::Result<DiscoveryPlan> {

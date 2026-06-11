@@ -107,6 +107,9 @@ impl IndexDatabase {
         progress(IndexProgress::Discovered { files: files.len() });
 
         let prepared = prepare_files_with_progress(&files, progress)?;
+        // Accumulate symbols (with ids) + remapped edge candidates across the loop; resolve and
+        // insert all edges in one in-memory pass afterward (no unresolved insert, no resolve UPDATEs).
+        let mut graph = edges::FullRebuildGraph::default();
         for (index, prepared_file) in prepared.iter().enumerate() {
             let current = index + 1;
             if should_report_file_progress(current, files.len()) {
@@ -118,8 +121,10 @@ impl IndexDatabase {
                     kind: prepared_file.file.kind,
                 });
             }
-            self.insert_prepared_file(prepared_file)?;
+            // Full rebuild: skip per-row chunk_fts writes; the closing rebuild_fts repopulates it.
+            self.insert_prepared_file(prepared_file, false, Some(&mut graph))?;
         }
+        edges::resolve_and_insert_edges(self.storage.connection(), graph.symbols, graph.edges)?;
 
         Ok(files.len())
     }
@@ -208,7 +213,9 @@ impl IndexDatabase {
                 &prepared_file.file.commit_sha,
                 &prepared_file.file.worktree_id,
             )?;
-            self.insert_prepared_file(prepared_file)?;
+            // Incremental: per-file replace, so keep chunk_fts synced in place (no full rebuild_fts).
+            // No accumulator — edges are inserted unresolved here and resolved by resolve_edges.
+            self.insert_prepared_file(prepared_file, true, None)?;
         }
 
         Ok(files.len() + deleted_count)

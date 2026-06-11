@@ -430,6 +430,17 @@ pub(crate) fn apply_logical_symbol_groups(conn: &Connection) -> rusqlite::Result
     Ok(())
 }
 
+pub(crate) fn apply_symbol_line_spans(conn: &Connection) -> rusqlite::Result<()> {
+    // Carry the symbol's 1-based line span (already known at parse time) on the row itself.
+    // Before this, every reader of `symbols` (edge extraction, edge resolution, logical-symbol
+    // rebuild) recomputed start_line/end_line with a per-symbol correlated subquery against
+    // `chunks` — O(symbols × chunks) and the dominant cost of a full rebuild. DEFAULT 0 is a
+    // sentinel only for rows migrated in place; a full reindex repopulates real values.
+    add_column_if_missing(conn, "symbols", "start_line", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "symbols", "end_line", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
 pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {
     let mut stmt = conn.prepare(
         "
@@ -472,6 +483,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_013_ID => Some(13),
             MIGRATION_014_ID => Some(14),
             MIGRATION_015_ID => Some(15),
+            MIGRATION_016_ID => Some(16),
             _ => None,
         })
         .max()
@@ -496,6 +508,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_013_ID
             | MIGRATION_014_ID
             | MIGRATION_015_ID
+            | MIGRATION_016_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -517,6 +530,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_013_ID => migration.checksum != MIGRATION_013_CHECKSUM,
         MIGRATION_014_ID => migration.checksum != MIGRATION_014_CHECKSUM,
         MIGRATION_015_ID => migration.checksum != MIGRATION_015_CHECKSUM,
+        MIGRATION_016_ID => migration.checksum != MIGRATION_016_CHECKSUM,
         _ => false,
     }
 }

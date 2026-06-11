@@ -136,34 +136,7 @@ pub(crate) fn symbols_for_file(
         "
         SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, \
          symbols.qualified_name, symbols.kind,
-               symbols.start_byte, symbols.end_byte,
-               COALESCE((
-                 SELECT chunks.start_byte
-                 FROM chunks
-                 WHERE chunks.file_id = symbols.file_id
-                   AND symbols.start_byte >= chunks.start_byte
-                   AND symbols.start_byte < chunks.end_byte
-                 ORDER BY chunks.end_byte - chunks.start_byte ASC
-                 LIMIT 1
-               ), symbols.start_byte) AS chunk_start_byte,
-               COALESCE((
-                 SELECT chunks.start_line
-                 FROM chunks
-                 WHERE chunks.file_id = symbols.file_id
-                   AND symbols.start_byte >= chunks.start_byte
-                   AND symbols.start_byte < chunks.end_byte
-                 ORDER BY chunks.end_byte - chunks.start_byte ASC
-                 LIMIT 1
-               ), 1) AS chunk_start_line,
-               COALESCE((
-                 SELECT chunks.text
-                 FROM chunks
-                 WHERE chunks.file_id = symbols.file_id
-                   AND symbols.start_byte >= chunks.start_byte
-                   AND symbols.start_byte < chunks.end_byte
-                 ORDER BY chunks.end_byte - chunks.start_byte ASC
-                 LIMIT 1
-               ), '') AS chunk_text
+               symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line
         FROM symbols
         WHERE file_id = ?1
         ORDER BY symbols.start_byte, symbols.end_byte
@@ -177,34 +150,7 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
         "
         SELECT symbols.id, symbols.file_id, symbols.language, symbols.name, \
          symbols.qualified_name, symbols.kind,
-               symbols.start_byte, symbols.end_byte,
-               COALESCE((
-                 SELECT chunks.start_byte
-                 FROM chunks
-                 WHERE chunks.file_id = symbols.file_id
-                   AND symbols.start_byte >= chunks.start_byte
-                   AND symbols.start_byte < chunks.end_byte
-                 ORDER BY chunks.end_byte - chunks.start_byte ASC
-                 LIMIT 1
-               ), symbols.start_byte) AS chunk_start_byte,
-               COALESCE((
-                 SELECT chunks.start_line
-                 FROM chunks
-                 WHERE chunks.file_id = symbols.file_id
-                   AND symbols.start_byte >= chunks.start_byte
-                   AND symbols.start_byte < chunks.end_byte
-                 ORDER BY chunks.end_byte - chunks.start_byte ASC
-                 LIMIT 1
-               ), 1) AS chunk_start_line,
-               COALESCE((
-                 SELECT chunks.text
-                 FROM chunks
-                 WHERE chunks.file_id = symbols.file_id
-                   AND symbols.start_byte >= chunks.start_byte
-                   AND symbols.start_byte < chunks.end_byte
-                 ORDER BY chunks.end_byte - chunks.start_byte ASC
-                 LIMIT 1
-               ), '') AS chunk_text
+               symbols.start_byte, symbols.end_byte, symbols.start_line, symbols.end_line
         FROM symbols
         ORDER BY symbols.qualified_name
         ",
@@ -215,11 +161,6 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
 pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
     let start_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
     let end_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0);
-    let chunk_start_byte = usize::try_from(row.get::<_, i64>(8)?).unwrap_or(start_byte);
-    let chunk_start_line = row.get::<_, i64>(9)?;
-    let chunk_text: String = row.get(10)?;
-    let start_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, start_byte);
-    let end_line = line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, end_byte);
     Ok(IndexedSymbol {
         id: row.get(0)?,
         file_id: row.get(1)?,
@@ -229,8 +170,8 @@ pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSym
         kind: row.get(5)?,
         start_byte,
         end_byte,
-        start_line,
-        end_line,
+        start_line: row.get(8)?,
+        end_line: row.get(9)?,
     })
 }
 pub(crate) fn insert_candidates(
@@ -258,7 +199,9 @@ pub(crate) fn insert_candidates(
         if !seen.insert(key) {
             continue;
         }
-        conn.execute(
+        // prepare_cached: this INSERT runs once per edge. conn.execute
+        // recompiles the SQL every call; the cached statement compiles once per connection.
+        conn.prepare_cached(
             "
             INSERT INTO edges(
                 source_file_id, from_symbol_id, from_name, to_name,
@@ -268,7 +211,8 @@ pub(crate) fn insert_candidates(
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ",
-            params![
+        )?
+        .execute(params![
                 file_id,
                 candidate.from_symbol_id,
                 candidate.from_name,
@@ -294,19 +238,6 @@ pub(crate) fn span_for_node(node: Node<'_>) -> EdgeSpan {
         start_byte: i64::try_from(node.start_byte()).unwrap_or(i64::MAX),
         end_byte: i64::try_from(node.end_byte()).unwrap_or(i64::MAX),
     }
-}
-pub(crate) fn line_for_byte(
-    chunk_text: &str,
-    chunk_start_byte: usize,
-    chunk_start_line: i64,
-    absolute_byte: usize,
-) -> i64 {
-    let relative_byte = absolute_byte.saturating_sub(chunk_start_byte).min(chunk_text.len());
-    chunk_start_line
-        + i64::try_from(
-            chunk_text.as_bytes()[..relative_byte].iter().filter(|ch| **ch == b'\n').count(),
-        )
-        .unwrap_or(0)
 }
 pub(crate) fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,

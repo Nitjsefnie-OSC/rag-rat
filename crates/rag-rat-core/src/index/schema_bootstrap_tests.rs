@@ -85,10 +85,46 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
     let symbol_fact_columns = table_columns(&db, "symbol_facts");
     assert!(symbol_fact_columns.contains(&"fact_kind".to_string()));
     assert!(symbol_fact_columns.contains(&"fact_value".to_string()));
+    let symbol_columns = table_columns(&db, "symbols");
+    assert!(symbol_columns.contains(&"start_line".to_string()));
+    assert!(symbol_columns.contains(&"end_line".to_string()));
     assert_eq!(
         db.status(&config.database).unwrap().schema.current_version,
         schema::LATEST_SCHEMA_VERSION
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn symbols_store_true_source_line_spans() {
+    // V016: start_line/end_line are persisted on the symbols row (from tree-sitter at parse time)
+    // instead of being recomputed by per-symbol correlated subqueries against chunks. Assert the
+    // stored 1-based spans match the actual source lines.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // alpha on line 2; beta spans lines 4..=6.
+    fs::write(
+        root.join("src/lib.rs"),
+        "// header\npub fn alpha() {}\n\npub fn beta() {\n    let _ = 1;\n}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let line_span = |name: &str| -> (i64, i64) {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT start_line, end_line FROM symbols WHERE name = ?1",
+                [name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(line_span("alpha"), (2, 2));
+    assert_eq!(line_span("beta"), (4, 6));
 
     fs::remove_dir_all(root).unwrap();
 }

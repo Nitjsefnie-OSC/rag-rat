@@ -49,7 +49,9 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
             } else {
                 EdgeConfidence::NameOnly
             };
-            conn.execute(
+            // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
+            // connection instead of on every call.
+            conn.prepare_cached(
                 "UPDATE edges
                  SET to_symbol_id = NULL,
                      target_start_line = NULL,
@@ -57,11 +59,11 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                      confidence = ?2,
                      resolution = 'unresolved'
                  WHERE id = ?1",
-                params![edge_id, confidence.as_str()],
-            )?;
+            )?
+            .execute(params![edge_id, confidence.as_str()])?;
             continue;
         };
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE edges
              SET to_symbol_id = ?2,
                  confidence = ?3,
@@ -69,7 +71,8 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
                  target_end_line = ?5,
                  resolution = ?6
              WHERE id = ?1",
-            params![
+        )?
+        .execute(params![
                 edge_id,
                 to_symbol_id.id,
                 confidence.as_str(),
@@ -81,6 +84,126 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
     }
     Ok(())
 }
+/// Full-rebuild fast path: resolve every accumulated edge candidate against an in-memory symbol
+/// index and insert it ONCE, already resolved — no unresolved insert, no `all_symbols` SELECT, no
+/// per-edge UPDATE pass. `symbols` carry their real DB ids (assigned in insertion order); we sort by
+/// `(qualified_name, id)` to reproduce `all_symbols`' `ORDER BY qualified_name` (tiebreak rowid)
+/// exactly, so `resolve_symbol`'s `matches[0]` picks the same symbol as the DB-based path.
+pub(crate) fn resolve_and_insert_edges(
+    conn: &Connection,
+    mut symbols: Vec<IndexedSymbol>,
+    edges: Vec<(i64, EdgeCandidate)>,
+) -> anyhow::Result<()> {
+    symbols.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name).then(a.id.cmp(&b.id)));
+    let index = SymbolIndex::build(&symbols);
+
+    // Drop the edges table's secondary indexes before the bulk insert, then rebuild them in one
+    // sorted pass after. Maintaining 5 indexes incrementally across hundreds of thousands of row
+    // inserts is the dominant cost here; building each once at the end is far cheaper. Drift-proof:
+    // the index DDL is read from the catalog, so a future migration's index is dropped/rebuilt too.
+    // Safe because a full rebuild owns the edges table inside the rebuild transaction (WAL).
+    let edge_indexes = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'edges' AND sql IS NOT NULL",
+        )?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, _) in &edge_indexes {
+        conn.execute_batch(&format!("DROP INDEX IF EXISTS \"{name}\""))?;
+    }
+
+    // Same per-file dedup + skip rules as `insert_candidates` (file_id in the key makes the global
+    // pass equivalent to the old per-file BTreeSet).
+    let mut seen = BTreeSet::new();
+    for (file_id, candidate) in &edges {
+        let to_name = candidate.to_name.trim();
+        if to_name.is_empty() || candidate.from_name.as_deref() == Some(to_name) {
+            continue;
+        }
+        let key = (
+            *file_id,
+            candidate.from_symbol_id,
+            candidate.from_name.clone(),
+            to_name.to_string(),
+            candidate.edge_kind,
+            candidate.source_span.start_byte,
+            candidate.source_span.end_byte,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let resolution = resolve_symbol(
+            ResolveSymbolRequest {
+                name: to_name,
+                target_qualified_name: candidate.target_qualified_name.as_deref(),
+                edge_kind: candidate.edge_kind.as_str(),
+                evidence: candidate.evidence.as_deref(),
+                receiver_hint: candidate.receiver_hint.as_deref(),
+                source_file_id: *file_id,
+                source_language: index.file_language.get(file_id).copied(),
+            },
+            &index,
+        );
+        let (to_symbol_id, confidence, target_start_line, target_end_line, reason) = match resolution
+        {
+            Some((symbol, confidence, reason)) => (
+                Some(symbol.id),
+                confidence,
+                Some(symbol.start_line),
+                Some(symbol.end_line),
+                reason,
+            ),
+            None => {
+                let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
+                    EdgeConfidence::Ambiguous
+                } else {
+                    EdgeConfidence::NameOnly
+                };
+                (None, confidence, None, None, "unresolved")
+            },
+        };
+        conn.prepare_cached(
+            "
+            INSERT INTO edges(
+                source_file_id, from_symbol_id, from_name, to_name,
+                target_qualified_name, evidence, receiver_hint,
+                source_start_line, source_end_line, source_start_byte, source_end_byte,
+                edge_kind, confidence,
+                to_symbol_id, target_start_line, target_end_line, resolution
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            ",
+        )?
+        .execute(params![
+            file_id,
+            candidate.from_symbol_id,
+            candidate.from_name,
+            to_name,
+            candidate.target_qualified_name,
+            candidate.evidence,
+            candidate.receiver_hint,
+            candidate.source_span.start_line,
+            candidate.source_span.end_line,
+            candidate.source_span.start_byte,
+            candidate.source_span.end_byte,
+            candidate.edge_kind.as_str(),
+            confidence.as_str(),
+            to_symbol_id,
+            target_start_line,
+            target_end_line,
+            reason,
+        ])?;
+    }
+
+    // Rebuild the indexes we dropped, each in one bulk sorted pass over the now-populated table.
+    for (_, sql) in &edge_indexes {
+        conn.execute_batch(sql)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_symbol<'a>(
     request: ResolveSymbolRequest<'_>,
     index: &SymbolIndex<'a>,

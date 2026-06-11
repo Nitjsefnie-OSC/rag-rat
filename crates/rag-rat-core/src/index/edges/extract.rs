@@ -7,13 +7,48 @@ pub(crate) fn index_file_edges(
     language: Language,
     text: &str,
 ) -> anyhow::Result<()> {
-    if language == Language::Markdown {
-        return Ok(());
-    }
+    // Inline path (incremental / graph-reindex): symbols come from the DB (they carry real ids),
+    // so candidates can be inserted directly. The full-rebuild path instead computes candidates in
+    // the parallel prepare phase via `edge_candidates` and remaps local ids at insert time.
     let symbols = symbols_for_file(conn, file_id)?;
-    let mut candidates = contains_edges(&symbols);
-    candidates.extend(syntactic_edges(path, language, text, &symbols)?);
+    let candidates = edge_candidates(path, language, text, &symbols)?;
     insert_candidates(conn, file_id, candidates)
+}
+
+/// Compute graph edge candidates for a file from its parsed `symbols`. This is the CPU-heavy part
+/// (it re-parses `text` with tree-sitter for syntactic edges), so the full-rebuild path runs it
+/// inside the parallel prepare phase. `symbols`' ids are used as `from_symbol_id`; the caller is
+/// responsible for those ids being meaningful (real DB ids on the inline path, local indices to be
+/// remapped on the prepared path).
+pub(crate) fn edge_candidates(
+    path: &Path,
+    language: Language,
+    text: &str,
+    symbols: &[IndexedSymbol],
+) -> anyhow::Result<Vec<EdgeCandidate>> {
+    if language == Language::Markdown {
+        return Ok(Vec::new());
+    }
+    let mut candidates = contains_edges(symbols);
+    candidates.extend(syntactic_edges(path, language, text, symbols)?);
+    Ok(candidates)
+}
+
+/// Like [`edge_candidates`] but walks an already-parsed tree (`root`) instead of re-parsing `text`.
+/// Used by the full-rebuild prepare phase, which parses each file once and shares the tree.
+pub(crate) fn edge_candidates_from_root(
+    path: &Path,
+    language: Language,
+    text: &str,
+    root: Node<'_>,
+    symbols: &[IndexedSymbol],
+) -> Vec<EdgeCandidate> {
+    if language == Language::Markdown {
+        return Vec::new();
+    }
+    let mut candidates = contains_edges(symbols);
+    collect_edges(language, text, root, symbols, path, &mut candidates);
+    candidates
 }
 /// The last `::`-separated segment of a qualified name.
 pub(crate) fn qn_tail(qualified_name: &str) -> &str {

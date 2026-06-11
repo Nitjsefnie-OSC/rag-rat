@@ -75,9 +75,18 @@ fn markdown_chunks(text: &str) -> Vec<Chunk> {
 }
 
 fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Vec<Chunk>> {
-    let symbols = parser::parse_symbols(path, language, text)?;
+    Ok(code_chunks_for_symbols(path, text, &parser::parse_symbols(path, language, text)?))
+}
+
+/// Build code chunks from already-parsed symbols — lets the full-rebuild prepare phase reuse the
+/// single shared parse instead of `code_chunks` re-parsing the file via `parse_symbols`.
+pub fn code_chunks_for_symbols(
+    path: &Path,
+    text: &str,
+    symbols: &[parser::ParsedSymbol],
+) -> Vec<Chunk> {
     let mut chunks = Vec::new();
-    for symbol in &symbols {
+    for symbol in symbols {
         let Some(symbol_span) = line_span(text, symbol.start_line, symbol.end_line) else {
             continue;
         };
@@ -104,9 +113,9 @@ fn code_chunks(path: &Path, language: Language, text: &str) -> anyhow::Result<Ve
             ));
         }
     }
-    chunks.extend(uncovered_code_chunks(path, text, &symbols));
+    chunks.extend(uncovered_code_chunks(path, text, symbols));
     chunks.sort_by_key(|chunk| (chunk.start_byte, chunk.end_byte));
-    if chunks.is_empty() { Ok(whole_file_chunk(path, text)) } else { Ok(chunks) }
+    if chunks.is_empty() { whole_file_chunk(path, text) } else { chunks }
 }
 
 fn uncovered_code_chunks(path: &Path, text: &str, symbols: &[parser::ParsedSymbol]) -> Vec<Chunk> {

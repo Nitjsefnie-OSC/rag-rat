@@ -46,8 +46,9 @@ impl IndexDatabase {
             )?;
             progress(IndexProgress::RebuildingLogicalSymbols);
             db.rebuild_logical_symbols()?;
+            // Edges were resolved and inserted in one in-memory pass inside
+            // index_targets_with_progress (full rebuild), so there is no separate resolve_edges phase.
             progress(IndexProgress::ResolvingGraph);
-            db.resolve_edges()?;
             db.mark_graph_index_current()?;
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;

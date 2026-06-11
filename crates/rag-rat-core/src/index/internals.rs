@@ -4,9 +4,6 @@ use super::*;
 /// inserted the file row) so `insert_chunks` doesn't re-`SELECT` it per file (#57).
 struct ChunkInsertFile<'a> {
     file_id: i64,
-    path: &'a str,
-    language: &'a str,
-    kind: &'a str,
     source_revision: &'a str,
 }
 
@@ -123,23 +120,16 @@ impl IndexDatabase {
         } else {
             chunker::chunks_for_file(path, language, text)
         };
+        let chunks = prepare_chunks(path, language.as_str(), kind.as_str(), chunks, text);
         let symbols =
             if kind == TargetKind::Generated || text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
                 Vec::new()
             } else {
                 symbols::symbols_for_file(path, language, text)
             };
-        self.insert_chunks(
-            ChunkInsertFile {
-                file_id,
-                path: &path_string(path),
-                language: language.as_str(),
-                kind: kind.as_str(),
-                source_revision: &sha256,
-            },
-            &chunks,
-            text,
-        )?;
+        // Inline/heal path: keep chunk_fts in sync per row (partial file replace would otherwise
+        // desync the external-content index until the next forced rebuild).
+        self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks, true)?;
         self.insert_symbols(file_id, language, &symbols)?;
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
@@ -148,9 +138,18 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// `write_fts`: false on a full rebuild (the closing bulk `rebuild_fts` repopulates `chunk_fts`),
+    /// true on incremental discovery (per-file replace needs the external-content index kept in sync
+    /// in place). See `insert_chunks`.
+    /// `graph`: on a full rebuild, `Some` accumulator — symbols (with their new DB ids) and remapped
+    /// edge candidates are collected for one in-memory resolve-and-insert pass after the loop, and
+    /// NO edges are inserted here. `None` (incremental) inserts edges unresolved per file as before,
+    /// to be resolved by the DB-based `resolve_edges`.
     pub(super) fn insert_prepared_file(
         &self,
         prepared_file: &PreparedIndexFile,
+        write_fts: bool,
+        graph: Option<&mut edges::FullRebuildGraph>,
     ) -> anyhow::Result<()> {
         let file = &prepared_file.file;
         let prepared = match &prepared_file.prepared {
@@ -191,54 +190,66 @@ impl IndexDatabase {
                 |row| row.get::<_, i64>(0),
             )?;
         self.insert_chunks(
-            ChunkInsertFile {
-                file_id,
-                path: &path,
-                language: file.language.as_str(),
-                kind: file.kind.as_str(),
-                source_revision: &prepared.sha256,
-            },
+            ChunkInsertFile { file_id, source_revision: &prepared.sha256 },
             &prepared.chunks,
-            &prepared.text,
+            write_fts,
         )?;
-        self.insert_symbols(file_id, file.language, &prepared.symbols)?;
-        if file.kind != TargetKind::Generated && prepared.text.len() <= edges::MAX_GRAPH_PARSE_BYTES
-        {
-            edges::index_file_edges(
-                self.storage.connection(),
-                file_id,
-                &file.relative_path,
-                file.language,
-                &prepared.text,
-            )?;
+        let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
+        // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
+        // remap them to the real DB ids just assigned.
+        match graph {
+            // Full rebuild: accumulate symbols (with ids) + remapped edges for one in-memory
+            // resolve-and-insert pass after the loop. No edge insert here.
+            Some(graph) => {
+                for (symbol, &id) in prepared.symbols.iter().zip(&symbol_db_ids) {
+                    graph.symbols.push(edges::IndexedSymbol::from_inserted(
+                        id,
+                        file_id,
+                        file.language,
+                        symbol,
+                    ));
+                }
+                for candidate in &prepared.edge_candidates {
+                    let mut candidate = candidate.clone();
+                    candidate.remap_from_symbol_id(&symbol_db_ids);
+                    graph.edges.push((file_id, candidate));
+                }
+            },
+            // Incremental: insert unresolved edges per file; resolve_edges resolves them afterward.
+            None =>
+                if !prepared.edge_candidates.is_empty() {
+                    let mut candidates = prepared.edge_candidates.clone();
+                    for candidate in &mut candidates {
+                        candidate.remap_from_symbol_id(&symbol_db_ids);
+                    }
+                    edges::insert_candidates(self.storage.connection(), file_id, candidates)?;
+                },
         }
         self.mark_fts_dirty()?;
         Ok(())
     }
 
+    /// Serial insert: pure prepared-statement stepping. The text hash, relocation anchor, and
+    /// embedding policy were all computed in the parallel prepare phase (see `prepare_chunks`), so
+    /// nothing here hashes or parses.
+    ///
+    /// `write_fts` controls the per-row `chunk_fts` insert. On a FULL REBUILD it's `false`: the
+    /// rebuild empties `chunk_fts` and the closing `rebuild_fts` repopulates it from the content
+    /// table in one bulk pass, so per-row writes are pure double work. Incremental / heal paths pass
+    /// `true`: they delete and re-insert individual files, which would leave `chunks` rows without
+    /// `chunk_fts` shadow entries (an external-content desync, #51) until a query forces a rebuild —
+    /// the per-row insert keeps the index consistent in place.
     fn insert_chunks(
         &self,
         file: ChunkInsertFile<'_>,
-        chunks: &[Chunk],
-        full_text: &str,
+        chunks: &[PreparedChunk],
+        write_fts: bool,
     ) -> anyhow::Result<()> {
-        // `path`/`language`/`kind` come from the caller (the file we just inserted), so we no
-        // longer re-`SELECT` them per file. Both INSERTs are `prepare_cached` so the statement
-        // is compiled once and stepped per row across the rebuild (#57).
-        let ChunkInsertFile { file_id, path, language, kind, source_revision } = file;
+        let ChunkInsertFile { file_id, source_revision } = file;
         let conn = self.storage.connection();
-        for chunk in chunks {
-            let anchor =
-                anchors::anchor_for_text(&chunk.text, chunk.start_line, chunk.end_line, full_text);
-            let embedding_policy = ai::embedding_policy_for_chunk(
-                Path::new(path),
-                language,
-                kind,
-                chunk.kind,
-                chunk.symbol_path.as_deref(),
-                &chunk.text,
-                ai::DEFAULT_MAX_EMBEDDING_CHARS,
-            );
+        for prepared in chunks {
+            let chunk = &prepared.chunk;
+            let anchor = &prepared.anchor;
             conn.prepare_cached(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte, \
                  start_line, end_line, text, text_hash,
@@ -258,7 +269,7 @@ impl IndexDatabase {
                 i64::try_from(chunk.start_line)?,
                 i64::try_from(chunk.end_line)?,
                 chunk.text,
-                hex_sha256(chunk.text.as_bytes()),
+                prepared.text_hash,
                 source_revision,
                 anchor.version,
                 anchor.normalized_hash,
@@ -267,28 +278,33 @@ impl IndexDatabase {
                 anchor.start_context_hash,
                 anchor.end_context_hash,
                 anchor.context_radius,
-                embedding_policy.policy,
-                embedding_policy.priority,
+                prepared.embedding.policy,
+                prepared.embedding.priority,
             ])?;
-            let chunk_id = conn.last_insert_rowid();
-            conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
-                .execute(params![chunk_id, chunk.text])?;
+            if write_fts {
+                let chunk_id = conn.last_insert_rowid();
+                conn.prepare_cached("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)")?
+                    .execute(params![chunk_id, chunk.text])?;
+            }
         }
         Ok(())
     }
 
+    /// Inserts symbols and returns their assigned DB ids in the SAME order as `symbols`, so the
+    /// caller can remap prepared edge candidates' local symbol indices to real ids.
     fn insert_symbols(
         &self,
         file_id: i64,
         language: Language,
         symbols: &[Symbol],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<i64>> {
         let conn = self.storage.connection();
+        let mut symbol_ids = Vec::with_capacity(symbols.len());
         for symbol in symbols {
             conn.prepare_cached(
                 "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
-                 end_byte, signature, docs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 end_byte, start_line, end_line, signature, docs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?
             .execute(params![
                 file_id,
@@ -298,10 +314,13 @@ impl IndexDatabase {
                 symbol.kind,
                 i64::try_from(symbol.start_byte)?,
                 i64::try_from(symbol.end_byte)?,
+                i64::try_from(symbol.start_line)?,
+                i64::try_from(symbol.end_line)?,
                 symbol.signature,
                 symbol.docs,
             ])?;
             let symbol_id = conn.last_insert_rowid();
+            symbol_ids.push(symbol_id);
             for fact in &symbol.facts {
                 conn.prepare_cached(
                     "INSERT OR IGNORE INTO symbol_facts(symbol_id, fact_kind, fact_value)
@@ -310,7 +329,7 @@ impl IndexDatabase {
                 .execute(params![symbol_id, fact.kind, fact.value])?;
             }
         }
-        Ok(())
+        Ok(symbol_ids)
     }
 
     pub(super) fn write_git_meta(&self, root: &Path) -> anyhow::Result<()> {
@@ -365,34 +384,7 @@ impl IndexDatabase {
             "
             SELECT symbols.id, symbols.file_id, files.path, symbols.language, symbols.name,
                    symbols.qualified_name, symbols.kind, symbols.start_byte, symbols.end_byte,
-                   symbols.signature,
-                   COALESCE((
-                     SELECT chunks.start_byte
-                     FROM chunks
-                     WHERE chunks.file_id = symbols.file_id
-                       AND symbols.start_byte >= chunks.start_byte
-                       AND symbols.start_byte < chunks.end_byte
-                     ORDER BY chunks.end_byte - chunks.start_byte ASC
-                     LIMIT 1
-                   ), symbols.start_byte) AS chunk_start_byte,
-                   COALESCE((
-                     SELECT chunks.start_line
-                     FROM chunks
-                     WHERE chunks.file_id = symbols.file_id
-                       AND symbols.start_byte >= chunks.start_byte
-                       AND symbols.start_byte < chunks.end_byte
-                     ORDER BY chunks.end_byte - chunks.start_byte ASC
-                     LIMIT 1
-                   ), 1) AS chunk_start_line,
-                   COALESCE((
-                     SELECT chunks.text
-                     FROM chunks
-                     WHERE chunks.file_id = symbols.file_id
-                       AND symbols.start_byte >= chunks.start_byte
-                       AND symbols.start_byte < chunks.end_byte
-                     ORDER BY chunks.end_byte - chunks.start_byte ASC
-                     LIMIT 1
-                   ), '') AS chunk_text
+                   symbols.signature, symbols.start_line, symbols.end_line
             FROM symbols
             JOIN files ON files.id = symbols.file_id
             ORDER BY files.path, symbols.language, symbols.qualified_name, symbols.kind,
@@ -400,15 +392,6 @@ impl IndexDatabase {
             ",
         )?;
         let rows = stmt.query_map([], |row| {
-            let start_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0);
-            let end_byte = usize::try_from(row.get::<_, i64>(8)?).unwrap_or(0);
-            let chunk_start_byte = usize::try_from(row.get::<_, i64>(10)?).unwrap_or(start_byte);
-            let chunk_start_line = row.get::<_, i64>(11)?;
-            let chunk_text: String = row.get(12)?;
-            let start_line =
-                symbol_line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, start_byte);
-            let end_line =
-                symbol_line_for_byte(&chunk_text, chunk_start_byte, chunk_start_line, end_byte);
             Ok(LogicalSymbolMemberRow {
                 symbol_id: row.get(0)?,
                 path: row.get(2)?,
@@ -417,8 +400,8 @@ impl IndexDatabase {
                 qualified_name: row.get(5)?,
                 kind: row.get(6)?,
                 signature: row.get(9)?,
-                start_line,
-                end_line,
+                start_line: row.get(10)?,
+                end_line: row.get(11)?,
             })
         })?;
         let mut groups: BTreeMap<LogicalSymbolKey, Vec<LogicalSymbolMemberRow>> = BTreeMap::new();
@@ -426,30 +409,33 @@ impl IndexDatabase {
             let row = row?;
             groups.entry(LogicalSymbolKey::from(&row)).or_default().push(row);
         }
+        // Group in memory, then bulk-insert. Both INSERTs are prepare_cached: the member insert runs
+        // once per symbol, and conn.execute would recompile the SQL every time.
+        let conn = self.storage.connection();
         for (key, members) in groups {
             let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
             let logical_symbol_id = key.stable_id();
-            self.storage.connection().execute(
+            conn.prepare_cached(
                 "
                 INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, \
                  kind, variant_count, group_reason)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ",
-                params![
-                    logical_symbol_id,
-                    key.language,
-                    key.path,
-                    key.name,
-                    key.qualified_name,
-                    key.kind,
-                    i64::try_from(members.len()).unwrap_or(i64::MAX),
-                    group_reason,
-                ],
-            )?;
+            )?
+            .execute(params![
+                logical_symbol_id,
+                key.language,
+                key.path,
+                key.name,
+                key.qualified_name,
+                key.kind,
+                i64::try_from(members.len()).unwrap_or(i64::MAX),
+                group_reason,
+            ])?;
             for member in members {
                 let signature_hash =
                     member.signature.as_deref().map(|signature| hex_sha256(signature.as_bytes()));
-                self.storage.connection().execute(
+                conn.prepare_cached(
                     "
                     INSERT INTO logical_symbol_members(
                         logical_symbol_id, symbol_id, cfg_expr, signature_hash, start_line, \
@@ -457,14 +443,14 @@ impl IndexDatabase {
                     )
                     VALUES (?1, ?2, NULL, ?3, ?4, ?5)
                     ",
-                    params![
-                        logical_symbol_id,
-                        member.symbol_id,
-                        signature_hash,
-                        member.start_line,
-                        member.end_line,
-                    ],
-                )?;
+                )?
+                .execute(params![
+                    logical_symbol_id,
+                    member.symbol_id,
+                    signature_hash,
+                    member.start_line,
+                    member.end_line,
+                ])?;
             }
         }
         Ok(())

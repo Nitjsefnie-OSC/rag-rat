@@ -24,15 +24,26 @@ pub fn anchor_for_text(
     end_line: usize,
     full_text: &str,
 ) -> ChunkAnchor {
-    let lines = full_text.lines().collect::<Vec<_>>();
+    anchor_for_lines(text, start_line, end_line, &full_text.lines().collect::<Vec<_>>())
+}
+
+/// Like [`anchor_for_text`] but takes the file's lines pre-split. Hot path: when anchoring every
+/// chunk of a file, the caller collects `full_text.lines()` once and reuses the slice, instead of
+/// re-splitting the whole file per chunk (O(file_size × chunks)).
+pub fn anchor_for_lines(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+    lines: &[&str],
+) -> ChunkAnchor {
     let radius = 2;
     ChunkAnchor {
         version: 1,
         normalized_hash: hash_normalized(text),
-        start_boundary_hash: boundary_hash(&lines, start_line),
-        end_boundary_hash: boundary_hash(&lines, end_line),
-        start_context_hash: context_hash(&lines, start_line, radius),
-        end_context_hash: context_hash(&lines, end_line, radius),
+        start_boundary_hash: boundary_hash(lines, start_line),
+        end_boundary_hash: boundary_hash(lines, end_line),
+        start_context_hash: context_hash(lines, start_line, radius),
+        end_context_hash: context_hash(lines, end_line, radius),
         context_radius: i64::try_from(radius).unwrap_or(2),
     }
 }
