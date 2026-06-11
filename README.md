@@ -2,12 +2,11 @@
 
 [![CI](https://github.com/cq27-dev/rag-rat/actions/workflows/ci.yml/badge.svg)](https://github.com/cq27-dev/rag-rat/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/cq27-dev/rag-rat/branch/main/graph/badge.svg)](https://codecov.io/gh/cq27-dev/rag-rat)
+[![crates.io](https://img.shields.io/crates/v/rag-rat.svg)](https://crates.io/crates/rag-rat)
 
 `rag-rat` is a local repo-intelligence index and MCP server for coding agents. It keeps source
 files read-only, writes only its configured SQLite database, and exposes current source, graph,
 git, GitHub papertrail, local-AI artifact status, and source-anchored repo memories as evidence.
-
-Current release: `v0.3.2`.
 
 ```mermaid
 sequenceDiagram
