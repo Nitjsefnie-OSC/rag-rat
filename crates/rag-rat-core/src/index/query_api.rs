@@ -462,6 +462,7 @@ impl IndexDatabase {
                 root,
                 None,
                 true,
+                &self.github,
             )
         } else {
             let client = github::GhCliGitHubClient;
@@ -470,6 +471,7 @@ impl IndexDatabase {
                 root,
                 Some(&client),
                 false,
+                &self.github,
                 progress,
             )
         }
@@ -486,10 +488,17 @@ impl IndexDatabase {
                 issue_ref,
                 None,
                 true,
+                &self.github,
             )
         } else {
             let client = github::GhCliGitHubClient;
-            github::sync_issue(self.storage.connection(), issue_ref, Some(&client), false)
+            github::sync_issue(
+                self.storage.connection(),
+                issue_ref,
+                Some(&client),
+                false,
+                &self.github,
+            )
         }
     }
 
@@ -502,7 +511,7 @@ impl IndexDatabase {
     }
 
     pub fn rationale_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<GitHubEvidence>> {
-        github::rationale_search(self.storage.connection(), query, limit)
+        github::rationale_search(self.storage.connection(), query, limit, &self.github)
     }
 
     pub fn github_refs_for_path(
@@ -525,7 +534,12 @@ impl IndexDatabase {
         let Some(chunk) = self.read_chunk(chunk_id)? else {
             return Ok(None);
         };
-        Ok(Some(github::papertrail_for_chunk(self.storage.connection(), &chunk, limit)?))
+        Ok(Some(github::papertrail_for_chunk(
+            self.storage.connection(),
+            &chunk,
+            limit,
+            &self.github,
+        )?))
     }
 
     pub fn papertrail_for_symbol(
@@ -537,7 +551,12 @@ impl IndexDatabase {
         let Some(symbol) = self.symbols(symbol, language, limit)?.into_iter().next() else {
             return Ok(None);
         };
-        Ok(Some(github::papertrail_for_symbol(self.storage.connection(), &symbol, limit)?))
+        Ok(Some(github::papertrail_for_symbol(
+            self.storage.connection(),
+            &symbol,
+            limit,
+            &self.github,
+        )?))
     }
 
     pub fn papertrail_for_selected_symbol(
@@ -545,7 +564,7 @@ impl IndexDatabase {
         symbol: &crate::query::symbol::SymbolHit,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
-        github::papertrail_for_symbol(self.storage.connection(), symbol, limit)
+        github::papertrail_for_symbol(self.storage.connection(), symbol, limit, &self.github)
     }
 
     pub fn papertrail_for_commit(
@@ -553,7 +572,7 @@ impl IndexDatabase {
         commit_hash: &str,
         limit: u32,
     ) -> anyhow::Result<Papertrail> {
-        github::papertrail_for_commit(self.storage.connection(), commit_hash, limit)
+        github::papertrail_for_commit(self.storage.connection(), commit_hash, limit, &self.github)
     }
 
     pub fn local_ai_status(&self) -> anyhow::Result<LocalAiStatus> {

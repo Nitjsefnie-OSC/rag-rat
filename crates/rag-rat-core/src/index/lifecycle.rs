@@ -16,8 +16,12 @@ impl IndexDatabase {
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
-        let db =
-            Self { storage, active_commit_sha: String::new(), active_worktree_id: String::new() };
+        let db = Self {
+            storage,
+            active_commit_sha: String::new(),
+            active_worktree_id: String::new(),
+            github: github::GitHubContext::default(),
+        };
         if check_graph {
             db.ensure_graph_index_current()?;
         }
@@ -29,8 +33,17 @@ impl IndexDatabase {
         db.storage.set_source_root(config.root.clone());
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
+        // Real usage: resolve the GitHub repo context from the local `gh` CLI here, at the
+        // boundary. rebuild/open (used by tests and the bare index command) leave it offline.
+        db.github = github::GitHubContext::from_gh();
         db.ensure_graph_index_current()?;
         Ok(db)
+    }
+
+    /// Set the GitHub repo context explicitly (tests / non-gh callers), so the library never
+    /// shells out to `gh`.
+    pub fn set_github_context(&mut self, default_repo: Option<&str>, gh_available: bool) {
+        self.github = github::GitHubContext::new(default_repo, gh_available);
     }
 
     pub fn migrate(path: &Path) -> anyhow::Result<schema::SchemaStatus> {
@@ -73,7 +86,12 @@ impl IndexDatabase {
         if let Some(root) = meta_for(storage.connection(), "source_root")? {
             storage.set_source_root(PathBuf::from(root));
         }
-        Ok(Self { storage, active_commit_sha: String::new(), active_worktree_id: String::new() })
+        Ok(Self {
+            storage,
+            active_commit_sha: String::new(),
+            active_worktree_id: String::new(),
+            github: github::GitHubContext::default(),
+        })
     }
 
     pub fn set_context(&mut self, commit_sha: &str, worktree_id: &str) -> anyhow::Result<()> {

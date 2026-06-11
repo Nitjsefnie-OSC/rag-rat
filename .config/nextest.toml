@@ -1,10 +1,6 @@
 # nextest profiles. The `ci` profile emits a JUnit report for Codecov Test Analytics.
-[profile.ci]
-# A few index/schema tests share the on-disk self-index and flake when run concurrently
-# (nextest runs each test in its own process, but the contention is on-disk, not in-process).
-# Serialize to keep CI deterministic.
-test-threads = 1
-
+# Tests are parallel-safe (each uses its own temp DB; the library no longer shells out to `gh`),
+# so this runs at nextest's default per-core parallelism.
 [profile.ci.junit]
 # Written to target/nextest/ci/junit.xml.
 path = "junit.xml"

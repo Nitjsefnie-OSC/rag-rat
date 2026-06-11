@@ -60,6 +60,10 @@ pub struct IndexDatabase {
     storage: IndexConnection,
     pub active_commit_sha: String,
     pub active_worktree_id: String,
+    /// Injected GitHub repo context. Resolved from `gh` only in `open_config` (real usage);
+    /// `rebuild`/`open` leave it offline, and tests set it explicitly — so the library never
+    /// shells out to `gh` during tests (#60).
+    github: github::GitHubContext,
 }
 
 #[derive(Debug, Clone)]

@@ -5,17 +5,19 @@ pub(crate) fn sync_from_refs<C: GitHubClient>(
     root: &Path,
     client: Option<&C>,
     offline: bool,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<GitHubSyncReport> {
-    sync_from_refs_with_progress(conn, root, client, offline, |_| {})
+    sync_from_refs_with_progress(conn, root, client, offline, ctx, |_| {})
 }
 pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
     conn: &Connection,
     root: &Path,
     client: Option<&C>,
     offline: bool,
+    ctx: &GitHubContext,
     mut progress: impl FnMut(GitHubSyncProgress),
 ) -> anyhow::Result<GitHubSyncReport> {
-    let refs = discover_and_store_refs(conn, root)?;
+    let refs = discover_and_store_refs(conn, root, ctx)?;
     let sync = if offline {
         SyncRefsReport::default()
     } else {
@@ -30,7 +32,7 @@ pub(crate) fn sync_from_refs_with_progress<C: GitHubClient>(
         failed_refs: sync.failed_refs,
         synced_items: sync.synced_items,
         errors: sync.errors,
-        status: status(conn)?,
+        status: status(conn, ctx)?,
     })
 }
 pub(crate) fn sync_issue<C: GitHubClient>(
@@ -38,8 +40,9 @@ pub(crate) fn sync_issue<C: GitHubClient>(
     issue_ref: &str,
     client: Option<&C>,
     offline: bool,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<GitHubSyncReport> {
-    let parsed = parse_issue_ref(issue_ref, default_repo().as_deref())
+    let parsed = parse_issue_ref(issue_ref, ctx.default_repo())
         .ok_or_else(|| anyhow::anyhow!("invalid GitHub issue reference `{issue_ref}`"))?;
     store_ref(conn, &GitHubRef {
         owner: parsed.owner,
@@ -66,10 +69,10 @@ pub(crate) fn sync_issue<C: GitHubClient>(
         failed_refs: sync.failed_refs,
         synced_items: sync.synced_items,
         errors: sync.errors,
-        status: status(conn)?,
+        status: status(conn, ctx)?,
     })
 }
-pub(crate) fn status(conn: &Connection) -> anyhow::Result<GitHubStatus> {
+pub(crate) fn status(conn: &Connection, ctx: &GitHubContext) -> anyhow::Result<GitHubStatus> {
     Ok(GitHubStatus {
         refs: count_table(conn, "github_refs")?,
         issues: count_table(conn, "github_issues")?,
@@ -78,7 +81,7 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<GitHubStatus> {
         reviews: count_table(conn, "github_reviews")?,
         review_comments: count_table(conn, "github_review_comments")?,
         last_sync_ms: meta(conn, "github_last_sync_ms")?.and_then(|value| value.parse().ok()),
-        capability: if gh_available() {
+        capability: if ctx.gh_available {
             "gh_cli_available".to_string()
         } else {
             "gh_cli_missing".to_string()
@@ -96,10 +99,10 @@ pub(crate) fn rationale_search(
     conn: &Connection,
     query: &str,
     limit: u32,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<Vec<GitHubEvidence>> {
     let mut evidence = Vec::new();
-    let default_repo = default_repo();
-    for reference in parse_refs(query, default_repo.as_deref()) {
+    for reference in parse_refs(query, ctx.default_repo()) {
         evidence.extend(evidence_for_issue(
             conn,
             &reference.owner,
@@ -134,10 +137,11 @@ pub(crate) fn papertrail_for_chunk(
     conn: &Connection,
     chunk: &crate::query::ReadChunk,
     limit: u32,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_path(conn, &chunk.path, limit)?;
     if evidence.is_empty() {
-        evidence = rationale_search(conn, &chunk.path, limit)?;
+        evidence = rationale_search(conn, &chunk.path, limit, ctx)?;
     }
     Ok(Papertrail {
         current_source: Some(CurrentSourceEvidence {
@@ -155,9 +159,10 @@ pub(crate) fn papertrail_for_symbol(
     conn: &Connection,
     symbol: &crate::query::symbol::SymbolHit,
     limit: u32,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_path(conn, &symbol.path, limit)?;
-    evidence.extend(rationale_search(conn, &symbol.qualified_name, limit)?);
+    evidence.extend(rationale_search(conn, &symbol.qualified_name, limit, ctx)?);
     dedupe_evidence(&mut evidence);
     evidence.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     let (start_line, end_line, chunk_id) = current_symbol_span(conn, symbol)?;
@@ -177,6 +182,7 @@ pub(crate) fn papertrail_for_commit(
     conn: &Connection,
     commit_hash: &str,
     limit: u32,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<Papertrail> {
     let mut evidence = evidence_for_commit_refs(conn, commit_hash, limit)?;
     let mut fallback_evidence = Vec::new();
@@ -190,7 +196,7 @@ pub(crate) fn papertrail_for_commit(
         for row in rows {
             fallback_evidence.extend(evidence_for_path(conn, &row?, limit)?);
         }
-        fallback_evidence.extend(rationale_search(conn, commit_hash, limit)?);
+        fallback_evidence.extend(rationale_search(conn, commit_hash, limit, ctx)?);
         mark_fallback_evidence(&mut fallback_evidence);
     }
     dedupe_evidence(&mut evidence);

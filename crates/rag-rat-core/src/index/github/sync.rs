@@ -3,8 +3,9 @@ use super::*;
 pub(crate) fn discover_and_store_refs(
     conn: &Connection,
     root: &Path,
+    ctx: &GitHubContext,
 ) -> anyhow::Result<Vec<GitHubRef>> {
-    let default_repo = default_repo();
+    let default_repo = ctx.default_repo().map(str::to_string);
     let mut refs = Vec::new();
     discover_commit_refs(conn, default_repo.as_deref(), &mut refs)?;
     discover_file_refs(conn, root, default_repo.as_deref(), &mut refs)?;

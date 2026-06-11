@@ -224,7 +224,14 @@ fn migrate_preserves_github_papertrail_cache() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    github::sync_from_refs(db.storage.connection(), &root, Some(&MockGitHubClient), false).unwrap();
+    github::sync_from_refs(
+        db.storage.connection(),
+        &root,
+        Some(&MockGitHubClient),
+        false,
+        &test_gh_ctx(),
+    )
+    .unwrap();
     assert_eq!(row_count(&db, "github_refs"), 1);
     assert_eq!(row_count(&db, "github_issues"), 1);
     assert_eq!(row_count(&db, "github_comments"), 1);
@@ -260,7 +267,14 @@ fn full_rebuild_preserves_github_papertrail_cache() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
     let db = IndexDatabase::rebuild(&config).unwrap();
-    github::sync_from_refs(db.storage.connection(), &root, Some(&MockGitHubClient), false).unwrap();
+    github::sync_from_refs(
+        db.storage.connection(),
+        &root,
+        Some(&MockGitHubClient),
+        false,
+        &test_gh_ctx(),
+    )
+    .unwrap();
     assert_eq!(row_count(&db, "github_issues"), 1);
     assert_eq!(row_count(&db, "github_fts"), 5);
     drop(db);
@@ -2972,18 +2986,27 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
 fn github_sync_caches_papertrail_and_rationale_without_query_time_crawling() {
     let (root, config) =
         markdown_config("# Decision\nRefs cq27-dev/rag-rat#42\nwe will keep sqlite\n");
-    let db = IndexDatabase::rebuild(&config).unwrap();
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    // Resolve the repo context explicitly so db.rationale_search("Fixes #42") qualifies the bare
+    // ref without shelling out to `gh` (#60).
+    db.set_github_context(Some("cq27-dev/rag-rat"), false);
     let mock = MockGitHubClient;
 
-    let offline =
-        github::sync_from_refs::<MockGitHubClient>(db.storage.connection(), &root, None, true)
-            .unwrap();
+    let offline = github::sync_from_refs::<MockGitHubClient>(
+        db.storage.connection(),
+        &root,
+        None,
+        true,
+        &test_gh_ctx(),
+    )
+    .unwrap();
     assert!(offline.offline);
     assert_eq!(offline.discovered_refs, 1);
     assert_eq!(offline.synced_items, 0);
 
     let report =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+            .unwrap();
     assert!(!report.offline);
     assert_eq!(report.discovered_refs, 1);
     assert_eq!(report.synced_items, 5);
@@ -3049,7 +3072,8 @@ fn papertrail_for_commit_prefers_commit_sourced_github_refs() {
         .query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get::<_, String>(0))
         .unwrap();
     let mock = MockGitHubClient;
-    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        .unwrap();
 
     let papertrail = db.papertrail_for_commit(&commit[..7], 10).unwrap();
     assert_eq!(papertrail.github_evidence.first().map(|item| item.number), Some(42));
@@ -3078,7 +3102,8 @@ fn papertrail_for_symbol_dedupes_duplicate_file_refs() {
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let mock = MockGitHubClient;
-    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+    github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+        .unwrap();
     let papertrail = db
         .papertrail_for_symbol("tracked_symbol", Some(Language::Rust), 10)
         .unwrap()
@@ -3106,7 +3131,8 @@ fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
     let mock = PartiallyFailingGitHubClient;
 
     let report =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+            .unwrap();
     assert_eq!(report.discovered_refs, 2);
     assert_eq!(report.synced_items, 5);
     assert_eq!(report.failed_refs, 1);
@@ -3119,7 +3145,8 @@ fn github_sync_keeps_partial_cache_and_skips_synced_refs_after_404() {
     assert_eq!(issue_hits[0].number, 42);
 
     let second =
-        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false).unwrap();
+        github::sync_from_refs(db.storage.connection(), &root, Some(&mock), false, &test_gh_ctx())
+            .unwrap();
     assert_eq!(second.synced_items, 0);
     assert_eq!(second.skipped_refs, 2);
     assert_eq!(second.failed_refs, 0);
@@ -5211,6 +5238,10 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
     }
 }
 
+/// GitHub context for tests: the rag-rat repo itself, never the live `gh` CLI (#60).
+fn test_gh_ctx() -> github::GitHubContext {
+    github::GitHubContext::new(Some("cq27-dev/rag-rat"), false)
+}
 fn source_config(root: PathBuf, language: Language) -> Config {
     Config {
         root: root.clone(),

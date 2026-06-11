@@ -18,6 +18,35 @@ pub(crate) use sync::*;
 
 use crate::index::now_ms;
 
+/// Resolved GitHub repo context, injected into the sync/query paths instead of being resolved
+/// from the local `gh` CLI inside the library. `gh` is network-bound, non-deterministic under
+/// parallelism, and unauthenticated in CI — so it is resolved ONLY at the real-usage boundary
+/// (`IndexDatabase::open_config`) and never in tests, which pass an explicit context (#60).
+#[derive(Debug, Clone, Default)]
+pub struct GitHubContext {
+    /// `owner/repo` used to qualify bare `#N` refs. `None` leaves bare refs unresolved.
+    pub default_repo: Option<String>,
+    /// Whether the `gh` CLI is available (reported as a capability in status).
+    pub gh_available: bool,
+}
+
+impl GitHubContext {
+    /// Resolve from the local `gh` CLI. Call ONLY at the real-usage boundary (open_config),
+    /// never inside the library internals or tests.
+    pub(crate) fn from_gh() -> Self {
+        Self { default_repo: default_repo(), gh_available: gh_available() }
+    }
+
+    /// An explicit context that never touches `gh` — for tests and non-gh callers.
+    pub(crate) fn new(default_repo: Option<&str>, gh_available: bool) -> Self {
+        Self { default_repo: default_repo.map(str::to_string), gh_available }
+    }
+
+    fn default_repo(&self) -> Option<&str> {
+        self.default_repo.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GitHubStatus {
     pub refs: u64,

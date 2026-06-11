@@ -13,10 +13,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The github-papertrail tests call `gh repo view` (default_repo) to resolve bare `#N` refs.
-  # Without auth, gh returns nothing and those tests fail. The auto-provided token authenticates
-  # gh against this repo. (Coupling tracked in an issue; fork PRs lack this secret.)
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   fmt:
@@ -52,8 +48,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      # Hash embedder only (no model downloads). The `ci` profile serializes tests (shared
-      # on-disk self-index) and emits a JUnit report at target/nextest/ci/junit.xml.
+      # Hash embedder only (no model downloads). Tests run in parallel; the `ci` profile emits a
+      # JUnit report at target/nextest/ci/junit.xml.
       - name: Run tests (nextest)
         run: cargo nextest run --workspace --no-default-features --locked --profile ci
       - name: Upload test results to Codecov
@@ -87,7 +83,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage (lcov)
-        run: cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info -- --test-threads=1
+        run: cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:

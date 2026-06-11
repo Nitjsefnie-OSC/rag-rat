@@ -337,7 +337,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn github_status(&self) -> anyhow::Result<GitHubStatus> {
-        github::status(self.storage.connection())
+        github::status(self.storage.connection(), &self.github)
     }
 
     pub(super) fn mark_fts_dirty(&self) -> anyhow::Result<()> {
