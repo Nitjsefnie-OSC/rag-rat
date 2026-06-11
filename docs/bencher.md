@@ -114,22 +114,3 @@ graph), but the whole tree still lands in the multi-GB range — borderline for 
 `ubuntu-latest` runner. If a release run OOMs or overruns `timeout-minutes`, either bound
 `RAG_RAT_KERNEL_SUBDIRS` to the core subsystems or move the job to a larger runner. Validate with a
 manual dispatch first.
-
-## One-time setup
-
-1. **Create the Bencher project.** On [bencher.dev](https://bencher.dev), create a project named
-   `rag-rat` (must match `BENCHER_PROJECT` in the workflows). The default `ubuntu-latest` testbed
-   matches `BENCHER_TESTBED`.
-2. **Add a project key as a repo secret.** In Bencher, create a **project API key** for the
-   `rag-rat` project (a token that starts with `bencher_run_`; project keys are scoped to one
-   project and limited to `bencher run` and other non-destructive commands). Add it to the GitHub
-   repo as the secret `BENCHER_API_TOKEN` (Settings → Secrets and variables → Actions). The
-   workflows surface it to the CLI as **`BENCHER_API_KEY`** — the `--key` auth path. Do *not* use
-   an account API token (a JWT starting with `eyJ`): the CLI would expect that under
-   `BENCHER_API_TOKEN`/`--token` and a project key fails JWT validation there. `GITHUB_TOKEN` for
-   PR comments is provided automatically by Actions.
-3. **Push to `main`.** The first `bench.yml` run seeds the baseline; subsequent PRs are gated
-   against it.
-
-If you change the iai-callgrind library version in `Cargo.toml`, bump `IAI_RUNNER_VERSION` in
-`bench.yml` and the `iai-runner-<version>` cache key in the two PR workflows to match.
