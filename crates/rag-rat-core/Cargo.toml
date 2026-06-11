@@ -39,3 +39,12 @@ libc.workspace = true
 default = ["fastembed", "model2vec"]
 fastembed = ["dep:fastembed"]
 model2vec = ["dep:model2vec-rs"]
+
+[dev-dependencies]
+# Instruction-count benchmarking (deterministic, CI-noise-immune). Needs the matching
+# `iai-callgrind-runner` binary on PATH + valgrind installed. See benches/rag_pipeline.rs.
+iai-callgrind = "0.16"
+
+[[bench]]
+name = "rag_pipeline"
+harness = false
