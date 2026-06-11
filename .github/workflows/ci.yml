@@ -13,6 +13,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The github-papertrail tests call `gh repo view` (default_repo) to resolve bare `#N` refs.
+  # Without auth, gh returns nothing and those tests fail. The auto-provided token authenticates
+  # gh against this repo. (Coupling tracked in an issue; fork PRs lack this secret.)
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   fmt:
