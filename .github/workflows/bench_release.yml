@@ -22,20 +22,25 @@ permissions:
 
 env:
   BENCHER_PROJECT: rag-rat
-  BENCHER_TESTBED: ubuntu-latest
+  # Distinct testbed: this runs on a self-hosted big-memory box, not a GitHub runner, so its numbers
+  # are tracked separately from the bounded GitHub-hosted runs.
+  BENCHER_TESTBED: hetzner-bigmem
   # Project key (`bencher_run_…`) → --key auth path (see bench.yml / docs/bencher.md).
   BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
   KERNEL_TAG: v7.0
 
 jobs:
   kernel:
-    runs-on: ubuntu-latest
-    # A whole-kernel index is long but bounded; cap it so a pathological run can't hang for 6h.
+    # Self-hosted runner (62 GB RAM): the whole-kernel index buffers the symbol/edge graph in memory
+    # and needs ~30 GB, which OOMs a 7 GB GitHub runner — hence the default scope of "." (whole tree)
+    # here. Only the release / workflow_dispatch triggers land here (never PRs), so a public-repo
+    # self-hosted runner is safe. See docs/bencher.md.
+    runs-on: [self-hosted, bigmem]
+    # A whole-kernel index is long but bounded; cap it so a pathological run can't hang for hours.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No rustup toolchain / cache actions here: the box has system cargo and a persistent target/.
 
       - name: Build release rag-rat (hash embedder; no model download)
         run: cargo build --release --no-default-features --bin rag-rat
