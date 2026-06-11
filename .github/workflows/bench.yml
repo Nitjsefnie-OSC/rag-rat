@@ -1,0 +1,73 @@
+name: bench
+
+# Continuous benchmarking on main. Tracks two independent signals in Bencher:
+#   - rag_pipeline (iai-callgrind): deterministic CPU instruction counts (index + cold/warm query)
+#   - index_time  (criterion):     wall-clock full-index time
+# Requires repo secret BENCHER_API_TOKEN and a Bencher project named `rag-rat` (see docs/bencher.md).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  checks: write
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BENCHER_PROJECT: rag-rat
+  BENCHER_TESTBED: ubuntu-latest
+  BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+  # Must match the iai-callgrind library version in Cargo.toml.
+  IAI_RUNNER_VERSION: "0.16.1"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install valgrind (iai-callgrind)
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: Cache iai-callgrind-runner
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/iai-callgrind-runner
+          key: iai-runner-${{ env.IAI_RUNNER_VERSION }}
+      - name: Install iai-callgrind-runner
+        run: command -v iai-callgrind-runner || cargo install --locked iai-callgrind-runner@${{ env.IAI_RUNNER_VERSION }}
+      - name: Cache bench corpus (cargo 0.97.1)
+        uses: actions/cache@v4
+        with:
+          path: target/bench-corpus
+          key: bench-corpus-cargo-0.97.1
+      - uses: bencherdev/bencher@main
+
+      # Deterministic instruction counts — tight percentage threshold (iai is noise-free).
+      - name: Track instruction counts (iai-callgrind)
+        run: |
+          bencher run \
+            --branch main \
+            --adapter rust_iai_callgrind \
+            --threshold-measure instructions \
+            --threshold-test percentage \
+            --threshold-upper-boundary 0.02 \
+            --thresholds-reset \
+            --err \
+            "cargo bench --no-default-features --bench rag_pipeline"
+
+      # Wall-clock time — statistical threshold (criterion is noisy).
+      - name: Track wall-clock index time (criterion)
+        run: |
+          bencher run \
+            --branch main \
+            --adapter rust_criterion \
+            --threshold-measure latency \
+            --threshold-test t_test \
+            --threshold-upper-boundary 0.95 \
+            --thresholds-reset \
+            --err \
+            "cargo bench --no-default-features --bench index_time"
