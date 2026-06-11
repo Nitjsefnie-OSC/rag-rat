@@ -44,7 +44,16 @@ model2vec = ["dep:model2vec-rs"]
 # Instruction-count benchmarking (deterministic, CI-noise-immune). Needs the matching
 # `iai-callgrind-runner` binary on PATH + valgrind installed. See benches/rag_pipeline.rs.
 iai-callgrind = "0.16"
+# Wall-clock benchmarking (full-index time on a larger corpus). default-features off to skip the
+# plotting deps — Bencher parses criterion's stdout estimates.
+criterion = { version = "0.5", default-features = false }
 
+# iai-callgrind: deterministic instruction counts (index + cold/warm query).
 [[bench]]
 name = "rag_pipeline"
+harness = false
+
+# criterion: wall-clock full-index time.
+[[bench]]
+name = "index_time"
 harness = false
