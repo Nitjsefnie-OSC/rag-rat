@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Newer pushes to the same branch/PR cancel older in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustfmt.toml uses nightly-only options (struct_lit_style, imports_granularity, …),
+      # so the format check must run on nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --no-default-features = hash-only build: no ONNX/model downloads, fast and network-free.
+      # The full feature set is compile-checked by the build-full job below.
+      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Single-threaded: some index/schema tests share the on-disk self-index and flake under
+      # high parallelism. Hash embedder only (no model downloads).
+      - run: cargo test --workspace --no-default-features --locked -- --test-threads=1
+
+  build-full:
+    name: build (fastembed + model2vec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Compile the default feature set (downloads the ONNX runtime once, then cached) so the
+      # released binary's embedding paths never break silently.
+      - run: cargo build --workspace --locked
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info -- --test-threads=1
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          # Tokenless upload works for public repos; CODECOV_TOKEN is used if the secret is set.
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
