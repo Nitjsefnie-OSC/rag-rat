@@ -1,0 +1,66 @@
+name: bench-release
+
+# Heavyweight indexing benchmarks that only make sense to run occasionally — specifically the
+# headline "index the whole Linux kernel in X seconds" number. A full kernel index is ~tens of
+# minutes, so this can't run per-push (that's what the lightweight criterion/iai benches in
+# bench.yml are for); it runs on a published release (and on manual dispatch, to validate the
+# number before trusting it on a release). Results go to Bencher via the generic JSON adapter.
+# See docs/bencher.md and tools/bench-kernel.sh.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      kernel_subdirs:
+        description: 'Kernel subtrees to index (space-separated; "." = whole tree)'
+        required: false
+        default: '.'
+
+permissions:
+  checks: write
+
+env:
+  BENCHER_PROJECT: rag-rat
+  BENCHER_TESTBED: ubuntu-latest
+  # Project key (`bencher_run_…`) → --key auth path (see bench.yml / docs/bencher.md).
+  BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
+  KERNEL_TAG: v7.0
+
+jobs:
+  kernel:
+    runs-on: ubuntu-latest
+    # A whole-kernel index is long but bounded; cap it so a pathological run can't hang for 6h.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release rag-rat (hash embedder; no model download)
+        run: cargo build --release --no-default-features --bin rag-rat
+
+      - name: Index the Linux kernel and emit BMF
+        env:
+          RAG_RAT_BIN: target/release/rag-rat
+          RAG_RAT_KERNEL_SUBDIRS: ${{ github.event.inputs.kernel_subdirs || '.' }}
+          BMF_OUT: kernel_bmf.json
+        run: bash tools/bench-kernel.sh
+
+      - uses: bencherdev/bencher@main
+
+      # Track latency / throughput / memory over releases. No --err: a slow kernel index must not
+      # fail a release publish; this is a headline signal, not a gate.
+      - name: Track kernel index (Bencher)
+        run: |
+          bencher run \
+            --branch main \
+            --adapter json \
+            --file kernel_bmf.json
+
+      - name: Upload BMF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel_bmf
+          path: kernel_bmf.json
