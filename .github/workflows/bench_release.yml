@@ -66,9 +66,11 @@ jobs:
             --adapter json \
             --file kernel_bmf.json
 
-      - name: Upload BMF artifact
+      - name: Upload BMF + RSS time-series artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kernel_bmf
-          path: kernel_bmf.json
+          path: |
+            kernel_bmf.json
+            kernel_rss_samples.csv

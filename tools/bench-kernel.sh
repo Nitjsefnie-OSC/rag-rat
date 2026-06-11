@@ -20,6 +20,9 @@
 set -euo pipefail
 
 KERNEL_TAG="${KERNEL_TAG:-v7.0}"
+# Pinned by commit SHA so the corpus is immutable even if the tag is ever moved (v7.0 = this commit).
+KERNEL_SHA="${KERNEL_SHA:-028ef9c96e96197026887c0f092424679298aae8}"
+RSS_CSV="${RSS_CSV:-kernel_rss_samples.csv}"
 RAG_RAT_BIN="${RAG_RAT_BIN:-target/release/rag-rat}"
 RAG_RAT_KERNEL_SUBDIRS="${RAG_RAT_KERNEL_SUBDIRS:-.}"
 BMF_OUT="${BMF_OUT:-kernel_bmf.json}"
@@ -36,10 +39,12 @@ command -v "$RAG_RAT_BIN" >/dev/null 2>&1 || [ -x "$RAG_RAT_BIN" ] || {
   exit 1
 }
 
-echo "bench-kernel: cloning Linux kernel ${KERNEL_TAG} (shallow) into ${WORK}/linux" >&2
-git clone --quiet --depth 1 --branch "$KERNEL_TAG" https://github.com/torvalds/linux.git "$WORK/linux"
-KERNEL_SHA="$(git -C "$WORK/linux" rev-parse HEAD)"
-echo "bench-kernel: ${KERNEL_TAG} = ${KERNEL_SHA}" >&2
+# Shallow-fetch the pinned commit directly (not the tag), so the corpus can't drift.
+echo "bench-kernel: fetching Linux kernel ${KERNEL_TAG} (${KERNEL_SHA}, shallow) into ${WORK}/linux" >&2
+git init -q "$WORK/linux"
+git -C "$WORK/linux" remote add origin https://github.com/torvalds/linux.git
+git -C "$WORK/linux" -c protocol.version=2 fetch -q --depth 1 origin "$KERNEL_SHA"
+git -C "$WORK/linux" checkout -q "$KERNEL_SHA"
 
 # Render a C-language config over the requested subtree(s). `c = [...]` maps to **/*.c + **/*.h.
 subdirs_toml="$(printf '"%s", ' $RAG_RAT_KERNEL_SUBDIRS)"
@@ -52,42 +57,79 @@ database = "$WORK/kernel-index.sqlite"
 c = [${subdirs_toml%, }]
 EOF
 
-# Single cold full index, measured. Wall clock + peak RSS come from python's resource.getrusage on
-# the child process — portable, no /usr/bin/time dependency (Arch/minimal boxes don't ship it). Use
-# the release binary built --no-default-features (hash embedder; no model download, no network) so
-# the number is the indexing machinery, reproducible across runs.
+# Single cold full index, measured. We capture TWO memory numbers:
+#   - maxrss: getrusage(RUSAGE_CHILDREN).ru_maxrss — the kernel-true peak (catches sub-sample spikes),
+#     used for the cross-tool comparison (the competitor's number is also maxrss).
+#   - a /proc/<pid>/VmRSS time-series sampled at 1 s — the before/after memory CURVE for the README,
+#     and a sampled peak. rag-rat is a SINGLE process (rayon = threads, not forked workers), so the
+#     main pid's VmRSS is the complete resident set — no process-group summing needed.
+# Release binary built --no-default-features (hash embedder; no model download, no network), so the
+# number is the indexing machinery, reproducible across runs.
 echo "bench-kernel: indexing (this takes a while)…" >&2
-python3 - "$RAG_RAT_BIN" "$WORK/rag-rat.toml" > "$WORK/measure.txt" <<'PY'
+python3 - "$RAG_RAT_BIN" "$WORK/rag-rat.toml" "$RSS_CSV" > "$WORK/measure.txt" <<'PY'
 import resource, subprocess, sys, time
-rag_rat, cfg = sys.argv[1], sys.argv[2]
+
+rag_rat, cfg, samples_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def vmrss_kb(pid):
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (FileNotFoundError, ProcessLookupError):
+        pass
+    return None
+
+proc = subprocess.Popen([rag_rat, "--config", cfg, "index", "--full"], stdout=subprocess.DEVNULL)
 start = time.monotonic()
-subprocess.run([rag_rat, "--config", cfg, "index", "--full"], stdout=subprocess.DEVNULL, check=True)
+sampled_peak_kb = 0
+samples = []
+while proc.poll() is None:
+    rss = vmrss_kb(proc.pid)
+    if rss is not None:
+        sampled_peak_kb = max(sampled_peak_kb, rss)
+        samples.append((round(time.monotonic() - start, 1), rss))
+    time.sleep(1.0)
+rc = proc.wait()
 seconds = time.monotonic() - start
-# ru_maxrss is the child's peak resident set size in kilobytes on Linux.
-rss_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-print(f"{seconds} {rss_kb}")
+maxrss_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+with open(samples_path, "w") as fh:
+    fh.write("t_seconds,vmrss_kb\n")
+    for t, r in samples:
+        fh.write(f"{t},{r}\n")
+print(f"{seconds} {maxrss_kb} {sampled_peak_kb} {rc}")
 PY
-read -r seconds rss_kb < "$WORK/measure.txt"
+read -r seconds maxrss_kb sampled_peak_kb rc < "$WORK/measure.txt"
+if [ "${rc:-1}" -ne 0 ]; then
+  echo "bench-kernel: rag-rat index exited non-zero ($rc)" >&2
+  exit 1
+fi
 
 # Read the extracted-fact counts from the DB and emit the BMF. Capturing symbols/edges/chunks (not
 # just files/s) makes the run comparable per extracted fact, not just per file — different tools
 # compute different products, so throughput alone is mush.
-python3 - "$WORK/kernel-index.sqlite" "$seconds" "$rss_kb" "$BMF_OUT" "$KERNEL_TAG" <<'PY'
+python3 - "$WORK/kernel-index.sqlite" "$seconds" "$maxrss_kb" "$sampled_peak_kb" "$BMF_OUT" "$KERNEL_TAG" <<'PY'
 import json, sqlite3, sys
-db, seconds, rss_kb, out, tag = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+db, seconds = sys.argv[1], float(sys.argv[2])
+maxrss_kb, sampled_peak_kb = int(sys.argv[3]), int(sys.argv[4])
+out, tag = sys.argv[5], sys.argv[6]
 conn = sqlite3.connect(db)
 count = lambda table: conn.execute(f"select count(*) from {table}").fetchone()[0]
 files, symbols, edges, chunks = count("files"), count("symbols"), count("edges"), count("chunks")
 resolved = conn.execute("select count(*) from edges where to_symbol_id is not null").fetchone()[0]
+resolved_pct = 100.0 * resolved / edges if edges else 0.0
 
 bmf = {
     # Benchmark name carries the tag so re-pinning to a newer kernel starts a distinct series.
     f"linux-kernel-{tag}/full-index": {
-        "latency": {"value": seconds * 1e9},      # nanoseconds — Bencher's built-in Latency measure
-        "throughput": {"value": files / seconds}, # files per second
-        "memory": {"value": rss_kb * 1024},       # peak RSS bytes
+        "latency": {"value": seconds * 1e9},        # nanoseconds — Bencher's built-in Latency measure
+        "throughput": {"value": files / seconds},   # files per second
+        "memory": {"value": maxrss_kb * 1024},      # kernel-true peak RSS (maxrss), bytes — cross-tool
+        "memory_sampled": {"value": sampled_peak_kb * 1024},  # 1 s-sampled peak VmRSS, bytes
         "symbols": {"value": symbols},
         "edges": {"value": edges},
+        "resolved_edges": {"value": resolved},
         "chunks": {"value": chunks},
     }
 }
@@ -96,8 +138,9 @@ with open(out, "w") as f:
 
 print(
     f"bench-kernel: indexed {files} files of Linux {tag} in {seconds:.1f}s "
-    f"({files/seconds:.1f} files/s, peak {rss_kb/1024:.0f} MiB) — "
-    f"{symbols} symbols, {edges} edges ({resolved} resolved), {chunks} chunks → {out}",
+    f"({files/seconds:.1f} files/s) — peak {maxrss_kb/1024:.0f} MiB maxrss "
+    f"(sampled {sampled_peak_kb/1024:.0f} MiB) — "
+    f"{symbols} symbols, {edges} edges ({resolved} resolved, {resolved_pct:.1f}%), {chunks} chunks → {out}",
     file=sys.stderr,
 )
 PY
