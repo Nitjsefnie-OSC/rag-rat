@@ -684,9 +684,24 @@ fn prepare_index_file(file: &IndexFile) -> PreparedIndexFile {
     PreparedIndexFile { file: file.clone(), prepared: prepare_index_content(file) }
 }
 
+/// Files per full-rebuild wave (prepare → insert → drop). Bounds peak memory; tunable via
+/// `RAG_RAT_INDEX_WAVE` for memory/throughput trade-offs on a given machine.
+fn index_wave_size() -> usize {
+    std::env::var("RAG_RAT_INDEX_WAVE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&size| size > 0)
+        .unwrap_or(2_000)
+}
+
+/// Prepare a slice of files in parallel. `base` / `grand_total` let a caller that processes files in
+/// waves report progress against the overall total rather than the wave size (a non-waved caller
+/// passes `0` and `files.len()`).
 fn prepare_files_with_progress<F>(
     files: &[IndexFile],
     progress: &mut F,
+    base: usize,
+    grand_total: usize,
 ) -> anyhow::Result<Vec<PreparedIndexFile>>
 where
     F: FnMut(IndexProgress),
@@ -700,7 +715,6 @@ where
         kind: TargetKind,
     }
 
-    let total = files.len();
     let prepared = thread::scope(|scope| {
         let (tx, rx) = mpsc::channel();
         let completed = AtomicUsize::new(0);
@@ -709,11 +723,11 @@ where
                 .par_iter()
                 .map(|file| {
                     let prepared = prepare_index_file(file);
-                    let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if should_report_file_progress(current, total) {
+                    let current = base + completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if should_report_file_progress(current, grand_total) {
                         let _ = tx.send(PreparedProgress {
                             current,
-                            total,
+                            total: grand_total,
                             path: file.relative_path.clone(),
                             language: file.language,
                             kind: file.kind,

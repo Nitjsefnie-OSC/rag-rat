@@ -106,28 +106,38 @@ impl IndexDatabase {
         let files = self.assign_file_scopes(files, &changes);
         progress(IndexProgress::Discovered { files: files.len() });
 
-        let prepared = prepare_files_with_progress(&files, progress)?;
-        // Accumulate symbols (with ids) + remapped edge candidates across the loop; resolve and
-        // insert all edges in one in-memory pass afterward (no unresolved insert, no resolve
-        // UPDATEs).
+        // Process files in WAVES: prepare a wave in parallel, insert it, then drop the wave's
+        // prepared output before preparing the next. The previous fan-in barrier materialized the
+        // prepared form (every chunk/symbol/edge-candidate/anchor) of ALL files at once — ~19 GB for
+        // the Linux kernel. Waves cap peak memory at one wave of prepared files + the accumulating
+        // symbol/edge graph (which is needed until resolution but is compact). Files stay in path
+        // order, so symbol/chunk/edge ids are assigned in exactly the same order — byte-identical
+        // output, no id remapping. Wave size is tunable via RAG_RAT_INDEX_WAVE.
+        let total = files.len();
+        let wave_size = index_wave_size();
         let mut graph = edges::FullRebuildGraph::default();
-        for (index, prepared_file) in prepared.iter().enumerate() {
-            let current = index + 1;
-            if should_report_file_progress(current, files.len()) {
-                progress(IndexProgress::IndexingFile {
-                    current,
-                    total: files.len(),
-                    path: prepared_file.file.relative_path.clone(),
-                    language: prepared_file.file.language,
-                    kind: prepared_file.file.kind,
-                });
+        let mut done = 0usize;
+        for wave in files.chunks(wave_size) {
+            let prepared = prepare_files_with_progress(wave, progress, done, total)?;
+            for prepared_file in &prepared {
+                done += 1;
+                if should_report_file_progress(done, total) {
+                    progress(IndexProgress::IndexingFile {
+                        current: done,
+                        total,
+                        path: prepared_file.file.relative_path.clone(),
+                        language: prepared_file.file.language,
+                        kind: prepared_file.file.kind,
+                    });
+                }
+                // Full rebuild: skip per-row chunk_fts writes; rebuild_fts repopulates it at the end.
+                self.insert_prepared_file(prepared_file, false, Some(&mut graph))?;
             }
-            // Full rebuild: skip per-row chunk_fts writes; the closing rebuild_fts repopulates it.
-            self.insert_prepared_file(prepared_file, false, Some(&mut graph))?;
+            // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.
         }
         edges::resolve_and_insert_edges(self.storage.connection(), graph.symbols, graph.edges)?;
 
-        Ok(files.len())
+        Ok(total)
     }
 
     fn index_changed_files_with_progress<F>(
@@ -197,7 +207,7 @@ impl IndexDatabase {
             self.mark_file_deleted(&path)?;
         }
 
-        let prepared = prepare_files_with_progress(&files, progress)?;
+        let prepared = prepare_files_with_progress(&files, progress, 0, files.len())?;
         for (index, prepared_file) in prepared.iter().enumerate() {
             let current = index + 1;
             if should_report_file_progress(current, files.len()) {
