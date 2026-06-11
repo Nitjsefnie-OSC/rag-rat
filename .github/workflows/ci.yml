@@ -51,9 +51,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Single-threaded: some index/schema tests share the on-disk self-index and flake under
-      # high parallelism. Hash embedder only (no model downloads).
-      - run: cargo test --workspace --no-default-features --locked -- --test-threads=1
+      - uses: taiki-e/install-action@nextest
+      # Hash embedder only (no model downloads). The `ci` profile serializes tests (shared
+      # on-disk self-index) and emits a JUnit report at target/nextest/ci/junit.xml.
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace --no-default-features --locked --profile ci
+      - name: Upload test results to Codecov
+        # Upload even when tests fail, so failures show up in Codecov Test Analytics.
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@v1
+        with:
+          files: target/nextest/ci/junit.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
   build-full:
     name: build (fastembed + model2vec)
