@@ -42,7 +42,7 @@ fn full_index(c: &mut Criterion) {
     // window wide enough to avoid the "couldn't complete in time" warning leaking onto stdout.
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(180));
-    group.bench_function("full_rebuild", |b| {
+    group.bench_function("full_rebuild_cargo", |b| {
         b.iter_batched(
             || bench_config(SUBDIR),
             |config| {
