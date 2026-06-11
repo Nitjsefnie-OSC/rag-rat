@@ -5071,6 +5071,176 @@ fn memory_doctor_lists_gone_and_suggests_candidates() {
 }
 
 #[test]
+fn memory_doctor_dedupes_cfg_split_candidates() {
+    // A gone binding whose same-name symbol is cfg-split must surface that candidate ONCE — the
+    // bare-name candidate query returns a row per physical twin, and the rebind suggestion is by
+    // qualified name, so undeduped twins would print the identical command twice.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Bind to a plain (non-cfg) helper in a.rs.
+    fs::write(root.join("src/a.rs"), "pub fn cfg_helper() -> u32 {\n    1\n}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let original = db
+        .symbol_candidates(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("cfg_helper".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .candidates[0]
+        .symbol_id;
+    db.memory_create(crate::query::memory::RepoMemoryCreate {
+        kind: "Invariant".to_string(),
+        title: "cfg helper note".to_string(),
+        body: "Bound to a helper that becomes a cfg-split pair in another file.".to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: Vec::new(),
+        bind: crate::query::memory::RepoMemoryBindTarget {
+            symbol_id: Some(original),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+
+    // Remove a.rs and reintroduce `cfg_helper` as a cfg-split pair in b.rs with DIFFERENT bodies,
+    // so content-hash relocation cannot fire (binding goes gone) while the qualified name survives
+    // as two physical twins sharing one logical symbol.
+    fs::remove_file(root.join("src/a.rs")).unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "#[cfg(not(target_arch = \"wasm32\"))]\npub fn cfg_helper() -> u32 {\n    \
+         11\n}\n\n#[cfg(target_arch = \"wasm32\")]\npub fn cfg_helper() -> u32 {\n    22\n}\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(db.memory_validate().unwrap().gone, 1, "binding must be gone");
+
+    let entries = db.memory_doctor().unwrap();
+    let entry = entries.iter().find(|e| e.title == "cfg helper note").expect("doctor entry");
+    let cfg_candidates: Vec<&String> =
+        entry.candidates.iter().filter(|c| c.ends_with("cfg_helper")).collect();
+    assert_eq!(cfg_candidates.len(), 1, "cfg twins collapse to one suggestion: {cfg_candidates:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn symbol_path_selector_is_exact_not_substring() {
+    // `--symbol-path` (the qualified-name route the doctor now suggests) must match exactly:
+    // the qualified name `…::spawn_blocking` must NOT also pull in `spawn_blocking_handle` /
+    // `spawn_blocking_offload`. This is what makes the doctor's suggestion runnable.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn spawn_blocking() {}\npub fn spawn_blocking_handle() {}\npub fn \
+         spawn_blocking_offload() {}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let hit = db
+        .select_symbol_for_bind(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: Some("src/lib.rs::spawn_blocking".to_string()),
+            symbol: None,
+            language: None,
+            allow_ambiguous: false,
+            limit: 10,
+        })
+        .unwrap()
+        .expect("exact qualified name resolves, no substring siblings")
+        .expect("one hit");
+    assert_eq!(hit.name, "spawn_blocking");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn select_symbol_for_bind_collapses_cfg_split_group() {
+    // The memory-doctor bug: a memory bound to a cfg-split helper goes gone, and the suggested
+    // `--symbol <qualified_name>` rebind hits BOTH cfg twins → ambiguous → dead end. The
+    // bind-resolution path must collapse a one-logical-group candidate set to a single member so
+    // the rebind succeeds, while a genuinely-distinct same-name set still disambiguates.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "#[cfg(not(target_arch = \"wasm32\"))]\npub fn spawn_blocking() {}\n\n#[cfg(target_arch = \
+         \"wasm32\")]\npub fn spawn_blocking() {}\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Resolve by the fully-qualified name the doctor would suggest. select_symbol (no collapse)
+    // must disambiguate; select_symbol_for_bind must collapse to one member of the logical group.
+    let qualified = db
+        .symbol_candidates(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("spawn_blocking".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .candidates[0]
+        .qualified_name
+        .clone();
+    let logical_id = db
+        .symbol_candidates(&crate::query::symbol::SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: None,
+            symbol: Some("spawn_blocking".to_string()),
+            language: Some(Language::Rust),
+            allow_ambiguous: true,
+            limit: 10,
+        })
+        .unwrap()
+        .candidates[0]
+        .logical_symbol_id
+        .expect("cfg twins share a logical id");
+
+    let selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: Some(qualified.clone()),
+        symbol: None,
+        language: None,
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    assert!(
+        db.select_symbol(&selector).unwrap().is_err(),
+        "plain select_symbol must still disambiguate the two cfg twins"
+    );
+    let hit = db
+        .select_symbol_for_bind(&selector)
+        .unwrap()
+        .expect("cfg group collapses, not ambiguous")
+        .expect("one member returned");
+    assert_eq!(hit.logical_symbol_id, Some(logical_id));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn repo_brief_ranks_churn_and_god_module_candidates() {
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);

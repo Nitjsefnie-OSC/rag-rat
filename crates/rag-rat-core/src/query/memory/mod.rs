@@ -102,7 +102,7 @@ pub struct RepoMemoryCreate {
     pub bind: RepoMemoryBindTarget,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RepoMemoryBindTarget {
     pub logical_symbol_id: Option<i64>,
     pub symbol_id: Option<i64>,

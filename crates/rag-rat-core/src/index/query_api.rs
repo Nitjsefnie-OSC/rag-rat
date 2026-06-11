@@ -205,6 +205,17 @@ impl IndexDatabase {
         crate::query::symbol::select_one(self.storage.connection(), selector)
     }
 
+    /// Resolve a selector to a single symbol for `memory rebind`, collapsing a cfg-split / overload
+    /// group (all candidates sharing one logical symbol) to one member instead of disambiguating.
+    pub fn select_symbol_for_bind(
+        &self,
+        selector: &crate::query::symbol::SymbolSelector,
+    ) -> anyhow::Result<
+        Result<Option<crate::query::symbol::SymbolHit>, crate::query::symbol::SymbolDisambiguation>,
+    > {
+        crate::query::symbol::select_one_for_bind(self.storage.connection(), selector)
+    }
+
     pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<crate::query::ReadChunk>> {
         self.read_chunk_with_graph_and_memories(chunk_id, GraphMetaMode::Full, 20, true)
     }

@@ -248,8 +248,16 @@ pub(crate) enum MemoryCommand {
     /// Re-anchor a memory to a symbol, path, or chunk.
     Rebind {
         memory_id: String,
+        /// Symbol name (substring-matched); cfg-split groups resolve to one. Ambiguous names list
+        /// `--symbol-id` choices — prefer `--symbol-path` for an exact qualified name.
         #[arg(long)]
         symbol: Option<String>,
+        /// Exact qualified name (`path::name`) — what `memory doctor` suggests; cfg-split safe.
+        #[arg(long)]
+        symbol_path: Option<String>,
+        /// Exact symbol id — the escape hatch when same-name symbols can't be told apart.
+        #[arg(long)]
+        symbol_id: Option<i64>,
         #[arg(long)]
         path: Option<String>,
         #[arg(long)]
@@ -377,6 +385,38 @@ mod tests {
                 assert_eq!(memory_id, "mem_1");
                 assert_eq!(symbol.as_deref(), Some("foo"));
             },
+            other => panic!("expected memory rebind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn memory_rebind_symbol_id_and_path_parse() {
+        let cli =
+            Cli::try_parse_from(["rag-rat", "memory", "rebind", "mem_2", "--symbol-id", "42"])
+                .expect("parse");
+        match cli.command {
+            Command::Memory(MemoryArgs {
+                command: MemoryCommand::Rebind { symbol_id, symbol_path, symbol, .. },
+            }) => {
+                assert_eq!(symbol_id, Some(42));
+                assert_eq!(symbol_path, None);
+                assert_eq!(symbol, None);
+            },
+            other => panic!("expected memory rebind, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rag-rat",
+            "memory",
+            "rebind",
+            "mem_3",
+            "--symbol-path",
+            "src/a.rs::foo",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Memory(MemoryArgs { command: MemoryCommand::Rebind { symbol_path, .. } }) =>
+                assert_eq!(symbol_path.as_deref(), Some("src/a.rs::foo")),
             other => panic!("expected memory rebind, got {other:?}"),
         }
     }

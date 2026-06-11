@@ -673,7 +673,15 @@ fn live_symbol_candidates(
         ranked.push((rank, qname));
     }
     ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    ranked.into_iter().map(|(_, qname)| qname).collect()
+    // Dedupe by qualified_name: cfg-split twins (and overloads) share one qualified_name, so the
+    // bare-name query above returns a row per physical symbol. The rebind suggestion is by
+    // qualified name, so the duplicates would print the same command twice — collapse them,
+    // keeping the best-ranked first occurrence.
+    let mut seen = std::collections::HashSet::new();
+    ranked
+        .into_iter()
+        .filter_map(|(_, qname)| seen.insert(qname.clone()).then_some(qname))
+        .collect()
 }
 
 /// READ-only; counts persisted anchor_status over active memories' bindings, does not re-validate.

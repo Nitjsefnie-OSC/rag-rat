@@ -243,6 +243,29 @@ pub(crate) fn doctor(config: &Config) -> anyhow::Result<()> {
         }
     }))
 }
+// Each `memory rebind` target sets one anchor field and defaults the rest, so the call sites
+// below state only what differs.
+fn symbol_bind_target(
+    hit: &rag_rat_core::query::symbol::SymbolHit,
+) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
+    rag_rat_core::query::memory::RepoMemoryBindTarget {
+        symbol_id: Some(hit.symbol_id),
+        logical_symbol_id: hit.logical_symbol_id,
+        ..Default::default()
+    }
+}
+
+fn path_bind_target(path: String) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
+    rag_rat_core::query::memory::RepoMemoryBindTarget { path: Some(path), ..Default::default() }
+}
+
+fn chunk_bind_target(chunk_id: i64) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
+    rag_rat_core::query::memory::RepoMemoryBindTarget {
+        chunk_id: Some(chunk_id),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
     match &args.command {
         MemoryCommand::Doctor { json } => {
@@ -273,8 +296,11 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                     }
                 } else {
                     for candidate in &entry.candidates {
+                        // Suggest --symbol-path (exact qualified-name match) rather than --symbol
+                        // (substring): a fully-qualified candidate fed to --symbol would also hit
+                        // longer siblings. Exact match plus cfg-group collapse makes this runnable.
                         eprintln!(
-                            "  rag-rat memory rebind {} --symbol {}",
+                            "  rag-rat memory rebind {} --symbol-path {}",
                             entry.memory_id, candidate
                         );
                     }
@@ -288,92 +314,47 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        MemoryCommand::Rebind { memory_id, symbol, path, chunk } => {
+        MemoryCommand::Rebind { memory_id, symbol, symbol_path, symbol_id, path, chunk } => {
             let db = open_index(config)?;
-            let bind = if let Some(symbol_name) = symbol {
+            let bind = if symbol.is_some() || symbol_path.is_some() || symbol_id.is_some() {
                 let selector = rag_rat_core::query::symbol::SymbolSelector {
                     logical_symbol_id: None,
-                    symbol_id: None,
-                    symbol_path: None,
-                    symbol: Some(symbol_name.clone()),
+                    symbol_id: *symbol_id,
+                    symbol_path: symbol_path.clone(),
+                    symbol: symbol.clone(),
                     language: None,
                     allow_ambiguous: false,
                     limit: 10,
                 };
-                match db.select_symbol(&selector)? {
-                    Ok(Some(hit)) => rag_rat_core::query::memory::RepoMemoryBindTarget {
-                        symbol_id: Some(hit.symbol_id),
-                        logical_symbol_id: hit.logical_symbol_id,
-                        chunk_id: None,
-                        edge_id: None,
-                        path: None,
-                        start_line: None,
-                        end_line: None,
-                        commit_hash: None,
-                        github_owner: None,
-                        github_repo: None,
-                        github_number: None,
-                        start_logical_symbol_id: None,
-                        end_logical_symbol_id: None,
-                        edge_sequence_hash: None,
-                        path_summary: None,
-                        edge_path: None,
-                        dir: None,
-                    },
-                    Ok(None) => anyhow::bail!("symbol `{symbol_name}` not found"),
+                let label = symbol
+                    .as_deref()
+                    .or(symbol_path.as_deref())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("#{}", symbol_id.unwrap_or_default()));
+                match db.select_symbol_for_bind(&selector)? {
+                    Ok(Some(hit)) => symbol_bind_target(&hit),
+                    Ok(None) => anyhow::bail!("symbol `{label}` not found"),
                     Err(disambiguation) => anyhow::bail!(
-                        "symbol `{symbol_name}` is ambiguous — candidates: {}",
+                        "symbol `{label}` is ambiguous — disambiguate with one of:\n{}",
                         disambiguation
                             .candidates
                             .iter()
-                            .map(|c| c.qualified_name.as_str())
+                            .map(|c| format!(
+                                "  --symbol-id {}   ({} in {})",
+                                c.symbol_id, c.qualified_name, c.path
+                            ))
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join("\n")
                     ),
                 }
             } else if let Some(path) = path {
-                rag_rat_core::query::memory::RepoMemoryBindTarget {
-                    symbol_id: None,
-                    logical_symbol_id: None,
-                    chunk_id: None,
-                    edge_id: None,
-                    path: Some(path.clone()),
-                    start_line: None,
-                    end_line: None,
-                    commit_hash: None,
-                    github_owner: None,
-                    github_repo: None,
-                    github_number: None,
-                    start_logical_symbol_id: None,
-                    end_logical_symbol_id: None,
-                    edge_sequence_hash: None,
-                    path_summary: None,
-                    edge_path: None,
-                    dir: None,
-                }
+                path_bind_target(path.clone())
             } else if let Some(chunk_id) = chunk {
-                rag_rat_core::query::memory::RepoMemoryBindTarget {
-                    symbol_id: None,
-                    logical_symbol_id: None,
-                    chunk_id: Some(*chunk_id),
-                    edge_id: None,
-                    path: None,
-                    start_line: None,
-                    end_line: None,
-                    commit_hash: None,
-                    github_owner: None,
-                    github_repo: None,
-                    github_number: None,
-                    start_logical_symbol_id: None,
-                    end_logical_symbol_id: None,
-                    edge_sequence_hash: None,
-                    path_summary: None,
-                    edge_path: None,
-                    dir: None,
-                }
+                chunk_bind_target(*chunk_id)
             } else {
                 anyhow::bail!(
-                    "memory rebind needs one of --symbol <name>, --path <path>, or --chunk <id>"
+                    "memory rebind needs one of --symbol <name>, --symbol-path <path::name>, \
+                     --symbol-id <id>, --path <path>, or --chunk <id>"
                 );
             };
             print_json(&db.memory_rebind(memory_id, bind)?)

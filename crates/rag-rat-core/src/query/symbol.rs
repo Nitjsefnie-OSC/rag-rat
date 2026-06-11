@@ -109,6 +109,36 @@ pub fn select_one(
     Ok(Ok(Some(candidates.remove(0))))
 }
 
+/// Like [`select_one`], but treats a candidate set that all belongs to a single logical symbol
+/// (cfg-split twins, or an overload group) as unambiguous. Binding to any member is binding to
+/// the same logical thing, so we collapse to the group's first member instead of forcing a
+/// disambiguation prompt. Used by `memory rebind`: the caller wants ONE bind target, and the
+/// memory-doctor suggestion for a cfg-split helper must resolve cleanly rather than dead-ending.
+pub fn select_one_for_bind(
+    conn: &Connection,
+    selector: &SymbolSelector,
+) -> anyhow::Result<Result<Option<SymbolHit>, SymbolDisambiguation>> {
+    match select_one(conn, selector)? {
+        Ok(hit) => Ok(Ok(hit)),
+        Err(disambiguation) => Ok(collapse_logical_group(disambiguation)),
+    }
+}
+
+/// Collapse a disambiguation whose every candidate shares one `logical_symbol_id` to that
+/// group's first member; otherwise return the disambiguation unchanged. A `None` logical id on
+/// any candidate means it isn't part of a single group, so it stays ambiguous.
+fn collapse_logical_group(
+    disambiguation: SymbolDisambiguation,
+) -> Result<Option<SymbolHit>, SymbolDisambiguation> {
+    let shared = disambiguation.candidates.first().and_then(|c| c.logical_symbol_id);
+    if let Some(shared) = shared
+        && disambiguation.candidates.iter().all(|c| c.logical_symbol_id == Some(shared))
+    {
+        return Ok(disambiguation.candidates.into_iter().next());
+    }
+    Err(disambiguation)
+}
+
 pub fn lookup_by_id(conn: &Connection, symbol_id: i64) -> anyhow::Result<Option<SymbolHit>> {
     let mut hit = conn
         .query_row(
