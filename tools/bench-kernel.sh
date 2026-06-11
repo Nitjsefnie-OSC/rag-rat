@@ -24,6 +24,12 @@ RAG_RAT_BIN="${RAG_RAT_BIN:-target/release/rag-rat}"
 RAG_RAT_KERNEL_SUBDIRS="${RAG_RAT_KERNEL_SUBDIRS:-.}"
 BMF_OUT="${BMF_OUT:-kernel_bmf.json}"
 WORK="${KERNEL_WORK:-$(mktemp -d)}"
+mkdir -p "$WORK"
+# The work dir holds the kernel checkout (~2 GB) + the SQLite index DB (~10 GB). Always remove it on
+# exit so reruns don't accumulate — critical when WORK lands on a size-limited tmpfs (e.g. a box
+# where /tmp is RAM-backed), which otherwise fills up and the index hits a SQLite disk-I/O error.
+# The BMF result is written to BMF_OUT (outside WORK), so cleanup doesn't lose it.
+trap 'rm -rf "$WORK"' EXIT
 
 command -v "$RAG_RAT_BIN" >/dev/null 2>&1 || [ -x "$RAG_RAT_BIN" ] || {
   echo "bench-kernel: rag-rat binary not found at '$RAG_RAT_BIN' (build with: cargo build --release --no-default-features --bin rag-rat)" >&2
