@@ -6,9 +6,6 @@
 //!   or falls back to a direct read-only query, prints `additionalContext` JSON.
 //!
 //! Exit 0 on every path — the hook must never block a tool call or session start.
-//! Specs:
-//!   `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`
-//!   `docs/plans/2026-06-10-sessionstart-orientation-hook-design.md`
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};

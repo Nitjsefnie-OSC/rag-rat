@@ -1,8 +1,7 @@
 //! Unix-socket listener serving the Claude Code grep-augmentation PreToolUse hook.
 //!
 //! One listener per worktree (socket election lock); newline-delimited JSON, one request per
-//! connection; per-session dedupe in memory. Read-only on the index by construction. Spec:
-//! `docs/specs/2026-06-09-grep-augment-pretooluse-hook.md`.
+//! connection; per-session dedupe in memory. Read-only on the index by construction.
 
 use serde::{Deserialize, Serialize};
 
