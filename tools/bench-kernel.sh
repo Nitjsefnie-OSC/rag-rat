@@ -46,11 +46,22 @@ database = "$WORK/kernel-index.sqlite"
 c = [${subdirs_toml%, }]
 EOF
 
-# Single cold full index, measured. `/usr/bin/time -v` gives wall clock + peak RSS without polluting
-# our own timing. Use the release binary built --no-default-features (hash embedder; no model
-# download, no network) so the number is the indexing machinery, reproducible across runs.
+# Single cold full index, measured. Wall clock + peak RSS come from python's resource.getrusage on
+# the child process — portable, no /usr/bin/time dependency (Arch/minimal boxes don't ship it). Use
+# the release binary built --no-default-features (hash embedder; no model download, no network) so
+# the number is the indexing machinery, reproducible across runs.
 echo "bench-kernel: indexing (this takes a while)…" >&2
-/usr/bin/time -v "$RAG_RAT_BIN" --config "$WORK/rag-rat.toml" index --full >/dev/null 2> "$WORK/time.txt"
+python3 - "$RAG_RAT_BIN" "$WORK/rag-rat.toml" > "$WORK/measure.txt" <<'PY'
+import resource, subprocess, sys, time
+rag_rat, cfg = sys.argv[1], sys.argv[2]
+start = time.monotonic()
+subprocess.run([rag_rat, "--config", cfg, "index", "--full"], stdout=subprocess.DEVNULL, check=True)
+seconds = time.monotonic() - start
+# ru_maxrss is the child's peak resident set size in kilobytes on Linux.
+rss_kb = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+print(f"{seconds} {rss_kb}")
+PY
+read -r seconds rss_kb < "$WORK/measure.txt"
 
 # True indexed-file count (what landed in the DB), for throughput.
 files="$(python3 - "$WORK/kernel-index.sqlite" <<'PY'
@@ -59,19 +70,12 @@ print(sqlite3.connect(sys.argv[1]).execute("select count(*) from files").fetchon
 PY
 )"
 
-python3 - "$WORK/time.txt" "$files" "$BMF_OUT" "$KERNEL_TAG" "$KERNEL_SHA" <<'PY'
-import json, re, sys
-time_txt, files, out, tag, sha = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
-text = open(time_txt).read()
-
-# "Elapsed (wall clock) time (h:mm:ss or m:ss): 41:23.45" — h:mm:ss(.ss) or m:ss(.ss)
-m = re.search(r"Elapsed \(wall clock\).*?:\s*([\d:.]+)", text)
-parts = [float(p) for p in m.group(1).split(":")]
-seconds = 0.0
-for p in parts:
-    seconds = seconds * 60 + p
-
-rss_kb = int(re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", text).group(1))
+python3 - "$seconds" "$rss_kb" "$files" "$BMF_OUT" "$KERNEL_TAG" "$KERNEL_SHA" <<'PY'
+import json, sys
+seconds = float(sys.argv[1])
+rss_kb = int(sys.argv[2])
+files = int(sys.argv[3])
+out, tag, sha = sys.argv[4], sys.argv[5], sys.argv[6]
 
 bmf = {
     # Benchmark name carries the tag so re-pinning to a newer kernel starts a distinct series.
