@@ -138,13 +138,13 @@ impl IndexDatabase {
         Ok(())
     }
 
-    /// `write_fts`: false on a full rebuild (the closing bulk `rebuild_fts` repopulates `chunk_fts`),
-    /// true on incremental discovery (per-file replace needs the external-content index kept in sync
-    /// in place). See `insert_chunks`.
-    /// `graph`: on a full rebuild, `Some` accumulator — symbols (with their new DB ids) and remapped
-    /// edge candidates are collected for one in-memory resolve-and-insert pass after the loop, and
-    /// NO edges are inserted here. `None` (incremental) inserts edges unresolved per file as before,
-    /// to be resolved by the DB-based `resolve_edges`.
+    /// `write_fts`: false on a full rebuild (the closing bulk `rebuild_fts` repopulates
+    /// `chunk_fts`), true on incremental discovery (per-file replace needs the external-content
+    /// index kept in sync in place). See `insert_chunks`.
+    /// `graph`: on a full rebuild, `Some` accumulator — symbols (with their new DB ids) and
+    /// remapped edge candidates are collected for one in-memory resolve-and-insert pass after
+    /// the loop, and NO edges are inserted here. `None` (incremental) inserts edges unresolved
+    /// per file as before, to be resolved by the DB-based `resolve_edges`.
     pub(super) fn insert_prepared_file(
         &self,
         prepared_file: &PreparedIndexFile,
@@ -235,10 +235,10 @@ impl IndexDatabase {
     ///
     /// `write_fts` controls the per-row `chunk_fts` insert. On a FULL REBUILD it's `false`: the
     /// rebuild empties `chunk_fts` and the closing `rebuild_fts` repopulates it from the content
-    /// table in one bulk pass, so per-row writes are pure double work. Incremental / heal paths pass
-    /// `true`: they delete and re-insert individual files, which would leave `chunks` rows without
-    /// `chunk_fts` shadow entries (an external-content desync, #51) until a query forces a rebuild —
-    /// the per-row insert keeps the index consistent in place.
+    /// table in one bulk pass, so per-row writes are pure double work. Incremental / heal paths
+    /// pass `true`: they delete and re-insert individual files, which would leave `chunks` rows
+    /// without `chunk_fts` shadow entries (an external-content desync, #51) until a query
+    /// forces a rebuild — the per-row insert keeps the index consistent in place.
     fn insert_chunks(
         &self,
         file: ChunkInsertFile<'_>,
@@ -409,8 +409,8 @@ impl IndexDatabase {
             let row = row?;
             groups.entry(LogicalSymbolKey::from(&row)).or_default().push(row);
         }
-        // Group in memory, then bulk-insert. Both INSERTs are prepare_cached: the member insert runs
-        // once per symbol, and conn.execute would recompile the SQL every time.
+        // Group in memory, then bulk-insert. Both INSERTs are prepare_cached: the member insert
+        // runs once per symbol, and conn.execute would recompile the SQL every time.
         let conn = self.storage.connection();
         for (key, members) in groups {
             let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };

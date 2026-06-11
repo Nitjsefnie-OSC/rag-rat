@@ -213,21 +213,20 @@ pub(crate) fn insert_candidates(
             ",
         )?
         .execute(params![
-                file_id,
-                candidate.from_symbol_id,
-                candidate.from_name,
-                to_name,
-                candidate.target_qualified_name,
-                candidate.evidence,
-                candidate.receiver_hint,
-                candidate.source_span.start_line,
-                candidate.source_span.end_line,
-                candidate.source_span.start_byte,
-                candidate.source_span.end_byte,
-                candidate.edge_kind.as_str(),
-                candidate.confidence.as_str(),
-            ],
-        )?;
+            file_id,
+            candidate.from_symbol_id,
+            candidate.from_name,
+            to_name,
+            candidate.target_qualified_name,
+            candidate.evidence,
+            candidate.receiver_hint,
+            candidate.source_span.start_line,
+            candidate.source_span.end_line,
+            candidate.source_span.start_byte,
+            candidate.source_span.end_byte,
+            candidate.edge_kind.as_str(),
+            candidate.confidence.as_str(),
+        ])?;
     }
     Ok(())
 }

@@ -93,8 +93,8 @@ impl IndexedSymbol {
     /// Build symbols for the parallel prepare phase, where real DB ids don't exist yet. `id` is the
     /// symbol's index in the prepared `symbols` vec; edge candidates produced from these carry that
     /// local index as `from_symbol_id`, which `insert_prepared_file` remaps to the real DB id once
-    /// symbols are inserted. Sorted by (start_byte, end_byte) to match `symbols_for_file`'s ORDER BY
-    /// so containing-symbol tie-breaking is identical to the inline path.
+    /// symbols are inserted. Sorted by (start_byte, end_byte) to match `symbols_for_file`'s ORDER
+    /// BY so containing-symbol tie-breaking is identical to the inline path.
     pub(crate) fn local_from_prepared(
         language: Language,
         symbols: &[crate::index::symbols::Symbol],
@@ -123,7 +123,8 @@ impl IndexedSymbol {
 impl EdgeCandidate {
     /// Replace a local `from_symbol_id` (an index into the prepared symbols, as produced by
     /// [`IndexedSymbol::local_from_prepared`]) with the real DB id from `db_ids`, indexed by the
-    /// prepared symbol's original position. A `None` from_symbol_id (file-level edge) is left alone.
+    /// prepared symbol's original position. A `None` from_symbol_id (file-level edge) is left
+    /// alone.
     pub(crate) fn remap_from_symbol_id(&mut self, db_ids: &[i64]) {
         if let Some(local) = self.from_symbol_id {
             self.from_symbol_id =
@@ -156,9 +157,10 @@ impl IndexedSymbol {
     }
 }
 
-/// Symbols (with real DB ids) and edge candidates (with their source file id) accumulated across the
-/// full-rebuild insert loop, so edges can be resolved in memory and inserted once, fully resolved —
-/// instead of inserting them unresolved per file and then resolving with a per-edge UPDATE pass.
+/// Symbols (with real DB ids) and edge candidates (with their source file id) accumulated across
+/// the full-rebuild insert loop, so edges can be resolved in memory and inserted once, fully
+/// resolved — instead of inserting them unresolved per file and then resolving with a per-edge
+/// UPDATE pass.
 #[derive(Default)]
 pub(crate) struct FullRebuildGraph {
     pub(crate) symbols: Vec<IndexedSymbol>,

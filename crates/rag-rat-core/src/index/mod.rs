@@ -547,8 +547,8 @@ struct PreparedChunk {
 }
 
 /// Compute the per-chunk hashes / anchor / embedding policy for a file's chunks. Splits the file's
-/// lines once (anchors only read a few boundary/context lines). Shared by the parallel prepare phase
-/// and the inline incremental path, so both keep this CPU work off the serial insert stage.
+/// lines once (anchors only read a few boundary/context lines). Shared by the parallel prepare
+/// phase and the inline incremental path, so both keep this CPU work off the serial insert stage.
 fn prepare_chunks(
     path: &Path,
     language: &str,
@@ -587,9 +587,10 @@ struct PreparedIndexContent {
     sha256: String,
     chunks: Vec<PreparedChunk>,
     symbols: Vec<Symbol>,
-    // Graph edge candidates computed here in the parallel prepare phase (their `from_symbol_id`s are
-    // local symbol indices, remapped to DB ids in insert_prepared_file). Empty for generated /
-    // oversized / markdown files. Moving this off the serial insert loop kills the duplicate parse.
+    // Graph edge candidates computed here in the parallel prepare phase (their `from_symbol_id`s
+    // are local symbol indices, remapped to DB ids in insert_prepared_file). Empty for
+    // generated / oversized / markdown files. Moving this off the serial insert loop kills the
+    // duplicate parse.
     edge_candidates: Vec<edges::EdgeCandidate>,
     parser_failure: Option<String>,
 }
@@ -765,8 +766,9 @@ fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexConten
 
     let symbols = parsed.as_ref().map(|p| symbols::from_parsed(&p.symbols)).unwrap_or_default();
 
-    // Preserve the historical failure signal: a clean parse → None, error nodes → the message, and a
-    // hard parse failure on otherwise-eligible code → an error (matches the old parse_error Err arm).
+    // Preserve the historical failure signal: a clean parse → None, error nodes → the message, and
+    // a hard parse failure on otherwise-eligible code → an error (matches the old parse_error
+    // Err arm).
     let parser_failure = if structural_eligible {
         match &parsed {
             Some(p) => p.parser_failure(),
@@ -793,8 +795,8 @@ fn prepare_index_content(file: &IndexFile) -> anyhow::Result<PreparedIndexConten
         &text,
     );
 
-    // Edge candidates walk the shared tree (no re-parse). from_symbol_id holds a local symbol index,
-    // remapped to the real DB id at insert time. Empty when there's no structural parse.
+    // Edge candidates walk the shared tree (no re-parse). from_symbol_id holds a local symbol
+    // index, remapped to the real DB id at insert time. Empty when there's no structural parse.
     let edge_candidates = match &parsed {
         Some(p) => {
             let local = edges::IndexedSymbol::local_from_prepared(file.language, &symbols);

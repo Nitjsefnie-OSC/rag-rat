@@ -70,8 +70,8 @@ const MIGRATION_015_DESCRIPTION: &str =
     "Add ordered edge fingerprints behind server-derived call-path hashes for validation";
 const MIGRATION_016_ID: &str = "016_symbol_line_spans";
 const MIGRATION_016_CHECKSUM: &str = "sha256:rag-rat-symbol-line-spans-v16";
-const MIGRATION_016_DESCRIPTION: &str =
-    "Store start_line/end_line on symbols so readers skip the per-symbol chunk-containment subqueries";
+const MIGRATION_016_DESCRIPTION: &str = "Store start_line/end_line on symbols so readers skip the \
+                                         per-symbol chunk-containment subqueries";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

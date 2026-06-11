@@ -393,7 +393,6 @@ fn node_text(node: Node<'_>, text: &str) -> Option<String> {
     node.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned)
 }
 
-
 fn signature_for(text: &str, start_byte: usize, end_byte: usize) -> Option<String> {
     text.get(start_byte..end_byte)?
         .lines()

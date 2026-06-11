@@ -116,11 +116,9 @@ fn symbols_store_true_source_line_spans() {
     let line_span = |name: &str| -> (i64, i64) {
         db.storage
             .connection()
-            .query_row(
-                "SELECT start_line, end_line FROM symbols WHERE name = ?1",
-                [name],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-            )
+            .query_row("SELECT start_line, end_line FROM symbols WHERE name = ?1", [name], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
             .unwrap()
     };
     assert_eq!(line_span("alpha"), (2, 2));

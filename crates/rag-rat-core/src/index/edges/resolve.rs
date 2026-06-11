@@ -73,21 +73,20 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
              WHERE id = ?1",
         )?
         .execute(params![
-                edge_id,
-                to_symbol_id.id,
-                confidence.as_str(),
-                to_symbol_id.start_line,
-                to_symbol_id.end_line,
-                reason,
-            ],
-        )?;
+            edge_id,
+            to_symbol_id.id,
+            confidence.as_str(),
+            to_symbol_id.start_line,
+            to_symbol_id.end_line,
+            reason,
+        ])?;
     }
     Ok(())
 }
 /// Full-rebuild fast path: resolve every accumulated edge candidate against an in-memory symbol
 /// index and insert it ONCE, already resolved — no unresolved insert, no `all_symbols` SELECT, no
-/// per-edge UPDATE pass. `symbols` carry their real DB ids (assigned in insertion order); we sort by
-/// `(qualified_name, id)` to reproduce `all_symbols`' `ORDER BY qualified_name` (tiebreak rowid)
+/// per-edge UPDATE pass. `symbols` carry their real DB ids (assigned in insertion order); we sort
+/// by `(qualified_name, id)` to reproduce `all_symbols`' `ORDER BY qualified_name` (tiebreak rowid)
 /// exactly, so `resolve_symbol`'s `matches[0]` picks the same symbol as the DB-based path.
 pub(crate) fn resolve_and_insert_edges(
     conn: &Connection,
@@ -104,8 +103,8 @@ pub(crate) fn resolve_and_insert_edges(
     // Safe because a full rebuild owns the edges table inside the rebuild transaction (WAL).
     let edge_indexes = conn
         .prepare(
-            "SELECT name, sql FROM sqlite_master \
-             WHERE type = 'index' AND tbl_name = 'edges' AND sql IS NOT NULL",
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'edges' AND \
+             sql IS NOT NULL",
         )?
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -146,24 +145,24 @@ pub(crate) fn resolve_and_insert_edges(
             },
             &index,
         );
-        let (to_symbol_id, confidence, target_start_line, target_end_line, reason) = match resolution
-        {
-            Some((symbol, confidence, reason)) => (
-                Some(symbol.id),
-                confidence,
-                Some(symbol.start_line),
-                Some(symbol.end_line),
-                reason,
-            ),
-            None => {
-                let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
-                    EdgeConfidence::Ambiguous
-                } else {
-                    EdgeConfidence::NameOnly
-                };
-                (None, confidence, None, None, "unresolved")
-            },
-        };
+        let (to_symbol_id, confidence, target_start_line, target_end_line, reason) =
+            match resolution {
+                Some((symbol, confidence, reason)) => (
+                    Some(symbol.id),
+                    confidence,
+                    Some(symbol.start_line),
+                    Some(symbol.end_line),
+                    reason,
+                ),
+                None => {
+                    let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
+                        EdgeConfidence::Ambiguous
+                    } else {
+                        EdgeConfidence::NameOnly
+                    };
+                    (None, confidence, None, None, "unresolved")
+                },
+            };
         conn.prepare_cached(
             "
             INSERT INTO edges(
