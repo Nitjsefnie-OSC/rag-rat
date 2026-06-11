@@ -58,9 +58,11 @@ caches it under `target/bench-corpus/`:
 
 The iai bench indexes a **small** subtree (`src/cargo/core/resolver`, ~10 files) because callgrind's
 ~50x slowdown applies even to the uncounted `setup` index builds — a large subtree would time the
-job out. The criterion bench indexes a **larger** subtree (`src/cargo/core`) for a meaningful
-"full index" wall time, since it runs at native speed. If you bump the pinned SHA, update the cache
-key (`bench-corpus-cargo-<version>`) in all three workflow files too.
+job out. The criterion bench indexes the **whole checkout** (~1.3k `.rs` files) — the realistic
+"index this repo" workload `rag-rat index` actually performs — since it runs at native speed; it
+reports the indexed `file_count_by_language` and files/sec throughput so the output shows real usage.
+If you bump the pinned SHA, update the cache key (`bench-corpus-cargo-<version>`) in all three
+workflow files too.
 
 ## CI workflows
 
