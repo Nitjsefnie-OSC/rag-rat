@@ -200,7 +200,32 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
 
     // No pre-built index: produce the `.scip` with the tool BEFORE acquiring the write lock, so the
     // slow rust-analyzer subprocess doesn't hold the lock and starve the watcher (#82 P3). Only the
-    // probe-recheck + join/write below run under the lock.
+    // brief pre-spawn snapshot + the join/write run under the lock.
+    //
+    // Probe the tool FIRST so a missing/unrunnable tool yields the documented `Blocked` + exit-0
+    // UX before anything touches the index (#88 review): opening the index is not guaranteed
+    // side-effect free (a stale graph version triggers an edge reindex), and a Blocked probe
+    // must not be preempted by an index-open failure.
+    if let rag_rat_core::index::oracle::ToolAvailability::Blocked { tool, program, hint } =
+        rag_rat_core::index::oracle::probe_oracle_tool(tool)
+    {
+        eprintln!("oracle: {hint}");
+        return print_json(&rag_rat_core::index::oracle::OracleRunOutcome::Blocked {
+            tool,
+            program,
+            hint,
+        });
+    }
+
+    // Snapshot the indexed shas BEFORE spawning (#83). The query itself is a cheap read, but
+    // `open_index` may upgrade a stale graph index (a WRITE — `ensure_graph_index_current`
+    // rebuilds `edges`), so the snapshot takes the write lock briefly and releases it before the
+    // subprocess spawns (#88 review). The join later requires every verdict's documents to still
+    // carry these shas, so a file the watcher reindexes ANYWHERE in the spawn → join window —
+    // including DURING the subprocess, which the post-exit `production_sha` snapshot cannot see —
+    // is skipped, never mis-joined. A reindex slipping in between this lock release and the spawn
+    // is detected by the same gate.
+    let pre_spawn_sha = with_oracle_write_lock(config, |db| db.oracle_pre_spawn_snapshot())?;
     let scip_output = config
         .database
         .parent()
@@ -224,13 +249,15 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
             bytes,
             production_sha,
         } => {
-            // The join's content gate revalidates against current disk bytes under the lock, and
-            // `production_sha` (the per-document disk hashes captured the instant the subprocess
-            // finished) pins the `.scip` to the content it was built against — so a file the
-            // watcher reindexes in this lock-free window is skipped, not mis-joined
-            // (#82 TOCTOU). Run only the join/write under the lock.
+            // The join's content gate revalidates against current disk bytes under the lock;
+            // `production_sha` (per-document disk hashes captured the instant the subprocess
+            // finished) pins the `.scip` to the content it was built against (#82 TOCTOU); and
+            // `pre_spawn_sha` (indexed shas captured before the spawn) extends that pin across
+            // the subprocess interior (#83) — together they cover the whole lock-free window, so
+            // a file the watcher reindexes anywhere in it is skipped, not mis-joined. Run only
+            // the join/write under the lock.
             let report = with_oracle_write_lock(config, |db| {
-                db.run_oracle(tool, &version, &bytes, Some(&production_sha))
+                db.run_oracle(tool, &version, &bytes, Some(&production_sha), Some(&pre_spawn_sha))
             })?;
             print_json(&serde_json::json!({
                 "outcome": "completed",

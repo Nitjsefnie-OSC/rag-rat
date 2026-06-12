@@ -41,6 +41,18 @@ pub(crate) struct OracleRunInput<'a> {
     /// == file_sha` (both the new content) still passes the index-vs-disk gate. See
     /// [`super::ScipProduction::Produced`].
     pub(crate) production_sha: Option<&'a HashMap<String, String>>,
+    /// The indexed `(path -> files.sha256)` snapshot taken **before the tool subprocess was
+    /// spawned** (#83); `None` for a pre-built `--scip` (no spawn). The post-exit
+    /// `production_sha` gate cannot see INSIDE the subprocess: the tool reads each source near
+    /// the start of a run that can take tens of seconds, so a file edited mid-run and
+    /// reindexed before the join leaves `.scip` describing the OLD content while
+    /// `files.sha256`, the disk bytes, and `production_sha` are all the NEW content — every
+    /// post-exit gate passes and a stale verdict persists. Requiring the join-time indexed sha
+    /// to ALSO equal this pre-spawn snapshot asserts the watcher reindexed nothing across the
+    /// ENTIRE window (spawn → join), for both the call-site and definition documents. Residual
+    /// ABA (an edit reverted to byte-identical content) is acceptable — the verdict is then
+    /// correct anyway.
+    pub(crate) pre_spawn_sha: Option<&'a HashMap<String, String>>,
 }
 
 /// Run the oracle join over all current edge candidates and persist verdicts + a run row.
@@ -96,6 +108,12 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         .filter_map(|(path, bytes)| bytes.as_ref().map(|b| (path.clone(), hex_sha256(b))))
         .collect();
 
+    // The join-time indexed `(path -> files.sha256)` map for the active checkout. Used by the
+    // pre-spawn gate's DEFINITION-side check (#83) and the moniker pass below (the call-site side
+    // compares against `candidate.file_sha`, which already IS the join-time indexed sha).
+    let indexed_shas =
+        store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
+
     // Cache symbol spans per source path (resolve_symbol is called per candidate). RefCell so the
     // resolver closure stays `Fn` (the join expects `&dyn Fn`) while lazily populating the cache.
     let symbol_span_cache: RefCell<HashMap<String, Vec<store::SymbolSpan>>> =
@@ -110,6 +128,11 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     // A non-call edge kind (`references_type` / `uses_macro` / …) marks `matched_occurrences` but
     // NOT this set, so its confirmation can't inflate recall.
     let mut covered_call_occurrences: HashSet<(String, usize, usize)> = HashSet::new();
+    // Documents a drift gate fired for (call-site OR definition side). The recall pass must
+    // exclude occurrences in (or resolving into) these: a skipped-as-drifted candidate's
+    // occurrence is not a heuristic miss — the oracle deliberately declined to judge it — so
+    // counting it as `oracle_only_calls` would falsely lower recall (#88 review).
+    let mut drifted_paths: HashSet<String> = HashSet::new();
 
     // Resolve a SCIP definition `(path, byte-range)` back to one of OUR symbols, scoped to the
     // active `(commit_sha, worktree_id)` checkout (via `symbol_spans_for_path`). Used both by the
@@ -146,6 +169,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         let disk = disk_sha.get(&candidate.source_path).map(String::as_str);
         if disk != Some(&candidate.file_sha) {
             report.skipped_drifted += 1;
+            drifted_paths.insert(candidate.source_path.clone());
             continue;
         }
 
@@ -161,6 +185,22 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
             && production_sha.get(&candidate.source_path).map(String::as_str) != disk
         {
             report.skipped_drifted += 1;
+            drifted_paths.insert(candidate.source_path.clone());
+            continue;
+        }
+
+        // Pre-spawn gate, CALL-SITE side (#83): the two gates above only prove the edge, the
+        // disk, and the post-exit production snapshot agree — all three can be the NEW content
+        // when a file was edited DURING the subprocess and the watcher reindexed it before the
+        // join, while the `.scip` still describes the old bytes. Requiring the join-time indexed
+        // sha (`candidate.file_sha`) to equal the snapshot taken BEFORE the spawn asserts no
+        // reindex happened across the entire spawn → join window.
+        if let Some(pre_spawn) = input.pre_spawn_sha
+            && pre_spawn.get(&candidate.source_path).map(String::as_str)
+                != Some(candidate.file_sha.as_str())
+        {
+            report.skipped_drifted += 1;
+            drifted_paths.insert(candidate.source_path.clone());
             continue;
         }
 
@@ -195,6 +235,22 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
                 != disk_sha.get(&def.path).map(String::as_str)
         {
             report.skipped_drifted += 1;
+            drifted_paths.insert(def.path.clone());
+            continue;
+        }
+
+        // Pre-spawn gate, DEFINITION side (#83): the same mid-subprocess hole applies to the
+        // resolved symbol's defining document — a def file edited during the subprocess and
+        // reindexed before the join resolves the byte-converted def range against the wrong
+        // symbol while every post-exit gate passes. The join-time indexed sha of the def file
+        // must equal the pre-spawn snapshot.
+        if let Some(pre_spawn) = input.pre_spawn_sha
+            && let Some(def) = index.definitions.get(&verdict.scip_symbol)
+            && pre_spawn.get(&def.path).map(String::as_str)
+                != indexed_shas.get(&def.path).map(String::as_str)
+        {
+            report.skipped_drifted += 1;
+            drifted_paths.insert(def.path.clone());
             continue;
         }
 
@@ -239,8 +295,6 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     // arbitrary winner changed between runs. Pick the best moniker per logical symbol instead:
     // shortest, then lexicographic. SCIP member monikers extend the parent's descriptor chain
     // (`…Struct#field.` vs `…Struct#`), so shortest selects the symbol's own moniker.
-    let indexed_shas =
-        store::indexed_file_shas_in_scope(conn, input.commit_sha, input.worktree_id)?;
     let mut best_monikers: HashMap<i64, &str> = HashMap::new();
     for (scip_symbol, def) in &index.definitions {
         let disk = disk_sha.get(&def.path).map(String::as_str);
@@ -249,6 +303,15 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         }
         if let Some(production_sha) = input.production_sha
             && production_sha.get(&def.path).map(String::as_str) != disk
+        {
+            continue;
+        }
+        // Pre-spawn gate (#83): same mid-subprocess discipline as the verdict join — a def file
+        // reindexed during the subprocess maps the moniker to the wrong symbol while every
+        // post-exit gate passes. (`disk` equals the join-time indexed sha here, per the first
+        // check above.)
+        if let Some(pre_spawn) = input.pre_spawn_sha
+            && pre_spawn.get(&def.path).map(String::as_str) != disk
         {
             continue;
         }
@@ -286,8 +349,13 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
     // can cover a call from an unindexed source file, so those occurrences are out of scope,
     // not misses.
     let indexed_paths = store::indexed_paths_in_scope(conn, commit_sha, worktree_id)?;
-    report.oracle_only_calls =
-        count_uncovered_calls(&index, &matched_occurrences, &indexed_paths, &resolve_symbol);
+    report.oracle_only_calls = count_uncovered_calls(
+        &index,
+        &matched_occurrences,
+        &indexed_paths,
+        &drifted_paths,
+        &resolve_symbol,
+    );
 
     report.status = "Completed".to_string();
     store::record_oracle_run(
@@ -349,13 +417,17 @@ fn count_uncovered_calls(
     index: &ScipIndex,
     matched: &HashSet<(String, usize, usize)>,
     indexed_paths: &HashSet<String>,
+    drifted_paths: &HashSet<String>,
     resolve_definition: &dyn Fn(&str, usize, usize) -> Option<i64>,
 ) -> u64 {
     let mut count = 0u64;
     for (path, occurrences) in &index.occurrences_by_path {
         // The call site must live in a file rag-rat indexed in this checkout; a call from an
         // unindexed source is unreachable by any edge candidate, so it is not a recall gap.
-        if !indexed_paths.contains(path) {
+        // A DRIFTED call-site document is excluded too (#88 review): its candidates were
+        // deliberately skipped as untrusted, so its uncovered occurrences are abstentions, not
+        // heuristic misses.
+        if !indexed_paths.contains(path) || drifted_paths.contains(path) {
             continue;
         }
         for occ in occurrences {
@@ -369,6 +441,12 @@ fn count_uncovered_calls(
             let Some(def) = index.definitions.get(&occ.symbol) else {
                 continue;
             };
+            // A def in a DRIFTED document is excluded for the same reason as a drifted call
+            // site: the byte-converted def range can't be trusted, and the candidates that
+            // depended on it were skipped, not missed.
+            if drifted_paths.contains(&def.path) {
+                continue;
+            }
             if resolve_definition(&def.path, def.start_byte, def.end_byte).is_none() {
                 continue;
             }

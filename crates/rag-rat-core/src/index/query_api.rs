@@ -11,12 +11,16 @@ impl IndexDatabase {
     /// `production_sha` is the per-document disk-hash snapshot a tool-driven run captured the
     /// instant its `.scip` was produced (`Some`), arming the scip-vs-disk content gate (#82
     /// TOCTOU); a pre-built `--scip` has no production moment and passes `None`.
+    /// `pre_spawn_sha` is the indexed-sha snapshot taken before the tool subprocess was spawned
+    /// (see [`Self::oracle_pre_spawn_snapshot`]), arming the pre-spawn gate that covers the
+    /// subprocess interior (#83); a pre-built `--scip` has no spawn and passes `None`.
     pub fn run_oracle(
         &self,
         tool: OracleTool,
         tool_version: &str,
         scip_bytes: &[u8],
         production_sha: Option<&std::collections::HashMap<String, String>>,
+        pre_spawn_sha: Option<&std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<OracleReport> {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!(
@@ -33,6 +37,21 @@ impl IndexDatabase {
             scip_bytes,
             &root,
             production_sha,
+            pre_spawn_sha,
+        )
+    }
+
+    /// The active checkout's indexed `(path -> files.sha256)` map — the pre-spawn snapshot the
+    /// CLI takes BEFORE spawning the oracle tool (and before acquiring the index write lock; this
+    /// is a cheap read-only query), so the join can reject any document the watcher reindexed
+    /// across the entire spawn → join window (#83).
+    pub fn oracle_pre_spawn_snapshot(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        oracle::pre_spawn_snapshot(
+            self.storage.connection(),
+            &self.active_commit_sha,
+            &self.active_worktree_id,
         )
     }
 
@@ -107,9 +126,9 @@ impl IndexDatabase {
         tool_version: &str,
         scip_bytes: &[u8],
     ) -> anyhow::Result<oracle::OracleReport> {
-        // A pre-built `--scip` carries no production moment we control, so there is no per-document
-        // snapshot to pin — the scip-vs-disk gate is off and only the index-vs-disk gate applies.
-        self.run_oracle(tool, tool_version, scip_bytes, None)
+        // A pre-built `--scip` carries no production moment or spawn we control, so neither the
+        // scip-vs-disk nor the pre-spawn gate can arm — only the index-vs-disk gate applies.
+        self.run_oracle(tool, tool_version, scip_bytes, None, None)
     }
 
     /// Probe whether an oracle tool is installed, for `oracle status`. A `Blocked` probe is
@@ -1966,6 +1985,47 @@ mod oracle_surfacing_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// `oracle_pre_spawn_snapshot` returns the active checkout's indexed `(path -> sha256)` map;
+    /// a run pinned to a MATCHING snapshot verdicts normally, while a snapshot disagreeing with
+    /// the join-time indexed sha (the mid-subprocess reindex, #83) skips the candidate.
+    #[test]
+    fn pre_spawn_snapshot_round_trips_through_run_oracle() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let (_edge_id, cs, ce, path) = call_edge(&db);
+        let snapshot = db.oracle_pre_spawn_snapshot().unwrap();
+        let indexed_sha: String = db
+            .storage
+            .connection()
+            .query_row("SELECT sha256 FROM files WHERE path = ?1", params![path], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            snapshot.get(&path).map(String::as_str),
+            Some(indexed_sha.as_str()),
+            "snapshot must carry the indexed sha for every active-checkout file"
+        );
+
+        let symbol = "scip-rust crate held-mini `target`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
+        let report = db
+            .run_oracle(OracleTool::RustAnalyzer, "v-test", &scip, None, Some(&snapshot))
+            .unwrap();
+        assert!(report.confirmed >= 1 || report.upgraded >= 1, "matching pin verdicts normally");
+        assert_eq!(report.skipped_drifted, 0);
+
+        let mut stale = snapshot.clone();
+        stale.insert(path.clone(), "pre-spawn-old".to_string());
+        let report =
+            db.run_oracle(OracleTool::RustAnalyzer, "v-test2", &scip, None, Some(&stale)).unwrap();
+        assert_eq!(report.rows_written, 0, "a mid-subprocess reindex must skip the candidate");
+        assert!(report.skipped_drifted >= 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Staleness revert: after a current run surfaces `compiler`, drifting the source file (so its
     /// `files.sha256` no longer matches the verdict's `file_sha`) reverts the edge to heuristic
     /// display — never `compiler`.
@@ -2349,6 +2409,7 @@ mod oracle_surfacing_tests {
             &db.active_worktree_id,
             &Index::default().write_to_bytes().unwrap(),
             &root,
+            None,
             None,
         )
         .unwrap();
