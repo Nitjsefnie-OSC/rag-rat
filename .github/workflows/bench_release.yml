@@ -47,9 +47,10 @@ env:
 
 jobs:
   kernel:
-    # Self-hosted runner (62 GB RAM): the whole-kernel index buffers the symbol/edge graph in memory
-    # and needs ~30 GB, which OOMs a 7 GB GitHub runner — hence the default scope of "." (whole tree)
-    # here. Only the release / workflow_dispatch triggers land here (never PRs), so a public-repo
+    # Self-hosted runner (62 GB RAM): the whole-kernel index peaks at ~5.5 GiB RSS (the embedding
+    # reconcile; see docs/benchmarks.md) plus the OS page cache over a ~10 GB index DB — runnable on
+    # a hosted box but with a noisy, contended wall-clock, which defeats the point of a headline
+    # number. Only the release / workflow_dispatch triggers land here (never PRs), so a public-repo
     # self-hosted runner is safe. See docs/bencher.md.
     runs-on: [self-hosted, bigmem]
     # A whole-kernel index is long but bounded; cap it so a pathological run can't hang for hours.

@@ -73,9 +73,9 @@ Four workflows under `.github/workflows/`:
 | Workflow | Trigger | Has the token? | Role |
 |---|---|---|---|
 | `bench.yml` | push to `main` | yes | Records both lightweight signals against the `main` branch; sets/refreshes the thresholds new PRs are compared against. |
-| `bench-pr-run.yml` | `pull_request` (incl. forks) | **no** | Runs the benches, uploads raw output + the PR event as an artifact. Never sees secrets, so a fork PR can't exfiltrate the token. |
-| `bench-pr-track.yml` | `workflow_run` of bench-pr-run | yes | Runs in the base-repo context: downloads the artifact, uploads results to Bencher, comments the comparison on the PR. |
-| `bench-release.yml` | `release: published` + manual `workflow_dispatch` | yes | The heavyweight Linux-kernel headline bench (below). Not a gate — tracks latency/throughput/memory over releases. |
+| `bench_pr_run.yml` | `pull_request` (incl. forks) | **no** | Runs the benches, uploads raw output + the PR event as an artifact. Never sees secrets, so a fork PR can't exfiltrate the token. |
+| `bench_pr_track.yml` | `workflow_run` of bench_pr_run | yes | Runs in the base-repo context: downloads the artifact, uploads results to Bencher, comments the comparison on the PR. |
+| `bench_release.yml` | `release: published` + manual `workflow_dispatch` | yes | The heavyweight Linux-kernel headline bench (below). Not a gate — tracks latency/throughput/memory over releases. |
 
 The `pull_request` → `workflow_run` split is Bencher's documented fork-safe pattern: untrusted fork
 code runs without secrets, and only the trusted base-repo workflow (which never executes fork code)
@@ -84,14 +84,19 @@ holds the API token. PR runs use `--start-point main --start-point-clone-thresho
 
 ## Release headline: indexing the Linux kernel
 
-`tools/bench-kernel.sh` (run by `bench-release.yml`) is the "indexes the Linux kernel in X seconds"
+`tools/bench-kernel.sh` (run by `bench_release.yml`) is the "indexes the Linux kernel in X seconds"
 benchmark. It shallow-clones a pinned kernel tag (`KERNEL_TAG`, default `v7.0`), indexes its C/H
 sources **once** with the release `rag-rat` binary (`index --full`, `--no-default-features` =
-hash embedder, no model download), and writes a Bencher Metric Format JSON file with three measures:
+hash embedder, no model download), and writes a Bencher Metric Format JSON file with eight measures:
 
 - `latency` — wall-clock seconds to index, in nanoseconds (Bencher's built-in Latency measure).
 - `throughput` — indexed files per second.
-- `memory` — peak resident set size in bytes (from `/usr/bin/time -v`).
+- `memory` — peak resident set size in bytes, from `getrusage(RUSAGE_CHILDREN).ru_maxrss` (the
+  kernel-true peak, catches sub-sample spikes).
+- `memory_sampled` — peak of a 1 Hz `/proc/<pid>/status` VmRSS time-series (also written to
+  `kernel_rss_samples.csv` as the before/after curve).
+- `symbols`, `edges`, `resolved_edges`, `chunks` — extracted-fact counts, so a run is comparable
+  per fact and not just per file (the unresolved-edge taxonomy goes to `kernel_unresolved_by_kind.csv`).
 
 It's a **single cold rebuild**, not a criterion loop: the whole kernel is ~63k C/H files and takes
 tens of minutes, so criterion's 10-sample minimum (×10) is a non-starter. One run is also exactly
@@ -109,8 +114,9 @@ RAG_RAT_KERNEL_SUBDIRS="kernel mm fs net lib" RAG_RAT_BIN=target/release/rag-rat
 
 Or in CI: **Actions → bench-release → Run workflow** (the `workflow_dispatch` input sets the subtree).
 
-**Runner sizing.** Memory scales sublinearly (mostly fixed overhead + the cross-file symbol/edge
-graph), but the whole tree still lands in the multi-GB range — borderline for the standard 7 GB
-`ubuntu-latest` runner. If a release run OOMs or overruns `timeout-minutes`, either bound
-`RAG_RAT_KERNEL_SUBDIRS` to the core subsystems or move the job to a larger runner. Validate with a
-manual dispatch first.
+**Runner sizing.** This job runs on the self-hosted `[self-hosted, bigmem]` runner, not a
+hosted one — the whole-tree index peaks at ~5.5 GiB (see [`benchmarks.md`](./benchmarks.md)), which
+plus the OS page cache over a ~10 GB index DB is borderline for a hosted runner and, more to the
+point, would give a noisy, contended wall-clock. If a run OOMs or overruns `timeout-minutes` on a
+constrained box, bound `RAG_RAT_KERNEL_SUBDIRS` to the core subsystems. Validate with a manual
+dispatch first.
