@@ -587,10 +587,41 @@ pub(crate) fn embedding_policy_skip_summary(
     max_embedding_chars: usize,
 ) -> anyhow::Result<BTreeMap<String, u64>> {
     let mut skipped_by_policy = BTreeMap::new();
-    for chunk in current_chunks(conn, None)? {
-        let policy = policy_for_job(&chunk, max_embedding_chars);
-        if !policy.eligible {
-            *skipped_by_policy.entry(policy.policy).or_default() += 1;
+    // STREAM the chunks one row at a time, counting skips, instead of materializing every chunk.
+    // The previous `current_chunks(conn, None)` loaded ALL chunk rows — including each chunk's full
+    // `text` — into a `Vec` just to produce this count. On a kernel-sized index (~4.2M chunks) that
+    // is ~4 GB resident for a summary that keeps nothing per row, and it runs on every reconcile
+    // (and `reconcile_plan`), so it dominated `index --full` peak memory. Same WHERE filter
+    // (`chunks.text IS NOT NULL`) and the same `embedding_policy_for_chunk`, so the counts are
+    // identical; only the column set is leaner (no `chunk_embeddings` join — policy ignores it).
+    let mut stmt = conn.prepare(
+        "
+        SELECT files.path, files.language, files.kind, chunks.chunk_kind, chunks.symbol_path,
+               chunks.text
+        FROM chunks
+        JOIN files ON files.id = chunks.file_id
+        WHERE chunks.text IS NOT NULL
+        ",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let path = row.get::<_, String>(0)?;
+        let language = row.get::<_, String>(1)?;
+        let file_kind = row.get::<_, String>(2)?;
+        let chunk_kind = row.get::<_, String>(3)?;
+        let symbol_path = row.get::<_, Option<String>>(4)?;
+        let text = row.get::<_, String>(5)?;
+        let decision = embedding_policy_for_chunk(
+            std::path::Path::new(&path),
+            &language,
+            &file_kind,
+            &chunk_kind,
+            symbol_path.as_deref(),
+            &text,
+            max_embedding_chars,
+        );
+        if !decision.eligible {
+            *skipped_by_policy.entry(decision.policy).or_default() += 1;
         }
     }
     Ok(skipped_by_policy)

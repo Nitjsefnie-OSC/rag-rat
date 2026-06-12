@@ -85,16 +85,23 @@ pub(crate) fn resolve_all_edges(conn: &Connection) -> anyhow::Result<()> {
 }
 /// Full-rebuild fast path: resolve every accumulated edge candidate against an in-memory symbol
 /// index and insert it ONCE, already resolved — no unresolved insert, no `all_symbols` SELECT, no
-/// per-edge UPDATE pass. `symbols` carry their real DB ids (assigned in insertion order); we sort
-/// by `(qualified_name, id)` to reproduce `all_symbols`' `ORDER BY qualified_name` (tiebreak rowid)
-/// exactly, so `resolve_symbol`'s `matches[0]` picks the same symbol as the DB-based path.
+/// per-edge UPDATE pass. The accumulated symbols/edges arrive interned (see [`FullRebuildGraph`]);
+/// symbols are hydrated back to owned [`IndexedSymbol`]s here (the arena is frozen by now) and each
+/// edge's strings are read as borrowed views into the arena — no per-edge `String` is rebuilt.
+/// Symbols carry their real DB ids (assigned in insertion order); we sort by `(qualified_name, id)`
+/// to reproduce `all_symbols`' `ORDER BY qualified_name` (tiebreak rowid) exactly, so
+/// `resolve_symbol`'s `matches[0]` picks the same symbol as the DB-based path.
 pub(crate) fn resolve_and_insert_edges(
     conn: &Connection,
-    mut symbols: Vec<IndexedSymbol>,
-    edges: Vec<(i64, EdgeCandidate)>,
+    graph: FullRebuildGraph,
 ) -> anyhow::Result<()> {
+    let (arena, compact_symbols, edges) = graph.into_parts();
+    let mut symbols: Vec<IndexedSymbol> =
+        compact_symbols.iter().map(|symbol| symbol.hydrate(&arena)).collect();
+    drop(compact_symbols);
     symbols.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name).then(a.id.cmp(&b.id)));
     let index = SymbolIndex::build(&symbols);
+    crate::index::mem_trace("edges: symbols hydrated + index built, before insert");
 
     // Drop the edges table's secondary indexes before the bulk insert, then rebuild them in one
     // sorted pass after. Maintaining 5 indexes incrementally across hundreds of thousands of row
@@ -112,34 +119,50 @@ pub(crate) fn resolve_and_insert_edges(
         conn.execute_batch(&format!("DROP INDEX IF EXISTS \"{name}\""))?;
     }
 
-    // Same per-file dedup + skip rules as `insert_candidates` (file_id in the key makes the global
-    // pass equivalent to the old per-file BTreeSet).
+    // Same per-file dedup + skip rules as `insert_candidates`. Edges are accumulated in file order
+    // (contiguous by `file_id`) and the dedup is per-file, so we CLEAR `seen` at each file boundary
+    // instead of carrying every edge's key for the whole rebuild. That keeps `seen` to one file's
+    // edges (a few hundred) rather than ~11M owned-`String` keys held until the loop ends — the
+    // dominant resolve-phase structure at kernel scale. Byte-identical: a `file_id` never recurs in
+    // a later block, so per-file reset makes exactly the dedup decisions a global per-`file_id` set
+    // would; `file_id` therefore drops out of the key (constant within each reset window).
     let mut seen = BTreeSet::new();
+    let mut seen_file_id: Option<i64> = None;
     for (file_id, candidate) in &edges {
-        let to_name = candidate.to_name.trim();
-        if to_name.is_empty() || candidate.from_name.as_deref() == Some(to_name) {
+        if seen_file_id != Some(*file_id) {
+            seen.clear();
+            seen_file_id = Some(*file_id);
+        }
+        // Read the interned fields back as borrowed views into the (now frozen) arena — no per-edge
+        // `String` is rebuilt. `from_name` stays untrimmed (the dedup key and the stored column use
+        // it verbatim); `to_name` is trimmed exactly as the owned path did.
+        let from_name = arena.get_opt(candidate.from_name);
+        let to_name = arena.get(candidate.to_name).trim();
+        if to_name.is_empty() || from_name == Some(to_name) {
             continue;
         }
         let key = (
-            *file_id,
             candidate.from_symbol_id,
-            candidate.from_name.clone(),
+            from_name.map(str::to_string),
             to_name.to_string(),
             candidate.edge_kind,
-            candidate.source_span.start_byte,
-            candidate.source_span.end_byte,
+            i64::from(candidate.source_span.start_byte),
+            i64::from(candidate.source_span.end_byte),
         );
         if !seen.insert(key) {
             continue;
         }
 
+        let target_qualified_name = arena.get_opt(candidate.target_qualified_name);
+        let evidence = arena.get_opt(candidate.evidence);
+        let receiver_hint = arena.get_opt(candidate.receiver_hint);
         let resolution = resolve_symbol(
             ResolveSymbolRequest {
                 name: to_name,
-                target_qualified_name: candidate.target_qualified_name.as_deref(),
+                target_qualified_name,
                 edge_kind: candidate.edge_kind.as_str(),
-                evidence: candidate.evidence.as_deref(),
-                receiver_hint: candidate.receiver_hint.as_deref(),
+                evidence,
+                receiver_hint,
                 source_file_id: *file_id,
                 source_language: index.file_language.get(file_id).copied(),
             },
@@ -178,15 +201,15 @@ pub(crate) fn resolve_and_insert_edges(
         .execute(params![
             file_id,
             candidate.from_symbol_id,
-            candidate.from_name,
+            from_name,
             to_name,
-            candidate.target_qualified_name,
-            candidate.evidence,
-            candidate.receiver_hint,
-            candidate.source_span.start_line,
-            candidate.source_span.end_line,
-            candidate.source_span.start_byte,
-            candidate.source_span.end_byte,
+            target_qualified_name,
+            evidence,
+            receiver_hint,
+            i64::from(candidate.source_span.start_line),
+            i64::from(candidate.source_span.end_line),
+            i64::from(candidate.source_span.start_byte),
+            i64::from(candidate.source_span.end_byte),
             candidate.edge_kind.as_str(),
             confidence.as_str(),
             to_symbol_id,
@@ -195,11 +218,13 @@ pub(crate) fn resolve_and_insert_edges(
             reason,
         ])?;
     }
+    crate::index::mem_trace("edges: inserted, before index rebuild");
 
     // Rebuild the indexes we dropped, each in one bulk sorted pass over the now-populated table.
     for (_, sql) in &edge_indexes {
         conn.execute_batch(sql)?;
     }
+    crate::index::mem_trace("edges: after index rebuild");
     Ok(())
 }
 

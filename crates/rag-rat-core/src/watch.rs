@@ -16,6 +16,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use notify::event::{AccessKind, AccessMode, EventKind};
 use notify::{Event, RecursiveMode, Watcher as _, recommended_watcher};
 
 use crate::config::Config;
@@ -117,12 +118,32 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A relevant event is a rescan/overflow notice, or one whose path matches a configured target —
-/// classification only decides *whether to fire a pass*, not what to index (the discover sweep does
-/// that). Ignored paths (`.rag-rat/`, `target/`, …) never match a target, so they never fire.
+/// Whether an event KIND should ever fire a pass. Only content mutations do — `Create`, `Remove`,
+/// any `Modify` (data/metadata/rename), and a write-close. Reads must NOT: notify's inotify mask
+/// includes `IN_OPEN`/`IN_CLOSE_NOWRITE`, so opening/reading a watched file emits `Access(Open)` /
+/// `Access(Close(Read))` events. Treating those as relevant created a feedback loop — the index
+/// pass's own file reads (and the MCP serving queries, and the grep-augment hook reading source)
+/// re-fired the watcher endlessly, re-indexing every couple seconds with `content_revision`
+/// unchanged. Those read events stack in the notify→watcher channel and keep the debounce armed.
+fn kind_is_mutation(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => true,
+        // A close-after-write signals a real write; open / read / read-close do not.
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) | EventKind::Other | EventKind::Any => false,
+    }
+}
+
+/// A relevant event is a rescan/overflow notice, or a *content-mutating* event whose path matches a
+/// configured target — classification only decides *whether to fire a pass*, not what to index (the
+/// discover sweep does that). Ignored paths (`.rag-rat/`, `target/`, …) never match a target, so
+/// they never fire; read-only events never fire regardless of path (see [`kind_is_mutation`]).
 fn event_is_relevant(config: &Config, event: &Event) -> bool {
     if event.need_rescan() {
         return true;
+    }
+    if !kind_is_mutation(&event.kind) {
+        return false;
     }
     event.paths.iter().any(|path| {
         path.strip_prefix(&config.root)
@@ -341,6 +362,20 @@ mod tests {
             d.should_fire(t0 + max),
             "max-latency cap must force a pass under sustained writes"
         );
+    }
+
+    #[test]
+    fn reads_are_not_mutations_but_writes_are() {
+        use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
+        // Reads must never fire — this is the anti-feedback-loop gate.
+        assert!(!kind_is_mutation(&EventKind::Access(AccessKind::Open(AccessMode::Read))));
+        assert!(!kind_is_mutation(&EventKind::Access(AccessKind::Close(AccessMode::Read))));
+        assert!(!kind_is_mutation(&EventKind::Access(AccessKind::Any)));
+        // Real content changes must fire.
+        assert!(kind_is_mutation(&EventKind::Create(CreateKind::File)));
+        assert!(kind_is_mutation(&EventKind::Remove(RemoveKind::File)));
+        assert!(kind_is_mutation(&EventKind::Modify(ModifyKind::Data(DataChange::Any))));
+        assert!(kind_is_mutation(&EventKind::Access(AccessKind::Close(AccessMode::Write))));
     }
 
     #[test]

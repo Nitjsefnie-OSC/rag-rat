@@ -31,30 +31,53 @@ impl IndexDatabase {
             "PRAGMA synchronous = OFF;
              PRAGMA cache_size = -262144;",
         )?;
+        maybe_set_sqlite_soft_heap_limit();
+        // Diagnostic: override wal_autocheckpoint for this rebuild. Setting it to 0 disables the
+        // auto-checkpoint that fires at COMMIT — used to test whether the trailing peak spike is
+        // the final checkpoint of the multi-GB WAL (mega-transaction) vs something else. No-op
+        // unless RAG_RAT_WAL_AUTOCHECKPOINT is set.
+        if let Ok(raw) = std::env::var("RAG_RAT_WAL_AUTOCHECKPOINT")
+            && let Ok(pages) = raw.trim().parse::<i64>()
+        {
+            db.storage.execute_batch(&format!("PRAGMA wal_autocheckpoint = {pages};"))?;
+        }
         let result = (|| -> anyhow::Result<()> {
-            db.storage.execute_batch("BEGIN TRANSACTION")?;
+            mem_trace("before clear (start of rebuild txn)");
+            // BEGIN IMMEDIATE acquires the write lock up front. A plain BEGIN starts as a reader
+            // and upgrades on the first mutation; if another writer raced in between, the upgrade
+            // fails with SQLITE_BUSY *immediately* (busy_timeout doesn't apply to the upgrade,
+            // since retrying would break snapshot isolation). IMMEDIATE makes the wait honor
+            // busy_timeout instead — the fix for the intermittent multi-writer "deadlock".
+            db.storage.execute_batch("BEGIN IMMEDIATE")?;
             db.clear_full_rebuild_tables()?;
+            mem_trace("after clear_full_rebuild_tables (purge)");
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
             let indexed = db.index_targets_with_progress(config, &mut progress)?;
+            mem_trace("after index_targets (edges resolved+inserted)");
             db.apply_prepared_git_history(
                 &config.root,
                 git_history
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
             )?;
+            mem_trace("after git_history");
             progress(IndexProgress::RebuildingLogicalSymbols);
             db.rebuild_logical_symbols()?;
+            mem_trace("after rebuild_logical_symbols");
             // Edges were resolved and inserted in one in-memory pass inside
             // index_targets_with_progress (full rebuild), so there is no separate resolve_edges
             // phase.
             progress(IndexProgress::ResolvingGraph);
             db.mark_graph_index_current()?;
+            mem_trace("after mark_graph_index_current");
             progress(IndexProgress::RebuildingFts);
             db.rebuild_fts()?;
+            mem_trace("after rebuild_fts");
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
             db.storage.execute_batch("COMMIT")?;
+            mem_trace("after COMMIT");
             progress(IndexProgress::Finished { files: indexed });
             Ok(())
         })();

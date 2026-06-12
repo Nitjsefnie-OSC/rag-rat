@@ -1,11 +1,13 @@
 mod extract;
 mod helpers;
+mod intern;
 mod resolve;
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub(crate) use extract::*;
 pub(crate) use helpers::*;
+use intern::{OptSym, StrArena, Sym};
 pub(crate) use resolve::*;
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -133,38 +135,137 @@ impl EdgeCandidate {
     }
 }
 
-impl IndexedSymbol {
-    /// Build an `IndexedSymbol` for a symbol that was just inserted (so it carries its real DB id),
-    /// for the full-rebuild in-memory edge resolution. Same shape `all_symbols` would return.
-    pub(crate) fn from_inserted(
-        id: i64,
-        file_id: i64,
-        language: Language,
-        symbol: &crate::index::symbols::Symbol,
-    ) -> Self {
+/// An accumulated symbol in interned form: the four string fields are [`Sym`] ids into the graph's
+/// arena, so the per-symbol footprint is a handful of `u32`s instead of four heap `String`s.
+/// Hydrated back to an owned [`IndexedSymbol`] only at resolution, when the arena is frozen.
+struct CompactSymbol {
+    id: i64,
+    file_id: i64,
+    language: Sym,
+    name: Sym,
+    qualified_name: Sym,
+    kind: Sym,
+    start_byte: usize,
+    end_byte: usize,
+    start_line: i64,
+    end_line: i64,
+}
+
+impl CompactSymbol {
+    fn hydrate(&self, arena: &StrArena) -> IndexedSymbol {
         IndexedSymbol {
-            id,
-            file_id,
-            language: language.as_str().to_string(),
-            name: symbol.name.clone(),
-            qualified_name: symbol.qualified_name.clone(),
-            kind: symbol.kind.clone(),
-            start_byte: symbol.start_byte,
-            end_byte: symbol.end_byte,
-            start_line: i64::try_from(symbol.start_line).unwrap_or(0),
-            end_line: i64::try_from(symbol.end_line).unwrap_or(0),
+            id: self.id,
+            file_id: self.file_id,
+            language: arena.get(self.language).to_string(),
+            name: arena.get(self.name).to_string(),
+            qualified_name: arena.get(self.qualified_name).to_string(),
+            kind: arena.get(self.kind).to_string(),
+            start_byte: self.start_byte,
+            end_byte: self.end_byte,
+            start_line: self.start_line,
+            end_line: self.end_line,
         }
     }
+}
+
+/// Source span as four `u32`s (16 bytes) instead of [`EdgeSpan`]'s four `i64`s (32). Byte offsets
+/// and line numbers fit `u32` for any real source file; the accumulator holds millions of these.
+#[derive(Clone, Copy)]
+struct CompactSpan {
+    start_line: u32,
+    end_line: u32,
+    start_byte: u32,
+    end_byte: u32,
+}
+
+impl CompactSpan {
+    fn from_span(span: EdgeSpan) -> Self {
+        let clamp = |value: i64| u32::try_from(value).unwrap_or(0);
+        CompactSpan {
+            start_line: clamp(span.start_line),
+            end_line: clamp(span.end_line),
+            start_byte: clamp(span.start_byte),
+            end_byte: clamp(span.end_byte),
+        }
+    }
+}
+
+/// An accumulated edge candidate in interned form. The five string fields become [`Sym`]/[`OptSym`]
+/// ids and the span shrinks to [`CompactSpan`], taking the per-edge footprint from ~184 bytes (with
+/// five owned `Option<String>`) to ~64 — the dominant lever on full-rebuild peak RSS, since the
+/// edge accumulator is held in full until resolution.
+struct CompactEdge {
+    from_symbol_id: Option<i64>,
+    from_name: OptSym,
+    to_name: Sym,
+    target_qualified_name: OptSym,
+    evidence: OptSym,
+    receiver_hint: OptSym,
+    source_span: CompactSpan,
+    edge_kind: EdgeKind,
+    confidence: EdgeConfidence,
 }
 
 /// Symbols (with real DB ids) and edge candidates (with their source file id) accumulated across
 /// the full-rebuild insert loop, so edges can be resolved in memory and inserted once, fully
 /// resolved — instead of inserting them unresolved per file and then resolving with a per-edge
-/// UPDATE pass.
+/// UPDATE pass. All string fields are interned into `arena`; see [`intern`].
 #[derive(Default)]
 pub(crate) struct FullRebuildGraph {
-    pub(crate) symbols: Vec<IndexedSymbol>,
-    pub(crate) edges: Vec<(i64, EdgeCandidate)>,
+    arena: StrArena,
+    symbols: Vec<CompactSymbol>,
+    edges: Vec<(i64, CompactEdge)>,
+}
+
+impl FullRebuildGraph {
+    /// Intern and accumulate one just-inserted symbol (carrying its real DB `id`).
+    pub(crate) fn push_symbol(
+        &mut self,
+        id: i64,
+        file_id: i64,
+        language: Language,
+        symbol: &crate::index::symbols::Symbol,
+    ) {
+        let compact = CompactSymbol {
+            id,
+            file_id,
+            language: self.arena.intern(language.as_str()),
+            name: self.arena.intern(&symbol.name),
+            qualified_name: self.arena.intern(&symbol.qualified_name),
+            kind: self.arena.intern(&symbol.kind),
+            start_byte: symbol.start_byte,
+            end_byte: symbol.end_byte,
+            start_line: i64::try_from(symbol.start_line).unwrap_or(0),
+            end_line: i64::try_from(symbol.end_line).unwrap_or(0),
+        };
+        self.symbols.push(compact);
+    }
+
+    /// Intern and accumulate one edge candidate produced by the prepare phase, after its local
+    /// `from_symbol_id` has been remapped to the real DB id via `db_ids`.
+    pub(crate) fn push_edge(&mut self, file_id: i64, candidate: &EdgeCandidate, db_ids: &[i64]) {
+        let from_symbol_id = candidate.from_symbol_id.and_then(|local| {
+            usize::try_from(local).ok().and_then(|index| db_ids.get(index)).copied()
+        });
+        let compact = CompactEdge {
+            from_symbol_id,
+            from_name: self.arena.intern_opt(candidate.from_name.as_deref()),
+            to_name: self.arena.intern(&candidate.to_name),
+            target_qualified_name: self
+                .arena
+                .intern_opt(candidate.target_qualified_name.as_deref()),
+            evidence: self.arena.intern_opt(candidate.evidence.as_deref()),
+            receiver_hint: self.arena.intern_opt(candidate.receiver_hint.as_deref()),
+            source_span: CompactSpan::from_span(candidate.source_span),
+            edge_kind: candidate.edge_kind,
+            confidence: candidate.confidence,
+        };
+        self.edges.push((file_id, compact));
+    }
+
+    fn into_parts(self) -> (StrArena, Vec<CompactSymbol>, Vec<(i64, CompactEdge)>) {
+        (self.arena, self.symbols, self.edges)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

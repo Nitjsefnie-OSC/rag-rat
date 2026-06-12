@@ -202,17 +202,10 @@ impl IndexDatabase {
             // resolve-and-insert pass after the loop. No edge insert here.
             Some(graph) => {
                 for (symbol, &id) in prepared.symbols.iter().zip(&symbol_db_ids) {
-                    graph.symbols.push(edges::IndexedSymbol::from_inserted(
-                        id,
-                        file_id,
-                        file.language,
-                        symbol,
-                    ));
+                    graph.push_symbol(id, file_id, file.language, symbol);
                 }
                 for candidate in &prepared.edge_candidates {
-                    let mut candidate = candidate.clone();
-                    candidate.remap_from_symbol_id(&symbol_db_ids);
-                    graph.edges.push((file_id, candidate));
+                    graph.push_edge(file_id, candidate, &symbol_db_ids);
                 }
             },
             // Incremental: insert unresolved edges per file; resolve_edges resolves them afterward.
@@ -380,78 +373,115 @@ impl IndexDatabase {
             ",
         )?;
 
-        let mut stmt = self.storage.connection().prepare(
+        // STREAM the grouping instead of materializing every symbol. The previous version built a
+        // `BTreeMap<LogicalSymbolKey, Vec<row>>` over ALL symbols — at kernel scale ~3.5M rows ×
+        // six owned `String`s each (plus a cloned key per group). That structure, allocated in the
+        // trailing rebuild phase AFTER the edge accumulator is freed, was the dominant full-rebuild
+        // peak-RSS spike (~6 GB transient at the very end of a whole-kernel index). Ordering the
+        // SELECT by the key's `Ord` (language, path, name, qualified_name, kind, signature — SQLite
+        // ASC sorts NULL first, matching Rust `None < Some`) then the within-group member order
+        // (start_byte, end_byte, which the old per-group Vec preserved) makes each group's rows
+        // arrive contiguously, so we flush a group the moment its key changes and hold only the
+        // current group's members (kilobytes). Byte-identical: same grouping, same
+        // `logical_symbols` insert order (ids are content-derived via `stable_id`, not rowids), and
+        // the same member order, verified against the golden index.
+        let conn = self.storage.connection();
+        let mut stmt = conn.prepare(
             "
-            SELECT symbols.id, symbols.file_id, files.path, symbols.language, symbols.name,
-                   symbols.qualified_name, symbols.kind, symbols.start_byte, symbols.end_byte,
-                   symbols.signature, symbols.start_line, symbols.end_line
+            SELECT symbols.id, files.path, symbols.language, symbols.name, symbols.qualified_name,
+                   symbols.kind, symbols.signature, symbols.start_line, symbols.end_line
             FROM symbols
             JOIN files ON files.id = symbols.file_id
-            ORDER BY files.path, symbols.language, symbols.qualified_name, symbols.kind,
-                     symbols.start_byte, symbols.end_byte
+            ORDER BY symbols.language, files.path, symbols.name, symbols.qualified_name,
+                     symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
             ",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(LogicalSymbolMemberRow {
+        let mut rows = stmt.query([])?;
+        let mut current: Option<(LogicalSymbolKey, Vec<LogicalSymbolMemberRow>)> = None;
+        while let Some(row) = rows.next()? {
+            let member = LogicalSymbolMemberRow {
                 symbol_id: row.get(0)?,
-                path: row.get(2)?,
-                language: row.get(3)?,
-                name: row.get(4)?,
-                qualified_name: row.get(5)?,
-                kind: row.get(6)?,
-                signature: row.get(9)?,
-                start_line: row.get(10)?,
-                end_line: row.get(11)?,
-            })
-        })?;
-        let mut groups: BTreeMap<LogicalSymbolKey, Vec<LogicalSymbolMemberRow>> = BTreeMap::new();
-        for row in rows {
-            let row = row?;
-            groups.entry(LogicalSymbolKey::from(&row)).or_default().push(row);
+                path: row.get(1)?,
+                language: row.get(2)?,
+                name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                kind: row.get(5)?,
+                signature: row.get(6)?,
+                start_line: row.get(7)?,
+                end_line: row.get(8)?,
+            };
+            // Compare the member's key fields against the current group WITHOUT allocating a key
+            // per row (only per group, on a boundary).
+            let same_group = current.as_ref().is_some_and(|(key, _)| {
+                key.language == member.language
+                    && key.path == member.path
+                    && key.name == member.name
+                    && key.qualified_name == member.qualified_name
+                    && key.kind == member.kind
+                    && key.signature == member.signature
+            });
+            if same_group {
+                current.as_mut().expect("same_group implies Some").1.push(member);
+            } else {
+                if let Some((key, members)) = current.take() {
+                    Self::insert_logical_group(conn, &key, &members)?;
+                }
+                let key = LogicalSymbolKey::from(&member);
+                current = Some((key, vec![member]));
+            }
         }
-        // Group in memory, then bulk-insert. Both INSERTs are prepare_cached: the member insert
-        // runs once per symbol, and conn.execute would recompile the SQL every time.
-        let conn = self.storage.connection();
-        for (key, members) in groups {
-            let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
-            let logical_symbol_id = key.stable_id();
+        if let Some((key, members)) = current.take() {
+            Self::insert_logical_group(conn, &key, &members)?;
+        }
+        Ok(())
+    }
+
+    /// Insert one logical symbol and its members. Extracted so `rebuild_logical_symbols` can flush
+    /// each group as its key changes (streaming) rather than buffering every group. Both INSERTs
+    /// are `prepare_cached` — the member insert runs once per symbol, so recompiling the SQL each
+    /// call would dominate.
+    fn insert_logical_group(
+        conn: &rusqlite::Connection,
+        key: &LogicalSymbolKey,
+        members: &[LogicalSymbolMemberRow],
+    ) -> anyhow::Result<()> {
+        let group_reason = if members.len() > 1 { "cfg_variant" } else { "single" };
+        let logical_symbol_id = key.stable_id();
+        conn.prepare_cached(
+            "
+            INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, kind, \
+             variant_count, group_reason)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+        )?
+        .execute(params![
+            logical_symbol_id,
+            key.language,
+            key.path,
+            key.name,
+            key.qualified_name,
+            key.kind,
+            i64::try_from(members.len()).unwrap_or(i64::MAX),
+            group_reason,
+        ])?;
+        for member in members {
+            let signature_hash =
+                member.signature.as_deref().map(|signature| hex_sha256(signature.as_bytes()));
             conn.prepare_cached(
                 "
-                INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name, \
-                 kind, variant_count, group_reason)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                INSERT INTO logical_symbol_members(
+                    logical_symbol_id, symbol_id, cfg_expr, signature_hash, start_line, end_line
+                )
+                VALUES (?1, ?2, NULL, ?3, ?4, ?5)
                 ",
             )?
             .execute(params![
                 logical_symbol_id,
-                key.language,
-                key.path,
-                key.name,
-                key.qualified_name,
-                key.kind,
-                i64::try_from(members.len()).unwrap_or(i64::MAX),
-                group_reason,
+                member.symbol_id,
+                signature_hash,
+                member.start_line,
+                member.end_line,
             ])?;
-            for member in members {
-                let signature_hash =
-                    member.signature.as_deref().map(|signature| hex_sha256(signature.as_bytes()));
-                conn.prepare_cached(
-                    "
-                    INSERT INTO logical_symbol_members(
-                        logical_symbol_id, symbol_id, cfg_expr, signature_hash, start_line, \
-                     end_line
-                    )
-                    VALUES (?1, ?2, NULL, ?3, ?4, ?5)
-                    ",
-                )?
-                .execute(params![
-                    logical_symbol_id,
-                    member.symbol_id,
-                    signature_hash,
-                    member.start_line,
-                    member.end_line,
-                ])?;
-            }
         }
         Ok(())
     }

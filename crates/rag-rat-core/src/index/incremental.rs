@@ -48,7 +48,9 @@ impl IndexDatabase {
         progress(IndexProgress::IndexingGitHistory);
         let mut git_history = Some(spawn_git_history_prepare(&config.root));
         let result = (|| -> anyhow::Result<()> {
-            db.storage.execute_batch("BEGIN TRANSACTION")?;
+            // BEGIN IMMEDIATE: acquire the write lock up front so a racing writer waits out
+            // busy_timeout instead of failing the deferred read→write upgrade with SQLITE_BUSY.
+            db.storage.execute_batch("BEGIN IMMEDIATE")?;
             db.set_meta("source_root", &config.root.display().to_string())?;
             db.storage.set_source_root(config.root.clone());
             db.write_git_meta(&config.root)?;
@@ -137,7 +139,7 @@ impl IndexDatabase {
             }
             // `prepared` (this wave's chunk texts / symbols / edge candidates) drops here.
         }
-        edges::resolve_and_insert_edges(self.storage.connection(), graph.symbols, graph.edges)?;
+        edges::resolve_and_insert_edges(self.storage.connection(), graph)?;
 
         Ok(total)
     }

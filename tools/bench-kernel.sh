@@ -15,7 +15,11 @@
 #   RAG_RAT_BIN              path to the release binary     (default: target/release/rag-rat)
 #   RAG_RAT_KERNEL_SUBDIRS   space-separated subtrees to    (default: ".", the whole tree)
 #                            index — set e.g. "kernel mm fs net lib" to bound scope/memory
+#   RAG_RAT_INDEX_WAVE       full-rebuild wave size (files prepared/inserted per wave before the
+#                            wave's prepared form is dropped) — the memory/speed knob. Read by the
+#                            binary; passed through this script's environment. (binary default: 2000)
 #   BMF_OUT                  output BMF JSON path           (default: kernel_bmf.json)
+#   TAXONOMY_CSV             unresolved-edge-by-kind CSV    (default: kernel_unresolved_by_kind.csv)
 #   KERNEL_WORK              working dir                    (default: a fresh mktemp dir)
 set -euo pipefail
 
@@ -23,6 +27,7 @@ KERNEL_TAG="${KERNEL_TAG:-v7.0}"
 # Pinned by commit SHA so the corpus is immutable even if the tag is ever moved (v7.0 = this commit).
 KERNEL_SHA="${KERNEL_SHA:-028ef9c96e96197026887c0f092424679298aae8}"
 RSS_CSV="${RSS_CSV:-kernel_rss_samples.csv}"
+TAXONOMY_CSV="${TAXONOMY_CSV:-kernel_unresolved_by_kind.csv}"
 RAG_RAT_BIN="${RAG_RAT_BIN:-target/release/rag-rat}"
 RAG_RAT_KERNEL_SUBDIRS="${RAG_RAT_KERNEL_SUBDIRS:-.}"
 BMF_OUT="${BMF_OUT:-kernel_bmf.json}"
@@ -109,16 +114,33 @@ fi
 # Read the extracted-fact counts from the DB and emit the BMF. Capturing symbols/edges/chunks (not
 # just files/s) makes the run comparable per extracted fact, not just per file — different tools
 # compute different products, so throughput alone is mush.
-python3 - "$WORK/kernel-index.sqlite" "$seconds" "$maxrss_kb" "$sampled_peak_kb" "$BMF_OUT" "$KERNEL_TAG" <<'PY'
-import json, sqlite3, sys
+python3 - "$WORK/kernel-index.sqlite" "$seconds" "$maxrss_kb" "$sampled_peak_kb" "$BMF_OUT" "$KERNEL_TAG" "$TAXONOMY_CSV" <<'PY'
+import json, os, sqlite3, sys
 db, seconds = sys.argv[1], float(sys.argv[2])
 maxrss_kb, sampled_peak_kb = int(sys.argv[3]), int(sys.argv[4])
-out, tag = sys.argv[5], sys.argv[6]
+out, tag, taxonomy_csv = sys.argv[5], sys.argv[6], sys.argv[7]
 conn = sqlite3.connect(db)
 count = lambda table: conn.execute(f"select count(*) from {table}").fetchone()[0]
 files, symbols, edges, chunks = count("files"), count("symbols"), count("edges"), count("chunks")
 resolved = conn.execute("select count(*) from edges where to_symbol_id is not null").fetchone()[0]
 resolved_pct = 100.0 * resolved / edges if edges else 0.0
+
+# Unresolved-edge taxonomy by edge_kind: the denominator semantics for the resolved rate. The
+# unresolved bucket is NOT all error — calls_name to extern/macro/function-pointer targets and
+# references_type to out-of-corpus types legitimately don't resolve in a tree-sitter pass. Bucketing
+# by edge_kind is the rough, honest breakdown; it is also the natural "before" baseline for the SCIP
+# oracle pass (issue #61), which upgrades exactly these buckets.
+unresolved_by_kind = conn.execute(
+    "select edge_kind, count(*) from edges where to_symbol_id is null "
+    "group by edge_kind order by count(*) desc"
+).fetchall()
+unresolved_total = edges - resolved
+with open(taxonomy_csv, "w") as fh:
+    fh.write("edge_kind,unresolved_count,pct_of_unresolved\n")
+    for kind, n in unresolved_by_kind:
+        pct = 100.0 * n / unresolved_total if unresolved_total else 0.0
+        fh.write(f"{kind},{n},{pct:.1f}\n")
+wave = os.environ.get("RAG_RAT_INDEX_WAVE", "2000 (default)")
 
 bmf = {
     # Benchmark name carries the tag so re-pinning to a newer kernel starts a distinct series.
@@ -136,11 +158,16 @@ bmf = {
 with open(out, "w") as f:
     json.dump(bmf, f, indent=2)
 
+taxonomy = " ".join(f"{kind}={n}" for kind, n in unresolved_by_kind)
 print(
     f"bench-kernel: indexed {files} files of Linux {tag} in {seconds:.1f}s "
-    f"({files/seconds:.1f} files/s) — peak {maxrss_kb/1024:.0f} MiB maxrss "
+    f"({files/seconds:.1f} files/s, wave={wave}) — peak {maxrss_kb/1024:.0f} MiB maxrss "
     f"(sampled {sampled_peak_kb/1024:.0f} MiB) — "
     f"{symbols} symbols, {edges} edges ({resolved} resolved, {resolved_pct:.1f}%), {chunks} chunks → {out}",
+    file=sys.stderr,
+)
+print(
+    f"bench-kernel: {unresolved_total} unresolved edges by kind → {taxonomy} (full breakdown in {taxonomy_csv})",
     file=sys.stderr,
 )
 PY

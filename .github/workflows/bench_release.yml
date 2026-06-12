@@ -16,6 +16,22 @@ on:
         description: 'Kernel subtrees to index (space-separated; "." = whole tree)'
         required: false
         default: '.'
+      wave_size:
+        description: 'Full-rebuild wave size (RAG_RAT_INDEX_WAVE) — the memory/speed knob (default 2000)'
+        required: false
+        default: '2000'
+      mem_trace:
+        description: 'Set to 1 to emit per-phase MEMTRACE (RSS + sqlite_memory) to the log for peak diagnosis'
+        required: false
+        default: ''
+      soft_heap_limit_mb:
+        description: 'Cap SQLite soft heap (MB) for the run — tests if a SQLite spike is discretionary buffering vs load-bearing'
+        required: false
+        default: ''
+      wal_autocheckpoint:
+        description: 'Override wal_autocheckpoint (pages) during rebuild; 0 disables the COMMIT-time checkpoint (peak ablation)'
+        required: false
+        default: ''
 
 permissions:
   checks: write
@@ -49,6 +65,16 @@ jobs:
         env:
           RAG_RAT_BIN: target/release/rag-rat
           RAG_RAT_KERNEL_SUBDIRS: ${{ github.event.inputs.kernel_subdirs || '.' }}
+          # Wave size is the memory/speed knob (see tools/bench-kernel.sh, perf(index) interning
+          # commit). Default 2000 matches the binary default, so a release run is unchanged.
+          RAG_RAT_INDEX_WAVE: ${{ github.event.inputs.wave_size || '2000' }}
+          # When dispatched with mem_trace=1, the binary prints per-phase RSS + sqlite_memory to
+          # stderr (the run log) to localize the full-rebuild peak. Empty on release runs (no-op).
+          RAG_RAT_MEM_TRACE: ${{ github.event.inputs.mem_trace }}
+          # Diagnostic: cap SQLite's soft heap to test discretionary-vs-load-bearing spikes. Empty
+          # on normal/release runs (no-op).
+          RAG_RAT_SQLITE_SOFT_HEAP_LIMIT_MB: ${{ github.event.inputs.soft_heap_limit_mb }}
+          RAG_RAT_WAL_AUTOCHECKPOINT: ${{ github.event.inputs.wal_autocheckpoint }}
           BMF_OUT: kernel_bmf.json
           # Put the multi-GB kernel checkout + index DB on disk (runner temp), not the default tmpfs
           # /tmp — on the self-hosted box /tmp is RAM-backed and a ~10 GB DB exhausts it.
@@ -74,3 +100,4 @@ jobs:
           path: |
             kernel_bmf.json
             kernel_rss_samples.csv
+            kernel_unresolved_by_kind.csv
