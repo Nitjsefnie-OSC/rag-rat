@@ -45,8 +45,18 @@ impl IndexDatabase {
             return Self::rebuild_with_progress(config, progress);
         }
         progress(IndexProgress::Started { database: config.database.clone(), mode });
-        progress(IndexProgress::IndexingGitHistory);
-        let mut git_history = Some(spawn_git_history_prepare(&config.root));
+        // Gate the git-history reload: `apply_prepared` is a full `git log` re-read (O(total
+        // history) — the `--numstat` pass diffs every commit) + 4-table wipe, and it runs on EVERY
+        // incremental/watcher pass. Skip it when HEAD/root/shallow are unchanged (the common case:
+        // a file edit or idle sweep leaves history untouched). Reloading only on a real change
+        // still catches every rewrite, since HEAD's sha is content-addressed. Decide BEFORE
+        // spawning `prepare` so an unchanged HEAD never pays the `git log` cost at all.
+        let mut git_history = if db.git_history_is_current(&config.root) {
+            None
+        } else {
+            progress(IndexProgress::IndexingGitHistory);
+            Some(spawn_git_history_prepare(&config.root))
+        };
         let result = (|| -> anyhow::Result<()> {
             // BEGIN IMMEDIATE: acquire the write lock up front so a racing writer waits out
             // busy_timeout instead of failing the deferred read→write upgrade with SQLITE_BUSY.
@@ -59,12 +69,10 @@ impl IndexDatabase {
                 IndexMode::Discover => db.index_discovered_files_with_progress(config, progress)?,
                 IndexMode::Full => unreachable!("full mode is handled by rebuild_with_progress"),
             };
-            db.apply_prepared_git_history(
-                &config.root,
-                git_history
-                    .take()
-                    .ok_or_else(|| anyhow::anyhow!("git history preparation was already used"))?,
-            )?;
+            // None when the gate above found git history already current — skip the reload.
+            if let Some(handle) = git_history.take() {
+                db.apply_prepared_git_history(&config.root, handle)?;
+            }
             if indexed > 0 {
                 progress(IndexProgress::RebuildingLogicalSymbols);
                 db.rebuild_logical_symbols()?;

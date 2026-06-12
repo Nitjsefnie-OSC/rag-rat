@@ -332,6 +332,13 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// O(1) check of whether the indexed git history is still current for `root`'s HEAD, so the
+    /// incremental path can skip the full `git log` re-read + table wipe. See
+    /// [`git_history::is_history_current`].
+    pub(super) fn git_history_is_current(&self, root: &Path) -> bool {
+        git_history::is_history_current(self.storage.connection(), root)
+    }
+
     pub(super) fn apply_prepared_git_history(
         &self,
         root: &Path,
@@ -885,6 +892,10 @@ impl IndexDatabase {
              )",
             params![path, commit_sha, worktree_id],
         )?;
+        // Deleting the chunks cascades (ON DELETE CASCADE, foreign_keys=ON) to git_chunk_blame,
+        // chunk_embeddings, and chunk_summaries — so the gate skipping the full git-history wipe
+        // does NOT leak blame. (`docs` has no FK and is not cleaned here — a pre-existing gap,
+        // tracked separately.)
         self.storage.connection().execute(
             "DELETE FROM chunks
              WHERE file_id IN (

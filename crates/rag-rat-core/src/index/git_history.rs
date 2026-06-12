@@ -90,6 +90,10 @@ pub struct ChunkBlameSummary {
 struct GitRepo {
     worktree_root: PathBuf,
     head: String,
+    /// True for a `--depth`-limited clone. A shallow clone can be deepened/unshallowed
+    /// without moving HEAD, so its reachable history is not pinned by the HEAD sha — the
+    /// reload gate must never skip while shallow. See [`is_history_current`].
+    shallow: bool,
 }
 
 #[derive(Debug)]
@@ -123,8 +127,12 @@ pub(crate) fn prepare(root: &Path) -> anyhow::Result<PreparedGitHistory> {
     let Some(repo) = git_repo(root) else {
         return Ok(PreparedGitHistory { repo: None, commits: Vec::new(), changes: Vec::new() });
     };
-    let commits = read_commits(root)?;
-    let changes = read_file_changes(root, &repo.worktree_root)?;
+    // Pin both logs to the sha captured above, not the implicit HEAD: HEAD can move between
+    // `git_repo` and these two separate `git log` invocations, which would record the meta head
+    // while the tables hold a newer commit's history. Pinning makes `prepare` atomic w.r.t. a
+    // concurrent commit and keeps the stored `git_history_indexed_head` honest for the gate.
+    let commits = read_commits(root, &repo.head)?;
+    let changes = read_file_changes(root, &repo.worktree_root, &repo.head)?;
     Ok(PreparedGitHistory { repo: Some(repo), commits, changes })
 }
 
@@ -191,7 +199,11 @@ pub(crate) fn apply_prepared(
         SELECT rowid, subject, body FROM git_commits;
         ",
     )?;
+    // Reload-gate key: head + root + shallow flag. `is_history_current` skips the next reload
+    // only when all three still match and git_commits is non-empty.
     set_meta(conn, "git_history_indexed_head", &repo.head)?;
+    set_meta(conn, "git_history_indexed_root", &root_key(root))?;
+    set_meta(conn, "git_history_indexed_shallow", if repo.shallow { "1" } else { "0" })?;
     status(conn, root)
 }
 
@@ -423,15 +435,18 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
         DELETE FROM git_chunk_blame;
         DELETE FROM git_file_changes;
         DELETE FROM git_commits;
-        DELETE FROM index_meta WHERE key = 'git_history_indexed_head';
+        DELETE FROM index_meta
+        WHERE key IN ('git_history_indexed_head', 'git_history_indexed_root',
+                      'git_history_indexed_shallow');
         ",
     )?;
     Ok(())
 }
 
-fn read_commits(root: &Path) -> anyhow::Result<Vec<CommitRecord>> {
+fn read_commits(root: &Path, head: &str) -> anyhow::Result<Vec<CommitRecord>> {
     let Some(output) = git_output(root, &[
         "log",
+        head,
         "--format=format:%H%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1f%B%x1e",
         "--",
         ".",
@@ -446,8 +461,13 @@ fn read_commits(root: &Path) -> anyhow::Result<Vec<CommitRecord>> {
         .collect())
 }
 
-fn read_file_changes(root: &Path, worktree_root: &Path) -> anyhow::Result<Vec<FileChange>> {
-    let Some(output) = git_output(root, &["log", "--numstat", "--format=format:%x1e%H", "--", "."])
+fn read_file_changes(
+    root: &Path,
+    worktree_root: &Path,
+    head: &str,
+) -> anyhow::Result<Vec<FileChange>> {
+    let Some(output) =
+        git_output(root, &["log", head, "--numstat", "--format=format:%x1e%H", "--", "."])
     else {
         return Ok(Vec::new());
     };
@@ -608,7 +628,50 @@ fn count_table(conn: &Connection, table: &str) -> anyhow::Result<u64> {
 fn git_repo(root: &Path) -> Option<GitRepo> {
     let worktree_root = git_output(root, &["rev-parse", "--show-toplevel"])?;
     let head = git_output(root, &["rev-parse", "HEAD"])?;
-    Some(GitRepo { worktree_root: PathBuf::from(worktree_root), head })
+    // `--is-shallow-repository` prints "true"/"false" (git 2.15+). Treat a probe failure as
+    // not-shallow: the worst case is one redundant full reload, never a skipped one.
+    let shallow =
+        git_output(root, &["rev-parse", "--is-shallow-repository"]).as_deref() == Some("true");
+    Some(GitRepo { worktree_root: PathBuf::from(worktree_root), head, shallow })
+}
+
+/// Canonical serialization of the indexed root for the reload gate. The git-history row set is
+/// a function of (HEAD, root) because the `-- .` pathspec runs in `current_dir(root)`, so the
+/// gate stores and compares the root alongside the head sha.
+fn root_key(root: &Path) -> String {
+    root.display().to_string()
+}
+
+/// O(1) gate for the per-pass git-history reload (`apply_prepared` is a full `git log` re-read +
+/// table wipe — O(total history); see its rewrite-safety note). Returns true only when the
+/// indexed commit/file-change rows are still valid for the current repo state, so the caller may
+/// skip the reload entirely. Conservative: any uncertainty returns false (reload).
+///
+/// HEAD sha is content-addressed over tree+parents, so any rewrite (squash/rebase/amend/
+/// force-pull) moves it and forces a reload. The two cases where HEAD alone is *not* a complete
+/// key — and are guarded here — are a shallow clone being deepened (history grows without moving
+/// HEAD) and the DB being re-pointed at a different `root` subtree at the same HEAD.
+pub(crate) fn is_history_current(conn: &Connection, root: &Path) -> bool {
+    let Some(repo) = git_repo(root) else {
+        // No git repo (or git failed): let apply_prepared run its clear() path.
+        return false;
+    };
+    if repo.shallow {
+        return false;
+    }
+    let probe = || -> anyhow::Result<bool> {
+        let head_matches =
+            meta(conn, "git_history_indexed_head")?.as_deref() == Some(repo.head.as_str());
+        let root_matches =
+            meta(conn, "git_history_indexed_root")?.as_deref() == Some(root_key(root).as_str());
+        // A prior reload done while shallow only saw truncated history; redo it now that we are
+        // not shallow even if HEAD is unchanged.
+        let prior_was_full = meta(conn, "git_history_indexed_shallow")?.as_deref() == Some("0");
+        // Guard against a torn/empty prior reload writing the meta without rows.
+        let has_rows = count_table(conn, "git_commits")? > 0;
+        Ok(head_matches && root_matches && prior_was_full && has_rows)
+    };
+    probe().unwrap_or(false)
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {

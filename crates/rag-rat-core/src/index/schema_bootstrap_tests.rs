@@ -1336,6 +1336,184 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A recognizable bogus row that only a git-history *reload* (full table wipe) would remove.
+/// Surviving the next incremental pass ⇒ the reload was skipped; gone ⇒ it ran. It lives in
+/// `git_file_changes` (a plain table the reload also wipes) rather than `git_commits`, because a
+/// stray `git_commits` row with no matching `commit_fts` entry desyncs the external-content FTS5
+/// and the reload's `DELETE FROM commit_fts` then corrupts it — a test artifact, not a real state.
+const SENTINEL_PATH: &str = "__rag_rat_reload_sentinel__";
+
+fn insert_sentinel_commit(db: &IndexDatabase) {
+    let conn = db.storage.connection();
+    // git_file_changes.commit_hash has a FK to git_commits.hash, so reuse a real commit hash; the
+    // sentinel marker is the path, which the reload wipes along with every other change row.
+    let hash: String =
+        conn.query_row("SELECT hash FROM git_commits LIMIT 1", [], |row| row.get(0)).unwrap();
+    conn.execute(
+        "INSERT INTO git_file_changes(commit_hash, path, additions, deletions, change_kind)
+         VALUES (?1, ?2, 0, 0, 'modified')",
+        rusqlite::params![hash, SENTINEL_PATH],
+    )
+    .unwrap();
+}
+
+fn sentinel_commit_count(db: &IndexDatabase) -> i64 {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM git_file_changes WHERE path = ?1",
+            [SENTINEL_PATH],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn git_history_targets() -> Vec<ResolvedTarget> {
+    vec![
+        ResolvedTarget {
+            name: "markdown".to_string(),
+            language: Language::Markdown,
+            directories: vec![PathBuf::from("docs")],
+            include: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Docs,
+        },
+        ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["**/*.rs".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        },
+    ]
+}
+
+fn rag_rat_config(root: &Path) -> Config {
+    Config {
+        root: root.to_path_buf(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: git_history_targets(),
+        local_ai: Default::default(),
+        watch: Default::default(),
+    }
+}
+
+/// Init a git repo at `root` with two commits over docs/ + src/, returning its rag-rat Config.
+fn git_history_test_config(root: &Path) -> Config {
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    run_git(root, &["init"]);
+    run_git(root, &["config", "user.name", "Rag Rat"]);
+    run_git(root, &["config", "user.email", "rag@example.com"]);
+    fs::write(root.join("docs/search.md"), "# Title\nalpha token\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn tracked_symbol() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-m", "Add alpha docs"]);
+    fs::write(root.join("docs/search.md"), "# Title\nbeta token\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-m", "Refresh beta docs"]);
+    rag_rat_config(root)
+}
+
+#[test]
+fn git_history_reload_is_skipped_when_head_is_unchanged() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    insert_sentinel_commit(&db);
+    drop(db);
+
+    // No file edit and no HEAD movement: the gate must skip the reload, so the sentinel survives.
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(sentinel_commit_count(&db), 1, "reload should be skipped when HEAD is unchanged");
+    // Real history is left intact (the 2 real commits are untouched by the skip).
+    assert_eq!(db.status(&config.database).unwrap().git_history.commit_count, 2);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_history_reloads_after_a_new_commit() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    insert_sentinel_commit(&db);
+    drop(db);
+
+    // A real new commit moves HEAD → the gate must reload, wiping the sentinel.
+    fs::write(root.join("docs/search.md"), "# Title\ngamma token\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-m", "Add gamma docs"]);
+
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(sentinel_commit_count(&db), 0, "a new commit must force a reload");
+    assert_eq!(db.commit_search("gamma", 10).unwrap().len(), 1, "new commit is indexed");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_history_reloads_after_a_history_rewrite() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    let config = git_history_test_config(&root);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let before = db.status(&config.database).unwrap().git_history.commit_count;
+    insert_sentinel_commit(&db);
+    drop(db);
+
+    // Amend rewrites the tip to a new sha WITHOUT adding a commit — a non-fast-forward rewrite,
+    // like the squash that motivated the gate. HEAD's content-addressed sha changes → reload.
+    run_git(&root, &["commit", "--amend", "-m", "Refresh delta docs"]);
+
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(sentinel_commit_count(&db), 0, "a history rewrite must force a reload");
+    let status = db.status(&config.database).unwrap();
+    assert_eq!(status.git_history.commit_count, before, "amend does not change the commit count");
+    assert_eq!(db.commit_search("delta", 10).unwrap().len(), 1, "rewritten subject is indexed");
+    assert_eq!(db.commit_search("beta", 10).unwrap().len(), 0, "old subject is gone after rewrite");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn git_history_reload_is_not_skipped_on_a_shallow_clone() {
+    let origin = unique_temp_root();
+    let _ = fs::remove_dir_all(&origin);
+    let _ = git_history_test_config(&origin); // origin repo with two commits
+
+    let shallow = unique_temp_root();
+    let _ = fs::remove_dir_all(&shallow);
+    // Local clones ignore --depth unless the source is a file:// URL; use one so the clone is
+    // genuinely shallow.
+    run_git(&std::env::temp_dir(), &[
+        "clone",
+        "--depth",
+        "1",
+        &format!("file://{}", origin.display()),
+        shallow.to_str().unwrap(),
+    ]);
+    let config = rag_rat_config(&shallow);
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    insert_sentinel_commit(&db);
+    drop(db);
+
+    // HEAD is unchanged, but a shallow clone can be deepened without moving HEAD, so its history
+    // is not pinned by the HEAD sha — the gate must NOT skip. It reloads and wipes the sentinel.
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(sentinel_commit_count(&db), 0, "a shallow clone must never skip the reload");
+
+    fs::remove_dir_all(origin).unwrap();
+    fs::remove_dir_all(shallow).unwrap();
+}
+
 #[test]
 fn indexes_rust_graph_edges_from_tree_sitter() {
     let root = unique_temp_root();
