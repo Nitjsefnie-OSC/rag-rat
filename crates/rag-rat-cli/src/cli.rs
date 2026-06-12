@@ -259,9 +259,9 @@ pub(crate) struct OracleRunArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct OracleStatusArgs {
-    /// The oracle tool to report on (default: rust-analyzer).
-    #[arg(long, value_enum, default_value_t = OracleToolArg::RustAnalyzer)]
-    pub tool: OracleToolArg,
+    /// Report on one oracle tool only (default: every known tool).
+    #[arg(long, value_enum)]
+    pub tool: Option<OracleToolArg>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -315,6 +315,10 @@ pub(crate) enum MemoryCommand {
         path: Option<String>,
         #[arg(long)]
         chunk: Option<i64>,
+        /// Directory anchor relative to the repo root (`""` for the repo root) — the area-level
+        /// binding `dir`-bound memories use.
+        #[arg(long)]
+        dir: Option<String>,
     },
 }
 
@@ -468,8 +472,9 @@ mod tests {
         ])
         .expect("parse");
         match cli.command {
-            Command::Memory(MemoryArgs { command: MemoryCommand::Rebind { symbol_path, .. } }) =>
-                assert_eq!(symbol_path.as_deref(), Some("src/a.rs::foo")),
+            Command::Memory(MemoryArgs { command: MemoryCommand::Rebind { symbol_path, .. } }) => {
+                assert_eq!(symbol_path.as_deref(), Some("src/a.rs::foo"))
+            },
             other => panic!("expected memory rebind, got {other:?}"),
         }
     }

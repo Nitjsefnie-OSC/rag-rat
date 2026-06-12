@@ -243,21 +243,30 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
 }
 
 /// `rag-rat oracle status` — verdict counts for the latest run in this checkout, plus whether the
-/// indexer tool is installed (its probe, a `Blocked` line when absent, never an error).
+/// indexer tool is installed (its probe, a `Blocked` line when absent, never an error). Always an
+/// ARRAY of per-tool objects: every known tool by default, one element under `--tool` — the shape
+/// stays stable as language backends (#71 TS, #72 Kotlin) join the registry.
 fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<()> {
-    let tool = args.tool.core();
-    let availability = db.probe_oracle_tool(tool);
-    // Use the most recent run's version for the verdict counts; no run → no counts (status is a
-    // read-only sibling — nothing to report against).
-    let status = match db.latest_oracle_run_version(tool)? {
-        Some(version) => Some(db.oracle_status(tool, &version)?),
-        None => None,
+    let tools: Vec<rag_rat_core::index::oracle::OracleTool> = match args.tool {
+        Some(tool) => vec![tool.core()],
+        None => rag_rat_core::index::oracle::OracleTool::ALL.to_vec(),
     };
-    print_json(&serde_json::json!({
-        "tool": tool.as_db_str(),
-        "tool_available": availability,
-        "verdicts": status,
-    }))
+    let mut entries = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let availability = db.probe_oracle_tool(tool);
+        // Use the most recent run's version for the verdict counts; no run → no counts (status is
+        // a read-only sibling — nothing to report against).
+        let status = match db.latest_oracle_run_version(tool)? {
+            Some(version) => Some(db.oracle_status(tool, &version)?),
+            None => None,
+        };
+        entries.push(serde_json::json!({
+            "tool": tool.as_db_str(),
+            "tool_available": availability,
+            "verdicts": status,
+        }));
+    }
+    print_json(&entries)
 }
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
@@ -391,6 +400,10 @@ fn path_bind_target(path: String) -> rag_rat_core::query::memory::RepoMemoryBind
     rag_rat_core::query::memory::RepoMemoryBindTarget { path: Some(path), ..Default::default() }
 }
 
+fn dir_bind_target(dir: String) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
+    rag_rat_core::query::memory::RepoMemoryBindTarget { dir: Some(dir), ..Default::default() }
+}
+
 fn chunk_bind_target(chunk_id: i64) -> rag_rat_core::query::memory::RepoMemoryBindTarget {
     rag_rat_core::query::memory::RepoMemoryBindTarget {
         chunk_id: Some(chunk_id),
@@ -446,7 +459,7 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        MemoryCommand::Rebind { memory_id, symbol, symbol_path, symbol_id, path, chunk } => {
+        MemoryCommand::Rebind { memory_id, symbol, symbol_path, symbol_id, path, chunk, dir } => {
             let db = open_index(config)?;
             let bind = if symbol.is_some() || symbol_path.is_some() || symbol_id.is_some() {
                 let selector = rag_rat_core::query::symbol::SymbolSelector {
@@ -483,10 +496,12 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                 path_bind_target(path.clone())
             } else if let Some(chunk_id) = chunk {
                 chunk_bind_target(*chunk_id)
+            } else if let Some(dir) = dir {
+                dir_bind_target(dir.clone())
             } else {
                 anyhow::bail!(
                     "memory rebind needs one of --symbol <name>, --symbol-path <path::name>, \
-                     --symbol-id <id>, --path <path>, or --chunk <id>"
+                     --symbol-id <id>, --path <path>, --chunk <id>, or --dir <dir>"
                 );
             };
             print_json(&db.memory_rebind(memory_id, bind)?)
