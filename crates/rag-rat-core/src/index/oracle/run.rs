@@ -30,6 +30,17 @@ pub(crate) struct OracleRunInput<'a> {
     /// Checkout root: document paths in the `.scip` are joined against this to read current bytes
     /// for position-encoding conversion.
     pub(crate) checkout_root: &'a Path,
+    /// `relative_path -> hex sha256` of the disk bytes captured the instant the tool finished
+    /// producing the `.scip`, for a tool-driven run; `None` for a pre-built `--scip` (no
+    /// production moment we control). When present it adds the scip-vs-disk leg of the content
+    /// gate (#82 TOCTOU): the `.scip`'s occurrence offsets describe the bytes the subprocess saw,
+    /// so the join only trusts them for a document whose disk content is STILL that snapshot. Both
+    /// documents a verdict depends on are pinned against it — the call-site document
+    /// (pre-classify) AND the resolved symbol's definition document (post-classify) — since
+    /// the watcher reindexing EITHER in the lock-free window corrupts the join while `disk_sha
+    /// == file_sha` (both the new content) still passes the index-vs-disk gate. See
+    /// [`super::ScipProduction::Produced`].
+    pub(crate) production_sha: Option<&'a HashMap<String, String>>,
 }
 
 /// Run the oracle join over all current edge candidates and persist verdicts + a run row.
@@ -129,7 +140,23 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         // silently-wrong verdict. Skip the candidate and tally it as drifted so `eval` can
         // warn. A file with no computed hash (unreadable) already produced no occurrences,
         // so it never reaches here.
-        if disk_sha.get(&candidate.source_path).map(String::as_str) != Some(&candidate.file_sha) {
+        let disk = disk_sha.get(&candidate.source_path).map(String::as_str);
+        if disk != Some(&candidate.file_sha) {
+            report.skipped_drifted += 1;
+            continue;
+        }
+
+        // scip-vs-disk gate (#82 TOCTOU): the index-vs-disk check above only proves the EDGE and
+        // the disk agree — both could be the NEW content the watcher reindexed in the
+        // lock-free window after the tool built the `.scip` against the OLD content. For a
+        // tool-driven run we also hold the disk hash captured at production time; require
+        // it to still match disk, so the `.scip`'s occurrence offsets describe the very
+        // bytes the join reads. A drifted document is skipped (tallied as drifted), exactly
+        // like index-vs-disk drift. A pre-built `--scip` (`production_sha == None`) has no
+        // production moment to pin, so it keeps the index-vs-disk gate only.
+        if let Some(production_sha) = input.production_sha
+            && production_sha.get(&candidate.source_path).map(String::as_str) != disk
+        {
             report.skipped_drifted += 1;
             continue;
         }
@@ -148,6 +175,25 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
             report.no_occurrence += 1;
             continue;
         };
+
+        // scip-vs-disk gate, DEFINITION side (#82 TOCTOU, def-document variant). The call-site gate
+        // above only pins the document the occurrence lives in. But an in-corpus verdict also
+        // depends on the DEFINITION document: the resolved symbol comes from converting the `.scip`
+        // def occurrence's offsets against the def file's join-time disk bytes, then mapping that
+        // byte range to a current indexed symbol. If the watcher reindexed the DEF file in the
+        // lock-free window, that conversion lands on the wrong bytes and resolves the wrong symbol
+        // (a mis-targeted `Upgrade`/`Contradict`, or a false external when it maps to
+        // nothing). Pin the def document the same way — its hash is already in the
+        // production snapshot. An external symbol with no in-corpus definition entry has no
+        // def document to pin, so it's unaffected.
+        if let Some(production_sha) = input.production_sha
+            && let Some(def) = index.definitions.get(&verdict.scip_symbol)
+            && production_sha.get(&def.path).map(String::as_str)
+                != disk_sha.get(&def.path).map(String::as_str)
+        {
+            report.skipped_drifted += 1;
+            continue;
+        }
 
         // Mark EXACTLY the occurrence the verdict matched as covered (finding 4): use the range the
         // join selected (reference-preferred, full containment), not a re-derived start-only match
@@ -201,8 +247,10 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
 }
 
 /// Hex SHA-256 of a byte slice — matches `files.sha256` (computed as `hex_sha256(fs::read(file))`),
-/// so the content-integrity check compares the same hash space the indexer wrote.
-fn hex_sha256(bytes: &[u8]) -> String {
+/// so the content-integrity check compares the same hash space the indexer wrote. `pub(crate)` so
+/// the production-time snapshot in `produce_scip_with_tool` hashes disk bytes in the SAME space the
+/// join's `disk_sha` / the candidate's `file_sha` live in (the scip-vs-disk gate, #82 TOCTOU).
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -434,7 +482,7 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 
 /// Count edges with a low-confidence heuristic resolution (`NameOnly`/`Ambiguous`) that the oracle
 /// produced a verdict for (i.e. have an `edge_oracle` row), scoped to the active checkout. Built on
-/// the shared `store::EDGE_ORACLE_SCOPE_JOIN` (the `?1..?4 = tool/version/commit_sha/worktree_id`
+/// the shared `store::edge_oracle_scope_join()` (the `?1..?4 = tool/version/commit_sha/worktree_id`
 /// scope) so the scope predicate is never re-spelled here — only the extra confidence filter is
 /// appended.
 fn count_low_confidence_with_oracle(
@@ -447,7 +495,7 @@ fn count_low_confidence_with_oracle(
     let count: i64 = conn.query_row(
         &format!(
             "SELECT COUNT(*){} AND edges.confidence IN ('NameOnly', 'Ambiguous')",
-            store::EDGE_ORACLE_SCOPE_JOIN
+            store::edge_oracle_scope_join()
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -460,7 +508,7 @@ fn count_low_confidence_with_oracle(
 /// (`count_low_confidence_with_oracle`), so the rate can never exceed 1.0. The `edges.confidence`
 /// filter is what guards against an `Exact`-with-NULL-`to_symbol_id` writer bug recreating an
 /// over-1.0 rate (the raw per-kind `counts.upgraded` would admit such an upgrade; this won't).
-/// Built on the shared `store::EDGE_ORACLE_SCOPE_JOIN`, like the upgradeable-fraction numerator.
+/// Built on the shared `store::edge_oracle_scope_join()`, like the upgradeable-fraction numerator.
 fn count_low_confidence_upgrades(
     conn: &Connection,
     tool: OracleTool,
@@ -472,7 +520,7 @@ fn count_low_confidence_upgrades(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind = 'upgrade' AND edges.confidence IN \
              ('NameOnly', 'Ambiguous')",
-            store::EDGE_ORACLE_SCOPE_JOIN
+            store::edge_oracle_scope_join()
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -486,7 +534,7 @@ fn count_low_confidence_upgrades(
 /// denominator (`count_unresolved_candidates`) counts, so the fraction can never exceed 1.0. There
 /// is at most one `edge_oracle` row per edge (PK `(edge_id, tool, tool_version)`), so this is a
 /// subset count, not a sum that could double-count. Built on the shared
-/// `store::EDGE_ORACLE_SCOPE_JOIN` so it stays ⊆ the scoped denominator by construction.
+/// `store::edge_oracle_scope_join()` so it stays ⊆ the scoped denominator by construction.
 fn count_upgradeable_low_confidence(
     conn: &Connection,
     tool: OracleTool,
@@ -498,7 +546,7 @@ fn count_upgradeable_low_confidence(
         &format!(
             "SELECT COUNT(*){} AND edge_oracle.kind IN ('upgrade', 'resolved-external') AND \
              edges.confidence IN ('NameOnly', 'Ambiguous')",
-            store::EDGE_ORACLE_SCOPE_JOIN
+            store::edge_oracle_scope_join()
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
         |row| row.get(0),
@@ -519,14 +567,17 @@ fn count_unresolved_candidates(
     worktree_id: &str,
 ) -> anyhow::Result<u64> {
     let count: i64 = conn.query_row(
-        "
+        &format!(
+            "
         SELECT COUNT(*)
         FROM edges
         JOIN files ON files.id = edges.source_file_id
         WHERE edges.callee_start_byte IS NOT NULL
           AND edges.confidence IN ('NameOnly', 'Ambiguous')
-          AND files.commit_sha = ?1 AND files.worktree_id = ?2
+          AND {scope}
         ",
+            scope = store::active_checkout_file_predicate("?1", "?2"),
+        ),
         rusqlite::params![commit_sha, worktree_id],
         |row| row.get(0),
     )?;

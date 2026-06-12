@@ -44,7 +44,11 @@ impl Drop for TempRoot {
 
 const TOOL: OracleTool = OracleTool::RustAnalyzer;
 const VERSION: &str = "test";
-const COMMIT: &str = "";
+// Model a REAL clean git checkout: a non-empty `commit_sha`, empty `worktree_id` (the
+// `FileScope::commit` case — the dominant production shape). The earlier `"" / ""` pair only
+// occurs in a non-git temp dir, where the active-checkout predicate degenerates and silently
+// masked the #82 P0 (the AND-of-both-non-empty predicate matched zero rows on every real repo).
+const COMMIT: &str = "deadbeefcafef00d";
 const WORKTREE: &str = "";
 
 /// A test corpus written to a temp checkout + an index DB seeded to match.
@@ -271,7 +275,7 @@ fn def_inside_corpus_upgrades_unresolved_edge() {
     });
     let bytes = full.write_to_bytes().unwrap();
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, _scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
@@ -293,7 +297,7 @@ fn def_outside_corpus_resolves_external() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -367,7 +371,7 @@ fn non_ascii_identifier_resolves_under_both_encodings() {
         });
         let bytes = index.write_to_bytes().unwrap();
 
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
         let (kind, resolved, _) =
             h.verdict(edge).unwrap_or_else(|| panic!("verdict written for encoding {encoding:?}"));
@@ -392,7 +396,7 @@ fn local_symbols_are_skipped() {
         occurrence(0, 14, 20, "local 0", SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     assert!(h.verdict(edge).is_none(), "local symbol must not produce a verdict");
 }
@@ -437,7 +441,7 @@ fn exact_edge_contradiction_recorded_not_applied() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Contradict.as_db_str());
@@ -481,7 +485,8 @@ fn exact_edge_agreement_recorded_as_confirm() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::Confirm.as_db_str());
@@ -602,8 +607,10 @@ fn edge_join_candidates_filters_null_range_and_scopes_by_worktree() {
     assert_eq!(candidates[0].edge_kind, "calls_name");
     assert_eq!(candidates[0].source_path, "caller.rs");
 
-    // A candidate in a different worktree is out of scope.
-    assert!(store::edge_join_candidates(&h.conn, COMMIT, "other-worktree").unwrap().is_empty());
+    // A candidate scoped to a DIFFERENT commit is out of scope. (Under clean-checkout semantics a
+    // commit-scoped file is visible from any worktree-overlay query as long as the commit matches,
+    // so the isolation that actually matters is the commit, not the overlay id.)
+    assert!(store::edge_join_candidates(&h.conn, "other-commit-sha", WORKTREE).unwrap().is_empty());
 }
 
 /// `symbol_spans_for_path` returns the file's symbols ordered by start byte, scoped to the path +
@@ -842,7 +849,8 @@ fn run_with_empty_scip_completes_with_no_verdicts() {
     let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
 
     let empty = Index::default().write_to_bytes().unwrap();
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty, h.root(), None).unwrap();
 
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1, "no document → no occurrence bucket");
@@ -874,7 +882,8 @@ fn candidate_outside_any_occurrence_counts_no_occurrence() {
         ),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1);
     assert_eq!(report.rows_written, 0);
@@ -916,7 +925,8 @@ fn run_aggregates_counts_and_recall_gap() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.upgraded, 1);
     assert_eq!(report.rows_written, 1);
@@ -957,7 +967,7 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
         ..Default::default()
     });
     let bytes = index.write_to_bytes().unwrap();
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert_eq!(
         h.verdict(edge).map(|(k, _, _)| k).as_deref(),
         Some("upgrade"),
@@ -976,7 +986,7 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
                 SymbolRole::UnspecifiedSymbolRole as i32,
             ),
         ]);
-    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty_doc, h.root()).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &empty_doc, h.root(), None).unwrap();
 
     assert!(h.verdict(edge).is_none(), "the dropped edge's stale verdict was cleared on rerun");
     let total: i64 =
@@ -1024,7 +1034,8 @@ fn recall_gap_counts_only_call_like_occurrences() {
         ..Default::default()
     };
     let bytes = index.write_to_bytes().unwrap();
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     // Only the one uncovered callable reference is the recall gap; the import + type ref are not.
     assert_eq!(report.oracle_only_calls, 1, "only the call-like uncovered reference counts");
@@ -1452,7 +1463,13 @@ fn parse_utf16_astral_character_shifts_offset_by_surrogate_width() {
 // leak into (or be erased by) the active run.
 // ---------------------------------------------------------------------------
 
-const OTHER_WORKTREE: &str = "other-wt";
+// A sibling checkout sharing the same DB: a DIFFERENT commit, clean (empty worktree). Modelling the
+// sibling as a distinct commit (rather than the same commit + a second worktree id) matches the
+// real shape — two checkouts at the same HEAD is unusual, and under the active-checkout predicate a
+// same-commit worktree overlay would (correctly) *shadow* the clean row by path, which is not the
+// cross-checkout-isolation property these tests mean to assert. Commit isolation is.
+const OTHER_COMMIT: &str = "5ad1f1ce5ad1f1ce";
+const OTHER_WORKTREE: &str = "";
 
 /// Finding 1: `clear_edge_oracle_for_tool` must delete ONLY the active checkout's verdicts. With
 /// two worktrees' verdicts for the same `(tool, tool_version)` in one DB, clearing one leaves the
@@ -1464,7 +1481,7 @@ fn clear_edge_oracle_is_scoped_to_active_checkout() {
     let active_file = h.add_file("a.rs", "fn caller() { target(); }\n");
     let active_edge = h.add_edge(active_file, "target", 14, 20, "NameOnly", None);
     // Another worktree's edge (same DB) + a verdict for the SAME tool/version.
-    let other_file = h.add_file_in_scope("a.rs", COMMIT, OTHER_WORKTREE);
+    let other_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let other_edge = h.add_edge(other_file, "target", 14, 20, "NameOnly", None);
 
     let mk = |edge| EdgeOracleRow {
@@ -1521,7 +1538,7 @@ fn upgradeable_fraction_denominator_is_scoped_to_active_checkout() {
 
     // Another worktree: an unresolved NameOnly candidate carrying a callee range, NO verdict. If
     // the denominator weren't scoped, it would count → fraction 1/2.
-    let other = h.add_file_in_scope("a.rs", COMMIT, OTHER_WORKTREE);
+    let other = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let _ = h.add_edge(other, "v", 0, 1, "NameOnly", None);
 
     let m = super::oracle_eval_metrics(
@@ -1586,7 +1603,7 @@ fn recall_gap_excludes_definitions_in_unindexed_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1645,7 +1662,7 @@ fn recall_gap_excludes_occurrences_in_unindexed_source_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1687,7 +1704,7 @@ fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
 
     // Sibling checkout B (same DB, same tool/version): TWO confirms + an upgrade. If A's counts
     // leaked B's rows, A's precision would jump to 3/4 and its recall would change.
-    let b_file = h.add_file_in_scope("a.rs", COMMIT, OTHER_WORKTREE);
+    let b_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
     let b_conf1 = h.add_edge(b_file, "e", 0, 1, "Exact", None);
     let b_conf2 = h.add_edge(b_file, "f", 1, 2, "Exact", None);
     let b_up = h.add_edge(b_file, "g", 2, 3, "NameOnly", None);
@@ -1724,7 +1741,8 @@ fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
     assert_eq!(status.upgraded, 0);
 
     // Sanity: checkout B's own scoped status sees its three rows, proving the rows really exist.
-    let status_b = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, OTHER_WORKTREE).unwrap();
+    let status_b =
+        super::oracle_status(&h.conn, TOOL, VERSION, OTHER_COMMIT, OTHER_WORKTREE).unwrap();
     assert_eq!(status_b.total_verdicts, 3);
     assert_eq!(status_b.confirmed, 2);
     assert_eq!(status_b.upgraded, 1);
@@ -1750,7 +1768,8 @@ fn exact_in_corpus_edge_contradicted_by_external_scip_resolution() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(
@@ -1798,7 +1817,8 @@ fn name_only_edge_with_external_scip_stays_resolved_external() {
         occurrence(0, 14, 19, external, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
 
     let (kind, _, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -1846,7 +1866,8 @@ fn scip_definition_outside_indexed_corpus_resolves_external() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
     assert_eq!(resolved, None, "def maps to no indexed symbol → external");
@@ -1869,7 +1890,8 @@ fn reference_without_definition_or_package_yields_no_verdict() {
         occurrence(0, 14, 21, bare, SymbolRole::UnspecifiedSymbolRole as i32),
     ]);
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     assert!(h.verdict(edge).is_none(), "no definition + no package → no verdict");
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.no_occurrence, 1, "dropped into the no-actionable bucket");
@@ -1912,7 +1934,7 @@ fn recall_gap_excludes_field_const_term_reads() {
             ..Default::default()
         };
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -1966,7 +1988,8 @@ fn covered_side_ignores_references_type_confirmation() {
     });
     let bytes = index.write_to_bytes().unwrap();
 
-    let report = run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
     // BOTH edges got verdicts (both carry callee ranges and join)…
     assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
     assert!(h.verdict(type_edge).is_some(), "type-ref edge verdicted");
@@ -2041,7 +2064,7 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
         let _ = target_sym;
         let bytes = index.write_to_bytes().unwrap();
         let report =
-            run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root()).unwrap();
+            run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None).unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -2056,6 +2079,132 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
     assert_eq!(written, 1);
 }
 
+/// #82 TOCTOU: the scip-vs-disk gate. A tool-driven run carries a per-document `production_sha`
+/// snapshot — the disk hashes captured the instant the subprocess finished. The join verdicts a
+/// candidate only when that snapshot STILL equals the disk bytes it reads; if the snapshot no
+/// longer matches (the watcher reindexed the call-site file in the lock-free window after the
+/// `.scip` was built, so index-vs-disk agrees on the NEW content while the `.scip` describes the
+/// OLD), the candidate is skipped as drifted instead of writing a spurious Compiler verdict. A
+/// document absent from the snapshot (unreadable at production) also fails the gate. The pre-built
+/// `--scip` path (`None`) keeps only the index-vs-disk gate — proven by
+/// `drifted_file_sha_is_skipped_not_verdicted`.
+#[test]
+fn stale_production_snapshot_is_skipped_not_verdicted() {
+    // What the production snapshot says about the documents a verdict depends on: the call-site
+    // file `caller.rs` and the definition file `defs.rs`.
+    enum Snapshot {
+        MatchesDisk,
+        StaleCaller,
+        MissingCaller,
+        StaleDefs,
+    }
+    // (verdict row; skipped_drifted; rows_written)
+    type Probe = (Option<(String, Option<i64>, String)>, u64, u64);
+    let build = |snapshot: Snapshot| -> Probe {
+        let h = Harness::new();
+        let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+        let defs = h.add_file("defs.rs", "fn target() {}\n");
+        let _target_sym = h.add_symbol(defs, "target", 3, 9);
+        let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
+
+        let sym = "scip-rust crate v1 `target`().";
+        let mut index = Index {
+            documents: vec![Document {
+                relative_path: "caller.rs".to_string(),
+                occurrences: vec![occurrence(
+                    0,
+                    14,
+                    20,
+                    sym,
+                    SymbolRole::UnspecifiedSymbolRole as i32,
+                )],
+                position_encoding: EnumOrUnknown::new(
+                    PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        index.documents.push(Document {
+            relative_path: "defs.rs".to_string(),
+            occurrences: vec![occurrence(0, 3, 9, sym, SymbolRole::Definition as i32)],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        });
+        let bytes = index.write_to_bytes().unwrap();
+
+        // Hash the disk bytes the way the join does, so MatchesDisk pins the actual current
+        // content.
+        let disk_hash =
+            |rel: &str| super::run::hex_sha256(&std::fs::read(h.root().join(rel)).unwrap());
+        let stale = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        let mut production: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        // Default: both documents match disk. Each arm then drifts exactly one (or omits it).
+        production.insert("caller.rs".to_string(), disk_hash("caller.rs"));
+        production.insert("defs.rs".to_string(), disk_hash("defs.rs"));
+        match snapshot {
+            Snapshot::MatchesDisk => {},
+            // The subprocess saw older CALL-SITE content than what's on disk at join time.
+            Snapshot::StaleCaller => {
+                production.insert("caller.rs".to_string(), stale);
+            },
+            Snapshot::MissingCaller => {
+                production.remove("caller.rs"); // unreadable at production → absent from the snapshot
+            },
+            // The call site is pristine, but the watcher reindexed the DEFINITION file in the
+            // window: the resolved-symbol byte range is converted against drifted bytes, so the
+            // verdict must be skipped even though `caller.rs` passes the call-site gate.
+            Snapshot::StaleDefs => {
+                production.insert("defs.rs".to_string(), stale);
+            },
+        }
+
+        let report = run_oracle(
+            &h.conn,
+            TOOL,
+            VERSION,
+            COMMIT,
+            WORKTREE,
+            &bytes,
+            h.root(),
+            Some(&production),
+        )
+        .unwrap();
+        (h.verdict(edge), report.skipped_drifted, report.rows_written)
+    };
+
+    let (verdict, skipped, written) = build(Snapshot::MatchesDisk);
+    assert!(verdict.is_some(), "a snapshot matching disk IS verdicted");
+    assert_eq!(skipped, 0);
+    assert_eq!(written, 1);
+
+    let (verdict, skipped, written) = build(Snapshot::StaleCaller);
+    assert!(verdict.is_none(), "a stale production snapshot must NOT be verdicted (TOCTOU)");
+    assert_eq!(skipped, 1, "the stale-snapshot candidate is tallied in skipped_drifted");
+    assert_eq!(written, 0, "nothing written from a `.scip` describing superseded content");
+
+    let (verdict, skipped, written) = build(Snapshot::MissingCaller);
+    assert!(
+        verdict.is_none(),
+        "a candidate absent from the production snapshot must NOT be verdicted"
+    );
+    assert_eq!(skipped, 1);
+    assert_eq!(written, 0);
+
+    // The def-document leg of the gate: call site pristine, definition file drifted from the
+    // snapshot → the resolved-target conversion is untrustworthy, so the verdict is skipped too.
+    let (verdict, skipped, written) = build(Snapshot::StaleDefs);
+    assert!(
+        verdict.is_none(),
+        "a verdict whose DEFINITION document drifted must NOT be verdicted (def-doc TOCTOU)"
+    );
+    assert_eq!(skipped, 1, "the stale-def candidate is tallied in skipped_drifted");
+    assert_eq!(written, 0);
+}
+
 /// Finding 3: a run recorded for ANOTHER worktree (same tool/version/commit) does NOT surface as
 /// this checkout's last run. `oracle_runs` now carries `worktree_id` and `last_run_meta` filters on
 /// it, so the status read describes only the active checkout — consistent with its worktree-scoped
@@ -2063,8 +2212,11 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
 #[test]
 fn last_run_meta_is_scoped_to_active_worktree() {
     let h = Harness::new();
-    // A run in a SIBLING worktree (same tool/version/commit). It must not be THIS checkout's last.
-    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, OTHER_WORKTREE, "Completed", "{}")
+    // A run in a SIBLING worktree (same tool/version/commit, distinct worktree id). It must not be
+    // THIS checkout's last. `oracle_runs.worktree_id` scoping is orthogonal to the file-predicate
+    // fix, so this uses a non-empty sibling worktree id directly rather than the file-level
+    // `OTHER_*` constants.
+    store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, "sibling-wt", "Completed", "{}")
         .unwrap();
 
     // This checkout has no run yet → no last run, despite the sibling's row existing.
@@ -2125,7 +2277,7 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root())
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None)
             .unwrap()
             .oracle_only_calls
     };
@@ -2135,7 +2287,7 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
 }
 
 /// Finding 6a: the oracle's checkout scope is leak-proof BY CONSTRUCTION — every raw `edge_oracle`
-/// query lives in `store.rs` (which owns the scoped helpers + the `EDGE_ORACLE_SCOPE_JOIN`
+/// query lives in `store.rs` (which owns the scoped helpers + the `edge_oracle_scope_join`
 /// predicate). This source-scan test fails CI if a future unscoped `FROM edge_oracle` query is
 /// added to any other oracle module (run.rs / status.rs / join.rs / scip.rs), forcing it back
 /// through the scoped helper.
@@ -2156,7 +2308,7 @@ fn raw_edge_oracle_queries_live_only_in_store() {
         assert!(
             !text.contains("FROM edge_oracle"),
             "{name} contains a raw `FROM edge_oracle` query — route it through \
-             store::count_edge_oracle_scoped / EDGE_ORACLE_SCOPE_JOIN so it can't drop the \
+             store::count_edge_oracle_scoped / edge_oracle_scope_join so it can't drop the \
              checkout scope",
         );
     }
@@ -2209,4 +2361,300 @@ fn name_only_recovery_rate_excludes_exact_upgrades() {
         m.name_only_recovery_rate
     );
     assert!((m.name_only_recovery_rate - 1.0).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 (#69): read-side surfacing helpers — `Compiler` tier, staleness/dirty
+// revert, `resolved-external`, `compare_graph_to_scip` data, and gc pruning of
+// `oracle_runs`. All deterministic against the synthetic harness conn (no
+// rust-analyzer, no `.scip` subprocess).
+// ---------------------------------------------------------------------------
+
+/// Seed one edge with a written verdict and return `(harness, edge_id, file_sha)`. The verdict's
+/// `file_sha` matches the file's recorded sha (current), so it surfaces; tests that want staleness
+/// drift the edge's file sha afterward. When `in_corpus` is set, a real `target` symbol is inserted
+/// and the verdict resolves to its id — so the def-drift gate (`resolved_symbol_id` must still
+/// EXIST in `symbols`) is satisfied for current verdicts. `None` (external) verdicts skip that
+/// gate.
+fn seed_verdict(
+    kind: OracleResolutionKind,
+    scip_symbol: &str,
+    in_corpus: bool,
+) -> (Harness, i64, String) {
+    let (h, edge, file_sha, _resolved) = seed_verdict_full(kind, scip_symbol, in_corpus);
+    (h, edge, file_sha)
+}
+
+/// Like [`seed_verdict`] but also returns the in-corpus `resolved_symbol_id` (when any), so a test
+/// can delete/reindex that definition symbol and assert the verdict stops surfacing (#82 finding
+/// 3).
+fn seed_verdict_full(
+    kind: OracleResolutionKind,
+    scip_symbol: &str,
+    in_corpus: bool,
+) -> (Harness, i64, String, Option<i64>) {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let file_sha: String = h
+        .conn
+        .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
+        .unwrap();
+    // An in-corpus resolution must point at a symbol that EXISTS — the def-drift gate in
+    // `edge_oracle_current_predicate` filters a dangling `resolved_symbol_id`.
+    let resolved_symbol_id = in_corpus.then(|| h.add_symbol(f, "target", 3, 9));
+    let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        edge_id: edge,
+        file_sha: &file_sha,
+        resolved_symbol_id,
+        scip_symbol,
+        kind,
+    })
+    .unwrap();
+    (h, edge, file_sha, resolved_symbol_id)
+}
+
+/// A CURRENT verdict (its `file_sha` matches `files.sha256`) is returned by the surfacing read —
+/// the `Compiler` tier data.
+#[test]
+fn current_verdict_is_surfaced_for_edge() {
+    let (h, edge, _sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
+    let verdicts =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    let verdict = verdicts.get(&edge).expect("current verdict surfaced");
+    assert_eq!(verdict.kind, OracleResolutionKind::Upgrade);
+    assert_eq!(verdict.resolution_reason(), format!("scip:{}@{VERSION}", TOOL.as_db_str()));
+}
+
+/// Staleness revert: drift the edge's file sha so it no longer matches the verdict's `file_sha`.
+/// The surfacing read excludes it — the edge reverts to heuristic display, never `Compiler`.
+#[test]
+fn drifted_file_verdict_is_not_surfaced() {
+    let (h, edge, _sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
+    // The file's content changed since the verdict was computed: its sha now differs from
+    // `edge_oracle.file_sha`, so the current-content predicate filters the verdict out.
+    h.conn.execute("UPDATE files SET sha256 = 'drifted-sha' WHERE path = 'a.rs'", []).unwrap();
+    let verdicts =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    assert!(verdicts.is_empty(), "a drifted file's verdict must not surface as Compiler");
+}
+
+/// Def-drift revert (#82 finding 3): an in-corpus verdict keeps its callsite file unchanged (so the
+/// `file_sha` gate still matches), but its resolved DEFINITION symbol is deleted/reinserted by
+/// incremental reindexing — the old `resolved_symbol_id` dangles. The surfacing read must drop the
+/// verdict (the def the compiler resolved to no longer exists), reverting to heuristic display.
+#[test]
+fn resolved_def_drift_verdict_is_not_surfaced() {
+    let (h, edge, _sha, resolved) =
+        seed_verdict_full(OracleResolutionKind::Upgrade, "scip x `target`().", true);
+    let resolved = resolved.expect("in-corpus verdict has a resolved symbol id");
+    // Sanity: while the resolved def symbol exists, the verdict surfaces.
+    let before =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    assert!(before.contains_key(&edge), "current in-corpus verdict surfaces before def drift");
+    // The def file was reindexed: AUTOINCREMENT mints new ids, so the old resolved symbol id is
+    // gone. Model that by deleting the resolved symbol row.
+    h.conn.execute("DELETE FROM symbols WHERE id = ?1", params![resolved]).unwrap();
+    let after =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    assert!(after.is_empty(), "a verdict whose resolved definition drifted must not surface");
+}
+
+/// Overlay def-drift (#82 P2): when the *def* file goes dirty, the indexer inserts a
+/// worktree-scoped overlay row and leaves the old commit-scoped symbols shadowed-but-PRESENT (not
+/// deleted). A raw `EXISTS (symbols.id = resolved_symbol_id)` would still find the stale id and
+/// keep surfacing a `Compiler` verdict pointing at the pre-edit target (the CALLSITE file is
+/// untouched, so its sha still matches). The scope-aware def-drift EXISTS — which joins `symbols ->
+/// files` and applies the active-checkout predicate — must treat the shadowed commit-scoped def as
+/// out of scope, reverting the verdict to heuristic. Callsite and def are in SEPARATE files so only
+/// the def's scope changes.
+#[test]
+fn overlay_shadowed_def_verdict_is_not_surfaced() {
+    let h = Harness::new();
+    // Callsite in `caller.rs` (stays committed); def in `defs.rs` (will get an overlay).
+    // The active context for a dirty checkout carries a real worktree id (the root path) alongside
+    // the HEAD commit — `resolve_git_context` always returns the root as `worktree_id`. Both the
+    // committed (clean) caller row and the dirty overlay use that id.
+    let active_wt = "/some/checkout/root";
+    let caller = h.add_file_in_scope("caller.rs", COMMIT, "");
+    h.conn
+        .execute("UPDATE files SET sha256 = 'caller-sha' WHERE id = ?1", params![caller])
+        .unwrap();
+    let defs = h.add_file_in_scope("defs.rs", COMMIT, "");
+    let resolved = h.add_symbol(defs, "target", 3, 9);
+    let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        edge_id: edge,
+        file_sha: "caller-sha",
+        resolved_symbol_id: Some(resolved),
+        scip_symbol: "scip x `target`().",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    // Sanity: with no overlay, the committed def is in scope → the verdict surfaces.
+    let before =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, active_wt, &[
+            edge,
+        ])
+        .unwrap();
+    assert!(before.contains_key(&edge), "verdict surfaces before the def file goes dirty");
+
+    // The def file goes dirty: a worktree-scoped overlay row for `defs.rs` is inserted; the
+    // committed `defs.rs` row (and its `target` symbol) stay shadowed-but-present. The active
+    // worktree id matches the overlay, so the committed def is now shadowed out of scope.
+    h.add_file_in_scope("defs.rs", "", active_wt);
+
+    let after =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, active_wt, &[
+            edge,
+        ])
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "a verdict whose resolved def is shadowed by a dirty overlay must not keep surfacing"
+    );
+}
+
+/// A verdict whose edge lives in a different checkout never surfaces for the active one: querying
+/// the seeded (clean-checkout) edge under a DIFFERENT commit is out of the active-checkout scope
+/// join, so the verdict is excluded. (Commit, not worktree id, is the isolation boundary for a
+/// commit-scoped row — a clean file is visible from any worktree-overlay query at the same commit,
+/// so a sibling-worktree query at the SAME commit would correctly still see it; the genuine
+/// out-of-scope case is a different commit.)
+#[test]
+fn out_of_scope_verdict_is_not_surfaced() {
+    let (h, edge, sha) = seed_verdict(OracleResolutionKind::Upgrade, "scip x `target`().", true);
+    // Query the SAME edge under a different commit's scope: the scope join excludes it.
+    let verdicts = store::current_oracle_verdicts_for_edges(
+        &h.conn,
+        TOOL,
+        VERSION,
+        "a-different-commit-sha",
+        WORKTREE,
+        &[edge],
+    )
+    .unwrap();
+    assert!(verdicts.is_empty(), "a verdict outside the active checkout must not surface");
+    let _ = sha;
+}
+
+/// #82 P3: the `--scip` run-id fingerprint is a stable 12-hex-char content hash, distinct for
+/// distinct bytes — so two indexes sharing a basename don't collide onto one `tool_version`.
+#[test]
+fn scip_content_fingerprint_is_stable_and_content_distinct() {
+    let a = super::scip_content_fingerprint(b"index-A-bytes");
+    let b = super::scip_content_fingerprint(b"index-B-bytes");
+    assert_eq!(a.len(), 12, "12 hex chars");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(a, super::scip_content_fingerprint(b"index-A-bytes"), "stable for identical bytes");
+    assert_ne!(a, b, "distinct bytes → distinct fingerprint (no basename collision)");
+}
+
+/// A `resolved-external` verdict surfaces a `resolved-external(<package>)` label derived from the
+/// SCIP symbol's package component.
+#[test]
+fn resolved_external_label_surfaces_package() {
+    let (h, edge, _sha) = seed_verdict(
+        OracleResolutionKind::ResolvedExternal,
+        "scip-rust cargo tokio 1.0 `spawn`().",
+        false,
+    );
+    let verdicts =
+        store::current_oracle_verdicts_for_edges(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &[edge])
+            .unwrap();
+    let verdict = verdicts.get(&edge).expect("verdict surfaced");
+    assert_eq!(verdict.resolved_external_label().as_deref(), Some("resolved-external(tokio)"));
+}
+
+/// `current_oracle_comparisons` returns CURRENT, in-scope verdicts joined to the heuristic edge —
+/// the `compare_graph_to_scip` data. A `Contradict` verdict appears with its scip symbol; a drifted
+/// row does not.
+#[test]
+fn comparisons_return_current_contradictions_only() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let sha: String = h
+        .conn
+        .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
+        .unwrap();
+    let target = h.add_symbol(f, "target", 3, 9);
+    // An Exact edge the heuristic resolved to `target`; the oracle CONTRADICTS it (points
+    // elsewhere).
+    let edge = h.add_edge(f, "target", 14, 20, "Exact", Some(target));
+    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
+        edge_id: edge,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "scip-rust cargo other 1.0 `target`().",
+        kind: OracleResolutionKind::Contradict,
+    })
+    .unwrap();
+
+    let comparisons =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(comparisons.len(), 1);
+    let c = &comparisons[0];
+    assert_eq!(c.kind, OracleResolutionKind::Contradict);
+    assert_eq!(c.edge_id, edge);
+    assert_eq!(c.heuristic_confidence, "Exact");
+    assert_eq!(c.scip_symbol, "scip-rust cargo other 1.0 `target`().");
+
+    // Drift the file → the comparison drops out (no stale contradiction surfaced).
+    h.conn.execute("UPDATE files SET sha256 = 'drift' WHERE id = ?1", params![f]).unwrap();
+    let after =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert!(after.is_empty(), "a drifted file's contradiction must not surface");
+}
+
+/// `latest_run_tool_version` returns the most recent run's version for the active checkout, and
+/// `None` when there is no run.
+#[test]
+fn latest_run_tool_version_tracks_active_checkout() {
+    let h = Harness::new();
+    assert_eq!(store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap(), None);
+    store::record_oracle_run(&h.conn, TOOL, "v1", COMMIT, WORKTREE, "Completed", "{}").unwrap();
+    store::record_oracle_run(&h.conn, TOOL, "v2", COMMIT, WORKTREE, "Completed", "{}").unwrap();
+    assert_eq!(
+        store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap().as_deref(),
+        Some("v2")
+    );
+    // A sibling worktree's run does not leak in.
+    store::record_oracle_run(&h.conn, TOOL, "v3", COMMIT, "other", "Completed", "{}").unwrap();
+    assert_eq!(
+        store::latest_run_tool_version(&h.conn, TOOL, COMMIT, WORKTREE).unwrap().as_deref(),
+        Some("v2")
+    );
+}
+
+/// gc: `prune_oracle_runs_outside_scope` drops runs whose `(commit, worktree)` is dead, keeps live
+/// ones, and refuses to prune when both live sets are empty (so a missing live set never wipes all
+/// run history).
+#[test]
+fn prune_oracle_runs_drops_dead_contexts_only() {
+    let h = Harness::new();
+    store::record_oracle_run(&h.conn, TOOL, "v1", "live-commit", "live-wt", "Completed", "{}")
+        .unwrap();
+    store::record_oracle_run(&h.conn, TOOL, "v1", "dead-commit", "dead-wt", "Completed", "{}")
+        .unwrap();
+    // A run whose commit is dead but whose worktree overlay is live survives (OR rule).
+    store::record_oracle_run(&h.conn, TOOL, "v1", "dead-commit", "live-wt", "Completed", "{}")
+        .unwrap();
+
+    let live_commits = vec!["live-commit".to_string()];
+    let live_worktrees = vec!["live-wt".to_string()];
+
+    // Empty live sets are a no-op (never wipe everything).
+    assert_eq!(store::prune_oracle_runs_outside_scope(&h.conn, &[], &[]).unwrap(), 0);
+
+    let deleted =
+        store::prune_oracle_runs_outside_scope(&h.conn, &live_commits, &live_worktrees).unwrap();
+    assert_eq!(deleted, 1, "only the (dead-commit, dead-wt) run is pruned");
+    let remaining: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM oracle_runs", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 2);
 }

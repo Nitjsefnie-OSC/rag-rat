@@ -105,11 +105,41 @@ pub fn impact_surface(
     impact_surface_with_options(conn, query, limit, GraphResolutionMode::Syntactic)
 }
 
+/// Traverse one direction, oracle-enrich, re-rank by effective confidence ONLY when a hop was
+/// promoted, and truncate to `limit` — the impact-side mirror of
+/// `IndexDatabase::traverse_with_oracle` so a compiler-upgraded neighbor survives the limit here
+/// too (#82 finding 4). Overfetches via `graph::oracle_overfetch_limit`, runs `enrich` over the
+/// larger candidate set, and — when `enrich` reports a promotion — stable-sorts by
+/// `graph::effective_confidence_rank` (so `compiler` outranks `exact`) before truncating.
+///
+/// `enrich` returns whether any hop was PROMOTED to `compiler`. With no promotion (no oracle run,
+/// or no in-scope verdict on these hops) the heuristic order + the caller's `limit` are already
+/// correct — re-sorting would change truncation membership on EVERY query, including repos with no
+/// oracle run (#82 P2). The overfetched set is in heuristic order, so its first `limit` rows are
+/// the original top-`limit`, identical to pre-oracle behavior.
+fn oracle_ranked_neighbors(
+    conn: &Connection,
+    symbol: &str,
+    reverse: bool,
+    limit: u32,
+    graph_options: &GraphTraversalOptions,
+    enrich: &impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
+) -> anyhow::Result<Vec<GraphHop>> {
+    let overfetch = graph::oracle_overfetch_limit(limit);
+    let mut hops = graph::traverse_with_options(conn, symbol, reverse, overfetch, graph_options)?;
+    if enrich(&mut hops)? {
+        hops.sort_by_key(|hop| graph::effective_confidence_rank(&hop.confidence));
+    }
+    hops.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok(hops)
+}
+
 pub fn impact_surface_report_for_symbol(
     conn: &Connection,
     symbol: &SymbolHit,
     limit: u32,
     options: &ImpactSurfaceOptions,
+    enrich: impl Fn(&mut Vec<GraphHop>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<ImpactSurfaceReport> {
     let graph_options = GraphTraversalOptions {
         resolution_mode: options.resolution_mode,
@@ -117,10 +147,28 @@ pub fn impact_surface_report_for_symbol(
         logical_symbol_id: symbol.logical_symbol_id,
         ..Default::default()
     };
-    let direct_semantic_callers =
-        graph::traverse_with_options(conn, &symbol.qualified_name, true, limit, &graph_options)?;
-    let direct_semantic_callees =
-        graph::traverse_with_options(conn, &symbol.qualified_name, false, limit, &graph_options)?;
+    // Overfetch → oracle-enrich → re-rank by effective confidence → truncate, so a
+    // compiler-upgraded low-confidence neighbor isn't dropped by the heuristic `LIMIT` before
+    // enrichment runs (#82 finding 4). Everything downstream (memory evidence edge ids,
+    // completeness counts) sees the SAME truncated, re-ranked window the report returns.
+    // `enrich` is a no-op for callers without an oracle pass (e.g. tests), so the lists
+    // collapse back to the plain heuristic top-`limit`.
+    let direct_semantic_callers = oracle_ranked_neighbors(
+        conn,
+        &symbol.qualified_name,
+        true,
+        limit,
+        &graph_options,
+        &enrich,
+    )?;
+    let direct_semantic_callees = oracle_ranked_neighbors(
+        conn,
+        &symbol.qualified_name,
+        false,
+        limit,
+        &graph_options,
+        &enrich,
+    )?;
     let names = vec![symbol.name.clone(), symbol.qualified_name.clone()];
     let import_export_dependents =
         import_export_items(conn, symbol.symbol_id, &symbol.qualified_name, &names, limit)?;
