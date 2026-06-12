@@ -4,6 +4,15 @@
 [![codecov](https://codecov.io/gh/cq27-dev/rag-rat/branch/main/graph/badge.svg)](https://codecov.io/gh/cq27-dev/rag-rat)
 [![crates.io](https://img.shields.io/crates/v/rag-rat.svg)](https://crates.io/crates/rag-rat)
 
+**What the repository knows about itself.** `rag-rat` is a codebase's durable, offline memory — its
+structure, history, rationale, and accumulated findings — answered with provenance on every result
+and persisting across sessions and agents.
+
+Every harness already ships `grep` and read; rag-rat is the layer they can't be. Its
+[grep-augmentation hook](#claude-code-grep-augmentation) is the proof — it rides along on your
+existing `grep`/search calls and injects the repo memories bound to the symbols you just matched,
+the rationale and invariants no search tool can surface.
+
 `rag-rat` is a local repo-intelligence index and MCP server for coding agents. It keeps source
 files read-only, writes only its configured SQLite database, and exposes current source, graph,
 git, GitHub papertrail, local-AI artifact status, and source-anchored repo memories as evidence.
