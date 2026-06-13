@@ -58,32 +58,36 @@ bench image on `hetzner-bigmem`), so they cover the **compiled subset** — the 
 `defconfig` actually compiles — not the whole 62,903-file tree the headline indexes. Resolution
 *quality* and tree-wide *coverage* are different populations, reported side by side, not merged.
 
+> **⚠️ Precision number under revision (see #61 follow-up).** The contradiction count below is
+> inflated by a comparison artifact: rag-rat indexes a C function's prototype *declaration* and its
+> *definition* as **separate concrete symbols** (`parser.rs`, `function_definition` + `declaration`
+> with a `function_declarator`), and the oracle compares **concrete** symbol ids. So a call the
+> heuristic bound to a function's declaration row, while `scip-clang` binds it to the *definition*
+> row, is counted as a **contradiction even though it's the same function**. The near-even
+> 311,527 / 316,991 confirm/contradict split is the fingerprint of this (which row sorts first is
+> ~a coin flip, independent of correctness). The fix is to compare **logical** symbols; the
+> corrected precision will replace the table below once re-measured. Treat 49.6% as a floor on a
+> measurement bug, **not** as "the heuristic is right half the time."
+
 | Metric | Value | Meaning |
 |---|---|---|
 | Compiled TUs | 2,956 | the `defconfig` compilation database scip-clang consumes |
 | Heuristic `calls_name` resolved (whole index) | 54.9% | byte-anchored name-calls the syntactic resolver binds, tree-wide |
-| **Compiler precision** | **49.6%** | confirmed / (confirmed + contradicted) — of heuristic-resolved calls the compiler also judged, the share it agreed with |
+| Compiler precision (provisional, inflated) | 49.6% | confirmed / (confirmed + contradicted) — over-counts contradictions; see caveat above |
 | Call recall | 44.3% | covered / (covered + oracle-only) — of calls the compiler saw, the share the graph had a `calls_name` edge for |
-| Confirmed | 311,527 | heuristic target matched the compiler's |
-| Contradicted | 316,991 | heuristic bound a *different* target than the compiler |
+| Confirmed | 311,527 | heuristic concrete target matched the compiler's |
+| Contradicted (inflated) | 316,991 | heuristic bound a different **concrete** target — includes decl-vs-def of the *same* function |
 | Upgraded | 290,175 | edges promoted to `Compiler`-tier confidence |
 | Resolved-external | 25,241 | dangling calls the compiler bound to a cross-TU / external symbol the heuristic couldn't reach |
 
-The headline result: on C, name-based call resolution is roughly a coin flip in precision — the
-compiler **contradicts ~half** (49.6% agreement) of the calls the heuristic resolved in the compiled
-subset. That one number is the case for the oracle. C earns it: same-named `static` functions recur
-across translation units, call sites expand out of macros, and function-pointer dispatch hides the
-callee — none of which a syntactic name match can disambiguate without a compilation database. The
-oracle is where that database enters: it confirmed 311k edges, upgraded 290k to compiler-grade
-confidence, and recovered 25k cross-TU externals the heuristic couldn't bind at all.
+What the oracle unambiguously demonstrates, independent of the precision artifact: it confirmed 311k
+edges, **upgraded 290k** unresolved/low-confidence edges to compiler-grade confidence, and recovered
+**25k cross-TU externals** the heuristic couldn't bind at all. The recall and upgrade numbers don't
+depend on the concrete-vs-logical comparison; the precision figure does, and is being corrected.
 
-Read the precision honestly: a "contradiction" isn't always the heuristic picking nonsense — often
-it bound *a* function named `foo` while the compiler knows *which* `foo`. Both are defensible from
-syntax alone; only the compiler resolves the ambiguity. That is exactly the error class the oracle
-exists to catch, and why `Compiler` is a distinct, higher confidence tier rather than a tweak to the
-heuristic's score. (scip-clang examined 8.7M call sites across the subset; the 7.8M `no_occurrence`
-edges are call sites outside the compiled subset or with no SCIP occurrence at their byte range —
-expected, since the index spans the whole tree while the compilation database spans `defconfig`.)
+(scip-clang examined 8.7M call sites across the subset; the 7.8M `no_occurrence` edges are call sites
+outside the compiled subset or with no SCIP occurrence at their byte range — expected, since the
+index spans the whole tree while the compilation database spans `defconfig`.)
 
 Run it yourself with `oracle-kernel.yml` (dispatch) or `tools/kernel-c-oracle.sh`; both pin
 `scip-clang` via the `tools/bench.Containerfile` image so the `tool_version` baked into every verdict
