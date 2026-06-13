@@ -268,12 +268,15 @@ pub(crate) struct OracleStatusArgs {
 pub(crate) enum OracleToolArg {
     #[value(name = "rust-analyzer")]
     RustAnalyzer,
+    #[value(name = "scip-clang")]
+    ScipClang,
 }
 
 impl OracleToolArg {
     pub(crate) fn core(self) -> rag_rat_core::index::oracle::OracleTool {
         match self {
             OracleToolArg::RustAnalyzer => rag_rat_core::index::oracle::OracleTool::RustAnalyzer,
+            OracleToolArg::ScipClang => rag_rat_core::index::oracle::OracleTool::ScipClang,
         }
     }
 }

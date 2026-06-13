@@ -173,6 +173,15 @@ pub fn produce_scip_with_tool(
             return Ok(ScipProduction::Blocked { tool, program, hint });
         },
     };
+    // Tool-specific prerequisite (scip-clang needs a compile_commands.json at the root). Missing →
+    // Blocked + hint, exit 0 — never a subprocess error (#71).
+    if let Some(hint) = manifest.prerequisite_blocked(checkout_root) {
+        return Ok(ScipProduction::Blocked {
+            tool: tool.as_db_str().to_string(),
+            program: manifest.program.to_string(),
+            hint,
+        });
+    }
     let mut command = manifest.scip_command(checkout_root, scip_output);
     let status = command
         .status()
@@ -350,23 +359,30 @@ pub(crate) fn current_oracle_comparisons(
 /// `as_db_str` / `from_db_str` per `rust-modern-style`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum OracleTool {
+    /// `rust-analyzer scip` — Rust (phase 2, #69).
     RustAnalyzer,
+    /// `scip-clang` — C / C++ (phase 4, #71). Consumes a `compile_commands.json` compilation
+    /// database rather than a source root, and is the SCIP emitter directly (no `scip`
+    /// subcommand), so its probe + invocation differ from rust-analyzer's — see `ToolManifest`.
+    ScipClang,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
-    /// `--tool`). Later language backends (#71 TS, #72 Kotlin) extend this alongside the enum.
-    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer];
+    /// `--tool`). Later language backends (#72 Kotlin) extend this alongside the enum.
+    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer, Self::ScipClang];
 
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::RustAnalyzer => "rust-analyzer",
+            Self::ScipClang => "scip-clang",
         }
     }
 
     pub fn from_db_str(value: &str) -> Option<Self> {
         match value {
             "rust-analyzer" => Some(Self::RustAnalyzer),
+            "scip-clang" => Some(Self::ScipClang),
             _ => None,
         }
     }

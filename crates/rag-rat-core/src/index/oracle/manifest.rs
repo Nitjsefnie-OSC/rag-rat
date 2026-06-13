@@ -57,22 +57,33 @@ impl ToolManifest {
                                component add rust-analyzer`) or pass a pre-built index with \
                                `--scip <path>`.",
             },
+            OracleTool::ScipClang => ToolManifest {
+                tool,
+                program: "scip-clang",
+                languages: &["c", "cpp"],
+                install_hint: "scip-clang not found on PATH. Install it from \
+                               github.com/sourcegraph/scip-clang and generate a \
+                               compile_commands.json for the checkout (e.g. `bear -- make`, CMake \
+                               `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, or the kernel's \
+                               scripts/clang-tools/gen_compile_commands.py), or pass a pre-built \
+                               index with `--scip <path>`.",
+            },
         }
     }
 
     /// Probe whether the tool can run by detecting its version AND confirming it can actually
-    /// produce SCIP (it exposes the `scip` subcommand). Never errors: an absent program, an
-    /// unrunnable one, OR a binary on `PATH` that lacks the `scip` subcommand all yield
-    /// [`ToolAvailability::Blocked`] with the install hint, so the `oracle run` / `oracle status`
-    /// UX degrades gracefully (exit 0) instead of failing — or worse, invoking a `scip`-less
-    /// binary and reporting a confusing subprocess error.
+    /// produce SCIP (the [`Self::can_emit_scip`] capability check, which is tool-specific). Never
+    /// errors: an absent program, an unrunnable one, OR a versioned binary that can't emit SCIP
+    /// all yield [`ToolAvailability::Blocked`] with the install hint, so the `oracle run` /
+    /// `oracle status` UX degrades gracefully (exit 0) instead of failing — or worse, invoking a
+    /// SCIP-less binary and reporting a confusing subprocess error.
     ///
     /// Checking only `--version` (#82 P3) would mark a stripped/wrong `rust-analyzer` build with no
     /// `scip` subcommand as `Available`, then fail the actual run. `Blocked` must mean "can't
-    /// produce SCIP," so we exercise `<program> scip --help` too.
+    /// produce SCIP."
     pub fn probe(&self) -> ToolAvailability {
         match detect_version(self.program) {
-            Some(version) if self.supports_scip_subcommand() => ToolAvailability::Available {
+            Some(version) if self.can_emit_scip() => ToolAvailability::Available {
                 tool: self.tool.as_db_str().to_string(),
                 program: self.program.to_string(),
                 version,
@@ -85,15 +96,40 @@ impl ToolManifest {
         }
     }
 
-    /// Whether `<program> scip --help` runs successfully — the cheap capability check that the
-    /// binary can actually emit a SCIP index (not just report a version). A non-zero exit or a
-    /// spawn failure means no `scip` subcommand, so the tool is `Blocked` for oracle purposes.
-    fn supports_scip_subcommand(&self) -> bool {
-        Command::new(self.program)
-            .arg("scip")
-            .arg("--help")
-            .output()
-            .is_ok_and(|output| output.status.success())
+    /// The cheap capability check that a versioned binary can actually emit a SCIP index — its
+    /// shape is tool-specific. `rust-analyzer` emits via a `scip` subcommand (`scip --help` must
+    /// exit 0; a stripped build without it is `Blocked`, #82 P3). `scip-clang` IS the SCIP
+    /// emitter — it has no subcommand — so a successful `--version` (already detected) is the
+    /// capability signal and this is a no-op `true`.
+    fn can_emit_scip(&self) -> bool {
+        match self.tool {
+            OracleTool::RustAnalyzer => Command::new(self.program)
+                .arg("scip")
+                .arg("--help")
+                .output()
+                .is_ok_and(|output| output.status.success()),
+            OracleTool::ScipClang => true,
+        }
+    }
+
+    /// A tool-specific prerequisite that must hold before a tool-driven run, beyond the binary
+    /// being installed. `None` means ready. `scip-clang` needs a `compile_commands.json`
+    /// compilation database at the checkout root; without it the run can't proceed, so it is
+    /// reported as `Blocked` (install-hint UX, exit 0) rather than a subprocess error. The
+    /// pre-built `--scip` path never reaches here.
+    pub fn prerequisite_blocked(&self, root: &Path) -> Option<String> {
+        match self.tool {
+            OracleTool::RustAnalyzer => None,
+            OracleTool::ScipClang => (!root.join("compile_commands.json").exists()).then(|| {
+                format!(
+                    "scip-clang requires a compile_commands.json at {} — generate one (e.g. `bear \
+                     -- make`, CMake `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, or the kernel's \
+                     scripts/clang-tools/gen_compile_commands.py), or pass a pre-built index with \
+                     `--scip <path>`.",
+                    root.display()
+                )
+            }),
+        }
     }
 
     /// Build the command that produces a `.scip` index at `output` for the checkout rooted at
@@ -104,6 +140,16 @@ impl ToolManifest {
             OracleTool::RustAnalyzer => {
                 let mut cmd = Command::new(self.program);
                 cmd.arg("scip").arg(root).arg("--output").arg(output);
+                cmd
+            },
+            // scip-clang consumes the compilation database, not a source root, and emits the index
+            // directly (no subcommand). Run with cwd = root so the compdb's relative paths
+            // resolve, and point it at `root/compile_commands.json` (prerequisite-checked).
+            OracleTool::ScipClang => {
+                let mut cmd = Command::new(self.program);
+                cmd.current_dir(root)
+                    .arg(format!("--compdb-path={}", root.join("compile_commands.json").display()))
+                    .arg(format!("--index-output-path={}", output.display()));
                 cmd
             },
         }
@@ -133,8 +179,7 @@ mod tests {
         // Exhaustive over the OracleTool registry: each variant must resolve to a manifest with a
         // non-empty program + hint, so `oracle run`/`status` can always describe it. (One variant
         // today; the `match` is the exhaustiveness guard a new variant trips.)
-        let all_tools: &[OracleTool] = &[OracleTool::RustAnalyzer];
-        for &tool in all_tools {
+        for &tool in OracleTool::ALL {
             let manifest = ToolManifest::for_tool(tool);
             assert_eq!(manifest.tool, tool);
             assert!(!manifest.program.is_empty());
@@ -185,10 +230,35 @@ mod tests {
             install_hint: "hint",
         };
         assert!(detect_version("cargo").is_some(), "cargo reports a version");
-        assert!(!manifest.supports_scip_subcommand(), "cargo has no `scip` subcommand");
+        assert!(!manifest.can_emit_scip(), "cargo has no `scip` subcommand");
         assert!(
             !manifest.probe().is_available(),
             "a versioned binary lacking `scip` must probe Blocked, not Available"
+        );
+    }
+
+    #[test]
+    fn scip_clang_consumes_a_compdb_not_a_root() {
+        // scip-clang's invocation differs from rust-analyzer's: --compdb-path / --index-output-path
+        // and cwd = root (so the compdb's relative paths resolve), no `scip` subcommand.
+        let manifest = ToolManifest::for_tool(OracleTool::ScipClang);
+        assert_eq!(manifest.program, "scip-clang");
+        let cmd = manifest.scip_command(Path::new("/repo"), Path::new("/tmp/out.scip"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec![
+            "--compdb-path=/repo/compile_commands.json",
+            "--index-output-path=/tmp/out.scip"
+        ]);
+        // No compile_commands.json under a bogus root → prerequisite Blocked (not a run error).
+        assert!(
+            manifest.prerequisite_blocked(Path::new("/no/such/repo/xyzzy")).is_some(),
+            "missing compile_commands.json must report a prerequisite block"
+        );
+        // rust-analyzer has no such prerequisite.
+        assert!(
+            ToolManifest::for_tool(OracleTool::RustAnalyzer)
+                .prerequisite_blocked(Path::new("/repo"))
+                .is_none()
         );
     }
 
