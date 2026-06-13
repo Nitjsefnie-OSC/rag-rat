@@ -9,7 +9,12 @@
 # NOT used by the lightweight iai-callgrind push/PR bench — that one is deterministic by design and
 # runs on the GitHub-hosted runner. valgrind + the iai runner are included anyway so this image can
 # reproduce that bench too if ever needed.
-FROM debian:bookworm-slim
+#
+# Base must be trixie, not bookworm: the pinned scip-clang prebuilt links against GLIBC_2.38, which
+# bookworm's glibc 2.36 can't satisfy ("version `GLIBC_2.38' not found"). Trixie (Debian 13) ships
+# glibc 2.41, which covers scip-clang and the rust-analyzer prebuilt. Same Debian tooling + package
+# names; only the libc floor moves.
+FROM debian:trixie-slim
 
 ARG RUST_VERSION=1.96.0
 ARG SCIP_CLANG_VERSION=v0.4.0
