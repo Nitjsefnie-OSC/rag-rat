@@ -41,6 +41,11 @@ pub(crate) struct JoinInput<'a> {
     pub(crate) index: &'a ScipIndex,
     /// Resolver from a definition `(path, byte-range)` to one of our symbol ids.
     pub(crate) resolve_symbol: &'a dyn Fn(&str, usize, usize) -> Option<i64>,
+    /// The logical symbol a concrete symbol id belongs to, if grouped (`logical_symbol_members`).
+    /// Used to fold a function's prototype declaration and its definition — separate CONCRETE
+    /// symbols in C/C++ — into the same identity when comparing the heuristic's target against the
+    /// compiler's, so binding a call to the decl vs the def is a `Confirm`, not a `Contradict`.
+    pub(crate) logical_symbol_of: &'a dyn Fn(i64) -> Option<i64>,
 }
 
 /// Classify one edge candidate. Returns `None` when no occurrence contains the callee token (the
@@ -83,13 +88,39 @@ pub(crate) fn classify_edge(input: &JoinInput<'_>) -> Option<EdgeVerdict> {
 /// Ambiguous).
 fn classify_resolved(input: &JoinInput<'_>, oracle_symbol_id: i64) -> OracleResolutionKind {
     if heuristic_resolved_in_corpus(input) {
-        if input.heuristic_symbol_id == Some(oracle_symbol_id) {
+        if heuristic_agrees_with_oracle(input, oracle_symbol_id) {
             OracleResolutionKind::Confirm
         } else {
             OracleResolutionKind::Contradict
         }
     } else {
         OracleResolutionKind::Upgrade
+    }
+}
+
+/// Whether the heuristic's target and the oracle's target are the SAME symbol — by concrete id, or
+/// by LOGICAL identity when the concrete ids differ. The logical fallback is what keeps a C/C++
+/// function's prototype-declaration row and its definition row from reading as a disagreement: the
+/// heuristic may bind a call to the declaration (e.g. via the resolver's `logical_variant` path)
+/// while the oracle maps `scip-clang`'s definition occurrence to the definition row — same
+/// function, two concrete `symbol_id`s grouped under one `logical_symbol_id`. Comparing concrete
+/// ids alone counted those as `Contradict` and roughly halved the measured precision (the
+/// confirm/contradict split was ~even because *which* concrete row the resolver returned first was
+/// order-dependent, not correctness-dependent). Concrete-equality stays the fast path; the logical
+/// lookup only runs when the ids differ.
+fn heuristic_agrees_with_oracle(input: &JoinInput<'_>, oracle_symbol_id: i64) -> bool {
+    let Some(heuristic_symbol_id) = input.heuristic_symbol_id else {
+        return false;
+    };
+    if heuristic_symbol_id == oracle_symbol_id {
+        return true;
+    }
+    match (
+        (input.logical_symbol_of)(heuristic_symbol_id),
+        (input.logical_symbol_of)(oracle_symbol_id),
+    ) {
+        (Some(heuristic_logical), Some(oracle_logical)) => heuristic_logical == oracle_logical,
+        _ => false,
     }
 }
 

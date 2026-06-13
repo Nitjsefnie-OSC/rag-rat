@@ -574,6 +574,75 @@ fn exact_edge_agreement_recorded_as_confirm() {
     assert_eq!(report.confirmed, 1);
 }
 
+/// Decl-vs-def is a CONFIRM, not a contradiction. C/C++ index a function's prototype declaration
+/// and its definition as separate concrete symbols (`parser.rs`: `function_definition` +
+/// `declaration` with a `function_declarator`). The heuristic may bind a call to the declaration
+/// row while the oracle maps `scip-clang`'s definition occurrence to the definition row — same
+/// function, two concrete `symbol_id`s under one `logical_symbol_id`. Comparing concrete ids alone
+/// scored this as a contradiction and ~halved measured precision (#61 follow-up); the join now
+/// folds to the logical symbol, so this is a confirm.
+#[test]
+fn decl_and_def_of_same_logical_symbol_is_confirm_not_contradiction() {
+    let h = Harness::new();
+    let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+    // The declaration (a prototype, e.g. in a header) and the definition are SEPARATE concrete
+    // symbols, both named `target`, grouped under one logical symbol.
+    let decl_file = h.add_file("target.h", "fn target();\n");
+    let def_file = h.add_file("target.c", "fn target() {}\n");
+    let decl_sym = h.add_symbol(decl_file, "target", 3, 9);
+    let def_sym = h.add_symbol(def_file, "target", 3, 9);
+    h.add_logical_symbol(1000, "target.c", "target", "target", def_sym);
+    h.conn
+        .execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, cfg_expr, \
+             signature_hash, start_line, end_line) VALUES (1000, ?1, NULL, NULL, 1, 1)",
+            params![decl_sym],
+        )
+        .unwrap();
+    // Heuristic is Exact but resolved to the DECLARATION row (the wrong concrete row, right fn).
+    let edge = h.add_edge(caller, "target", 14, 20, "Exact", Some(decl_sym));
+
+    let symbol = "scip-rust crate v1 `target`().";
+    let mut index = Index {
+        documents: vec![Document {
+            relative_path: "caller.rs".to_string(),
+            occurrences: vec![occurrence(
+                0,
+                14,
+                20,
+                symbol,
+                SymbolRole::UnspecifiedSymbolRole as i32,
+            )],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // The compiler's DEFINITION occurrence lands in target.c → maps to the definition row.
+    index.documents.push(Document {
+        relative_path: "target.c".to_string(),
+        occurrences: vec![occurrence(0, 3, 9, symbol, SymbolRole::Definition as i32)],
+        position_encoding: EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        ..Default::default()
+    });
+    let bytes = index.write_to_bytes().unwrap();
+
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+
+    let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
+    assert_eq!(
+        kind,
+        OracleResolutionKind::Confirm.as_db_str(),
+        "decl-row heuristic vs def-row oracle of the SAME logical function must confirm"
+    );
+    assert_eq!(resolved, Some(def_sym), "oracle resolves to the definition row");
+    assert_eq!(report.confirmed, 1);
+    assert_eq!(report.contradicted, 0, "same logical symbol is not a contradiction");
+}
+
 /// The migration creates the side tables with the expected columns + STRICT mode.
 #[test]
 fn migration_creates_oracle_side_tables() {

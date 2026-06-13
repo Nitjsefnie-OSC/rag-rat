@@ -152,6 +152,20 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
         join::map_definition_to_symbol(spans, def_start, def_end)
     };
 
+    // Map a concrete symbol id to its logical symbol, so the join can fold a C/C++ function's
+    // prototype declaration and its definition (separate concrete symbols) into one identity when
+    // comparing heuristic vs compiler. Only hit on would-be contradictions (concrete ids differ),
+    // and cached: the distinct symbol-id set is bounded, so repeated lookups stay cheap.
+    let logical_id_cache: RefCell<HashMap<i64, Option<i64>>> = RefCell::new(HashMap::new());
+    let logical_symbol_of = |symbol_id: i64| -> Option<i64> {
+        if let Some(cached) = logical_id_cache.borrow().get(&symbol_id) {
+            return *cached;
+        }
+        let logical = store::logical_symbol_id_for_member(conn, symbol_id).unwrap_or(None);
+        logical_id_cache.borrow_mut().insert(symbol_id, logical);
+        logical
+    };
+
     for candidate in &candidates {
         report.edges_examined += 1;
         let Some(occurrences) = index.occurrences_by_path.get(&candidate.source_path) else {
@@ -212,6 +226,7 @@ pub(crate) fn run(conn: &Connection, input: &OracleRunInput<'_>) -> anyhow::Resu
             occurrences,
             index: &index,
             resolve_symbol: &resolve_symbol,
+            logical_symbol_of: &logical_symbol_of,
         });
 
         let Some(verdict) = verdict else {
