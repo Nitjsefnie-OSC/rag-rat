@@ -25,8 +25,11 @@ KERNEL_CONFIG="${KERNEL_CONFIG:-defconfig}"
 RAG_RAT_BIN="${RAG_RAT_BIN:-target/release/rag-rat}"
 WORK="${KERNEL_WORK:-$(mktemp -d)}"
 BMF_OUT="${BMF_OUT:-kernel_c_oracle_bmf.json}"
-# Resolve to an absolute path before any cd, and before WORK might be removed.
-RAG_RAT_BIN="$(command -v "$RAG_RAT_BIN" || readlink -f "$RAG_RAT_BIN")"
+# Resolve to an ABSOLUTE path before any cd — `command -v` can return a relative path (e.g.
+# `target/release/rag-rat`), which breaks once the script cd's into the kernel tree, so always
+# canonicalize the result.
+RAG_RAT_BIN="$(command -v "$RAG_RAT_BIN" || echo "$RAG_RAT_BIN")"
+RAG_RAT_BIN="$(readlink -f "$RAG_RAT_BIN")"
 BMF_OUT="$(readlink -f "$BMF_OUT" 2>/dev/null || echo "$PWD/$BMF_OUT")"
 mkdir -p "$WORK"
 DB="$WORK/kernel-index.sqlite"

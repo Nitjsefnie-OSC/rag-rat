@@ -32,17 +32,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build release rag-rat (hash embedder; no model download)
-        run: cargo build --release --no-default-features --bin rag-rat
+      # Pinned bench environment (#71): scip-clang, rust-analyzer, the kernel-build deps (bc/…),
+      # and the Rust toolchain all live in the image, so a missing host package (the `bc` failure)
+      # can't recur and the SCIP indexer versions are reproducible. Layer-cached on the runner.
+      - name: Build bench image
+        run: docker build -t rag-rat-bench -f tools/bench.Containerfile .
 
       - name: Run the scip-clang oracle over the kernel and emit BMF
         env:
-          RAG_RAT_BIN: target/release/rag-rat
           KERNEL_CONFIG: ${{ github.event.inputs.kernel_config || 'defconfig' }}
-          BMF_OUT: kernel_c_oracle_bmf.json
-          # Keep the multi-GB checkout + index DB off the RAM-backed /tmp on the self-hosted box.
-          KERNEL_WORK: ${{ runner.temp }}/coracle-${{ github.run_id }}
-        run: bash tools/kernel-c-oracle.sh
+        # Mount the checkout at /repo (BMF lands here, on the host) and runner.temp at /work (the
+        # multi-GB kernel checkout + index DB stay on real disk, not the container overlay). Named
+        # volumes cache cargo + target across runs. rag-rat is built inside the image's pinned
+        # toolchain, then the script runs.
+        run: |
+          docker run --rm \
+            -v "$PWD":/repo \
+            -v "${{ runner.temp }}":/work \
+            -v rag-rat-cargo-registry:/usr/local/cargo/registry \
+            -v rag-rat-target:/repo/target \
+            -e KERNEL_CONFIG="$KERNEL_CONFIG" \
+            -e BMF_OUT=/work/kernel_c_oracle_bmf.json \
+            -e KERNEL_WORK=/work/coracle-${{ github.run_id }} \
+            -e RAG_RAT_BIN=/repo/target/release/rag-rat \
+            rag-rat-bench \
+            bash -c 'cargo build --release --no-default-features --bin rag-rat && bash tools/kernel-c-oracle.sh'
 
       - uses: bencherdev/bencher@main
 
@@ -52,7 +66,7 @@ jobs:
           bencher run \
             --branch main \
             --adapter json \
-            --file kernel_c_oracle_bmf.json \
+            --file "${{ runner.temp }}/kernel_c_oracle_bmf.json" \
             --project "$BENCHER_PROJECT" \
             --testbed "$BENCHER_TESTBED"
 
@@ -62,5 +76,5 @@ jobs:
         with:
           name: kernel-c-oracle
           path: |
-            kernel_c_oracle_bmf.json
+            ${{ runner.temp }}/kernel_c_oracle_bmf.json
             ${{ runner.temp }}/coracle-${{ github.run_id }}/oracle-report.json
