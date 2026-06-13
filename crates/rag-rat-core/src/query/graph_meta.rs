@@ -240,25 +240,26 @@ fn primary_symbol(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<Pri
 }
 
 fn count_callers(conn: &Connection, symbol: &PrimarySymbol) -> anyhow::Result<u64> {
-    let count = conn.query_row(
-        "
+    let count = conn
+        .prepare_cached(
+            "
         SELECT COUNT(DISTINCT COALESCE(from_symbol_id, -id))
         FROM edges
         WHERE edge_kind IN ('calls_name', 'constructs', 'uses_macro')
           AND (to_symbol_id = ?1 OR (to_symbol_id IS NULL AND to_name_id = (SELECT id FROM \
-         edge_strings WHERE value = ?2)))
+             edge_strings WHERE value = ?2)))
         ",
-        params![symbol.id, symbol.name],
-        |row| row.get::<_, i64>(0),
-    )?;
+        )?
+        .query_row(params![symbol.id, symbol.name], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
 fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
     // Mirror the filter in `callees()` so `callee_count` (and thus the `truncated` flag) reflects
     // the callees actually surfaced — not the unresolved name-only std calls we hide.
-    let count = conn.query_row(
-        "
+    let count = conn
+        .prepare_cached(
+            "
         SELECT COUNT(DISTINCT COALESCE(CAST(to_symbol_id AS TEXT), to_name))
         FROM edges
         WHERE from_symbol_id = ?1
@@ -269,9 +270,8 @@ fn count_callees(conn: &Connection, symbol_id: i64) -> anyhow::Result<u64> {
               OR (confidence = 'Syntactic' AND target_qualified_name IS NOT NULL)
           )
         ",
-        [symbol_id],
-        |row| row.get::<_, i64>(0),
-    )?;
+        )?
+        .query_row([symbol_id], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -332,7 +332,7 @@ fn callers(
     symbol: &PrimarySymbol,
     limit: u32,
 ) -> anyhow::Result<Vec<CallerEvidence>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT DISTINCT
                source_files.path,
@@ -391,7 +391,7 @@ fn callers(
 }
 
 fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<CalleeEvidence>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT DISTINCT
                edges.to_name,
@@ -477,7 +477,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
 }
 
 fn imports(conn: &Connection, chunk_id: i64, limit: u32) -> anyhow::Result<Vec<ImportEvidence>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT edges.to_name, edges.confidence
         FROM edges
@@ -503,7 +503,7 @@ fn referenced_types(
     symbol_id: i64,
     limit: u32,
 ) -> anyhow::Result<Vec<TypeEvidence>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "
         SELECT DISTINCT edges.to_name, edges.confidence
         FROM edges

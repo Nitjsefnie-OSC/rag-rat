@@ -417,7 +417,10 @@ fn graph_boost(conn: &Connection, hit: &SearchHit, terms: &[String]) -> anyhow::
     // every row (the query_warm instruction + random-I/O blow-up). The value→id subqueries are
     // constant (≤2 ids each), keeping the index seek; the dictionary joins then reconstruct the
     // display strings only for the index-matched rows.
-    let mut stmt = conn.prepare(
+    // prepare_cached: this runs once per search CANDIDATE (~limit*8); caching collapses ~80
+    // cold statement compilations of this multi-join query to one per connection (#79 cold-query
+    // prepare cost).
+    let mut stmt = conn.prepare_cached(
         "
         SELECT ek.value, conf.value, fn.value, tn.value
         FROM edges_data d
