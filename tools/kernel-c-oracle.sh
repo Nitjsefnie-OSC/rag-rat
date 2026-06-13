@@ -103,6 +103,34 @@ print(f"compiler-confirmed precision of heuristic-resolved edges: {precision:.1f
       f"(confirm/(confirm+contradict))")
 print(f"call recall (oracle-seen calls a calls_name edge covered): {recall:.1f}%")
 
+# Contradiction attribution (#61): which heuristic RESOLUTION PATH produces the disagreements, and
+# is the disagreement a same-NAME collision (heuristic bound the right name, wrong definition —
+# improvable with linkage / include-scope disambiguation) or a name MISMATCH (call site is a macro
+# expansion / function pointer the compiler resolved elsewhere — not syntactically fixable). This is
+# the data that decides whether tree-sitter resolution can be pushed further or the oracle is the
+# only lever. `edges` is a view exposing `resolution` (the path) and `confidence` (the tier).
+print("\n--- contradiction attribution by heuristic resolution path ---")
+print(f"{'confidence':<10} {'resolution':<22} {'confirm':>9} {'contra':>9} {'precision':>9}")
+for conf, res, c, x in conn.execute(
+    "SELECT e.confidence, e.resolution, "
+    "SUM(CASE WHEN o.kind='confirm' THEN 1 ELSE 0 END), "
+    "SUM(CASE WHEN o.kind='contradict' THEN 1 ELSE 0 END) "
+    "FROM edge_oracle o JOIN edges e ON e.id = o.edge_id "
+    "WHERE o.kind IN ('confirm','contradict') "
+    "GROUP BY e.confidence, e.resolution ORDER BY 4 DESC"
+).fetchall():
+    prec = 100.0 * c / (c + x) if (c + x) else 0.0
+    print(f"{conf or '':<10} {res or '':<22} {c:>9} {x:>9} {prec:>8.1f}%")
+
+same, tot = conn.execute(
+    "SELECT SUM(CASE WHEN o.scip_symbol LIKE '%'||e.to_name||'%' THEN 1 ELSE 0 END), COUNT(*) "
+    "FROM edge_oracle o JOIN edges e ON e.id = o.edge_id WHERE o.kind='contradict'"
+).fetchone()
+print(f"\ncontradictions where the call name appears in the compiler's symbol: {same}/{tot} "
+      f"({100.0 * same / tot if tot else 0:.1f}%)")
+print("  high → same-name collision (improvable: linkage/include scoping); "
+      "low → macro/fn-pointer (oracle-only)")
+
 bmf = {f"linux-kernel-{tag}/c-oracle": {
     "compiled_tus": {"value": tus},
     "heuristic_resolved_rate": {"value": heur_rate},
