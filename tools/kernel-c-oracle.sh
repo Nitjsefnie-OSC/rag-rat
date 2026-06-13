@@ -103,6 +103,28 @@ print(f"compiler-confirmed precision of heuristic-resolved edges: {precision:.1f
       f"(confirm/(confirm+contradict))")
 print(f"call recall (oracle-seen calls a calls_name edge covered): {recall:.1f}%")
 
+# Precision split by edge_kind (#61): the blended `precision` above mixes function calls
+# (`calls_name`) with type references (`references_type`) etc. They have very different
+# characters — type refs suffer the forward-declaration-vs-definition problem — so the blended
+# number under-sells call resolution. Report per-kind precision and surface calls vs types to the
+# BMF.
+print("\n--- compiler precision by edge_kind ---")
+print(f"{'edge_kind':<18} {'confirm':>10} {'contra':>10} {'precision':>10}")
+kind_prec = {}
+for ek, c, x in conn.execute(
+    "SELECT e.edge_kind, "
+    "SUM(CASE WHEN o.kind='confirm' THEN 1 ELSE 0 END), "
+    "SUM(CASE WHEN o.kind='contradict' THEN 1 ELSE 0 END) "
+    "FROM edge_oracle o JOIN edges e ON e.id = o.edge_id "
+    "WHERE o.kind IN ('confirm','contradict') "
+    "GROUP BY e.edge_kind ORDER BY 2 DESC"
+).fetchall():
+    prec = 100.0 * c / (c + x) if (c + x) else 0.0
+    kind_prec[ek] = prec
+    print(f"{ek or '':<18} {c:>10} {x:>10} {prec:>9.1f}%")
+calls_precision = kind_prec.get("calls_name", 0.0)
+types_precision = kind_prec.get("references_type", 0.0)
+
 # Contradiction attribution (#61): which heuristic RESOLUTION PATH produces the disagreements, and
 # is the disagreement a same-NAME collision (heuristic bound the right name, wrong definition —
 # improvable with linkage / include-scope disambiguation) or a name MISMATCH (call site is a macro
@@ -166,6 +188,8 @@ bmf = {f"linux-kernel-{tag}/c-oracle": {
     "compiled_tus": {"value": tus},
     "heuristic_resolved_rate": {"value": heur_rate},
     "compiler_precision": {"value": precision},
+    "compiler_precision_calls": {"value": calls_precision},
+    "compiler_precision_types": {"value": types_precision},
     "call_recall": {"value": recall},
     "confirmed": {"value": confirmed},
     "contradicted": {"value": contradicted},
