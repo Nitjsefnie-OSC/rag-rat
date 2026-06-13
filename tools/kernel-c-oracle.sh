@@ -131,6 +131,37 @@ print(f"\ncontradictions where the call name appears in the compiler's symbol: {
 print("  high → same-name collision (improvable: linkage/include scoping); "
       "low → macro/fn-pointer (oracle-only)")
 
+# logical_variant hypothesis (#61): does this path contradict because the heuristic picks a C
+# function's prototype DECLARATION (smaller byte span, parsed first) while the compiler resolves to
+# the DEFINITION (larger span, has a body) of the SAME path::name? If so, a definition-preference
+# tiebreak fixes it. `hs` = heuristic-chosen symbol, `os` = oracle-resolved symbol.
+lv = conn.execute(
+    "SELECT "
+    " SUM(CASE WHEN hs.qualified_name = os.qualified_name THEN 1 ELSE 0 END), "          # same file+name
+    " SUM(CASE WHEN (hs.end_byte-hs.start_byte) < (os.end_byte-os.start_byte) THEN 1 ELSE 0 END), "  # heuristic smaller (decl)
+    " COUNT(*) "
+    "FROM edge_oracle o JOIN edges e ON e.id=o.edge_id "
+    "LEFT JOIN symbols hs ON hs.id=e.to_symbol_id "
+    "LEFT JOIN symbols os ON os.id=o.resolved_symbol_id "
+    "WHERE o.kind='contradict' AND e.resolution='logical_variant' "
+    "AND hs.id IS NOT NULL AND os.id IS NOT NULL"
+).fetchone()
+sq, hsm, lvt = lv
+print(f"\n--- logical_variant contradiction shape (n={lvt}) ---")
+print(f"  heuristic & oracle share qualified_name (same file+name, i.e. decl-vs-def): {sq}/{lvt} "
+      f"({100.0*sq/lvt if lvt else 0:.1f}%)")
+print(f"  heuristic span < oracle span (heuristic picked the smaller = declaration): {hsm}/{lvt} "
+      f"({100.0*hsm/lvt if lvt else 0:.1f}%)")
+print("  both high → definition-preference tiebreak among same-path::name candidates is the fix")
+print("  sample rows (call | heuristic name@span | oracle name@span):")
+for tn, hn, hsp, on, osp in conn.execute(
+    "SELECT e.to_name, hs.name, hs.end_byte-hs.start_byte, os.name, os.end_byte-os.start_byte "
+    "FROM edge_oracle o JOIN edges e ON e.id=o.edge_id "
+    "JOIN symbols hs ON hs.id=e.to_symbol_id JOIN symbols os ON os.id=o.resolved_symbol_id "
+    "WHERE o.kind='contradict' AND e.resolution='logical_variant' LIMIT 12"
+).fetchall():
+    print(f"    {tn:<24} {hn or '?'}@{hsp}  ->  {on or '?'}@{osp}")
+
 bmf = {f"linux-kernel-{tag}/c-oracle": {
     "compiled_tus": {"value": tus},
     "heuristic_resolved_rate": {"value": heur_rate},
