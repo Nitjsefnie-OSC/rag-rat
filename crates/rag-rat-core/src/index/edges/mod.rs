@@ -1,12 +1,15 @@
 mod extract;
 mod helpers;
+mod imports;
 mod intern;
 mod resolve;
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 pub(crate) use extract::*;
 pub(crate) use helpers::*;
+pub(crate) use imports::local_crate_roots;
 use intern::{OptSym, StrArena, Sym};
 pub(crate) use resolve::*;
 use rusqlite::{Connection, params};
@@ -107,6 +110,7 @@ pub(crate) struct IndexedSymbol {
     language: String,
     name: String,
     qualified_name: String,
+    scope_path: String,
     kind: String,
     start_byte: usize,
     end_byte: usize,
@@ -133,6 +137,7 @@ impl IndexedSymbol {
                 language: language.as_str().to_string(),
                 name: symbol.name.clone(),
                 qualified_name: symbol.qualified_name.clone(),
+                scope_path: symbol.scope_path.clone(),
                 kind: symbol.kind.clone(),
                 start_byte: symbol.start_byte,
                 end_byte: symbol.end_byte,
@@ -167,6 +172,7 @@ struct CompactSymbol {
     language: Sym,
     name: Sym,
     qualified_name: Sym,
+    scope_path: Sym,
     kind: Sym,
     start_byte: usize,
     end_byte: usize,
@@ -182,6 +188,7 @@ impl CompactSymbol {
             language: arena.get(self.language).to_string(),
             name: arena.get(self.name).to_string(),
             qualified_name: arena.get(self.qualified_name).to_string(),
+            scope_path: arena.get(self.scope_path).to_string(),
             kind: arena.get(self.kind).to_string(),
             start_byte: self.start_byte,
             end_byte: self.end_byte,
@@ -294,6 +301,7 @@ impl FullRebuildGraph {
             language: self.arena.intern(language.as_str()),
             name: self.arena.intern(&symbol.name),
             qualified_name: self.arena.intern(&symbol.qualified_name),
+            scope_path: self.arena.intern(&symbol.scope_path),
             kind: self.arena.intern(&symbol.kind),
             start_byte: symbol.start_byte,
             end_byte: symbol.end_byte,
@@ -365,6 +373,11 @@ impl IndexedSymbol {
 pub(crate) struct SymbolIndex<'a> {
     /// Exact `qualified_name` match.
     by_qualified: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
+    /// Exact `scope_path` match (semantic scope, e.g. `Workspace::new`). Tried before bare-name
+    /// fallback: it aligns with an edge's source-derived `target_qualified_name`, so the strong
+    /// qualified path fires for methods/nested items instead of collapsing to bare-name
+    /// collisions.
+    by_scope_path: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Short-name fallback (`symbol.name`).
     by_name: HashMap<&'a str, Vec<&'a IndexedSymbol>>,
     /// Candidates for the `qualified_name.ends_with("::{q}")` suffix match, keyed by the last
@@ -378,16 +391,18 @@ pub(crate) struct SymbolIndex<'a> {
 impl<'a> SymbolIndex<'a> {
     fn build(symbols: &'a [IndexedSymbol]) -> Self {
         let mut by_qualified: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let mut by_scope_path: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut by_qn_tail: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
         let mut file_language: HashMap<i64, &str> = HashMap::new();
         for symbol in symbols {
             by_qualified.entry(symbol.qualified_name.as_str()).or_default().push(symbol);
+            by_scope_path.entry(symbol.scope_path.as_str()).or_default().push(symbol);
             by_name.entry(symbol.name.as_str()).or_default().push(symbol);
             by_qn_tail.entry(qn_tail(&symbol.qualified_name)).or_default().push(symbol);
             file_language.entry(symbol.file_id).or_insert(symbol.language.as_str());
         }
-        Self { by_qualified, by_name, by_qn_tail, file_language }
+        Self { by_qualified, by_scope_path, by_name, by_qn_tail, file_language }
     }
 }
 
@@ -399,4 +414,8 @@ pub(crate) struct ResolveSymbolRequest<'a> {
     receiver_hint: Option<&'a str>,
     source_file_id: i64,
     source_language: Option<&'a str>,
+    /// `name` is brought into this file by a `use` from an EXTERNAL dependency crate (#61 Project
+    /// B). When set, the name denotes that dependency's item, so resolution must NOT bind it to a
+    /// local same-named symbol — it stays unresolved (the oracle bins it `resolved-external`).
+    imported_external: bool,
 }
