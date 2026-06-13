@@ -61,31 +61,42 @@ bench image on `hetzner-bigmem`), so they cover the **compiled subset** — the 
 | Metric | Value | Meaning |
 |---|---|---|
 | Compiled TUs | 2,956 | the `defconfig` compilation database scip-clang consumes |
-| Heuristic `calls_name` resolved (whole index) | 54.9% | byte-anchored name-calls the syntactic resolver binds, tree-wide |
-| **Compiler precision** | **50.1%** | confirmed / (confirmed + contradicted) — of calls the heuristic *committed* to, the share the compiler agreed with |
+| Heuristic `calls_name` resolved (whole index) | 64.0% | byte-anchored name-calls the syntactic resolver binds, tree-wide |
+| **Compiler precision (blended)** | **91.5%** | confirmed / (confirmed + contradicted), over every judged edge kind |
+| — `calls_name` | **91.8%** | function-call resolution (315,099 confirm / 28,068 contradict) |
+| — `references_type` | **91.1%** | type references (215,997 / 21,226) — see the forward-declaration fix below |
 | Call recall | 44.3% | covered / (covered + oracle-only) — of calls the compiler saw, the share the graph had a `calls_name` edge for |
-| Confirmed | 314,830 | heuristic target matched the compiler's |
-| Contradicted | 313,368 | heuristic bound a different target than the compiler |
-| Upgraded | 290,149 | edges promoted to `Compiler`-tier confidence |
-| Resolved-external | 25,249 | dangling calls the compiler bound to a cross-TU / external symbol the heuristic couldn't reach |
+| Confirmed | 531,096 | heuristic target matched the compiler's |
+| Contradicted | 49,294 | heuristic bound a different target than the compiler |
+| Upgraded | 334,259 | edges promoted to `Compiler`-tier confidence |
+| Resolved-external | 28,951 | dangling refs the compiler bound to a cross-TU / external symbol the heuristic couldn't reach |
 
-The headline: on C, name-based resolution agrees with the compiler only **~half the time** on the
-calls it commits to. This number survived a scare — an earlier reading suspected the near-even
-confirm/contradict split was a measurement artifact (rag-rat indexes a C function's prototype
-*declaration* and its *definition* as separate concrete symbols, and the comparison used concrete
-ids, so decl-vs-def of the *same* function could read as a contradiction). The fix (#93) makes the
-comparison **logical-symbol-aware** — and it moved precision by **less than one point** (49.6% →
-50.1%). So the ~50% is *real*, not an artifact: C earns it through same-named `static`s recurring
-across translation units, macro-expanded call sites, and function-pointer dispatch — none of which a
-syntactic name match disambiguates without a compilation database. Note "committed to": the resolver
-*declines* (leaves `NameOnly`/`Ambiguous`, unresolved) when it can't pick a target, so this is
-precision over the edges where the graph made a definite claim — not "half the index is wrong."
+The headline: on the compiled subset, name-based resolution agrees with the compiler **~92% of the
+time** on the edges it commits to — and that's after the oracle caught a real indexing bug. Getting
+here is the instructive part:
 
-Beyond precision, the oracle **upgraded 290k** unresolved/low-confidence edges to compiler-grade
-confidence and recovered **25k cross-TU externals** the heuristic couldn't bind at all — the gap a
-compilation database fills. (scip-clang examined 8.7M call sites; the 7.8M `no_occurrence` edges are
-call sites outside the compiled subset or with no SCIP occurrence at their byte range — expected,
-since the index spans the whole tree while the compilation database spans `defconfig`.)
+- **The first measurement read 50.1% blended** — alarming, and it looked like "C resolution is a
+  coin flip." It wasn't a measurement artifact (a `#93` logical-symbol comparison fix moved it <1pt),
+  so the number was real — but it was a *blend* hiding two very different populations.
+- **Splitting by edge kind exposed the culprit:** `calls_name` was already **85%**, while
+  `references_type` was **18%**. Type references, not call resolution, were dragging the headline
+  down.
+- **Root cause (#61):** the C/C++ parser emitted a symbol for *every* `struct`/`union`/`enum`
+  specifier — definitions, forward declarations (`struct X;`), *and* bare uses (`struct X *p`) — plus
+  function prototypes. A `references_type` edge then bound to a tiny bodyless forward-decl/use
+  occurrence instead of the real definition (`pt_regs@14 bytes` vs the real `pt_regs@1556`).
+- **The fix:** index **definitions only** — a specifier must carry its body, and bare prototypes are
+  dropped. `references_type` precision jumped **18% → 91.1%**, `calls_name` rose **85% → 91.8%** (the
+  same change removed mis-resolutions to prototypes), and the blend went **50.1% → 91.5%**.
+
+So the honest story is the opposite of the first read: C heuristic resolution is **~92% precise**,
+and the SCIP oracle's value showed up twice — it *found* the forward-declaration bug, then quantified
+the fix. Beyond precision, this run **upgraded 334k** unresolved/low-confidence edges to compiler-grade
+confidence and recovered **29k cross-TU externals** the heuristic couldn't bind. ("committed to": the
+resolver leaves `NameOnly`/`Ambiguous` when it can't pick a target, so precision is over edges where
+the graph made a definite claim. The ~7.8M `no_occurrence` edges are call sites outside the compiled
+subset or with no SCIP occurrence at their byte range — expected, since the index spans the whole tree
+while the compilation database spans `defconfig`.)
 
 ## Rust edge resolution: heuristic vs compiler (rust-analyzer SCIP oracle)
 
@@ -98,20 +109,22 @@ indexed `.rs` file (no subset caveat).
 |---|---|---|
 | Rust files indexed | 1,349 | the cargo workspace |
 | Heuristic `calls_name` resolved (in-corpus) | 14.6% | most calls in cargo target std/deps, which a single-repo name resolver can't bind in-corpus |
-| **Compiler precision** | **78.4%** | confirmed / (confirmed + contradicted) — of committed calls, the share rust-analyzer agreed with |
+| **Compiler precision (blended)** | **78.4%** | confirmed / (confirmed + contradicted), over every judged edge kind |
+| — `calls_name` | **87.5%** | function-call resolution (13,469 / 1,918) |
+| — `references_type` | **70.2%** | type references (12,380 / 5,244) |
 | **Call recall** | **95.4%** | covered / (covered + oracle-only) — the graph had a `calls_name` edge for ~all calls the compiler saw |
 | Confirmed | 26,146 | heuristic target matched the compiler's |
 | Contradicted | 7,198 | heuristic bound a different target than the compiler |
 | Upgraded | 58,994 | edges promoted to `Compiler`-tier confidence |
 | Resolved-external | 67,589 | calls the compiler bound to std / a dependency crate (the bulk of cargo's calls) |
 
-Read the two side by side: **Rust precision 78.4% vs C 50.1%, Rust recall 95.4% vs C 44.3%.**
-Name-based resolution quality is strongly language-dependent — Rust's name-unique, qualified-path
-symbols resolve far more reliably than C's `static`/macro/function-pointer call sites. The low 14.6%
-in-corpus rate is not a weakness: cargo calls overwhelmingly into `std` and dependency crates, and
-the oracle correctly bins **67.6k** of those as `resolved-external` rather than forcing a wrong
-in-corpus target. Of the calls the heuristic *does* commit to in-repo, ~4 in 5 match the compiler,
-and the graph covers 95% of the calls rust-analyzer saw.
+Read the two side by side: **call resolution `calls_name` — C 91.8% vs Rust 87.5%**; blended C 91.5%
+vs Rust 78.4% (Rust's lower blend is its `references_type` at 70.2%, a softer version of the same
+type-resolution challenge — Rust has no forward declarations, but generic/trait type references
+still under-resolve syntactically). Recall: C 44.3% (the oracle only sees the compiled `defconfig`
+subset) vs Rust 95.4% (rust-analyzer sees the whole workspace). The low 14.6% in-corpus rate is not a
+weakness: cargo calls overwhelmingly into `std` and dependency crates, and the oracle correctly bins
+**67.6k** of those as `resolved-external` rather than forcing a wrong in-corpus target.
 
 Run them yourself: `oracle-kernel.yml` / `tools/kernel-c-oracle.sh` (C) and `oracle-rust.yml` /
 `tools/rust-scip-oracle.sh` (Rust). Both pin the SCIP indexer via `tools/bench.Containerfile`, so the
