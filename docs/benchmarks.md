@@ -48,6 +48,47 @@ Unresolved-edge taxonomy (the 32.6% / 3,655,631 edges the graph leaves dangling,
 `tools/bench-kernel.sh`, the `calls_name` bucket is extern / macro / function-pointer call targets
 the syntactic resolver can't bind without a compilation database — see issue #61 (SCIP oracle).
 
+## C edge resolution: heuristic vs compiler (SCIP oracle)
+
+The headline resolves 67.4% of edges *syntactically* — by name, no compiler. The SCIP oracle (#61)
+measures how good that syntactic resolution actually is: it replays a real compilation through
+`scip-clang` (a clang-based SCIP indexer) and diffs its ground-truth bindings against the heuristic's.
+Numbers below are one `oracle-kernel.yml` run (`scip-clang 0.4.0`, kernel `defconfig`, containerized
+bench image on `hetzner-bigmem`), so they cover the **compiled subset** — the 2,956 translation units
+`defconfig` actually compiles — not the whole 62,903-file tree the headline indexes. Resolution
+*quality* and tree-wide *coverage* are different populations, reported side by side, not merged.
+
+| Metric | Value | Meaning |
+|---|---|---|
+| Compiled TUs | 2,956 | the `defconfig` compilation database scip-clang consumes |
+| Heuristic `calls_name` resolved (whole index) | 54.9% | byte-anchored name-calls the syntactic resolver binds, tree-wide |
+| **Compiler precision** | **49.6%** | confirmed / (confirmed + contradicted) — of heuristic-resolved calls the compiler also judged, the share it agreed with |
+| Call recall | 44.3% | covered / (covered + oracle-only) — of calls the compiler saw, the share the graph had a `calls_name` edge for |
+| Confirmed | 311,527 | heuristic target matched the compiler's |
+| Contradicted | 316,991 | heuristic bound a *different* target than the compiler |
+| Upgraded | 290,175 | edges promoted to `Compiler`-tier confidence |
+| Resolved-external | 25,241 | dangling calls the compiler bound to a cross-TU / external symbol the heuristic couldn't reach |
+
+The headline result: on C, name-based call resolution is roughly a coin flip in precision — the
+compiler **contradicts ~half** (49.6% agreement) of the calls the heuristic resolved in the compiled
+subset. That one number is the case for the oracle. C earns it: same-named `static` functions recur
+across translation units, call sites expand out of macros, and function-pointer dispatch hides the
+callee — none of which a syntactic name match can disambiguate without a compilation database. The
+oracle is where that database enters: it confirmed 311k edges, upgraded 290k to compiler-grade
+confidence, and recovered 25k cross-TU externals the heuristic couldn't bind at all.
+
+Read the precision honestly: a "contradiction" isn't always the heuristic picking nonsense — often
+it bound *a* function named `foo` while the compiler knows *which* `foo`. Both are defensible from
+syntax alone; only the compiler resolves the ambiguity. That is exactly the error class the oracle
+exists to catch, and why `Compiler` is a distinct, higher confidence tier rather than a tweak to the
+heuristic's score. (scip-clang examined 8.7M call sites across the subset; the 7.8M `no_occurrence`
+edges are call sites outside the compiled subset or with no SCIP occurrence at their byte range —
+expected, since the index spans the whole tree while the compilation database spans `defconfig`.)
+
+Run it yourself with `oracle-kernel.yml` (dispatch) or `tools/kernel-c-oracle.sh`; both pin
+`scip-clang` via the `tools/bench.Containerfile` image so the `tool_version` baked into every verdict
+is reproducible.
+
 ## Memory profile: where the peak lives
 
 The run has **two** memory humps, and the higher one is missed by the named probes. The per-phase
