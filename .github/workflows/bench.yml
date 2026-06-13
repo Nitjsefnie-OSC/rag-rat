@@ -49,7 +49,12 @@ jobs:
           key: bench-corpus-cargo-0.97.1
       - uses: bencherdev/bencher@main
 
-      # Deterministic instruction counts — tight percentage threshold (iai is noise-free).
+      # Instruction counts — TRACKING ONLY, no `--err`. iai is *mostly* deterministic, but the
+      # search path iterates `HashMap`s seeded by `RandomState`, so instruction counts jitter a few
+      # percent run-to-run; a 2% `--err` gate red-failed every push for weeks (docs-only commits
+      # included) against a stale baseline, providing zero signal. Track + alert in Bencher instead
+      # of hard-failing the workflow — same "headline signal, not a gate" stance as bench-release.
+      # Re-arm `--err` (with a sane boundary above the jitter) once the baseline has stabilised.
       - name: Track instruction counts (iai-callgrind)
         run: |
           bencher run \
@@ -59,10 +64,9 @@ jobs:
             --threshold-test percentage \
             --threshold-upper-boundary 0.02 \
             --thresholds-reset \
-            --err \
             "cargo bench --no-default-features --bench rag_pipeline"
 
-      # Wall-clock time — statistical threshold (criterion is noisy).
+      # Wall-clock time — statistical threshold (criterion is noisy). Tracking only, same rationale.
       - name: Track wall-clock index time (criterion)
         run: |
           bencher run \
@@ -72,5 +76,4 @@ jobs:
             --threshold-test t_test \
             --threshold-upper-boundary 0.95 \
             --thresholds-reset \
-            --err \
             "cargo bench --no-default-features --bench index_time"

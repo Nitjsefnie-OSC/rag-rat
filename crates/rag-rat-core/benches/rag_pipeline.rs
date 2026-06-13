@@ -10,11 +10,9 @@
 
 mod shared;
 
-use std::path::PathBuf;
-
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
-use rag_rat_core::IndexDatabase;
-use shared::{bench_config, built_index, built_index_path};
+use rag_rat_core::{Config, IndexDatabase};
+use shared::{bench_config, built_config, built_index, open_like_production};
 
 /// Small subtree — keeps each callgrind run (including setups) fast.
 const SUBDIR: &str = "src/cargo/core/resolver";
@@ -26,8 +24,8 @@ fn resolver_config() -> rag_rat_core::Config {
 fn resolver_index() -> IndexDatabase {
     built_index(SUBDIR)
 }
-fn resolver_index_path() -> PathBuf {
-    built_index_path(SUBDIR)
+fn resolver_built_config() -> Config {
+    built_config(SUBDIR)
 }
 
 // Index cost: full rebuild of the subtree. Setup (clone + Config) is not measured; only `rebuild`.
@@ -37,11 +35,13 @@ fn index(config: rag_rat_core::Config) -> IndexDatabase {
     IndexDatabase::rebuild(&config).expect("rebuild corpus index")
 }
 
-// Cold query: open a freshly-built index from disk (cold page cache) and run one search.
+// Cold query: open a freshly-built index from disk (cold page cache) the way production `search`
+// does (open + active-checkout context, offline), then run one search — the open is INSIDE the
+// measured body, so this captures the realistic cold-open cost. Setup (rebuild) is not measured.
 #[library_benchmark]
-#[bench::cargo_resolver(setup = resolver_index_path)]
-fn query_cold(db_path: PathBuf) -> usize {
-    let db = IndexDatabase::open(&db_path).expect("open index");
+#[bench::cargo_resolver(setup = resolver_built_config)]
+fn query_cold(config: Config) -> usize {
+    let db = open_like_production(&config);
     db.search(QUERY, 10, false).expect("search").len()
 }
 

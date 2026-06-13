@@ -73,9 +73,26 @@ pub fn built_index(subdir: &str) -> IndexDatabase {
     IndexDatabase::rebuild(&bench_config(subdir)).expect("rebuild corpus index")
 }
 
-/// Build a fresh index of `subdir` and return its on-disk path.
-pub fn built_index_path(subdir: &str) -> PathBuf {
+/// Build a fresh index of `subdir` and return its `Config`, so a cold-open bench can reopen the DB
+/// the way production `open_config` does — see [`open_like_production`]. (Returns the Config, not
+/// just the path, because the realistic reopen needs `config.root` to resolve the active-checkout
+/// git context.)
+pub fn built_config(subdir: &str) -> Config {
     let config = bench_config(subdir);
     IndexDatabase::rebuild(&config).expect("rebuild corpus index");
-    config.database
+    config
+}
+
+/// Open an already-built index from disk the way the production `search` path does
+/// (`IndexDatabase::open_config`), but deterministic + offline so it's fit for a bench: `open`
+/// restores `source_root` from meta, `set_context` installs the active-checkout scope view that
+/// `search` filters through, and the GitHub context is pinned offline (no `gh` shell-out). Without
+/// the context, a bare `open` leaves the scope empty and `search` measures an unrealistically light
+/// path (the old `query_cold` under-measure; this is the #80 fix).
+pub fn open_like_production(config: &Config) -> IndexDatabase {
+    let mut db = IndexDatabase::open(&config.database).expect("open index");
+    let (commit_sha, worktree_id) = rag_rat_core::index::resolve_git_context(&config.root);
+    db.set_context(&commit_sha, &worktree_id).expect("install active-checkout scope");
+    db.set_github_context(None, false);
+    db
 }

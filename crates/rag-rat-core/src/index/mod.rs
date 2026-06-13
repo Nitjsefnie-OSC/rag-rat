@@ -1077,7 +1077,10 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub(crate) fn resolve_git_context(root: &Path) -> (String, String) {
+/// The active-checkout `(commit_sha, worktree_id)` keys for `root`, as `open_config` derives them.
+/// `pub` so out-of-crate callers that open an index by path (benches mirroring the production
+/// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
+pub fn resolve_git_context(root: &Path) -> (String, String) {
     let commit_sha =
         git_output(root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
     let worktree_id = root.to_string_lossy().trim_end_matches('/').to_string();
