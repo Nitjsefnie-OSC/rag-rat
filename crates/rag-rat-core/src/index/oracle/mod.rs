@@ -183,9 +183,25 @@ pub fn produce_scip_with_tool(
         });
     }
     let mut command = manifest.scip_command(checkout_root, scip_output);
-    let status = command
-        .status()
+    // Forward the tool's stdout to OUR stderr, never inherit it onto our stdout: the CLI emits the
+    // run's JSON report on stdout, and a tool that prints progress to stdout (scip-clang's
+    // `[N/M] Indexed …`) would otherwise corrupt that JSON. A piped child + a copy thread keeps
+    // the progress live on stderr (where rust-analyzer's already goes) while stdout stays clean.
+    command.stdout(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|err| anyhow::anyhow!("failed to invoke {}: {err}", manifest.program))?;
+    let piped = child.stdout.take();
+    let forwarder = std::thread::spawn(move || {
+        if let Some(mut out) = piped {
+            let mut err = std::io::stderr();
+            let _ = std::io::copy(&mut out, &mut err);
+        }
+    });
+    let status = child
+        .wait()
+        .map_err(|err| anyhow::anyhow!("failed waiting for {}: {err}", manifest.program))?;
+    let _ = forwarder.join();
     if !status.success() {
         anyhow::bail!("{} scip exited with status {status}", manifest.program);
     }
