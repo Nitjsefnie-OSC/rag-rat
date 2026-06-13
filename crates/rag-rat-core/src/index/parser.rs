@@ -188,14 +188,18 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
                 Some(("object", companion_name(node).unwrap_or(node))),
             _ => None,
         },
+        // C/C++ index DEFINITIONS, not bare declarations. A function prototype (`int foo(void);`,
+        // a `declaration` with a `function_declarator`) and a bodyless type specifier — a forward
+        // declaration (`struct X;`) or a use (`struct X *p`) — are NOT definitions, so they are not
+        // emitted as symbols. Indexing them made `references_type` edges bind to a tiny
+        // forward-decl/use occurrence instead of the real definition (#61: 18% type precision, vs
+        // 85% for calls). `has_body` distinguishes a definition (`struct X { … }`) from the rest.
         Language::C => match kind {
             "function_definition" =>
                 Some(("function", function_name(node).or_else(|| child_name(node))?)),
-            "declaration" if has_descendant_kind(node, "function_declarator") =>
-                Some(("function", function_name(node).or_else(|| child_name(node))?)),
-            "struct_specifier" => Some(("struct", child_name(node)?)),
-            "union_specifier" => Some(("union", child_name(node)?)),
-            "enum_specifier" => Some(("enum", child_name(node)?)),
+            "struct_specifier" if has_body(node) => Some(("struct", child_name(node)?)),
+            "union_specifier" if has_body(node) => Some(("union", child_name(node)?)),
+            "enum_specifier" if has_body(node) => Some(("enum", child_name(node)?)),
             "type_definition" => Some(("type", child_name(node)?)),
             "preproc_function_def" => Some(("macro", child_name(node)?)),
             _ => None,
@@ -203,12 +207,10 @@ fn symbol_node(language: Language, node: Node<'_>) -> Option<(&'static str, Node
         Language::Cpp => match kind {
             "function_definition" =>
                 Some(("function", function_name(node).or_else(|| child_name(node))?)),
-            "declaration" if has_descendant_kind(node, "function_declarator") =>
-                Some(("function", function_name(node).or_else(|| child_name(node))?)),
-            "class_specifier" => Some(("class", child_name(node)?)),
-            "struct_specifier" => Some(("struct", child_name(node)?)),
-            "union_specifier" => Some(("union", child_name(node)?)),
-            "enum_specifier" => Some(("enum", child_name(node)?)),
+            "class_specifier" if has_body(node) => Some(("class", child_name(node)?)),
+            "struct_specifier" if has_body(node) => Some(("struct", child_name(node)?)),
+            "union_specifier" if has_body(node) => Some(("union", child_name(node)?)),
+            "enum_specifier" if has_body(node) => Some(("enum", child_name(node)?)),
             "type_definition" | "alias_declaration" => Some(("type", child_name(node)?)),
             "namespace_definition" => Some(("namespace", child_name(node)?)),
             "preproc_function_def" => Some(("macro", child_name(node)?)),
@@ -247,10 +249,13 @@ fn first_descendant_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Nod
     None
 }
 
-fn has_descendant_kind(node: Node<'_>, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| child.kind() == kind || has_descendant_kind(child, kind))
+/// Whether a C/C++ `*_specifier` node carries its body (`field_declaration_list` /
+/// `enumerator_list` via the grammar's `body` field) — i.e. it is a DEFINITION (`struct X { … }`),
+/// not a forward declaration (`struct X;`) or a use (`struct X *p`). Only definitions are indexed
+/// as symbols so `references_type` edges resolve to the real definition rather than a bodyless
+/// occurrence (#61).
+fn has_body(node: Node<'_>) -> bool {
+    node.child_by_field_name("body").is_some()
 }
 
 fn companion_name(node: Node<'_>) -> Option<Node<'_>> {

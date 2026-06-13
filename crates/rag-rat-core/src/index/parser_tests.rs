@@ -138,8 +138,36 @@ int runtime_close(Runtime *runtime);
     assert_symbol(&symbols, "struct", "Runtime");
     assert_symbol(&symbols, "enum", "RuntimeState");
     assert_symbol(&symbols, "function", "runtime_open");
-    assert_symbol(&symbols, "function", "runtime_close");
     assert_symbol(&symbols, "macro", "runtime_debug");
+    // `int runtime_close(Runtime *runtime);` is a bare prototype (declaration), not a definition —
+    // not indexed (#61). Only `function_definition`s are. The `typedef struct Runtime Runtime;`
+    // also references `struct Runtime` bodyless, but the `struct Runtime { … }` definition is what
+    // supplies the indexed `struct Runtime` symbol above.
+    assert_no_symbol(&symbols, "function", "runtime_close");
+}
+
+/// #61: C/C++ index type DEFINITIONS, not forward declarations or uses. A bodyless `struct X;`
+/// (forward decl) and `struct X *p` (use) must NOT produce a symbol — only `struct X { … }` does —
+/// so a `references_type` edge resolves to the real definition, not a tiny bodyless occurrence.
+#[test]
+fn c_forward_declarations_and_uses_are_not_symbols() {
+    let text = r#"
+struct Defined { int field; };
+struct Forward;
+union UForward;
+enum EForward;
+
+struct Forward *use_forward(struct Defined *d) {
+    return (struct Forward *)d;
+}
+"#;
+    let symbols = parser::parse_symbols(Path::new("src/types.c"), Language::C, text).unwrap();
+    // The definition (has a body) is indexed.
+    assert_symbol(&symbols, "struct", "Defined");
+    // Forward declarations (no body) and the bodyless uses of `Forward` are not.
+    assert_no_symbol(&symbols, "struct", "Forward");
+    assert_no_symbol(&symbols, "union", "UForward");
+    assert_no_symbol(&symbols, "enum", "EForward");
 }
 
 #[test]
@@ -187,6 +215,14 @@ fn assert_symbol(symbols: &[parser::ParsedSymbol], kind: &str, name: &str) {
     assert!(
         symbols.iter().any(|symbol| symbol.kind == kind && symbol.name == name),
         "missing {kind} {name}; got {:?}",
+        symbols.iter().map(|symbol| (&symbol.kind, &symbol.name)).collect::<Vec<_>>()
+    );
+}
+
+fn assert_no_symbol(symbols: &[parser::ParsedSymbol], kind: &str, name: &str) {
+    assert!(
+        !symbols.iter().any(|symbol| symbol.kind == kind && symbol.name == name),
+        "unexpected {kind} {name}; got {:?}",
         symbols.iter().map(|symbol| (&symbol.kind, &symbol.name)).collect::<Vec<_>>()
     );
 }
