@@ -332,6 +332,20 @@ pub(crate) fn resolve_symbol<'a>(
         .filter(|symbol| kind_matches(symbol))
         .collect::<Vec<_>>();
     let preferred = preferred_matches(request.edge_kind, &matches);
+    // In languages with separate type/value namespaces (Rust, C, C++), a `references_type`
+    // reference must resolve to a type DEFINITION (struct/enum/trait/type/…). If none of the
+    // same-named candidates is one, do NOT fall back to a non-type symbol (an `impl` block, a
+    // module, a function/const/macro) — leave it unresolved, so the graph never points a type
+    // reference at a non-type. Those fallbacks were pure contradictions (#61): when a type's real
+    // definition is external / in another crate, the only in-corpus same-named symbol is often an
+    // `impl Foo` or a module, and binding to it is always wrong. NOT applied to TS/Kotlin, where a
+    // type-position reference legitimately targets a value (a React component `const`/`function`).
+    if preferred.is_empty()
+        && request.edge_kind == EdgeKind::ReferencesType.as_str()
+        && matches!(request.source_language, Some("rust" | "c" | "cpp"))
+    {
+        return None;
+    }
     let matches = if preferred.is_empty() { matches.as_slice() } else { preferred.as_slice() };
     match matches {
         [symbol] => Some((*symbol, EdgeConfidence::Syntactic, "target_name_fallback")),
@@ -611,5 +625,61 @@ mod tests {
         let (to, _, resolution) = edge_state(&conn, edge);
         assert_eq!(to, Some(target_overlay), "overlay symbols win over shadowed committed rows");
         assert_eq!(resolution, "qualified_suffix");
+    }
+
+    fn add_symbol_kind(
+        conn: &Connection,
+        file_id: i64,
+        name: &str,
+        qualified: &str,
+        kind: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte, \
+             end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, ?3, ?4, 0, 10, 1, 1)",
+            params![file_id, name, qualified, kind],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn add_type_ref_edge(conn: &Connection, source_file_id: i64, to_name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO edges(source_file_id, to_name, edge_kind, confidence, resolution) VALUES \
+             (?1, ?2, 'references_type', 'NameOnly', 'unresolved')",
+            params![source_file_id, to_name],
+        )
+        .unwrap();
+        conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+    }
+
+    /// #61: a `references_type` reference resolves only to a type DEFINITION. When the sole
+    /// same-named in-corpus symbol is a non-type (an `impl` block — the type's real definition is
+    /// external / in another crate), the edge stays UNRESOLVED rather than binding to the non-type.
+    /// A real type definition still resolves.
+    #[test]
+    fn references_type_does_not_resolve_to_a_non_type_symbol() {
+        let conn = seeded_conn();
+        let user = add_file(&conn, "a.rs", NEW);
+        let defs = add_file(&conn, "b.rs", NEW);
+        // A symbol in the source file so the index knows it's Rust (source_language drives the
+        // type/value-namespace strictness; a real source file always has at least the caller).
+        add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
+        // Only same-named candidate for `Widget` is an impl block (no struct/enum/trait in-corpus).
+        add_symbol_kind(&conn, defs, "Widget", "crate::b::Widget", "impl");
+        // A genuine type definition under a different name (the positive control).
+        let gadget = add_symbol_kind(&conn, defs, "Gadget", "crate::b::Gadget", "struct");
+        let ref_impl = add_type_ref_edge(&conn, user, "Widget");
+        let ref_struct = add_type_ref_edge(&conn, user, "Gadget");
+
+        crate::index::install_scope_view(&conn, NEW, "").unwrap();
+        resolve_all_edges(&conn).unwrap();
+
+        let (to, _, resolution) = edge_state(&conn, ref_impl);
+        assert_eq!(to, None, "a type reference must not bind to an impl block");
+        assert_eq!(resolution, "unresolved");
+
+        let (to, _, _) = edge_state(&conn, ref_struct);
+        assert_eq!(to, Some(gadget), "a type reference still resolves to a struct definition");
     }
 }
