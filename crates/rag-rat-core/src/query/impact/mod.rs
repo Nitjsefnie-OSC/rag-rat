@@ -74,6 +74,10 @@ pub struct ImpactCompleteness {
     pub parser_failures: u64,
     pub stale_files: u64,
     pub memory_status: ImpactMemoryStatus,
+    /// Sections that returned exactly `limit` rows and were therefore capped — more results may
+    /// exist (no silent caps, #49). Empty when nothing was truncated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub truncated_sections: Vec<String>,
     pub caveats: Vec<String>,
 }
 
@@ -194,7 +198,7 @@ pub fn impact_surface_report_for_symbol(
     } else {
         Vec::new()
     };
-    let repo_memories = if options.include_memories {
+    let (repo_memories, memories_truncated) = if options.include_memories {
         let caller_edge_ids =
             direct_semantic_callers.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
         let callee_edge_ids =
@@ -207,12 +211,15 @@ pub fn impact_surface_report_for_symbol(
             limit,
         )?
     } else {
-        RepoMemoryEvidence {
-            direct: Vec::new(),
-            path_crossed: Vec::new(),
-            call_path_crossed: Vec::new(),
-            stale: Vec::new(),
-        }
+        (
+            RepoMemoryEvidence {
+                direct: Vec::new(),
+                path_crossed: Vec::new(),
+                call_path_crossed: Vec::new(),
+                stale: Vec::new(),
+            },
+            false,
+        )
     };
     let mut caveats = vec![
         "Graph evidence is tree-sitter/syntactic, not compiler-grade name resolution.".to_string(),
@@ -225,6 +232,34 @@ pub fn impact_surface_report_for_symbol(
             "No exact graph callers found. Text search found {} symbol/path hits. This likely \
              indicates graph extraction or resolution gaps.",
             text_fallback_hits.len()
+        ));
+    }
+    // No silent caps (#49): a section that returns exactly `limit` rows was capped and may hide
+    // more. Name every capped section so the agent can raise `limit` or narrow the query instead of
+    // trusting a truncated list as complete.
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let truncated_sections: Vec<String> = [
+        ("direct_semantic_callers", direct_semantic_callers.len()),
+        ("direct_semantic_callees", direct_semantic_callees.len()),
+        ("import_export_dependents", import_export_dependents.len()),
+        ("tests_touching_symbol_path", tests_touching_symbol_path.len()),
+        ("docs_mentioning_symbol_path", docs_mentioning_symbol_path.len()),
+        ("text_fallback_hits", text_fallback_hits.len()),
+        ("recent_commits_touching_symbol_path", recent_commits_touching_symbol_path.len()),
+        ("github_rationale_issues_prs", github_rationale_issues_prs.len()),
+    ]
+    .into_iter()
+    .filter(|&(_, len)| limit_usize != 0 && len >= limit_usize)
+    .map(|(name, _)| name.to_string())
+    // `repo_memories` is capped per lane inside memory_evidence; its `memories_truncated` flag
+    // accounts for rows split off to `stale` (which the active-lane lengths would miss), #146 review.
+    .chain(memories_truncated.then(|| "repo_memories".to_string()))
+    .collect();
+    if !truncated_sections.is_empty() {
+        caveats.push(format!(
+            "Sections truncated at limit={limit}: {}. More results may exist — raise `limit` or \
+             narrow the query.",
+            truncated_sections.join(", ")
         ));
     }
     Ok(ImpactSurfaceReport {
@@ -255,6 +290,7 @@ pub fn impact_surface_report_for_symbol(
                 .unwrap_or(u64::MAX),
                 stale: u64::try_from(repo_memories.stale.len()).unwrap_or(u64::MAX),
             },
+            truncated_sections,
             caveats,
         },
         direct_semantic_callers,
