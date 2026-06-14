@@ -49,7 +49,7 @@ Simple bindings map a language to directories:
 
 ```toml
 [target_bindings]
-rust = ["core/held-core/src"]
+rust = ["crates/app/src"]
 typescript = ["apps/mobile/src"]
 kotlin = ["apps/wear-bridge/src"]
 markdown = ["docs"]
@@ -59,9 +59,9 @@ Expanded targets add name, kind, include, and exclude metadata:
 
 ```toml
 [[target]]
-name = "held-core-generated-bindings"
+name = "generated-bindings"
 language = "typescript"
-directories = ["packages/held-core/src/generated"]
+directories = ["packages/app/src/generated"]
 kind = "generated"
 include = ["**/*.ts"]
 exclude = ["**/*.map"]

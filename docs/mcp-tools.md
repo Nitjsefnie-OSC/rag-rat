@@ -1,68 +1,55 @@
 # MCP Tools
 
-`rag-rat mcp --config rag-rat.toml` starts a local `rmcp` STDIO server. The server is read-only for configured source roots; it may update the configured SQLite index when automatic stale-index healing is needed.
-The server opens the index through the configured root, so search and graph tools resolve the active
-git commit plus dirty worktree overlay in the same way as CLI queries.
+`rag-rat mcp` starts a local `rmcp` STDIO server. The server is read-only for configured source
+roots; it may update the configured SQLite index when automatic stale-index healing is needed. It
+opens the index through the configured root, so search and graph tools resolve the active git commit
+plus dirty worktree overlay in the same way as CLI queries.
 
 ## Install
 
-The MCP server is launched by the MCP client over STDIO. It does not listen on a TCP port.
-
-Install the binary from a local checkout:
-
-```bash
-cargo install --path tools/rag-rat --bin rag-rat --features fastembed
-rag-rat index --discover --config /home/kk/src/held/rag-rat.toml
-rag-rat models install fastembed-all-minilm-l6-v2 --config /home/kk/src/held/rag-rat.toml
-rag-rat reconcile --changed-first --limit 500 --batch-size 64 --config /home/kk/src/held/rag-rat.toml
-rag-rat doctor --config /home/kk/src/held/rag-rat.toml
-```
-
-Use `embedding-hash` instead of FastEmbed when a small dependency footprint matters more than real
-semantic embeddings:
+The MCP server is launched by the MCP client over STDIO; it does not listen on a TCP port. The
+recommended setup is `rag-rat init` from the target repo, which indexes it and registers a
+**project-scoped** MCP server. The per-repo setup, by hand:
 
 ```bash
-cargo install --path tools/rag-rat --bin rag-rat
-rag-rat models install embedding-hash --config /home/kk/src/held/rag-rat.toml
+cd /path/to/your/repo
+cargo install rag-rat                 # or: cargo install --path crates/rag-rat-cli --bin rag-rat
+rag-rat index --discover
+rag-rat models install fastembed-all-minilm-l6-v2
+rag-rat reconcile --changed-first --limit 500 --batch-size 64
+rag-rat doctor
 ```
 
-MCP client config for the installed binary:
+Use `embedding-hash` (built with `--no-default-features`) instead of FastEmbed when a small
+dependency footprint matters more than real semantic embeddings:
+
+```bash
+rag-rat models install embedding-hash
+```
+
+Register a **project-scoped** server that runs in the repo so it resolves that repo's `rag-rat.toml`:
+
+```bash
+claude mcp add --scope project rag-rat -- rag-rat mcp
+```
+
+or a project `.mcp.json` / equivalent:
 
 ```json
 {
   "mcpServers": {
-    "rag-rat": {
-      "command": "/home/kk/.cargo/bin/rag-rat",
-      "args": ["mcp", "--config", "/home/kk/src/held/rag-rat.toml"]
-    }
+    "rag-rat": { "command": "rag-rat", "args": ["mcp"] }
   }
 }
 ```
 
-Development config without installing:
+Do **not** register a single global/user-scoped server with a hardcoded `--config /some/repo/...`:
+it would serve that one repo's index and memories in every project. Keep the server project-scoped
+and let it find `rag-rat.toml` from the repo it runs in. `--config <path>` remains available for a
+specific profile, and `rag-rat mcp --json` switches tool results from TOON to JSON.
 
-```json
-{
-  "mcpServers": {
-    "rag-rat-dev": {
-      "command": "cargo",
-      "args": [
-        "run",
-        "--manifest-path",
-        "/home/kk/src/held/tools/rag-rat/Cargo.toml",
-        "--features",
-        "fastembed",
-        "--bin",
-        "rag-rat",
-        "--",
-        "mcp",
-        "--config",
-        "/home/kk/src/held/rag-rat.toml"
-      ]
-    }
-  }
-}
-```
+To run from a checkout without installing, use a project-scoped server whose command is
+`cargo run --manifest-path /path/to/rag-rat/Cargo.toml --bin rag-rat -- mcp`.
 
 ## Tools
 
@@ -115,8 +102,8 @@ TOON and takes a global `--json` flag for JSON output.)
       "logical_symbol_id": 98,
       "logical_variant_count": 2,
       "logical_group_reason": "cfg_variant",
-      "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
-      "qualified_name": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+      "symbol_path": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
+      "qualified_name": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
       "kind": "function",
       "signature": "pub(crate) async fn spawn_blocking<F, T>(...)"
     }
@@ -196,7 +183,7 @@ intentionally return little or nothing unless `symbol_id` or `logical_symbol_id`
   "query": {
     "tool": "find_callers",
     "symbol_id": 3150,
-    "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+    "symbol_path": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
     "resolution": "exact"
   },
   "summary": {
@@ -257,7 +244,7 @@ currently indexed source files, then compares `(path, line)` sets:
   "query": {
     "symbol_id": 3150,
     "logical_symbol_id": 123,
-    "symbol_path": "core/held-core/src/runtime/task_spawn.rs::spawn_blocking",
+    "symbol_path": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
     "pattern": "crate::runtime::task_spawn::spawn_blocking\\(",
     "resolution": "syntactic",
     "include_tests": true

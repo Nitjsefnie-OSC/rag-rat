@@ -24,6 +24,8 @@ Reach for these first:
   call sites.
 - **`read_chunk`** — current text for a chunk with anchor validation + graph + memories.
 - **`repo_brief` / `repo_clusters`** — orientation (spine, churn, god-modules, ownership clusters).
+- **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; pass `personalize` to
+  bias toward what you're editing. Compiler-grade once `rag-rat oracle run` has run.
 
 Why this beats grep here:
 - Results carry **provenance**: confidence labels, coverage warnings, and raw evidence, so you can
@@ -92,5 +94,5 @@ the domain question, with invariant comments and tests (migrations included).
 cargo build
 cargo test -p rag-rat-core
 cargo clippy --all-targets
-cargo fmt
+cargo +nightly fmt   # CI uses nightly rustfmt; stable fmt silently diverges and reddens CI
 ```
