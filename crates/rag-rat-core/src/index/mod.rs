@@ -192,7 +192,14 @@ pub struct DiscoveryStatus {
 }
 
 const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
-const GRAPH_INDEX_VERSION: &str = "6";
+// Bumped whenever the resolved graph's SHAPE changes so an upgraded index re-resolves its edges on
+// next open (`ensure_graph_index_current`) instead of carrying forward stale resolutions. 7: the
+// per-package + module-aware import scope (#61) — re-resolve repopulates the `packages` rows and
+// re-derives the dedicated `import_scope_*` edge columns, which the V022 migration only ADDED
+// (never backfilled), so without the bump a migrated index keeps empty package scopes and the
+// global-fallback behavior forever. The file→package mapping itself is computed at LOAD time from
+// `packages` (no persisted `files.package_id`), so the re-resolve only needs the `packages` rows.
+const GRAPH_INDEX_VERSION: &str = "7";
 
 #[derive(Debug, Error)]
 pub enum IndexError {

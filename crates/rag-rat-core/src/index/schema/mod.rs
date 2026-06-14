@@ -5,7 +5,7 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 21;
+pub const LATEST_SCHEMA_VERSION: u32 = 22;
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -92,6 +92,10 @@ const MIGRATION_021_ID: &str = "021_symbol_scope_path";
 const MIGRATION_021_CHECKSUM: &str = "sha256:rag-rat-symbol-scope-path-v21";
 const MIGRATION_021_DESCRIPTION: &str =
     "Add symbols.scope_path (semantic enclosing-scope path) for scope-aware edge resolution (#61)";
+const MIGRATION_022_ID: &str = "022_per_package_import_scope";
+const MIGRATION_022_CHECKSUM: &str = "sha256:rag-rat-per-package-import-scope-v22";
+const MIGRATION_022_DESCRIPTION: &str = "Add packages table + dedicated edge import-scope columns \
+                                         for per-package, module-aware import resolution (#61)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -295,6 +299,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_021_CHECKSUM,
         description: MIGRATION_021_DESCRIPTION,
         apply: apply_symbol_scope_path,
+    },
+    Migration {
+        id: MIGRATION_022_ID,
+        checksum: MIGRATION_022_CHECKSUM,
+        description: MIGRATION_022_DESCRIPTION,
+        apply: apply_per_package_import_scope,
     },
 ];
 
