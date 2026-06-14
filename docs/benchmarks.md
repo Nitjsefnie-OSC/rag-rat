@@ -1,70 +1,108 @@
 # Measured benchmarks
 
 Concrete numbers for the headline workload — indexing the whole Linux kernel — plus the memory
-profile that workload exposes. This is the *results* companion to [`bencher.md`](./bencher.md),
-which documents the *harness* (Bencher, the CI workflows, and `tools/bench-kernel.sh`). Numbers here
-are single cold runs on a self-hosted box, not statistically-gated CI signals; treat them as
-"what one run looks like," not a regression gate.
+profile that workload exposes and how syntactic resolution compares to a real compiler. This is the
+*results* companion to [`bencher.md`](./bencher.md), which documents the *harness* (Bencher, the CI
+workflows, and `tools/bench-kernel.sh`). Numbers here are single cold runs, not statistically-gated
+CI signals; treat them as "what one run looks like," not a regression gate.
+
+These numbers are the **v0.5.0** baseline. v0.5.0 indexes the kernel ~2.7× faster than v0.4.x — and
+that is a *correctness* change, not lost coverage: see [v0.5.0 rebaseline](#v050-rebaseline-why-the-kernel-got-27-faster).
 
 ## Test harness
 
-All numbers below come from one machine — the self-hosted Bencher testbed `hetzner-bigmem` (the
-`bench-release` workflow's `[self-hosted, bigmem]` runner). The kernel index is run here rather than
-on a hosted runner for a stable, uncontended wall-clock, not because it no longer fits a hosted box
-(the peak is 5.5 GiB; see below).
+The kernel index runs on a self-hosted big-memory box (the `bench-release` workflow's
+`[self-hosted, bigmem]` runner), inside the pinned bench container so the toolchain and SCIP indexers
+are reproducible. It runs here rather than on a hosted runner for a stable, uncontended wall-clock —
+not because it no longer fits a hosted box (the peak is 4.15 GiB; see below).
 
 | | |
 |---|---|
 | CPU | AMD Ryzen 5 3600 — 6 cores / 12 threads, up to ~4.2 GHz |
-| RAM | 64 GB (62 GiB) DDR4 (+ 31 GiB swap present; not monitored during the run) |
-| Storage | 2× Samsung MZVLB512HBJQ NVMe SSD in Linux mdraid **RAID1**, ext4 root — kernel checkout + index DB both on NVMe (`KERNEL_WORK` set off the box's RAM-backed `/tmp`) |
-| OS / kernel | Arch Linux, Linux 6.18.7 |
-| Toolchain | rustc/cargo 1.96.0, git 2.54.0 |
+| RAM | 64 GB (62 GiB) DDR4 |
+| Storage | 2× Samsung MZVLB512HBJQ NVMe SSD in Linux mdraid **RAID1**, ext4 — kernel checkout + index DB both on NVMe (`KERNEL_WORK` set off the box's RAM-backed `/tmp`) |
+| Build + run env | `tools/bench.Containerfile` — `debian:trixie-slim`, rustc/cargo **1.96.0** (stable), release build (`cargo build --release --no-default-features`) |
 
 The rebuild's per-wave prepare stage is parallel (rayon), but the bulk of the wall-clock — the edge
-insert + index rebuild + FTS pipeline (~t+133–636 s below) — is serial and storage-bound, so storage
-speed dominates wall-clock more than core count does. Peak RSS is governed by the graph/chunk set
-and `RAG_RAT_INDEX_WAVE`, not by core count.
+resolve + insert + index rebuild + FTS pipeline — is serial and storage-bound, so storage speed
+dominates wall-clock more than core count does. Peak RSS is governed by the graph/chunk set and
+`RAG_RAT_INDEX_WAVE`, not by core count.
 
 ## Headline: indexing the Linux kernel
 
 Linux kernel **v7.0** (pinned at commit `028ef9c96e96197026887c0f092424679298aae8`, shallow-cloned),
-full index (`index --full`), hash embedder (`--no-default-features`, no model download), release
-build.
+full index (`index --full`), whole tree (`RAG_RAT_KERNEL_SUBDIRS=.`), hash embedder
+(`--no-default-features`, no model download), release build, `RAG_RAT_INDEX_WAVE=2000`.
 
 | Metric | Value |
 |---|---|
 | Files indexed (C/H) | 62,903 |
-| Wall-clock | 738.5 s |
-| Throughput | 85.2 files/s |
-| **Peak RSS** | **5.50 GiB** (5,905,502,208 B maxrss; 1 Hz sampler agrees) |
-| Symbols | 3,536,897 |
-| Edges (call graph) | 11,213,107 |
-| Edges resolved | 7,557,476 (67.4%) |
-| Chunks | 4,246,140 |
+| **Wall-clock** | **269.1 s** (4.49 min) |
+| Throughput | 233.7 files/s |
+| **Peak RSS** | **4.15 GiB** (4,249 MiB maxrss; 1 Hz sampler agrees at 4,250 MiB) |
+| On-disk index DB | 4.98 GiB (5,099 MiB, post-checkpoint) |
+| Symbols | 1,057,527 |
+| Edges (call graph) | 9,144,061 |
+| Edges resolved | 5,371,873 (58.7%) |
+| Chunks | 1,611,390 |
 
-Unresolved-edge taxonomy (the 32.6% / 3,655,631 edges the graph leaves dangling, by kind):
-`calls_name` 2,335,838 (63.9%), `references_type` 917,941 (25.1%), `imports` 401,852 (11.0%). Per
-`tools/bench-kernel.sh`, the `calls_name` bucket is extern / macro / function-pointer call targets
-the syntactic resolver can't bind without a compilation database — see issue #61 (SCIP oracle).
+Unresolved-edge taxonomy (the 41.3% / 3,772,188 edges the syntactic graph leaves dangling, by kind):
+`calls_name` 1,861,690 (49.4%), `references_type` 1,508,646 (40.0%), `imports` 401,852 (10.7%). The
+`calls_name` bucket is extern / macro / function-pointer call targets the syntactic resolver can't
+bind without a compilation database; `references_type` is dominated by references whose type
+*definition* lives in an uncompiled or external header — both are exactly what the SCIP oracle
+recovers (below).
+
+### v0.5.0 rebaseline: why the kernel got ~2.7× faster
+
+v0.4.x indexed the same 62,903 files in **~724 s**; v0.5.0 does it in **269 s**. Nothing is being
+skipped at the file level — the file count is identical. The difference is the **#61 C/C++
+definitions-only** extraction change: the parser now emits a symbol for a struct/union/enum/function
+only when it carries its **body** (a definition), not for forward declarations (`struct X;`), bare
+type uses (`struct X *p`), or function prototypes. The kernel's headers repeat those prototypes and
+forward-decls across thousands of includes, so dropping them as "symbols" removes most of the work:
+
+| Metric | v0.4.x (pre-#61) | v0.5.0 | Δ |
+|---|---|---|---|
+| Files indexed | 62,903 | 62,903 | — (no scope loss) |
+| Wall-clock | 723.6 s | 269.1 s | **−63%** |
+| Symbols | 3,536,897 | 1,057,527 | −70% |
+| Chunks | 4,246,140 | 1,611,390 | −62% |
+| Edges | 11,213,107 | 9,144,061 | −18% |
+| Resolved | 67.4% | 58.7% | −8.7 pp |
+| Peak RSS | 5.60 GiB | 4.15 GiB | −26% |
+| On-disk DB | 8.01 GiB | 4.98 GiB | −38% |
+
+The two numbers that look *worse* are both improvements:
+
+- **Fewer symbols/chunks** is the point — a forward declaration is not a definition, and the dropped
+  ~2.5M symbols were bodyless prototype/forward-decl/use occurrences, not real code. Real
+  definitions are still indexed.
+- **Lower resolved rate** (67.4% → 58.7%) reflects *higher* precision, not lost resolution. The old
+  rate was inflated by edges binding to declaration pseudo-symbols — frequently the wrong target
+  (`references_type` would land on a 14-byte forward-decl of `pt_regs` instead of the real
+  1556-byte definition). The same change took measured C `references_type` precision from **18% →
+  91%** (see below). Lower rate, far higher correctness.
+
+So v0.5.0's 269 s is the correct baseline for "indexes the Linux kernel" — a correctness-driven
+speedup, not a coverage regression.
 
 ## C edge resolution: heuristic vs compiler (SCIP oracle)
 
-The headline resolves 67.4% of edges *syntactically* — by name, no compiler. The SCIP oracle (#61)
+The headline resolves 58.7% of edges *syntactically* — by name, no compiler. The SCIP oracle (#61)
 measures how good that syntactic resolution actually is: it replays a real compilation through
 `scip-clang` (a clang-based SCIP indexer) and diffs its ground-truth bindings against the heuristic's.
 Numbers below are one `oracle-kernel.yml` run (`scip-clang 0.4.0`, kernel `defconfig`, containerized
-bench image on `hetzner-bigmem`), so they cover the **compiled subset** — the 2,956 translation units
-`defconfig` actually compiles — not the whole 62,903-file tree the headline indexes. Resolution
+bench image on the self-hosted bigmem box), so they cover the **compiled subset** — the translation
+units `defconfig` actually compiles — not the whole 62,903-file tree the headline indexes. Resolution
 *quality* and tree-wide *coverage* are different populations, reported side by side, not merged.
 
 | Metric | Value | Meaning |
 |---|---|---|
 | Compiled TUs | 2,956 | the `defconfig` compilation database scip-clang consumes |
-| Heuristic `calls_name` resolved (whole index) | 64.0% | byte-anchored name-calls the syntactic resolver binds, tree-wide |
 | **Compiler precision (blended)** | **91.5%** | confirmed / (confirmed + contradicted), over every judged edge kind |
 | — `calls_name` | **91.8%** | function-call resolution (315,099 confirm / 28,068 contradict) |
-| — `references_type` | **91.1%** | type references (215,997 / 21,226) — see the forward-declaration fix below |
+| — `references_type` | **91.1%** | type references (215,997 / 21,226) — after the definitions-only fix |
 | Call recall | 44.3% | covered / (covered + oracle-only) — of calls the compiler saw, the share the graph had a `calls_name` edge for |
 | Confirmed | 531,096 | heuristic target matched the compiler's |
 | Contradicted | 49,294 | heuristic bound a different target than the compiler |
@@ -73,30 +111,30 @@ bench image on `hetzner-bigmem`), so they cover the **compiled subset** — the 
 
 The headline: on the compiled subset, name-based resolution agrees with the compiler **~92% of the
 time** on the edges it commits to — and that's after the oracle caught a real indexing bug. Getting
-here is the instructive part:
+here is the instructive part, and it is the same change that rebaselined the kernel headline above:
 
 - **The first measurement read 50.1% blended** — alarming, and it looked like "C resolution is a
-  coin flip." It wasn't a measurement artifact (a `#93` logical-symbol comparison fix moved it <1pt),
+  coin flip." It wasn't a measurement artifact (a `#93` logical-symbol comparison fix moved it <1 pt),
   so the number was real — but it was a *blend* hiding two very different populations.
 - **Splitting by edge kind exposed the culprit:** `calls_name` was already **85%**, while
-  `references_type` was **18%**. Type references, not call resolution, were dragging the headline
-  down.
+  `references_type` was **18%**. Type references, not call resolution, dragged the headline down.
 - **Root cause (#61):** the C/C++ parser emitted a symbol for *every* `struct`/`union`/`enum`
   specifier — definitions, forward declarations (`struct X;`), *and* bare uses (`struct X *p`) — plus
   function prototypes. A `references_type` edge then bound to a tiny bodyless forward-decl/use
-  occurrence instead of the real definition (`pt_regs@14 bytes` vs the real `pt_regs@1556`).
+  occurrence instead of the real definition.
 - **The fix:** index **definitions only** — a specifier must carry its body, and bare prototypes are
   dropped. `references_type` precision jumped **18% → 91.1%**, `calls_name` rose **85% → 91.8%** (the
-  same change removed mis-resolutions to prototypes), and the blend went **50.1% → 91.5%**.
+  same change removed mis-resolutions to prototypes), and the blend went **50.1% → 91.5%**. This is
+  also what cut the kernel-index symbol/chunk counts (and therefore wall-clock) above.
 
 So the honest story is the opposite of the first read: C heuristic resolution is **~92% precise**,
 and the SCIP oracle's value showed up twice — it *found* the forward-declaration bug, then quantified
-the fix. Beyond precision, this run **upgraded 334k** unresolved/low-confidence edges to compiler-grade
-confidence and recovered **29k cross-TU externals** the heuristic couldn't bind. ("committed to": the
-resolver leaves `NameOnly`/`Ambiguous` when it can't pick a target, so precision is over edges where
-the graph made a definite claim. The ~7.8M `no_occurrence` edges are call sites outside the compiled
-subset or with no SCIP occurrence at their byte range — expected, since the index spans the whole tree
-while the compilation database spans `defconfig`.)
+the fix. Beyond precision, this run **upgraded 334k** unresolved/low-confidence edges to
+compiler-grade confidence and recovered **29k cross-TU externals** the heuristic couldn't bind.
+("committed to": the resolver leaves `NameOnly`/`Ambiguous` when it can't pick a target, so precision
+is over edges where the graph made a definite claim. The bulk of edges are `no_occurrence` — call
+sites outside the compiled subset or with no SCIP occurrence at their byte range — expected, since the
+index spans the whole tree while the compilation database spans `defconfig`.)
 
 ## Rust edge resolution: heuristic vs compiler (rust-analyzer SCIP oracle)
 
@@ -108,7 +146,6 @@ indexed `.rs` file (no subset caveat).
 | Metric | Value | Meaning |
 |---|---|---|
 | Rust files indexed | 1,349 | the cargo workspace |
-| Heuristic `calls_name` resolved (in-corpus) | 14.6% | most calls in cargo target std/deps, which a single-repo name resolver can't bind in-corpus |
 | **Compiler precision (blended)** | **81.4%** | confirmed / (confirmed + contradicted), over every judged edge kind |
 | — `calls_name` | **88.6%** | function-call resolution (15,907 / 2,045) |
 | — `references_type` | **73.4%** | type references (12,012 / 4,356) — after the resolution fixes below |
@@ -121,6 +158,7 @@ indexed `.rs` file (no subset caveat).
 Read the two side by side: **call resolution `calls_name` — C 91.8% vs Rust 88.6%**; blended C 91.5%
 vs Rust 81.4%. Rust's lower blend is its `references_type` at 73.4%. Three resolution fixes lifted the
 Rust numbers from a 78.4% blend:
+
 - **type-only resolution** (a `references_type` reference no longer binds to a non-type symbol — an
   `impl` block, module, etc. — in Rust/C/C++): removed 621 mis-binds, `references_type` 70.2% → 72.5%.
 - **semantic scope paths** (symbols carry a `scope_path` like `Workspace::new` that aligns with an
@@ -128,7 +166,7 @@ Rust numbers from a 78.4% blend:
   `calls_name` 87.5% → 88.6%, blended → 80.9%.
 - **crate-aware import scope** (a name `use`d from an external dependency crate isn't bound to a local
   same-named symbol — local workspace crates are told apart from deps by scanning the corpus's
-  Cargo.toml manifests): `references_type` 72.5% → 73.4%, blended → 81.4%.
+  Cargo.toml manifests, per package): `references_type` 72.5% → 73.4%, blended → 81.4%.
 
 What keeps `references_type` at ~73% rather than higher is mostly **not a resolver bug**: a large
 share is **cross-crate workspace references** — a type defined in the `cargo` crate but referenced
@@ -136,8 +174,8 @@ from a sibling member is emitted by rust-analyzer as an external moniker with no
 the oracle can't credit rag-rat's *correct* in-corpus binding. That's a measurement floor; real
 `references_type` precision is meaningfully above the reported number. Recall: C 44.3% (oracle sees
 only the compiled `defconfig` subset) vs Rust 95.4% (rust-analyzer sees the whole workspace). The low
-14.6% in-corpus call rate is not a weakness: cargo calls overwhelmingly into `std`/dependency crates,
-and the oracle correctly bins **68k** of those as `resolved-external` rather than forcing a wrong
+in-corpus call rate is not a weakness: cargo calls overwhelmingly into `std`/dependency crates, and
+the oracle correctly bins **68k** of those as `resolved-external` rather than forcing a wrong
 in-corpus target.
 
 Run them yourself: `oracle-kernel.yml` / `tools/kernel-c-oracle.sh` (C) and `oracle-rust.yml` /
@@ -146,70 +184,43 @@ Run them yourself: `oracle-kernel.yml` / `tools/kernel-c-oracle.sh` (C) and `ora
 
 ## Memory profile: where the peak lives
 
-The run has **two** memory humps, and the higher one is missed by the named probes. The per-phase
-`RAG_RAT_MEM_TRACE=1` probes instrument the rebuild transaction and stop at COMMIT; they do **not**
-cover the embedding reconcile that `index --full` runs afterward. The 1 Hz `/proc` VmRSS sampler
-covers the whole process and is what catches the true peak. (Values below are GiB; MEMTRACE prints
-them labeled "GB" but computes KiB/1024², i.e. GiB.)
+The v0.5.0 kernel index peaks at **4.15 GiB** (4,249 MiB maxrss; the 1 Hz `/proc` VmRSS sampler
+agrees at 4,250 MiB). The run has **two** memory humps, and the higher one is missed by the named
+per-phase probes:
 
-Rebuild transaction (MEMTRACE, `t` from transaction start):
+1. **The edge-resolution window** (inside the rebuild transaction). The whole symbol + edge graph is
+   held in memory until the single resolve-and-insert pass; once `index_targets` frees it, RSS drops
+   to a flat resident baseline through logical-symbol building, FTS, and COMMIT.
+2. **The embedding reconcile** (after COMMIT, where the true peak lives). `index --full` runs the
+   embedding reconcile once the rebuild commits; the hash embedder is always ready, so embeddings are
+   actually computed. The reconcile materializes chunk rows to embed them, adding a few GiB on top of
+   the resident baseline for a sustained plateau — this is the process peak, and it is **not**
+   covered by the `RAG_RAT_MEM_TRACE=1` per-phase probes (which instrument the rebuild transaction and
+   stop at COMMIT). Only the whole-process sampler catches it.
 
-```
-before clear (start of rebuild txn):                  t+0s    rss=0.01
-edges: symbols hydrated + index built, before insert: t+133s  rss=4.64
-edges: inserted, before index rebuild:                t+479s  rss=4.64
-edges: after index rebuild:                           t+520s  rss=4.66   <- rebuild's own ceiling
-after index_targets (edges resolved+inserted):        t+523s  rss=2.99   <- in-memory graph freed
-after rebuild_logical_symbols:                        t+574s  rss=2.99
-after rebuild_fts:                                    t+636s  rss=2.99
-after COMMIT:                                         t+698s  rss=2.99
-```
+Both humps shrank from v0.4.x with the #61 symbol/chunk reduction: a smaller in-memory graph lowers
+the edge window, and ~62% fewer chunks lower the reconcile's materialization — together taking the
+peak from 5.60 GiB to 4.15 GiB. To regenerate the per-phase curve on your own run, set
+`RAG_RAT_MEM_TRACE=1` (rebuild transaction phases, to stderr) plus the sampler CSV the bench writes
+(`RSS_CSV`, the post-COMMIT reconcile the MEM_TRACE probes miss).
 
-The rebuild's own ceiling is the **edge-resolution window** (t+133–520 s): the whole symbol + edge
-graph is held in memory until the single resolve-and-insert pass, ~4.6 GiB. Once `index_targets`
-frees it, RSS settles to ~3.0 GiB and stays flat through logical symbols, FTS, and COMMIT.
+### How the peak got here
 
-But the **process peak is higher and comes later** — the VmRSS sampler shows a second hump *after*
-COMMIT, during the embedding reconcile (the hash embedder is always ready, so embeddings are
-actually computed):
+Two earlier fixes set the pre-#61 ceiling that #61 then lowered further:
 
-```
-sampler t+719.5s  rss=2.99 GiB   (post-COMMIT baseline)
-        t+721.5s  rss=4.04
-        t+723.5s  rss=5.23
-        t+724.5s  rss=5.50       <- reconcile peak, held a sustained ~11 s
-        t+735.5s  rss=5.50
-        t+736.5s  rss=3.28       (reconcile done; chunk rows freed)
-```
+- **Streaming reconcile fix** (`d5b834e`, ~9.3 GiB → 5.5 GiB). The reconcile used to count
+  policy-skipped chunks by materializing *every* chunk row — including each chunk's full `text` — into
+  a `Vec`, ~4 GiB resident purely for a count, even when zero chunks end up embedded. Streaming the
+  count row-by-row removed that ~4 GiB (the isolated skip-summary dropped 3950 MB → 11 MB, counts
+  identical).
+- **Interned edge accumulator** (`#79`/`#92`). The rebuild's edge phase was made ~4 GiB cheaper by
+  interning the edge accumulator to `Sym(u32)` ids (`CompactEdge` ≈ 64 B vs 176 B), verified
+  byte-identical against a golden index.
 
-The sampler clock starts at process spawn, ~22 s ahead of the MEMTRACE transaction clock (DB open,
-migration, discovery run first), so sampler t+720 ≈ MEMTRACE "after COMMIT" t+698. The peak is a
-sustained ~11 s plateau at **5.50 GiB**, not a sub-second transient: the reconcile materializes
-chunk rows to embed them, ~2.5 GiB on top of the ~3.0 GiB resident baseline. maxrss and the sampled
-plateau agree.
-
-So the ceiling is the **embedding reconcile**, with the rebuild's edge phase (4.66 GiB) a close
-second. (An earlier projection had the edge phase becoming the ceiling once the reconcile was fixed;
-the measured run corrects that — the fix lowered the reconcile but did not dethrone it.)
-
-### How the peak got here (~9.3 GiB → 5.5 GiB)
-
-The measured drop is the **streaming reconcile fix** (`d5b834e`). The reconcile used to count
-policy-skipped chunks by materializing *every* chunk row — including each chunk's full `text` — into
-a `Vec`, ~4 GiB resident purely for a count, even when zero chunks end up embedded. Streaming the
-count row-by-row removed that ~4 GiB (the isolated skip-summary dropped 3950 MB → 11 MB, counts
-identical). What remains at 5.5 GiB is the reconcile's *actual* embedding materialization — the next
-lever is to stream the embedding job the same way it now streams the count.
-
-Separately and earlier, the rebuild's edge phase was made ~4 GiB cheaper by interning the edge
-accumulator to `Sym(u32)` ids (`CompactEdge` ≈ 64 B vs 176 B), verified byte-identical against a
-golden index. That win was measured on smaller corpora (~1% delta there) and modeled at kernel
-scale, not isolated in a kernel run; it sets the 4.6 GiB edge-phase baseline above.
-
-Ruled out as the peak, each on the real artifact rather than by reasoning:
+Ruled out as the peak, each checked on the real artifact rather than by reasoning:
 
 - The **SQLite checkpoint is flat at ~28 MB**, shown three ways (default cache, 256 MB cache,
-  `synchronous=OFF`) replaying the real 9.5 GB WAL. `mmap_size=0`, no hooks.
+  `synchronous=OFF`) replaying the real multi-GB WAL. `mmap_size=0`, no hooks.
 - **glibc arenas** account for only ~1.2 GiB (`MALLOC_ARENA_MAX=1`, a live-process malloc setting).
 
 ## Knobs
@@ -217,9 +228,10 @@ Ruled out as the peak, each on the real artifact rather than by reasoning:
 - `RAG_RAT_INDEX_WAVE` (default 2000) — full-rebuild wave size: files are prepared in parallel
   waves, so the rebuild peak ≈ one wave of prepared files + the accumulating graph. Lower it to
   trade speed for peak RSS on a memory-constrained box.
-- `RAG_RAT_MEM_TRACE=1` — emit the per-phase rebuild RSS + sqlite-memory curve above to stderr.
-  (Note: it does not instrument the post-COMMIT reconcile — use the sampler CSV for that.)
-- `RAG_RAT_KERNEL_SUBDIRS` (bench only) — bound the indexed subtree to go faster while iterating.
+- `RAG_RAT_MEM_TRACE=1` — emit the per-phase rebuild RSS + sqlite-memory curve to stderr. (Note: it
+  does not instrument the post-COMMIT reconcile — use the sampler CSV for that.)
+- `RAG_RAT_KERNEL_SUBDIRS` (bench only) — bound the indexed subtree (e.g. `"kernel mm fs net lib"`)
+  to go faster while iterating; `.` is the whole tree (the headline).
 
 See [`bencher.md`](./bencher.md) and `tools/bench-kernel.sh` for running it yourself or in CI.
 
