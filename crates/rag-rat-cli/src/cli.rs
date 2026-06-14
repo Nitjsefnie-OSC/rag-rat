@@ -54,6 +54,9 @@ pub(crate) enum Command {
     /// Ownership / co-change clusters.
     Clusters(ClustersArgs),
 
+    /// Rank the most load-bearing symbols by weighted PageRank over the edge graph.
+    ImportantSymbols(ImportantSymbolsArgs),
+
     /// Run the stdio MCP server.
     Mcp,
 
@@ -145,6 +148,20 @@ pub(crate) struct BriefArgs {
     /// Omit drive-by repo memories.
     #[arg(long)]
     pub no_memories: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ImportantSymbolsArgs {
+    /// Max load-bearing symbols to return.
+    #[arg(long)]
+    pub limit: Option<u32>,
+    /// Symbols to bias importance toward (the symbols you're working on) — names, symbol paths, or
+    /// numeric ids, comma-separated or repeated. A numeric value is a raw symbol id; otherwise
+    /// it's resolved by symbol path then name (ambiguous/missing entries are skipped). Empty =
+    /// global importance (the CLI is global-by-default — it never auto-seeds from the git
+    /// diff).
+    #[arg(long, value_delimiter = ',')]
+    pub personalize: Vec<String>,
 }
 
 #[derive(Debug, Args)]

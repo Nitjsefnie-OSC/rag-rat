@@ -26,6 +26,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -1406,6 +1407,7 @@ fn git_history_indexes_commits_paths_queries_and_blame() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let status = db.status(&config.database).unwrap();
@@ -1520,6 +1522,7 @@ fn rag_rat_config(root: &Path) -> Config {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     }
 }
 
@@ -2464,6 +2467,7 @@ DEVICE_DT_INST_DEFINE(0, entropy_init, NULL, NULL, NULL,
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -3156,6 +3160,7 @@ where
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let symbol = db.symbols("spawn_blocking", Some(Language::Rust), 10).unwrap().remove(0);
@@ -3920,6 +3925,7 @@ fn parser_failures_report_paths() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -5804,6 +5810,7 @@ fn repo_brief_ranks_churn_and_god_module_candidates() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -5883,6 +5890,7 @@ fn repo_clusters_groups_cotouched_files() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
 
@@ -5972,6 +5980,7 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     }
 }
 
@@ -5994,6 +6003,7 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     }
 }
 
@@ -6400,6 +6410,7 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -6624,6 +6635,7 @@ fn dir_tree_truncates_at_max_nodes() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -6765,6 +6777,7 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
     let conn = db.storage.connection();
@@ -7364,6 +7377,7 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
     (root, config)
 }
@@ -7524,6 +7538,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
         local_ai: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        oracle: Default::default(),
     };
 
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -7628,6 +7643,176 @@ fn incremental_pass_heals_stale_overlay_rows() {
         extra_id, restamp_id,
         "re-stamp is in place — the row id (and ids hanging off it) survive"
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Phase 3: the LOCAL structural-load enrichment (`scoped weighted fan-in`) rides along on BOTH the
+/// `impact_surface` neighbors AND `symbol_lookup` / `search` hits — labeled, never as PageRank. A
+/// hub called by several functions outranks a leaf nothing depends on.
+#[test]
+fn load_bearing_enrichment_present_on_impact_neighbors_and_lookup_hits() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub fn load_bearing_hub() -> i32 { 1 }
+pub fn quiet_leaf() -> i32 { 2 }
+pub fn caller_one() -> i32 { load_bearing_hub() }
+pub fn caller_two() -> i32 { load_bearing_hub() }
+pub fn caller_three() -> i32 { load_bearing_hub() }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // impact_surface neighbors: running impact on a CALLER surfaces the hub as a callee neighbor,
+    // and the hub (three callers) carries the labeled load-bearing signal — the third importance
+    // scale, never PageRank.
+    let caller_selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("caller_one".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    let caller = db.select_symbol(&caller_selector).unwrap().unwrap().expect("caller symbol");
+    let report = db
+        .impact_surface_report_for_selected_symbol(
+            &caller,
+            50,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+    let enriched_hub = report
+        .direct_semantic_callees
+        .iter()
+        .find_map(|hop| hop.importance.as_ref())
+        .expect("the hub callee neighbor carries the load-bearing enrichment");
+    assert_eq!(enriched_hub.label, "local structural load", "labeled, not PageRank");
+    assert_eq!(enriched_hub.signal, "scoped weighted fan-in");
+    assert!(enriched_hub.score > 0.0, "the hub's three callers give it positive fan-in");
+
+    // symbol_lookup hits: the hub (3 callers) outscores the leaf (0). Both carry the label, but the
+    // leaf has no in-edges in scope so its enrichment is absent — the score reflects scoped fan-in.
+    let hub_hit = db
+        .symbols("load_bearing_hub", Some(Language::Rust), 10)
+        .unwrap()
+        .into_iter()
+        .find(|h| h.qualified_name.ends_with("load_bearing_hub"))
+        .expect("hub lookup hit");
+    let hub_importance =
+        hub_hit.importance.as_ref().expect("hub has callers → a load-bearing signal");
+    assert_eq!(hub_importance.label, "local structural load");
+    assert!(hub_importance.score > 0.0, "the hub's three callers give it positive fan-in");
+
+    let leaf_hit = db
+        .symbols("quiet_leaf", Some(Language::Rust), 10)
+        .unwrap()
+        .into_iter()
+        .find(|h| h.qualified_name.ends_with("quiet_leaf"))
+        .expect("leaf lookup hit");
+    assert!(
+        leaf_hit.importance.is_none(),
+        "a symbol nothing depends on has no in-scope fan-in: {:?}",
+        leaf_hit.importance
+    );
+
+    // search hits carry the same enrichment on the resolved symbol.
+    let search_hub =
+        db.search("load_bearing_hub", 20, true).unwrap().into_iter().find(|hit| {
+            hit.symbol_path.as_deref().is_some_and(|s| s.ends_with("load_bearing_hub"))
+        });
+    if let Some(hit) = search_hub
+        && let Some(importance) = hit.importance.as_ref()
+    {
+        assert_eq!(importance.label, "local structural load", "search hit labeled correctly");
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Phase 3 regression: a CALLEE neighbor whose call was written with a `::` path carries a
+/// source-level `target_qualified_name` (e.g. `crate::helper::deep_helper`) that does NOT match
+/// rag-rat's `path::name` `qualified_name`. The enrichment must resolve such callees by
+/// `to_symbol` (the verified rag-rat `path::name` target) FIRST — resolving by
+/// `target_qualified_name` first leaves every qualified-call callee un-enriched. The sibling test
+/// above misses this: its callees are bare calls, so `target_qualified_name` is `None` and the
+/// fallback to `to_symbol` masks the wrong-order bug.
+#[test]
+fn load_bearing_enrichment_present_on_qualified_callee_neighbor() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // `deep_helper` is reached only via the `crate::helper::deep_helper()` path, so its callee
+    // edge carries a `target_qualified_name` of `crate::helper::deep_helper` — divergent from the
+    // rag-rat `path::name` `qualified_name`. Two callers give it fan-in ≥ 1 (so its scoped
+    // weighted fan-in is `Some`).
+    fs::write(
+        root.join("src/helper.rs"),
+        r#"
+pub fn deep_helper() -> i32 { 7 }
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub mod helper;
+pub fn qualified_caller_one() -> i32 { crate::helper::deep_helper() }
+pub fn qualified_caller_two() -> i32 { crate::helper::deep_helper() }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let caller_selector = crate::query::symbol::SymbolSelector {
+        logical_symbol_id: None,
+        symbol_id: None,
+        symbol_path: None,
+        symbol: Some("qualified_caller_one".to_string()),
+        language: Some(Language::Rust),
+        allow_ambiguous: false,
+        limit: 10,
+    };
+    let caller =
+        db.select_symbol(&caller_selector).unwrap().unwrap().expect("qualified caller symbol");
+    let report = db
+        .impact_surface_report_for_selected_symbol(
+            &caller,
+            50,
+            &crate::query::impact::ImpactSurfaceOptions::default(),
+        )
+        .unwrap();
+
+    let callee_hop = report
+        .direct_semantic_callees
+        .iter()
+        .find(|hop| hop.to_symbol.as_deref().is_some_and(|s| s.ends_with("deep_helper")))
+        .expect("the qualified callee neighbor is surfaced");
+    // The callee carries the divergent source-level qualified name — the exact shape that
+    // un-enriched callees in the wild (`self::storage::connection`, etc.).
+    assert!(
+        callee_hop
+            .target_qualified_name
+            .as_deref()
+            .is_some_and(|q| q.contains("::") && !q.contains('/')),
+        "callee carries a source-level (non path::name) target_qualified_name: {:?}",
+        callee_hop.target_qualified_name
+    );
+    let importance = callee_hop
+        .importance
+        .as_ref()
+        .expect("the qualified callee neighbor carries the load-bearing enrichment");
+    assert_eq!(importance.label, "local structural load", "labeled, not PageRank");
+    assert_eq!(importance.signal, "scoped weighted fan-in");
+    assert!(importance.score > 0.0, "two callers give the callee positive fan-in");
 
     fs::remove_dir_all(root).unwrap();
 }

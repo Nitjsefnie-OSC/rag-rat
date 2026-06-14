@@ -1,7 +1,47 @@
+use rusqlite::OptionalExtension;
+
 use super::*;
 use crate::index::oracle::{
     self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
 };
+use crate::query::pagerank::ImportantSymbolsResult;
+
+/// Inputs to [`IndexDatabase::important_symbols`]. The seed (`personalize`) takes names, paths, or
+/// numeric ids; `auto_seed_from_diff` is the MCP-only default (seed from the current git diff when
+/// no explicit seed is given) — the CLI passes `false` so it stays global-by-default. The
+/// intentional MCP/CLI divergence is acceptance-invariant #1.
+pub struct ImportantSymbolsRequest {
+    pub limit: usize,
+    pub personalize: Vec<String>,
+    pub auto_seed_from_diff: bool,
+}
+
+/// Explicit seed selectors resolved to in-graph symbol ids, plus the count that resolved to nothing
+/// (ambiguous / missing — skipped, not fatal).
+struct ResolvedSeeds {
+    symbol_ids: Vec<i64>,
+    unresolved: u64,
+}
+
+/// The git-diff auto-seed, mapped through the scoped `files` view, with provenance counts.
+#[derive(Default)]
+struct DiffSeed {
+    symbol_ids: Vec<i64>,
+    changed_paths: u64,
+    indexed_paths: u64,
+    skipped: crate::query::pagerank::SkippedSeeds,
+}
+
+/// What one changed path contributed to the diff seed.
+enum ChangedPathSymbols {
+    /// The path is indexed (non-generated) in the active scope; its symbol ids (possibly empty for
+    /// a config/markdown file or a parser gap).
+    Symbols(Vec<i64>),
+    /// The path is indexed as a generated artifact — deliberately excluded from the seed.
+    Generated,
+    /// The path is not in the active scope's `files` view at all.
+    None,
+}
 
 impl IndexDatabase {
     /// Run a SCIP-oracle pass from a pre-built `.scip` over the current (active commit/worktree)
@@ -148,6 +188,18 @@ impl IndexDatabase {
         )
     }
 
+    /// The `started_at` (Unix-epoch ms) of the most recent oracle run for `tool` in this checkout,
+    /// or `None` when none exists — the staleness clock the background auto-fresh oracle (Phase
+    /// 5) compares against the index's `indexed_at_ms` to decide whether verdicts are stale.
+    pub fn latest_oracle_run_started_at(&self, tool: OracleTool) -> anyhow::Result<Option<i64>> {
+        oracle::latest_run_started_at(
+            self.storage.connection(),
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )
+    }
+
     pub fn status(&self, database: &Path) -> anyhow::Result<IndexStatus> {
         let mut counts = BTreeMap::new();
         let mut stmt = self
@@ -285,6 +337,7 @@ impl IndexDatabase {
             graph_mode,
             graph_limit,
         )?;
+        self.enrich_search_hits_with_load_bearing(&mut hits)?;
         Ok(hits)
     }
 
@@ -324,6 +377,7 @@ impl IndexDatabase {
             graph_mode,
             graph_limit,
         )?;
+        self.enrich_search_hits_with_load_bearing(&mut hits)?;
         Ok(hits)
     }
 
@@ -333,14 +387,20 @@ impl IndexDatabase {
         language: Option<Language>,
         limit: u32,
     ) -> anyhow::Result<Vec<crate::query::symbol::SymbolHit>> {
-        crate::query::symbol::lookup(self.storage.connection(), name, language, limit)
+        let mut hits =
+            crate::query::symbol::lookup(self.storage.connection(), name, language, limit)?;
+        self.enrich_symbol_hits_with_load_bearing(&mut hits)?;
+        Ok(hits)
     }
 
     pub fn symbol_candidates(
         &self,
         selector: &crate::query::symbol::SymbolSelector,
     ) -> anyhow::Result<crate::query::symbol::SymbolLookup> {
-        crate::query::symbol::lookup_candidates(self.storage.connection(), selector)
+        let mut lookup =
+            crate::query::symbol::lookup_candidates(self.storage.connection(), selector)?;
+        self.enrich_symbol_hits_with_load_bearing(&mut lookup.candidates)?;
+        Ok(lookup)
     }
 
     pub fn select_symbol(
@@ -1586,6 +1646,7 @@ impl IndexDatabase {
                     summary: bounded_summary(&text),
                     graph: None,
                     score_components: None,
+                    importance: None,
                 })
             },
         )?;
@@ -1644,12 +1705,20 @@ impl IndexDatabase {
         // finding
         // 4) and before the memory-evidence edge-id collection — so a compiler-upgraded neighbor
         // can't be dropped by the heuristic limit, and downstream counts see the final window.
-        let report = crate::query::impact::impact_surface_report_for_symbol(
+        let mut report = crate::query::impact::impact_surface_report_for_symbol(
             self.storage.connection(),
             symbol,
             limit,
             options,
             |hops| self.enrich_hops_with_oracle(hops),
+        )?;
+        // Attach the LOCAL structural-load signal (scoped weighted fan-in — the third importance
+        // scale, NOT PageRank) to the direct graph neighbors AFTER the oracle re-rank + truncate,
+        // so it scores exactly the neighbors the report returns. One gated oracle fetch is
+        // reused across all neighbors.
+        self.enrich_neighbors_with_load_bearing(
+            &mut report.direct_semantic_callers,
+            &mut report.direct_semantic_callees,
         )?;
         Ok(report)
     }
@@ -1666,6 +1735,503 @@ impl IndexDatabase {
         options: crate::query::clusters::RepoClustersOptions,
     ) -> anyhow::Result<crate::query::clusters::RepoClustersReport> {
         crate::query::clusters::repo_clusters(self.storage.connection(), options)
+    }
+
+    /// Top load-bearing symbols by weighted PageRank over the active checkout's edge graph (#108).
+    /// `personalize_to` biases importance toward those symbol ids (changed/query symbols); empty =
+    /// global.
+    ///
+    /// When a SCIP oracle run exists for this checkout, ranking uses the compiler-verified graph
+    /// (contradicted edges dropped, upgrades retargeted, confirmed/upgraded edges weighted above
+    /// heuristic) — otherwise the heuristic graph with confidence weighting. The oracle lookup is
+    /// gated on a run existing, so absent oracle data it costs nothing (no scan).
+    /// Rank load-bearing symbols, returning the labeled [`ImportantSymbolsResult`] (mode + seed
+    /// provenance), per the spec's "three scales". Seed resolution happens HERE, at the query
+    /// boundary, because it needs both the symbol index (name/path → id) and git (the working-set
+    /// diff) — `query::pagerank` stays a pure ranking primitive over raw ids.
+    ///
+    /// Seed precedence:
+    /// - explicit `request.personalize` (names / paths / numeric ids) → `SeedKind::Explicit`;
+    /// - else, if `request.auto_seed_from_diff` (the MCP default), the current git diff →
+    ///   `SeedKind::GitDiff`;
+    /// - else (the CLI default, or an explicit empty/`global` selector) → global, un-seeded.
+    ///
+    /// A seed intent that resolves to NO in-graph symbol (bad names only, or a diff with no indexed
+    /// symbols) does NOT hard-error: it falls through to global ranking but REPORTS the
+    /// fall-through (`mode = global …` + `reason` + the diff counts), so the caller sees WHY it
+    /// was un-seeded.
+    pub fn important_symbols(
+        &self,
+        request: ImportantSymbolsRequest,
+    ) -> anyhow::Result<ImportantSymbolsResult> {
+        use crate::query::pagerank::{ImportanceMode, SeedKind, SeedSource, SkippedSeeds};
+
+        let oracle_effects = self.symbol_importance_oracle_effects()?;
+        // Heuristic-only ranking (no oracle run for this checkout) earns a one-line nudge that
+        // compiler-grade ranking is available. The config-unaware wording lives here; CLI/MCP swap
+        // in the auto-run variant when `[oracle] auto_run` is on.
+        let ranking_hint: Option<String> = oracle_effects
+            .is_none()
+            .then(|| crate::query::pagerank::RANKING_HINT_RUN_ORACLE.to_string());
+        let rank = |seed: &[i64]| -> anyhow::Result<crate::query::pagerank::RankedImportance> {
+            crate::query::pagerank::important_symbols(
+                self.storage.connection(),
+                crate::query::pagerank::ImportanceOptions {
+                    limit: request.limit,
+                    personalize_to: seed,
+                    oracle_effects: oracle_effects.as_ref(),
+                },
+            )
+        };
+
+        // Explicit names/paths/ids win over the auto-diff default.
+        if !request.personalize.is_empty() {
+            let resolved = self.resolve_seed_selectors(&request.personalize)?;
+            let ranked = rank(&resolved.symbol_ids)?;
+            let seed_source = SeedSource {
+                kind: SeedKind::Explicit,
+                // Explicit seeds are names, not paths — no path population to report.
+                changed_paths: 0,
+                indexed_paths: 0,
+                symbol_seed_count: resolved.symbol_ids.len() as u64,
+                effective_seed_count: ranked.effective_seed_count,
+                skipped: SkippedSeeds { no_symbols: resolved.unresolved, ..Default::default() },
+            };
+            // No seed reached the graph — either nothing resolved, or the resolved symbols are not
+            // endpoints of any edge — so the ranking is actually global. Label it Global and say
+            // why, rather than implying it is personalized to the named symbols. (#142 review)
+            if ranked.effective_seed_count == 0 {
+                let reason = if resolved.symbol_ids.is_empty() {
+                    "no named symbols resolved to the active scope"
+                } else {
+                    "named symbols are not connected in the graph"
+                };
+                return Ok(ImportantSymbolsResult {
+                    mode: ImportanceMode::Global,
+                    seed_source: Some(seed_source),
+                    reason: Some(reason.to_string()),
+                    diff_paths_considered: None,
+                    diff_paths_with_symbols: None,
+                    ranking_hint: ranking_hint.clone(),
+                    symbols: ranked.symbols,
+                });
+            }
+            return Ok(ImportantSymbolsResult {
+                mode: ImportanceMode::PersonalizedToChanges,
+                seed_source: Some(seed_source),
+                reason: None,
+                diff_paths_considered: None,
+                diff_paths_with_symbols: None,
+                ranking_hint,
+                symbols: ranked.symbols,
+            });
+        }
+
+        // No explicit seed. CLI stays global-by-default; only the MCP default auto-seeds from diff.
+        if !request.auto_seed_from_diff {
+            return Ok(ImportantSymbolsResult {
+                mode: ImportanceMode::Global,
+                seed_source: None,
+                reason: None,
+                diff_paths_considered: None,
+                diff_paths_with_symbols: None,
+                ranking_hint: ranking_hint.clone(),
+                symbols: rank(&[])?.symbols,
+            });
+        }
+
+        let diff = self.diff_seed()?;
+        let ranked = rank(&diff.symbol_ids)?;
+        // The diff produced no effective graph seed — either no changed path mapped to an indexed
+        // symbol (markdown/config/generated/deleted-only, parser gaps) OR the symbols it resolved
+        // are isolated in the graph — so the ranking is actually global. Report it with counts and
+        // the reason rather than mislabeling it personalized. (#142 review)
+        if ranked.effective_seed_count == 0 {
+            let reason = if diff.symbol_ids.is_empty() {
+                "no symbols found in current diff"
+            } else {
+                "diff symbols are not connected in the graph"
+            };
+            return Ok(ImportantSymbolsResult {
+                mode: ImportanceMode::Global,
+                seed_source: Some(SeedSource {
+                    kind: SeedKind::GitDiff,
+                    changed_paths: diff.changed_paths,
+                    indexed_paths: diff.indexed_paths,
+                    symbol_seed_count: diff.symbol_ids.len() as u64,
+                    effective_seed_count: 0,
+                    skipped: diff.skipped,
+                }),
+                reason: Some(reason.to_string()),
+                diff_paths_considered: Some(diff.changed_paths),
+                diff_paths_with_symbols: Some(diff.indexed_paths),
+                ranking_hint: ranking_hint.clone(),
+                symbols: ranked.symbols,
+            });
+        }
+        Ok(ImportantSymbolsResult {
+            mode: ImportanceMode::PersonalizedToChanges,
+            seed_source: Some(SeedSource {
+                kind: SeedKind::GitDiff,
+                changed_paths: diff.changed_paths,
+                indexed_paths: diff.indexed_paths,
+                symbol_seed_count: diff.symbol_ids.len() as u64,
+                effective_seed_count: ranked.effective_seed_count,
+                skipped: diff.skipped,
+            }),
+            reason: None,
+            diff_paths_considered: None,
+            diff_paths_with_symbols: None,
+            ranking_hint,
+            symbols: ranked.symbols,
+        })
+    }
+
+    /// Resolve a mixed list of explicit seed selectors (numeric symbol ids, symbol paths, or bare
+    /// names) to in-index symbol ids at the query boundary. A numeric string is a raw symbol id; a
+    /// name that resolves to nothing in the active scope is SKIPPED (counted in `unresolved`),
+    /// never fatal — one bad name must not sink the whole call. Resolution order per
+    /// non-numeric entry: `symbol_path` (EXACT qualified name) first; only if that resolves to
+    /// exactly one symbol do we use it — otherwise we fall through to a bare-NAME lookup.
+    ///
+    /// Personalization is a teleport SET, not a single-symbol picker: a bare name therefore seeds
+    /// ALL of its in-scope matches (the type PLUS its `impl` blocks/methods all carry the type's
+    /// name — that whole entity is exactly what we want to bias toward), rather than skipping on
+    /// ambiguity the way a `memory rebind`-style resolver would. Skipping on >1 match was the Phase
+    /// 4 UX bug: any type with impls (essentially every type) matched >1 symbol, so the
+    /// headline `--personalize <Type>` resolved to nothing and silently fell back to global
+    /// ranking.
+    fn resolve_seed_selectors(&self, selectors: &[String]) -> anyhow::Result<ResolvedSeeds> {
+        use crate::query::symbol::SymbolSelector;
+
+        // Cap per-name expansion so a very common name (matched by hundreds of symbols) can't flood
+        // the teleport set and wash out the signal. 25 comfortably covers a type plus its impls/
+        // methods (the intended entity) while bounding pathological names; the overall `symbol_ids`
+        // is sort+dedup'd below so a name and an explicit id that overlap don't double-count.
+        const PER_NAME_SEED_CAP: u32 = 25;
+
+        let mut symbol_ids = Vec::new();
+        let mut unresolved = 0_u64;
+        for raw in selectors {
+            let entry = raw.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Ok(id) = entry.parse::<i64>() {
+                symbol_ids.push(id);
+                continue;
+            }
+            // Try `symbol_path` (EXACT qualified name) FIRST: an unambiguous fully-qualified name
+            // resolves to exactly one symbol and we use it as-is. `allow_ambiguous: false` makes a
+            // multi-candidate qualified name resolve to `Err(disambiguation)` → fall through to the
+            // bare-name expansion below; a missing one is `Ok(None)` → also fall through.
+            let by_path = SymbolSelector {
+                logical_symbol_id: None,
+                symbol_id: None,
+                symbol_path: Some(entry.to_string()),
+                symbol: None,
+                language: None,
+                allow_ambiguous: false,
+                limit: 8,
+            };
+            if let Ok(Some(hit)) = self.select_symbol(&by_path)? {
+                symbol_ids.push(hit.symbol_id);
+                continue;
+            }
+            // Bare-NAME fallback: resolve to ALL in-scope matches (capped) and seed every one.
+            // `symbol_candidates` → `lookup_candidates` reads through the per-connection scoped
+            // `files` view (overlay rows win, non-active checkouts excluded), so these ids are
+            // already scope-correct — keep that path; do not query raw tables.
+            let by_name = SymbolSelector {
+                symbol_path: None,
+                symbol: Some(entry.to_string()),
+                allow_ambiguous: true,
+                limit: PER_NAME_SEED_CAP,
+                ..by_path
+            };
+            // Use the UNENRICHED lookup: seed resolution only needs `symbol_id`, and the enriched
+            // `symbol_candidates` would fetch the oracle effect map + run a fan-in query per hit —
+            // a whole-graph oracle scan per seed name, repeated, all discarded here (#142 review).
+            let candidates =
+                crate::query::symbol::lookup_candidates(self.storage.connection(), &by_name)?
+                    .candidates;
+            if candidates.is_empty() {
+                unresolved += 1;
+            } else {
+                symbol_ids.extend(candidates.into_iter().map(|hit| hit.symbol_id));
+            }
+        }
+        symbol_ids.sort_unstable();
+        symbol_ids.dedup();
+        Ok(ResolvedSeeds { symbol_ids, unresolved })
+    }
+
+    /// Auto-seed from the current git diff (the MCP default). Maps the changed paths through the
+    /// per-connection scoped `files` view to in-scope symbol ids, bucketing the paths that
+    /// contribute no seed (deleted, generated, no-symbols) for provenance.
+    fn diff_seed(&self) -> anyhow::Result<DiffSeed> {
+        let Some(root) = self.storage.source_root() else {
+            // No source root → no working tree to diff (e.g. a bare/copied index). Treat as an
+            // empty diff, not an error: the caller falls through to global with a reason.
+            return Ok(DiffSeed::default());
+        };
+        // A configured source root that is not a git worktree (or has no HEAD, or git is absent)
+        // must NOT fail the whole tool: auto-seed-from-diff is a best-effort default, so treat any
+        // git error as an empty diff and let the caller fall through to global — mirroring the
+        // other index paths that tolerate missing git with empty metadata. (#142 review)
+        let Ok(changed) = crate::index::git_changed_paths(root) else {
+            return Ok(DiffSeed::default());
+        };
+        let changed_paths = (changed.changed.len() + changed.deleted.len()) as u64;
+        let mut seed = DiffSeed { changed_paths, ..Default::default() };
+        // Deleted/renamed-away paths can never carry an in-scope symbol — count and skip them.
+        seed.skipped.deleted = changed.deleted.len() as u64;
+
+        let mut symbol_ids = Vec::new();
+        for path in &changed.changed {
+            let path = crate::index::path_string_for_seed(path);
+            match self.symbol_ids_for_changed_path(&path)? {
+                ChangedPathSymbols::Symbols(ids) if !ids.is_empty() => {
+                    seed.indexed_paths += 1;
+                    symbol_ids.extend(ids);
+                },
+                // Indexed as a generated artifact: real but deliberately excluded from the seed.
+                ChangedPathSymbols::Generated => seed.skipped.generated += 1,
+                // In the working set but contributes no in-scope symbol (config/markdown, parser
+                // gap, or not indexed at all).
+                ChangedPathSymbols::Symbols(_) | ChangedPathSymbols::None =>
+                    seed.skipped.no_symbols += 1,
+            }
+        }
+        symbol_ids.sort_unstable();
+        symbol_ids.dedup();
+        seed.symbol_ids = symbol_ids;
+        Ok(seed)
+    }
+
+    /// Map ONE changed path to its in-scope symbol ids, classifying via the per-connection scoped
+    /// `files` view. SCOPED-VIEW REQUIREMENT (#89): the JOIN goes through `files` (the TEMP VIEW
+    /// installed per connection — overlay rows win, other commits/worktrees excluded), NEVER raw
+    /// `main.symbols`/`main.files`. Querying raw tables here would seed PageRank from symbols
+    /// belonging to a non-active checkout (or shadowed committed rows), corrupting a per-scope
+    /// ranking with cross-scope identity — the exact failure the scope view exists to prevent.
+    fn symbol_ids_for_changed_path(&self, path: &str) -> anyhow::Result<ChangedPathSymbols> {
+        let conn = self.storage.connection();
+        // First: is the path indexed in the active scope at all, and is it generated? `files` is
+        // the scoped view, so a path outside the active checkout returns no row → `None`.
+        let generated: Option<bool> = conn
+            .query_row("SELECT generated FROM files WHERE path = ?1", [path], |row| {
+                row.get::<_, i64>(0).map(|flag| flag != 0)
+            })
+            .optional()?;
+        let Some(generated) = generated else {
+            return Ok(ChangedPathSymbols::None);
+        };
+        if generated {
+            return Ok(ChangedPathSymbols::Generated);
+        }
+        // SCOPED-VIEW REQUIREMENT (#89): join symbols to the `files` scope view, not raw tables, so
+        // only symbols of the ACTIVE version of this file become PageRank seeds.
+        let mut stmt = conn.prepare(
+            "SELECT symbols.id
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             WHERE files.path = ?1",
+        )?;
+        let ids =
+            stmt.query_map([path], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(ChangedPathSymbols::Symbols(ids))
+    }
+
+    /// Build the `edge_id -> EdgeOracleEffect` map that makes [`Self::important_symbols`]
+    /// SCIP-aware, merging current+in-scope verdicts across every oracle tool that has a run in
+    /// this checkout. Returns `None` when no run exists — the common case, where ranking pays zero
+    /// oracle cost (one existence probe short-circuits the per-tool version lookups + the
+    /// whole-graph verdict scan). Maps `OracleResolutionKind` to a ranking effect here so
+    /// `query::pagerank` stays free of oracle types:
+    /// - the compiler resolved an in-corpus target (`Upgrade` or `Contradict` with a resolved
+    ///   symbol) → **retarget** the edge there (the compiler's answer, whether it upgrades an
+    ///   unconfirmed edge or overrides a wrong heuristic one);
+    /// - `Confirm` → verify the heuristic target in place;
+    /// - `ResolvedExternal`, or a `Contradict` with no in-corpus target → **drop** the phantom edge
+    ///   (the real callee is out of corpus);
+    /// - an `Upgrade` with no resolved target → leave the edge heuristic (unconfirmed, not refuted
+    ///   — #82 finding 2).
+    fn symbol_importance_oracle_effects(
+        &self,
+    ) -> anyhow::Result<
+        Option<std::collections::HashMap<i64, crate::query::pagerank::EdgeOracleEffect>>,
+    > {
+        use crate::index::oracle::OracleResolutionKind as Kind;
+        use crate::query::pagerank::EdgeOracleEffect;
+        // CPU gate: one scoped existence query, so the dominant "no oracle ever" path skips the
+        // per-tool version lookups and the whole-graph verdict scan entirely.
+        if !oracle::any_run_in_scope(
+            self.storage.connection(),
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+        )? {
+            return Ok(None);
+        }
+        let mut effects: Option<std::collections::HashMap<i64, EdgeOracleEffect>> = None;
+        for &tool in oracle::OracleTool::ALL {
+            let Some(version) = self.latest_oracle_run_version(tool)? else {
+                continue;
+            };
+            let verdicts = oracle::current_oracle_verdicts_all(
+                self.storage.connection(),
+                tool,
+                &version,
+                &self.active_commit_sha,
+                &self.active_worktree_id,
+            )?;
+            let map = effects.get_or_insert_with(std::collections::HashMap::new);
+            for (edge_id, (kind, resolved_symbol_id)) in verdicts {
+                let effect = match (kind, resolved_symbol_id) {
+                    // Out-of-corpus callee: the in-repo target is a phantom either way.
+                    (Kind::ResolvedExternal, _) | (Kind::Contradict, None) =>
+                        EdgeOracleEffect::Drop,
+                    (Kind::Confirm, _) => EdgeOracleEffect::Confirm,
+                    // Compiler resolved an in-corpus target — trust it over the heuristic.
+                    (Kind::Upgrade | Kind::Contradict, Some(id)) => EdgeOracleEffect::Retarget(id),
+                    // Upgrade we can't name a target for: leave the edge heuristic.
+                    (Kind::Upgrade, None) => continue,
+                };
+                // An edge belongs to one file → one language → at most one tool's verdict, so this
+                // never overwrites a different tool's effect for the same edge.
+                map.insert(edge_id, effect);
+            }
+        }
+        Ok(effects)
+    }
+
+    /// The active-scope symbol id for a qualified name, resolved THROUGH the per-connection `files`
+    /// scope view so a foreign scope's same-named symbol never matches (the same #89 discipline the
+    /// fan-in query uses). `None` when no in-scope symbol has that qualified name. When more than
+    /// one in-scope symbol shares the name (overloads / cfg twins) the lowest id is returned —
+    /// the fan-in is computed per concrete symbol id, and the load-bearing signal is a coarse
+    /// bucket, so picking a stable representative is acceptable for the enrichment.
+    fn active_symbol_id_for_qualified_name(
+        &self,
+        qualified_name: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .storage
+            .connection()
+            .query_row(
+                "SELECT s.id FROM symbols s
+                 JOIN files ON files.id = s.file_id
+                 WHERE s.qualified_name = ?1
+                 ORDER BY s.id
+                 LIMIT 1",
+                [qualified_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Build the load-bearing oracle context ONCE for an enrichment call: reuse the same gated
+    /// verdict map `important_symbols` uses (a single existence probe short-circuits the
+    /// no-oracle-ever path), and hold it for the whole pass so no symbol triggers its own verdict
+    /// scan. The returned owned map is borrowed into an [`OracleContext`] per symbol below.
+    fn load_bearing_oracle_effects(
+        &self,
+    ) -> anyhow::Result<
+        Option<std::collections::HashMap<i64, crate::query::pagerank::EdgeOracleEffect>>,
+    > {
+        self.symbol_importance_oracle_effects()
+    }
+
+    /// Attach the LOCAL structural-load enrichment (scoped weighted fan-in — the third importance
+    /// scale, NOT PageRank) to `impact_surface` neighbors. The neighbor whose load we score is the
+    /// edge's FAR end: for a CALLER hop that's `from_symbol`, for a CALLEE hop that's `to_symbol`.
+    /// The oracle effect map is fetched ONCE and reused across every hop.
+    fn enrich_neighbors_with_load_bearing(
+        &self,
+        callers: &mut [crate::query::graph::GraphHop],
+        callees: &mut [crate::query::graph::GraphHop],
+    ) -> anyhow::Result<()> {
+        use crate::query::load_bearing::{self, OracleContext};
+        // Nothing to enrich → don't pay the oracle lookup. (#142 review)
+        if callers.is_empty() && callees.is_empty() {
+            return Ok(());
+        }
+        let effects = self.load_bearing_oracle_effects()?;
+        let oracle = OracleContext { effects: effects.as_ref() };
+        let enrich = |hop: &mut crate::query::graph::GraphHop,
+                      neighbor: Option<&str>|
+         -> anyhow::Result<()> {
+            let Some(name) = neighbor else { return Ok(()) };
+            let Some(symbol_id) = self.active_symbol_id_for_qualified_name(name)? else {
+                return Ok(());
+            };
+            hop.importance = load_bearing::scoped_weighted_fan_in(
+                self.storage.connection(),
+                symbol_id,
+                &oracle,
+            )?;
+            Ok(())
+        };
+        for hop in callers.iter_mut() {
+            let neighbor = hop.from_symbol.clone();
+            enrich(hop, neighbor.as_deref())?;
+        }
+        for hop in callees.iter_mut() {
+            let neighbor = hop.to_symbol.clone().or_else(|| hop.target_qualified_name.clone());
+            enrich(hop, neighbor.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Attach the load-bearing enrichment to search hits, scoring each hit's symbol (resolved from
+    /// `chunk.symbol_path`, which is the chunk's qualified name) through the active scope. Hits
+    /// with no symbol, or whose symbol has no in-scope in-edges, are left un-enriched. One
+    /// oracle fetch for the whole batch.
+    fn enrich_search_hits_with_load_bearing(&self, hits: &mut [SearchHit]) -> anyhow::Result<()> {
+        use crate::query::load_bearing::{self, OracleContext};
+        // Nothing enrichable → don't pay the (whole-graph) oracle lookup. A result made entirely of
+        // file/doc chunks with no `symbol_path` (common for Markdown/config) would otherwise scan
+        // every oracle verdict and then skip every hit. (#142 review)
+        if hits.iter().all(|hit| hit.symbol_path.is_none()) {
+            return Ok(());
+        }
+        let effects = self.load_bearing_oracle_effects()?;
+        let oracle = OracleContext { effects: effects.as_ref() };
+        for hit in hits.iter_mut() {
+            let Some(symbol_path) = hit.symbol_path.clone() else { continue };
+            let Some(symbol_id) = self.active_symbol_id_for_qualified_name(&symbol_path)? else {
+                continue;
+            };
+            hit.importance = load_bearing::scoped_weighted_fan_in(
+                self.storage.connection(),
+                symbol_id,
+                &oracle,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Attach the load-bearing enrichment to `symbol_lookup` hits (each carries its own
+    /// `symbol_id`). One oracle fetch for the whole batch.
+    fn enrich_symbol_hits_with_load_bearing(
+        &self,
+        hits: &mut [crate::query::symbol::SymbolHit],
+    ) -> anyhow::Result<()> {
+        use crate::query::load_bearing::{self, OracleContext};
+        // Nothing to enrich → don't pay the oracle lookup. (#142 review)
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let effects = self.load_bearing_oracle_effects()?;
+        let oracle = OracleContext { effects: effects.as_ref() };
+        for hit in hits.iter_mut() {
+            hit.importance = load_bearing::scoped_weighted_fan_in(
+                self.storage.connection(),
+                hit.symbol_id,
+                &oracle,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn memory_create(
@@ -1883,6 +2449,7 @@ mod oracle_surfacing_tests {
             local_ai: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
+            oracle: Default::default(),
         }
     }
 
@@ -2259,6 +2826,88 @@ mod oracle_surfacing_tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// End-to-end #108 SCIP-aware ranking: an in-corpus Contradict RETARGETS importance to the
+    /// compiler's true callee. The heuristic resolves `caller -> target`; the compiler contradicts
+    /// it, resolving the callee to the in-corpus `other`. Before the run, `target` carries the
+    /// call's rank and `other` none; after, the rank flows to `other` (the compiler's answer),
+    /// not the heuristic guess. Proves the wrapper gates on a run existing, maps in-corpus
+    /// Contradict to a retarget, and applies it through to the ranker.
+    #[test]
+    fn important_symbols_retargets_an_in_corpus_contradiction() {
+        let root = temp_root();
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() { target(); } fn target() {} fn other() {}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let conn = db.storage.connection();
+
+        let (edge_id, cs, ce, path) = call_edge(&db);
+        let name_of = |id: i64| -> String {
+            conn.query_row("SELECT qualified_name FROM symbols WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let target_sym: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let target_qn = name_of(target_sym);
+        // Force the heuristic edge to look exactly-resolved to `target`.
+        conn.execute(
+            "UPDATE edges SET confidence = 'Exact', resolution = 'exact', to_symbol_id = ?2 WHERE \
+             id = ?1",
+            params![edge_id, target_sym],
+        )
+        .unwrap();
+
+        let score_of = |out: &[crate::query::pagerank::SymbolImportance], qn: &str| {
+            out.iter().find(|s| s.qualified_name == qn).map_or(0.0, |s| s.score)
+        };
+
+        // The compiler contradicts the heuristic, resolving the callee to the other in-corpus def.
+        let (other_id, other_start, other_end): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, start_byte, end_byte FROM symbols WHERE name = 'other' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let other_qn = name_of(other_id);
+
+        // Heuristic ranking (no oracle run yet): `target` carries the call's rank, `other` none.
+        let before = global_ranking(&db);
+        assert!(
+            score_of(&before, &target_qn) > 0.0,
+            "heuristically `target` carries rank: {before:?}"
+        );
+        assert_eq!(
+            score_of(&before, &other_qn),
+            0.0,
+            "`other` is uncalled heuristically: {before:?}"
+        );
+
+        let symbol = "scip-rust crate held-mini `other`().";
+        let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((other_start, other_end)));
+        db.run_oracle_from_scip(OracleTool::RustAnalyzer, "v-test", &scip).unwrap();
+
+        // SCIP-aware ranking: the edge is retargeted to the compiler's `other` — rank flows there,
+        // and the contradicted heuristic target `target` loses it.
+        let after = global_ranking(&db);
+        assert!(
+            score_of(&after, &other_qn) > score_of(&after, &target_qn),
+            "rank flows to the compiler's resolved callee, not the heuristic guess: {after:?}"
+        );
+        assert!(
+            score_of(&after, &other_qn) > score_of(&before, &other_qn),
+            "the retargeted callee gains rank it did not have heuristically: {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// #82 finding 2: an `Upgrade` on a heuristic-unresolved edge must surface the SCIP-RESOLVED
     /// symbol as the hop's target, not the heuristic's missing/heuristic one. We strip the
     /// heuristic resolution (NameOnly, no `to_symbol_id`) and let the compiler resolve in-corpus,
@@ -2512,6 +3161,7 @@ mod oracle_surfacing_tests {
             verified_target_symbol: false,
             shown_by_default: true,
             callsite: None,
+            importance: None,
         };
         let hops = vec![
             hop(Some("resolved-external(tokio)")),
@@ -2574,6 +3224,373 @@ mod oracle_surfacing_tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Global (un-seeded) ranking — the common assertion shape: no explicit seed, no auto-diff.
+    fn global_ranking(db: &IndexDatabase) -> Vec<crate::query::pagerank::SymbolImportance> {
+        db.important_symbols(ImportantSymbolsRequest {
+            limit: 20,
+            personalize: Vec::new(),
+            auto_seed_from_diff: false,
+        })
+        .unwrap()
+        .symbols
+    }
+
+    /// A real committed git checkout where `caller` calls `target`, plus an UNCOMMITTED edit that
+    /// adds `fn touched()` to a second file — so `git_changed_paths` reports a non-empty diff with
+    /// an indexed symbol. `touched` CALLS `placeholder` so it is an endpoint of a resolved edge,
+    /// i.e. an actual node in the PageRank graph — a seed must reach the graph to personalize the
+    /// ranking (an isolated changed symbol now correctly falls back to global; see
+    /// `seed_resolving_only_to_isolated_symbols_is_labeled_global`). Returns the db; `touched.rs`
+    /// is the changed file.
+    fn checkout_with_dirty_indexed_symbol() -> (IndexDatabase, PathBuf) {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        fs::write(root.join("src/touched.rs"), "pub fn placeholder() {}\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        // Edit a tracked file AFTER commit → an uncommitted working-tree change with a real symbol
+        // that participates in the graph (touched → placeholder).
+        fs::write(
+            root.join("src/touched.rs"),
+            "pub fn placeholder() {} pub fn touched() { placeholder(); }\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        (db, root)
+    }
+
+    /// Name/path/id seed resolution: a valid name resolves to a personalized ranking; a missing
+    /// name is skipped (counted, not fatal); an all-missing seed falls through to global WITH a
+    /// reason.
+    #[test]
+    fn explicit_seed_resolves_names_and_skips_misses() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // A real name + a bogus one: the bogus is skipped (no_symbols += 1), the real one seeds.
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["target".to_string(), "does_not_exist_anywhere".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(result.mode.label(), "importance relative to your current changes");
+        let seed = result.seed_source.expect("explicit seed reports provenance");
+        assert_eq!(seed.kind, crate::query::pagerank::SeedKind::Explicit);
+        assert_eq!(seed.symbol_seed_count, 1, "only the real name seeded");
+        assert_eq!(seed.skipped.no_symbols, 1, "the bogus name is skipped, not fatal");
+        assert!(result.reason.is_none());
+
+        // A raw numeric id is accepted verbatim (the `target` symbol id).
+        let target_id: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT id FROM symbols WHERE name = 'target' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let by_id = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec![target_id.to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(by_id.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+
+        // All-missing seed → global fall-through WITH a reason (never silent, never an error).
+        let all_missing = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["nope_a".to_string(), "nope_b".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(all_missing.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert!(all_missing.reason.is_some(), "all-missing explicit seed reports why it's global");
+        assert_eq!(all_missing.seed_source.unwrap().skipped.no_symbols, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #142 review: a seed that RESOLVES to real symbols which are not endpoints of any resolved
+    /// edge has no effect on the ranking, so the result must be labeled `Global` (with a reason and
+    /// `effective_seed_count = 0`), NOT `PersonalizedToChanges` — otherwise the caller is told the
+    /// ranking is "relative to your changes" when it is actually global.
+    #[test]
+    fn seed_resolving_only_to_isolated_symbols_is_labeled_global() {
+        let root = temp_root();
+        // `caller -> target` is the only edge; `island` is a real symbol with no edges, so it never
+        // enters the PageRank graph.
+        fs::write(
+            root.join("src/lib.rs"),
+            "fn caller() { target(); } fn target() {} fn island() {}\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["island".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(
+            result.mode,
+            crate::query::pagerank::ImportanceMode::Global,
+            "an isolated seed yields a global ranking, not a personalized one"
+        );
+        let seed = result.seed_source.expect("seed provenance is still reported");
+        assert_eq!(seed.symbol_seed_count, 1, "the name resolved to exactly one symbol");
+        assert_eq!(seed.effective_seed_count, 0, "but that symbol is not a graph node");
+        assert_eq!(result.reason.as_deref(), Some("named symbols are not connected in the graph"));
+
+        // Contrast: a connected seed (`target`) genuinely personalizes.
+        let connected = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["target".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(connected.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        assert_eq!(connected.seed_source.unwrap().effective_seed_count, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #142 review: auto-seed-from-diff in a source root that is NOT a git worktree must not fail
+    /// the tool — it is best-effort, so it falls through to a global ranking (with a reason)
+    /// instead of propagating the git error. (`temp_root()` is deliberately not `git init`-ed.)
+    #[test]
+    fn auto_seed_outside_a_git_worktree_falls_back_to_global() {
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert!(!result.symbols.is_empty(), "the global ranking is still computed");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A name that matches MULTIPLE in-scope symbols seeds ALL of them — personalization is a
+    /// teleport SET, so `--personalize Thing` (where `Thing` is a struct plus its impls) biases
+    /// toward the whole entity, NOT skip-on-ambiguity. This is the Phase 4 UX-bug fix: any type
+    /// with impls used to resolve to nothing and fall back to global.
+    #[test]
+    fn multi_match_name_seeds_all_in_scope_symbols() {
+        let root = temp_root();
+        // A struct `Thing` plus two `impl Thing` blocks → the bare name `Thing` matches the struct
+        // row AND the impl rows (impl blocks carry the type's name), i.e. ≥ 2 symbols share
+        // "Thing".
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub struct Thing;\nimpl Thing { pub fn a(&self) {} }\nimpl Thing { pub fn b(&self) \
+             {} }\n",
+        )
+        .unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Sanity: the bare name really does match more than one symbol.
+        let match_count: i64 = db
+            .storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM symbols WHERE name = 'Thing'", [], |r| r.get(0))
+            .unwrap();
+        assert!(match_count >= 2, "the struct + its impls all carry the name: {match_count}");
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: vec!["Thing".to_string()],
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        // PERSONALIZED, not global: the multi-match name resolved to multiple seeds.
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        let seed = result.seed_source.expect("reports provenance");
+        assert_eq!(seed.kind, crate::query::pagerank::SeedKind::Explicit);
+        assert!(
+            seed.symbol_seed_count >= 2,
+            "all of the name's in-scope symbols are seeded: {seed:?}"
+        );
+        assert_eq!(seed.skipped.no_symbols, 0, "a matched name is never counted as a miss");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Auto-seed maps the git diff to symbols THROUGH the scoped `files` view: a dirty indexed file
+    /// yields a personalized result whose seed provenance is `git_diff`.
+    #[test]
+    fn auto_seed_from_diff_picks_changed_symbols() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let (db, root) = checkout_with_dirty_indexed_symbol();
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::PersonalizedToChanges);
+        let seed = result.seed_source.expect("auto-seed reports provenance");
+        assert_eq!(seed.kind, crate::query::pagerank::SeedKind::GitDiff);
+        assert!(seed.indexed_paths >= 1, "the dirty indexed file counted: {seed:?}");
+        assert!(seed.symbol_seed_count >= 1, "the changed file's symbol seeded: {seed:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Diff with NO indexed symbols (a changed markdown file only) → global mode, a reason, and the
+    /// diff counts, NOT a silent fall-through.
+    #[test]
+    fn diff_without_symbols_falls_back_to_global_with_reason() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = temp_root();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        // The only working-tree change is a markdown file — never indexed as a Rust symbol.
+        fs::write(root.join("NOTES.md"), "# notes\n").unwrap();
+        let config = rust_config(root.clone());
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(result.mode, crate::query::pagerank::ImportanceMode::Global);
+        assert_eq!(result.reason.as_deref(), Some("no symbols found in current diff"));
+        assert_eq!(result.diff_paths_with_symbols, Some(0));
+        let seed = result.seed_source.expect("a fall-through still reports the diff it tried");
+        assert!(seed.changed_paths >= 1, "the markdown change was considered: {seed:?}");
+        assert_eq!(seed.symbol_seed_count, 0);
+        assert!(!result.symbols.is_empty(), "global ranking still returns the spine");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Deleted and generated changed paths are counted in `skipped`, not seeded.
+    #[test]
+    fn deleted_and_generated_paths_counted_in_skipped() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = temp_root();
+        fs::create_dir_all(root.join("gen")).unwrap();
+        fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n").unwrap();
+        fs::write(root.join("src/doomed.rs"), "pub fn doomed() {}\n").unwrap();
+        fs::write(root.join("gen/out.rs"), "pub fn generated_fn() {}\n").unwrap();
+        // A config with a Generated target for `gen/` so `out.rs` indexes generated.
+        let config = Config {
+            root: root.clone(),
+            database: root.join(".rag-rat/index.sqlite"),
+            targets: vec![
+                ResolvedTarget {
+                    name: "rust".to_string(),
+                    language: Language::Rust,
+                    directories: vec![PathBuf::from("src")],
+                    include: vec!["src/".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Source,
+                },
+                ResolvedTarget {
+                    name: "gen".to_string(),
+                    language: Language::Rust,
+                    directories: vec![PathBuf::from("gen")],
+                    include: vec!["gen/".to_string()],
+                    exclude: Vec::new(),
+                    kind: TargetKind::Generated,
+                },
+            ],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+
+        // Working-tree changes: delete a tracked file, and edit the generated one.
+        fs::remove_file(root.join("src/doomed.rs")).unwrap();
+        fs::write(root.join("gen/out.rs"), "pub fn generated_fn() {} pub fn more() {}\n").unwrap();
+
+        let result = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        let seed = result.seed_source.expect("reports provenance");
+        assert_eq!(seed.skipped.deleted, 1, "the removed file is counted deleted: {seed:?}");
+        assert_eq!(seed.skipped.generated, 1, "the generated file is counted generated: {seed:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Acceptance invariant #1: with a non-empty diff carrying an indexed symbol, MCP defaults
+    /// (auto-seed ON) ⇒ PERSONALIZED, while CLI defaults (auto-seed OFF) ⇒ GLOBAL. The intentional
+    /// divergence — easy to "clean up" into uniformity by accident, so it's pinned.
+    #[test]
+    fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
+        if std::process::Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let (db, root) = checkout_with_dirty_indexed_symbol();
+
+        // MCP default: auto_seed_from_diff = true → personalized.
+        let mcp = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: true,
+            })
+            .unwrap();
+        assert_eq!(
+            mcp.mode,
+            crate::query::pagerank::ImportanceMode::PersonalizedToChanges,
+            "MCP no-personalize + non-empty diff ⇒ personalized"
+        );
+
+        // CLI default: auto_seed_from_diff = false → global even with the same non-empty diff.
+        let cli = db
+            .important_symbols(ImportantSymbolsRequest {
+                limit: 20,
+                personalize: Vec::new(),
+                auto_seed_from_diff: false,
+            })
+            .unwrap();
+        assert_eq!(
+            cli.mode,
+            crate::query::pagerank::ImportanceMode::Global,
+            "CLI no-personalize ⇒ global, even with a non-empty diff"
+        );
+        assert!(cli.seed_source.is_none(), "CLI global carries no seed provenance");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// #82 P2 regression: `find_callers` with NO oracle data must return the IDENTICAL membership

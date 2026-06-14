@@ -4,9 +4,10 @@ use rag_rat_core::OutputFormat;
 
 use super::*;
 use crate::cli::{
-    BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs, IndexArgs,
-    MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs, ModelsCommand, OracleArgs,
-    OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs, ReconcileArgs,
+    BriefArgs, ClustersArgs, EvalArgs, GithubArgs, GithubCommand, HookAction, HooksArgs,
+    ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs,
+    ModelsCommand, OracleArgs, OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs,
+    ReconcileArgs,
 };
 
 /// Process-wide output format, set once from the global `--json` flag in `main` before any command
@@ -86,6 +87,34 @@ pub(crate) fn clusters(config: &Config, args: &ClustersArgs) -> anyhow::Result<(
         include_memories: !args.no_memories,
         min_cluster_size: args.min_cluster_size.unwrap_or(2),
     })?)
+}
+pub(crate) fn important_symbols(
+    config: &Config,
+    args: &ImportantSymbolsArgs,
+) -> anyhow::Result<()> {
+    let db = open_index(config)?;
+    // CLI stays global-by-default: no auto-seed from the git diff (`auto_seed_from_diff: false`).
+    // Only an explicit `--personalize` seeds — the intentional divergence from the MCP default.
+    let mut result = db.important_symbols(rag_rat_core::index::ImportantSymbolsRequest {
+        limit: args.limit.unwrap_or(20) as usize,
+        personalize: args.personalize.clone(),
+        auto_seed_from_diff: false,
+    })?;
+    apply_auto_run_ranking_hint(&mut result, config);
+    print_output(&result)
+}
+
+/// Swap the heuristic-ranking nudge to the background-oracle wording when `[oracle] auto_run` is on
+/// (the core method, config-unaware, emits the manual `oracle run` variant). No-op when the hint is
+/// absent (a current oracle run exists) or auto_run is off.
+pub(crate) fn apply_auto_run_ranking_hint(
+    result: &mut rag_rat_core::query::pagerank::ImportantSymbolsResult,
+    config: &Config,
+) {
+    if config.oracle.auto_run && result.ranking_hint.is_some() {
+        result.ranking_hint =
+            Some(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN.to_string());
+    }
 }
 pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
     let targets = config
@@ -198,7 +227,7 @@ pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
 /// snapshot is taken at exit, not when rust-analyzer read each file, so a mid-subprocess edit + a
 /// pre-join reindex remains best-effort — pinning the pre-spawn `files.sha256` would close that
 /// residual tail (follow-up).
-fn with_oracle_write_lock<T>(
+pub(crate) fn with_oracle_write_lock<T>(
     config: &Config,
     body: impl FnOnce(&IndexDatabase) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
@@ -849,6 +878,7 @@ mod tests {
             local_ai: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
+            oracle: Default::default(),
         };
         (root, config)
     }

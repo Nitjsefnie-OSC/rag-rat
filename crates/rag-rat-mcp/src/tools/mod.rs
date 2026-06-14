@@ -133,6 +133,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "impact_surface",
     "repo_brief",
     "repo_clusters",
+    "important_symbols",
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
@@ -225,6 +226,21 @@ pub struct RepoClustersArgs {
     pub include_memories: bool,
     #[serde(default = "default_min_cluster_size")]
     pub min_cluster_size: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ImportantSymbolsArgs {
+    /// Max load-bearing symbols to return.
+    #[serde(default = "default_repo_brief_limit")]
+    pub limit: u32,
+    /// Symbols to bias importance toward (the symbols you're editing/querying) — names, symbol
+    /// paths, or numeric ids; the random surfer teleports back to these, lifting the spine *they*
+    /// depend on. A numeric value is a raw symbol id; otherwise it's resolved by symbol path then
+    /// name (ambiguous/missing entries are skipped, never fatal). LEAVE EMPTY to auto-seed from
+    /// your current git diff (the default — "importance relative to your current changes").
+    /// Pass a single `"global"` to force whole-repo PageRank instead.
+    #[serde(default)]
+    pub personalize: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -659,6 +675,20 @@ fn finalize_tool_result(config: &Config, name: &str, mut result: Value) -> anyho
     {
         obj.insert("version".to_string(), serde_json::json!(version));
     }
+    // Mirror the CLI's `apply_auto_run_ranking_hint`: when the background auto-fresh oracle is on,
+    // rewrite `important_symbols`' heuristic nudge so it doesn't tell the agent to run `oracle run`
+    // by hand — compiler ranking refreshes on its own. The core query is config-unaware, so the
+    // rewrite happens here where the config is available. (#142 review)
+    if name == "important_symbols"
+        && config.oracle.auto_run
+        && let Some(obj) = result.as_object_mut()
+        && obj.get("ranking_hint").and_then(Value::as_str).is_some()
+    {
+        obj.insert(
+            "ranking_hint".to_string(),
+            serde_json::json!(rag_rat_core::query::pagerank::RANKING_HINT_AUTO_RUN),
+        );
+    }
     Ok(result)
 }
 
@@ -758,6 +788,14 @@ pub fn description(name: &str) -> &'static str {
         "repo_clusters" =>
             "Map the repo into ownership clusters from path proximity, graph edges, and git \
              co-touch — a cheap overview of subsystems and their representative files.",
+        "important_symbols" =>
+            "Rank the most load-bearing symbols by weighted PageRank over the call/type/import \
+             edge graph — what the rest of the code most depends on. Run before editing to see the \
+             spine you shouldn't reinvent or break. By DEFAULT (no `personalize`) it auto-seeds \
+             from your current git diff, returning importance relative to your current changes; \
+             pass `personalize` (names, symbol paths, or ids you're working on) to seed it \
+             explicitly, or a single `\"global\"` to force whole-repo PageRank. The result is a \
+             labeled object: `mode` (which scale), `seed_source` (seed provenance), and `symbols`.",
         "ffi_surface" =>
             "Find the FFI surface: #[uniffi::export] items, exported impl members, and generated \
              binding artifacts (detected by path). Empty in repos without FFI.",
@@ -851,6 +889,7 @@ pub fn schema(name: &str) -> Value {
         "impact_surface" => schema_for::<ImpactArgs>(),
         "repo_brief" => schema_for::<RepoBriefArgs>(),
         "repo_clusters" => schema_for::<RepoClustersArgs>(),
+        "important_symbols" => schema_for::<ImportantSymbolsArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
         "git_history_for_path" | "github_refs_for_path" => schema_for::<PathHistoryArgs>(),

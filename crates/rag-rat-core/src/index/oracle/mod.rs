@@ -18,6 +18,7 @@
 //! - `status.rs`— status type surfaced like `local_ai_status`.
 //! - `store.rs` — `oracle_runs` / `edge_oracle` read + write helpers.
 
+mod auto_run;
 mod join;
 mod manifest;
 mod run;
@@ -30,6 +31,7 @@ mod tests;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use auto_run::{AutoRunDecision, AutoRunInputs, auto_run_decision};
 pub(crate) use join::package_of;
 pub use manifest::{ToolAvailability, ToolManifest};
 use run::OracleRunInput;
@@ -335,6 +337,30 @@ pub(crate) fn current_oracle_verdicts_for_edges(
     )
 }
 
+/// Fetch ALL current, in-scope oracle verdicts for `(tool, tool_version)` in this checkout, keyed
+/// by `edge_id` → `(kind, resolved_symbol_id)`. The whole-graph sibling of
+/// [`current_oracle_verdicts_for_edges`], for symbol-importance ranking which walks every edge (one
+/// scan, not a query per edge). Same scope + currency gate via the store helper.
+pub(crate) fn current_oracle_verdicts_all(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
+    store::current_oracle_verdicts_all(conn, tool, tool_version, commit_sha, worktree_id)
+}
+
+/// Whether ANY oracle run exists in the active checkout (across all tools) — the cheap existence
+/// probe that short-circuits the per-tool [`latest_run_tool_version`] calls when nothing ever ran.
+pub(crate) fn any_run_in_scope(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<bool> {
+    store::any_run_in_scope(conn, commit_sha, worktree_id)
+}
+
 /// Prune `oracle_runs` rows for dead `(commit_sha, worktree_id)` contexts — the gc companion to the
 /// `edge_oracle` FK cascade. See [`store::prune_oracle_runs_outside_scope`]. Returns rows deleted.
 pub fn prune_oracle_runs_outside_scope(
@@ -355,6 +381,18 @@ pub fn latest_run_tool_version(
     worktree_id: &str,
 ) -> anyhow::Result<Option<String>> {
     store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)
+}
+
+/// The `started_at` (Unix-epoch ms) of the most recent run for `tool` in the active checkout, or
+/// `None` when no run exists — the staleness clock the background auto-fresh oracle compares
+/// against the index's `indexed_at_ms`. See [`auto_run_decision`].
+pub fn latest_run_started_at(
+    conn: &Connection,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Option<i64>> {
+    store::latest_run_started_at(conn, tool, commit_sha, worktree_id)
 }
 
 /// Load the CURRENT, in-scope `edge_oracle` verdicts joined to their heuristic edge resolution —
