@@ -3012,7 +3012,7 @@ fn memory_survives_file_move_via_moniker_relocation() {
     )])]);
     run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
 
-    let report = validate_memories(&h.conn).unwrap();
+    let report = validate_memories(&h.conn, None).unwrap();
     assert!(report.relocated >= 1, "expected a relocation, got {report:?}");
 
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
@@ -3060,7 +3060,7 @@ fn cross_version_moniker_match_requires_kind_corroboration() {
         run_oracle(&h.conn, TOOL, "v-newer", COMMIT, WORKTREE, &bytes, h.root(), None, None)
             .unwrap();
 
-        validate_memories(&h.conn).unwrap();
+        validate_memories(&h.conn, None).unwrap();
         let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
         let symbol_binding =
             memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
@@ -3069,6 +3069,233 @@ fn cross_version_moniker_match_requires_kind_corroboration() {
             "cross-version match with new_kind={new_kind}"
         );
     }
+}
+
+/// Point the index `source_root` meta at the harness checkout so the off-index filesystem
+/// existence fallback (#98) has a root to resolve a binding path against.
+fn set_source_root(h: &Harness) {
+    h.conn
+        .execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
+            params![h.root().to_string_lossy()],
+        )
+        .unwrap();
+}
+
+/// Create a bare path-bound memory and return its id + the validated anchor status of the `path`
+/// binding.
+fn path_binding_status_after_validate(h: &Harness, path: &str) -> String {
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: format!("note about {path}"),
+        body: "this guidance is still valid".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { path: Some(path.to_string()), ..Default::default() },
+    })
+    .unwrap();
+    validate_memories(&h.conn, None).unwrap();
+    let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
+    memory
+        .bindings
+        .iter()
+        .find(|b| b.binding_kind == "path")
+        .expect("path binding")
+        .anchor_status
+        .clone()
+}
+
+/// #98: a memory bound to a NON-INDEXED file that exists on disk (a Containerfile, shell script,
+/// `.yml`, `.toml` — anything outside the indexed language set, so it has no `files` row by
+/// construction) must validate `current`, not `gone`. Acting on a false `gone` would delete valid
+/// guidance.
+#[test]
+fn path_binding_to_unindexed_file_present_on_disk_is_current() {
+    let h = Harness::new();
+    set_source_root(&h);
+    std::fs::create_dir_all(h.root().join("tools")).unwrap();
+    std::fs::write(h.root().join("tools/bench.Containerfile"), "FROM scratch\n").unwrap();
+    // Deliberately NO `files` row — this file type is outside the indexed set.
+    assert_eq!(
+        path_binding_status_after_validate(&h, "tools/bench.Containerfile"),
+        "current",
+        "a path bound to a real-but-unindexed file is an area anchor, not gone"
+    );
+}
+
+/// #98: a path binding whose target is absent from BOTH the index and the filesystem is genuinely
+/// `gone`.
+#[test]
+fn path_binding_to_missing_file_is_gone() {
+    let h = Harness::new();
+    set_source_root(&h);
+    assert_eq!(
+        path_binding_status_after_validate(&h, "tools/deleted.Containerfile"),
+        "gone",
+        "a path that exists nowhere is genuinely gone"
+    );
+}
+
+/// #98: a SPANNED path binding (`path:start-end`) to a non-indexed file has no chunk to hash, so it
+/// is `unverified` rather than `gone` — it can't be content-validated but its target is alive.
+#[test]
+fn spanned_path_binding_to_unindexed_file_is_unverified() {
+    let h = Harness::new();
+    set_source_root(&h);
+    std::fs::create_dir_all(h.root().join("tools")).unwrap();
+    std::fs::write(h.root().join("tools/build.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "spanned note".to_string(),
+        body: "lines 1-2 matter".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget {
+            path: Some("tools/build.sh".to_string()),
+            start_line: Some(1),
+            end_line: Some(2),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    validate_memories(&h.conn, None).unwrap();
+    let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
+    let pb = memory.bindings.iter().find(|b| b.binding_kind == "path").expect("path binding");
+    assert_eq!(
+        pb.anchor_status, "unverified",
+        "a spanned binding to a non-indexed file can't be hashed but isn't gone"
+    );
+}
+
+/// #98 (dir analogue): a `dir` binding to a directory that exists on disk but holds only
+/// non-indexed files (so `dir_has_files` finds nothing) must validate `current`, not `gone`.
+#[test]
+fn dir_binding_to_unindexed_dir_present_on_disk_is_current() {
+    let h = Harness::new();
+    set_source_root(&h);
+    std::fs::create_dir_all(h.root().join("scripts")).unwrap();
+    std::fs::write(h.root().join("scripts/deploy.sh"), "#!/bin/sh\n").unwrap();
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "scripts dir note".to_string(),
+        body: "deploy scripts live here".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget { dir: Some("scripts".to_string()), ..Default::default() },
+    })
+    .unwrap();
+    validate_memories(&h.conn, None).unwrap();
+    let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
+    let db = memory.bindings.iter().find(|b| b.binding_kind == "dir").expect("dir binding");
+    assert_eq!(
+        db.anchor_status, "current",
+        "a dir present on disk with only non-indexed files is current, not gone"
+    );
+}
+
+/// #98 (dir analogue): a `dir` binding to a directory absent from index and filesystem is `gone`.
+#[test]
+fn dir_binding_to_missing_dir_is_gone() {
+    let h = Harness::new();
+    set_source_root(&h);
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "ghost dir note".to_string(),
+        body: "nothing here".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget {
+            dir: Some("does/not/exist".to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    validate_memories(&h.conn, None).unwrap();
+    let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
+    let db = memory.bindings.iter().find(|b| b.binding_kind == "dir").expect("dir binding");
+    assert_eq!(db.anchor_status, "gone", "a dir that exists nowhere is genuinely gone");
+}
+
+/// #98 review (Codex): a `path` binding names a FILE. If the file is deleted and a DIRECTORY now
+/// occupies that name, the file is genuinely `gone` — the off-index fallback must use `is_file`,
+/// not `exists`, so a directory at the path can't keep the file anchor alive.
+#[test]
+fn path_binding_to_a_dir_replacing_the_file_is_gone() {
+    let h = Harness::new();
+    set_source_root(&h);
+    // A directory sits where the bound file used to be.
+    std::fs::create_dir_all(h.root().join("tools/build.sh")).unwrap();
+    assert_eq!(
+        path_binding_status_after_validate(&h, "tools/build.sh"),
+        "gone",
+        "a directory occupying a file-bound path does not keep the file anchor alive"
+    );
+}
+
+/// #98 review (Codex): path bindings are repo-root-relative by contract. An absolute path or one
+/// with `..` could resolve OUTSIDE `source_root` (`root.join(abs)` replaces the root), letting an
+/// unrelated out-of-repo file mark the anchor alive. Such a binding must be treated as `gone`.
+#[test]
+fn path_binding_escaping_source_root_is_gone() {
+    let h = Harness::new();
+    set_source_root(&h);
+    // A real file OUTSIDE the source_root, reachable only by escaping it via `..`.
+    let outside = h.root().parent().unwrap().join(format!("escape-{}.sh", std::process::id()));
+    std::fs::write(&outside, "#!/bin/sh\n").unwrap();
+    let traversal = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+    let status = path_binding_status_after_validate(&h, &traversal);
+    let _ = std::fs::remove_file(&outside);
+    assert_eq!(
+        status, "gone",
+        "a `..`-escaping path must not validate against an out-of-repo file"
+    );
+}
+
+/// #98 review (Codex): under a shared DB across git worktrees, `index_meta.source_root` holds
+/// whichever worktree last indexed. `validate_memories` must prefer the caller-supplied ACTIVE
+/// checkout root so a sibling worktree checks its OWN filesystem, not the last indexer's.
+#[test]
+fn validate_prefers_active_root_over_persisted_meta() {
+    let h = Harness::new();
+    // Persisted meta points at a bogus root (a stale/sibling worktree); the active checkout is
+    // h.root(), where the file actually lives.
+    h.conn
+        .execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES ('source_root', ?1)",
+            params![h.root().join("nonexistent-worktree").to_string_lossy()],
+        )
+        .unwrap();
+    std::fs::create_dir_all(h.root().join("tools")).unwrap();
+    std::fs::write(h.root().join("tools/notes.Containerfile"), "FROM scratch\n").unwrap();
+    let created = create_memory(&h.conn, RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: "worktree note".to_string(),
+        body: "still valid".to_string(),
+        confidence: "high".to_string(),
+        created_by: None,
+        source: None,
+        tags: Vec::new(),
+        bind: RepoMemoryBindTarget {
+            path: Some("tools/notes.Containerfile".to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    validate_memories(&h.conn, Some(h.root())).unwrap();
+    let memory = memory_by_id(&h.conn, &created.memory.memory_id).unwrap().unwrap();
+    let pb = memory.bindings.iter().find(|b| b.binding_kind == "path").expect("path binding");
+    assert_eq!(
+        pb.anchor_status, "current",
+        "the active checkout root must win over the stale persisted source_root"
+    );
 }
 
 /// `scip_moniker` binding statuses: `unverified` when the tool has no data at all, `gone` when
@@ -3092,7 +3319,7 @@ fn moniker_binding_validation_statuses() {
     let memory_id = create_target_memory(&h, sym);
 
     let moniker_status = |h: &Harness| -> String {
-        validate_memories(&h.conn).unwrap();
+        validate_memories(&h.conn, None).unwrap();
         let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
         memory
             .bindings
@@ -3203,7 +3430,7 @@ fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
     )])]);
     run_oracle(&h.conn, TOOL, "v-bumped", COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
 
-    validate_memories(&h.conn).unwrap();
+    validate_memories(&h.conn, None).unwrap();
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
     let moniker_binding =
         memory.bindings.iter().find(|b| b.binding_kind == "scip_moniker").expect("moniker binding");
@@ -3222,7 +3449,7 @@ fn moniker_string_drift_rebinds_via_live_logical_symbol_then_survives_move() {
         SymbolRole::Definition as i32,
     )])]);
     run_oracle(&h.conn, TOOL, "v-bumped", COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
-    validate_memories(&h.conn).unwrap();
+    validate_memories(&h.conn, None).unwrap();
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
     let symbol_binding =
         memory.bindings.iter().find(|b| b.binding_kind == "symbol").expect("symbol binding");
@@ -3263,7 +3490,7 @@ fn string_resolution_preserves_bind_time_tool_version() {
         SymbolRole::Definition as i32,
     )])]);
     run_oracle(&h.conn, TOOL, "v-newer", COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
-    validate_memories(&h.conn).unwrap();
+    validate_memories(&h.conn, None).unwrap();
 
     let memory = memory_by_id(&h.conn, &memory_id).unwrap().unwrap();
     let moniker_binding =
@@ -3310,7 +3537,7 @@ fn bare_path_binding_survives_file_edit_spanned_goes_stale() {
 
     // Edit the file: new content, new sha on the files row.
     h.set_file_sha(file, "edited-sha");
-    validate_memories(&h.conn).unwrap();
+    validate_memories(&h.conn, None).unwrap();
 
     let status =
         |id: &str| memory_by_id(&h.conn, id).unwrap().unwrap().bindings[0].anchor_status.clone();
@@ -3323,7 +3550,7 @@ fn bare_path_binding_survives_file_edit_spanned_goes_stale() {
 
     // Deleting the file row sends both to gone.
     h.conn.execute("DELETE FROM files WHERE id = ?1", [file]).unwrap();
-    validate_memories(&h.conn).unwrap();
+    validate_memories(&h.conn, None).unwrap();
     assert_eq!(status(&bare), "gone");
     assert_eq!(status(&spanned), "gone");
 }
