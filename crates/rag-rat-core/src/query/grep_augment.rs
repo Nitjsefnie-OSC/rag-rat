@@ -220,6 +220,11 @@ pub fn compose(
     // Seen set for memory dedup — preserves insertion order (symbol-bound first, then FTS,
     // then path-bound), unlike the old sort+dedup which ordered by creation-time ID.
     let mut seen_memory_ids: HashSet<String> = HashSet::new();
+    // Within-call dedup of symbol hits by (path, qualified_name): `symbol::lookup` can return the
+    // same logical symbol once per concrete row (overloads, multiple definitions, re-export rows),
+    // which otherwise renders as N identical "Known symbols" lines — same defect as the lexical
+    // lane (#139).
+    let mut seen_symbol_keys: HashSet<String> = HashSet::new();
 
     if let Some(ident) = extract_symbol_identifier(&normalized) {
         // Symbol lane. Bare name for qualified queries: `Watcher::spawn` → `spawn`.
@@ -227,7 +232,7 @@ pub fn compose(
         for hit in symbol::lookup(conn, bare, None, MAX_SYMBOLS)? {
             symbol_lane_had_hits = true;
             let key = format!("{}:{}", hit.path, hit.qualified_name);
-            if dedupe.symbol_keys.contains(&key) {
+            if dedupe.symbol_keys.contains(&key) || !seen_symbol_keys.insert(key.clone()) {
                 continue;
             }
             let (callers, callees) = edge_counts(conn, &hit)?;
@@ -276,15 +281,12 @@ pub fn compose(
     // gate: keep only hits within LEXICAL_RELATIVE_FLOOR of the best hit's score, so the weak tail
     // (e.g. an incidental match several ranks down) isn't injected as noise.
     let lexical_lines = if !symbol_lane_had_hits {
-        let hits = lexical::search_lexical_only(conn, &normalized, MAX_LEXICAL_HITS, false)?;
-        let best = hits.iter().map(|hit| hit.score).fold(0.0_f64, f64::max);
-        let floor = best * LEXICAL_RELATIVE_FLOOR;
-        hits.into_iter()
-            .filter(|hit| hit.score >= floor)
-            .map(|hit| {
-                format!("- {}:{}-{} — {}", hit.path, hit.start_line, hit.end_line, hit.summary)
-            })
-            .collect::<Vec<_>>()
+        lexical_lines_from_hits(lexical::search_lexical_only(
+            conn,
+            &normalized,
+            MAX_LEXICAL_HITS,
+            false,
+        )?)
     } else {
         Vec::new()
     };
@@ -293,6 +295,22 @@ pub fn compose(
         return Ok(None);
     }
     Ok(Some(render(memories, symbol_items, lexical_lines)))
+}
+
+/// Floor-filter, dedup, and render the lexical-lane hits. Extracted so the dedup is unit-testable:
+/// `search_lexical_only` can return the same chunk more than once (e.g. one row per matched FTS
+/// term), which — capped at `MAX_LEXICAL_HITS` — otherwise rendered as N identical "Indexed hits"
+/// lines (#139). Keeps the first occurrence of each `(path, start, end)`, preserving rank order,
+/// after the relevance floor.
+fn lexical_lines_from_hits(hits: Vec<lexical::SearchHit>) -> Vec<String> {
+    let best = hits.iter().map(|hit| hit.score).fold(0.0_f64, f64::max);
+    let floor = best * LEXICAL_RELATIVE_FLOOR;
+    let mut seen: HashSet<(String, i64, i64)> = HashSet::new();
+    hits.into_iter()
+        .filter(|hit| hit.score >= floor)
+        .filter(|hit| seen.insert((hit.path.clone(), hit.start_line, hit.end_line)))
+        .map(|hit| format!("- {}:{}-{} — {}", hit.path, hit.start_line, hit.end_line, hit.summary))
+        .collect()
 }
 
 /// A single rendered symbol line plus the key that identifies it in the dedupe set.
@@ -480,6 +498,75 @@ mod tests {
     use super::*;
     use crate::index::schema;
     use crate::query::memory::{self, RepoMemoryBindTarget, RepoMemoryCreate};
+    use crate::search::lexical::SearchHit;
+
+    fn lexical_hit(path: &str, start: i64, end: i64, score: f64) -> SearchHit {
+        SearchHit {
+            chunk_id: 0,
+            path: path.to_string(),
+            language: "rust".to_string(),
+            kind: "chunk".to_string(),
+            start_line: start,
+            end_line: end,
+            symbol_path: None,
+            score,
+            retrieval_mode: "lexical".to_string(),
+            summary: format!("{path} summary"),
+            graph: None,
+            score_components: None,
+        }
+    }
+
+    /// #139: the same chunk returned more than once (capped at MAX_LEXICAL_HITS) rendered as N
+    /// identical "Indexed hits" lines. The dedup keeps one line per (path, start, end); the
+    /// relevance floor still drops weak hits.
+    #[test]
+    fn lexical_lines_dedup_chunks_and_apply_floor() {
+        let hits = vec![
+            lexical_hit("a.rs", 1, 9, 1.0),
+            lexical_hit("a.rs", 1, 9, 1.0), // exact duplicate chunk
+            lexical_hit("a.rs", 1, 9, 1.0), // and again — would have filled all 3 slots
+            lexical_hit("b.rs", 2, 3, 0.9), // distinct, above floor (0.6 * 1.0)
+            lexical_hit("c.rs", 4, 5, 0.1), // below floor → dropped
+        ];
+        let lines = lexical_lines_from_hits(hits);
+        assert_eq!(lines.len(), 2, "a.rs deduped to one, c.rs floored out: {lines:?}");
+        assert!(lines[0].contains("a.rs:1-9"), "first line is a.rs once: {lines:?}");
+        assert!(lines[1].contains("b.rs:2-3"), "second is b.rs: {lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("c.rs")), "weak hit dropped: {lines:?}");
+    }
+
+    /// #139 (symbol lane): two symbol rows sharing (path, qualified_name) — overloads / cfg
+    /// variants / re-export rows — must render once, not once per row.
+    #[test]
+    fn symbol_lane_dedups_duplicate_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+             VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
+            [],
+        )
+        .unwrap();
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO symbols(file_id, language, name, qualified_name, kind, start_byte,
+                                     end_byte, signature, docs)
+                 VALUES (1, 'rust', 'foo', 'a::foo', 'function', 0, 10, 'fn foo()', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let out = compose(&conn, "foo", None, &DedupeFilter::default())
+            .unwrap()
+            .expect("symbol lane augments");
+        assert_eq!(
+            out.context.matches("`a::foo`").count(),
+            1,
+            "duplicate symbol rows must render once:\n{}",
+            out.context
+        );
+    }
 
     fn seeded_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
