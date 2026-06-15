@@ -1,5 +1,6 @@
 export function openDatabase(): void {
-  NativeHeldCore.openDatabase();
+  const handle = NativeHeldCore.openDatabase();
+  void handle;
 }
 
 export type BridgeState = "open" | "closed";
@@ -14,7 +15,10 @@ export class BridgeClient {
   open(): void {}
 }
 
-export const useBridge = () => bridgeName;
+export const useBridge = (): string => {
+  const currentBridgeName = bridgeName;
+  return currentBridgeName;
+};
 
 export const BridgeBadge = function BridgeBadge() {
   return bridgeName;
