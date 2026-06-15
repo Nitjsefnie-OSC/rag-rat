@@ -32,6 +32,65 @@ pub(crate) fn active_checkout_file_predicate(sha_param: &str, wt_param: &str) ->
     )
 }
 
+/// The heuristic "before" resolution counts over the active checkout's edge candidates (those with
+/// a callee range — the oracle's `edges_examined` population). `(total, resolved_in_corpus,
+/// unresolved)`:
+/// - `resolved_in_corpus` mirrors the join's [`super::join`] `heuristic_resolved_in_corpus`:
+///   confidence `Exact`/`Syntactic` AND a non-NULL `to_symbol_id`. Same definition both sides, so
+///   `resolved_after = resolved_before + upgraded + resolved_external` is consistent.
+/// - `unresolved` is the low-confidence (`NameOnly`/`Ambiguous`) population (the oracle's
+///   upgrade/recovery denominator).
+pub(crate) fn resolution_before_counts(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<(u64, u64, u64)> {
+    let scope = active_checkout_file_predicate("?1", "?2");
+    let (total, resolved, unresolved): (i64, i64, i64) = conn.query_row(
+        &format!(
+            "
+        SELECT
+          COUNT(*),
+          COUNT(*) FILTER (
+            WHERE edges.confidence IN ('Exact', 'Syntactic') AND edges.to_symbol_id IS NOT NULL
+          ),
+          COUNT(*) FILTER (WHERE edges.confidence IN ('NameOnly', 'Ambiguous'))
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.callee_start_byte IS NOT NULL
+          AND edges.callee_end_byte IS NOT NULL
+          AND {scope}
+        ",
+        ),
+        params![commit_sha, worktree_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok((
+        u64::try_from(total).unwrap_or(0),
+        u64::try_from(resolved).unwrap_or(0),
+        u64::try_from(unresolved).unwrap_or(0),
+    ))
+}
+
+/// The number of logical symbols enriched with a SCIP moniker for `(tool, tool_version)` — the
+/// "symbols enriched" signal (#70). Scoped to `tool_version` (not just `tool`) so the count
+/// describes the SAME run as the report's `edge_oracle`-derived metrics: a later same-tool run with
+/// a different `tool_version` must not bleed its monikers into this report.
+/// `logical_symbol_monikers` is keyed `(logical_symbol_id, tool)` (repo-global, not
+/// checkout-scoped).
+pub(crate) fn count_symbols_with_moniker(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+) -> anyhow::Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM logical_symbol_monikers WHERE tool = ?1 AND tool_version = ?2",
+        params![tool.as_db_str(), tool_version],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
 /// An edge candidate to feed the oracle join: the callee identifier byte range (the SCIP key, #67)
 /// plus enough context to write a verdict and to recognise agreement/disagreement.
 #[derive(Debug, Clone)]
