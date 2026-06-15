@@ -339,8 +339,10 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
                     tool,
                     &version,
                     &bytes,
-                    Some(&production_sha),
-                    Some(&pre_spawn_sha),
+                    rag_rat_core::index::OracleShaSnapshots {
+                        production: Some(&production_sha),
+                        pre_spawn: Some(&pre_spawn_sha),
+                    },
                     started_at_ms,
                 )
             })?;
@@ -820,7 +822,7 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     };
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
-    let gc_report = db.gc().ok();
+    let gc_report = db.garbage_collect().ok();
     // Re-anchor repo memories: post-checkout/merge/rewrite/commit are exactly when files move,
     // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
     // leaving stale anchors until a manual memory_validate.
