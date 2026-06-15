@@ -123,6 +123,53 @@ pub fn run_oracle_at(
     })
 }
 
+/// Run the oracle for a corpus report PROVISIONALLY: execute the pass, assemble the typed report,
+/// apply the corpus health gate, and COMMIT only if healthy. When the gate fails, the whole
+/// transaction — INCLUDING the authoritative clear of the prior `(tool, tool_version)` verdicts and
+/// the tool's monikers — is rolled back, so a rejected run leaves the previous healthy run's
+/// verdicts / monikers / `oracle_runs` row completely intact (Codex on #175). This is why the
+/// report path must NOT reuse the committing [`run_oracle_at`] + a post-hoc delete: the
+/// authoritative clear at the run's start already destroys the prior state, so only
+/// never-committing can preserve it.
+///
+/// `provenance.tool_version` is the run's content-addressed version — the single source for the run
+/// row, the metric scope, and the report envelope. Returns the report (always, for stdout) and the
+/// health violations (empty = committed; non-empty = rolled back).
+#[allow(clippy::too_many_arguments)]
+pub fn run_oracle_report(
+    conn: &Connection,
+    profile: &report::CorpusProfile,
+    provenance: &report::RunProvenance,
+    tool: OracleTool,
+    commit_sha: &str,
+    worktree_id: &str,
+    scip_bytes: &[u8],
+    checkout_root: &Path,
+    production_sha: Option<&HashMap<String, String>>,
+    pre_spawn_sha: Option<&HashMap<String, String>>,
+    started_at_ms: i64,
+) -> anyhow::Result<(report::OracleResolutionReport, Vec<HealthViolation>)> {
+    let tx = conn.unchecked_transaction()?;
+    let run = run::run_in_tx(conn, &OracleRunInput {
+        tool,
+        tool_version: &provenance.tool_version,
+        commit_sha,
+        worktree_id,
+        scip_bytes,
+        checkout_root,
+        production_sha,
+        pre_spawn_sha,
+        started_at_ms,
+    })?;
+    let report = resolution_report(conn, profile, provenance, tool, commit_sha, worktree_id, &run)?;
+    let violations = check_corpus_health(profile, &report);
+    if violations.is_empty() {
+        tx.commit()?;
+    }
+    // Unhealthy → `tx` drops uncommitted → the whole run (clear + writes + run row) rolls back.
+    Ok((report, violations))
+}
+
 /// The indexed `(path -> files.sha256)` map for the active checkout — the pre-spawn snapshot
 /// callers take BEFORE spawning the oracle tool (#83). Cheap (reads indexed shas; hashes
 /// nothing), and read-only, so the CLI takes it before acquiring the index write lock.

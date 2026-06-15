@@ -130,6 +130,42 @@ impl IndexDatabase {
         )
     }
 
+    /// Run the oracle for a corpus report PROVISIONALLY and apply its health gate atomically: the
+    /// pass + report assembly + gate run in ONE transaction that commits only if healthy, so a
+    /// gate-failing run is rolled back whole — leaving the prior healthy verdicts/monikers/run row
+    /// intact (Codex on #175). `provenance.tool_version` is the run's content-addressed version.
+    /// Returns the report (always, for stdout) + the violations (empty = committed). The `shas` arm
+    /// the content-drift gates exactly as [`Self::run_oracle_at`].
+    pub fn run_oracle_report(
+        &self,
+        profile: &oracle::CorpusProfile,
+        provenance: &oracle::RunProvenance,
+        tool: OracleTool,
+        scip_bytes: &[u8],
+        shas: OracleShaSnapshots<'_>,
+        started_at_ms: i64,
+    ) -> anyhow::Result<(oracle::OracleResolutionReport, Vec<oracle::HealthViolation>)> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!(
+                "index has no source_root metadata; rebuild required for the oracle pass"
+            );
+        };
+        let root = root.to_path_buf();
+        oracle::run_oracle_report(
+            self.storage.connection(),
+            profile,
+            provenance,
+            tool,
+            &self.active_commit_sha,
+            &self.active_worktree_id,
+            scip_bytes,
+            &root,
+            shas.production,
+            shas.pre_spawn,
+            started_at_ms,
+        )
+    }
+
     /// Persisted oracle status (verdict counts + last run) for a tool/version, scoped to this
     /// database's active `(commit_sha, worktree_id)` checkout.
     pub fn oracle_status(

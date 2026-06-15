@@ -8,8 +8,8 @@ use crate::cli::EvalArgs;
 use crate::cli::{
     BriefArgs, ClustersArgs, GithubArgs, GithubCommand, HookAction, HooksArgs,
     ImportantSymbolsArgs, IndexArgs, MaintenanceArgs, MemoryArgs, MemoryCommand, ModelsArgs,
-    ModelsCommand, OracleArgs, OracleCommand, OracleRunArgs, OracleStatusArgs, QueryArgs,
-    ReconcileArgs,
+    ModelsCommand, OracleArgs, OracleCommand, OracleReportArgs, OracleRunArgs, OracleStatusArgs,
+    QueryArgs, ReconcileArgs,
 };
 
 /// Process-wide output format, set once from the global `--json` flag in `main` before any command
@@ -214,6 +214,7 @@ pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
             let db = open_index(config)?;
             oracle_status(&db, status_args)
         },
+        OracleCommand::Report(report_args) => oracle_report(config, report_args),
     }
 }
 
@@ -386,6 +387,232 @@ fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<
     }
     print_output(&entries)
 }
+
+/// `rag-rat oracle report --corpus <id>` — run the oracle for a declared corpus and emit its typed
+/// C2 [`OracleResolutionReport`] (before/after edge resolution + verdicts + metrics, schema- and
+/// profile-stamped) as JSON/TOON. The report is ALWAYS printed (so a Δ glue script can consume it
+/// even on a failing run); then the per-corpus health gate runs and, on any violation, the command
+/// exits non-zero — catching "scip emitted almost nothing" / "venv didn't resolve deps" / a broken
+/// parse even when the underlying oracle command itself succeeded.
+///
+/// Unlike `oracle run`, a missing/unrunnable tool is a hard ERROR here, not the exit-0 `Blocked`
+/// UX: this is a measurement runner over a corpus whose tool CI is expected to have installed, so a
+/// silent skip would let a broken environment pass green.
+fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()> {
+    use rag_rat_core::index::oracle;
+
+    // Load the corpus profile (defaults to the committed `tools/oracle-corpora.toml`).
+    let corpora_path = args
+        .corpora
+        .clone()
+        .unwrap_or_else(|| config.root.join("tools").join("oracle-corpora.toml"));
+    let toml_str = fs::read_to_string(&corpora_path).map_err(|err| {
+        anyhow::anyhow!("failed to read corpora file {}: {err}", corpora_path.display())
+    })?;
+    let corpora = oracle::load_corpora(&toml_str)?;
+    let profile = oracle::corpus_by_id(&corpora, &args.corpus)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no corpus `{}` in {}", args.corpus, corpora_path.display())
+        })?
+        .clone();
+
+    // Map the corpus's declared tool id to an oracle backend.
+    let tool = oracle::OracleTool::from_db_str(&profile.tool).ok_or_else(|| {
+        anyhow::anyhow!(
+            "corpus `{}` names unknown oracle tool `{}`",
+            profile.corpus_id,
+            profile.tool
+        )
+    })?;
+
+    // Fail closed if the active checkout's target bindings don't match the corpus profile (Codex on
+    // #175). The report stamps this profile's `corpus_profile_hash`, asserting "these numbers are
+    // that corpus"; if `rag-rat oracle report --corpus X` is pointed at a checkout indexing a
+    // different population (wrong repo/targets), the health gate could pass on the wrong numbers
+    // while the report stays *comparable* under the intended hash — a silently-wrong Δ. (Tag-vs-SHA
+    // resolution makes an in-command repo/rev check intractable; the runner guarantees those by
+    // cloning repo@rev, so we validate the bindings, which independently fix the measured
+    // population.)
+    ensure_checkout_matches_corpus(config, &profile)?;
+
+    let rag_rat_commit = rag_rat_commit_provenance();
+
+    // Run the oracle + assemble the report + apply the health gate as ONE provisional transaction
+    // (`db.run_oracle_report` commits only if healthy, else rolls the whole run back), all under
+    // the index write lock so a watcher reindex can't interleave. Producing the `.scip` with
+    // the tool happens OUTSIDE the lock (#82 P3): the slow subprocess must not starve the
+    // watcher.
+    let (report, violations) = if let Some(scip_path) = &args.scip {
+        let scip_bytes = fs::read(scip_path).map_err(|err| {
+            anyhow::anyhow!("failed to read SCIP index {}: {err}", scip_path.display())
+        })?;
+        let tool_version = format!(
+            "scip-file:{}@{}",
+            scip_path.file_name().and_then(|n| n.to_str()).unwrap_or("index.scip"),
+            oracle::scip_content_fingerprint(&scip_bytes),
+        );
+        let provenance = oracle::RunProvenance {
+            tool_version,
+            rag_rat_commit: rag_rat_commit.clone(),
+            // worktree_id filled under the lock (it's the active checkout's, read from the db).
+            worktree_id: String::new(),
+            production_sha: oracle::scip_content_fingerprint(&scip_bytes),
+        };
+        with_oracle_write_lock(config, |db| {
+            let provenance =
+                oracle::RunProvenance { worktree_id: db.active_worktree_id.clone(), ..provenance };
+            // A pre-built `--scip` arms neither content-drift gate and has no spawn moment.
+            db.run_oracle_report(
+                &profile,
+                &provenance,
+                tool,
+                &scip_bytes,
+                rag_rat_core::index::OracleShaSnapshots::default(),
+                crate::now_epoch_ms(),
+            )
+        })?
+    } else {
+        // No pre-built index: probe first so a missing tool fails before touching the index, then
+        // snapshot the pre-spawn shas (under the lock) and produce the `.scip` outside it
+        // (#82/#83).
+        if let oracle::ToolAvailability::Blocked { hint, .. } = oracle::probe_oracle_tool(tool) {
+            anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
+        }
+        let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
+            Ok((crate::now_epoch_ms(), db.oracle_pre_spawn_snapshot()?))
+        })?;
+        let scip_output = config
+            .database
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("rag-rat-oracle-report-{}.scip", std::process::id()));
+        let production = oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+        let _ = fs::remove_file(&scip_output);
+        match production? {
+            oracle::ScipProduction::Blocked { hint, .. } => {
+                anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
+            },
+            oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+                let provenance = oracle::RunProvenance {
+                    tool_version: version,
+                    rag_rat_commit: rag_rat_commit.clone(),
+                    worktree_id: String::new(),
+                    production_sha: oracle::scip_content_fingerprint(&bytes),
+                };
+                with_oracle_write_lock(config, |db| {
+                    let provenance = oracle::RunProvenance {
+                        worktree_id: db.active_worktree_id.clone(),
+                        ..provenance
+                    };
+                    db.run_oracle_report(
+                        &profile,
+                        &provenance,
+                        tool,
+                        &bytes,
+                        rag_rat_core::index::OracleShaSnapshots {
+                            production: Some(&production_sha),
+                            pre_spawn: Some(&pre_spawn_sha),
+                        },
+                        started_at_ms,
+                    )
+                })?
+            },
+        }
+    };
+
+    // Emit the report unconditionally — the glue/Δ script consumes it even for a failing run (an
+    // unhealthy run was already rolled back whole inside the transaction).
+    print_output(&report)?;
+
+    // Health gate: a violated threshold means the run is untrustworthy, so exit non-zero even
+    // though the oracle command itself succeeded. Violations go to stderr (the report owns stdout).
+    if !violations.is_empty() {
+        for violation in &violations {
+            eprintln!("corpus health [{}]: {}", violation.check, violation.detail);
+        }
+        anyhow::bail!(
+            "corpus `{}` failed {} health threshold(s)",
+            profile.corpus_id,
+            violations.len()
+        );
+    }
+    Ok(())
+}
+
+/// Fail closed unless the active checkout's targets are EXACTLY the corpus profile's `bindings`
+/// rendered through the plain `[target_bindings]` form — same languages, same directories, AND
+/// default include/exclude filters. The corpus runner generates the checkout's `rag-rat.toml` from
+/// these bindings (the simple form), so that's the invariant; any deviation means
+/// `oracle report --corpus X` would stamp X's `corpus_profile_hash` onto a different file
+/// population.
+///
+/// Two layers, both load-bearing:
+/// 1. language → directory set equality (catches a wrong repo / extra or missing bindings).
+/// 2. default filters per target: a `[[target]]` with the same language+dirs but custom
+///    `include`/`exclude` indexes a filtered subset/superset under the same hash (Codex on #175),
+///    so reject any target whose filters aren't the simple form's defaults (`include =
+///    ["**/*.<ext>", …]`, `exclude = []`).
+fn ensure_checkout_matches_corpus(
+    config: &Config,
+    profile: &rag_rat_core::index::oracle::CorpusProfile,
+) -> anyhow::Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut actual: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for target in &config.targets {
+        actual
+            .entry(target.language.as_str().to_string())
+            .or_default()
+            .extend(target.directories.iter().map(|dir| dir.to_string_lossy().into_owned()));
+    }
+    let expected: BTreeMap<String, BTreeSet<String>> = profile
+        .bindings
+        .iter()
+        .map(|(lang, dirs)| (lang.clone(), dirs.iter().cloned().collect()))
+        .collect();
+
+    anyhow::ensure!(
+        actual == expected,
+        "active checkout target bindings {actual:?} do not match corpus `{}` bindings \
+         {expected:?} — run `oracle report` against a checkout indexed with the corpus's bindings \
+         (the corpus runner does this) so the report measures the population its profile hash \
+         claims",
+        profile.corpus_id,
+    );
+
+    // The dir set can match while a custom `include`/`exclude` quietly filters the indexed files.
+    // The corpus binding has no filter knobs, so a legitimate checkout carries exactly the simple
+    // form's defaults; anything else measures a different population under the same hash.
+    for target in &config.targets {
+        let default_include: BTreeSet<String> =
+            target.language.simple_extensions().iter().map(|ext| format!("**/*.{ext}")).collect();
+        let include: BTreeSet<String> = target.include.iter().cloned().collect();
+        anyhow::ensure!(
+            target.exclude.is_empty() && include == default_include,
+            "target `{}` ({}) has custom include/exclude filters (include {:?}, exclude {:?}) — \
+             `oracle report --corpus {}` requires the corpus's plain bindings (default filters) \
+             so the report's profile hash matches the file population it measured",
+            target.name,
+            target.language.as_str(),
+            target.include,
+            target.exclude,
+            profile.corpus_id,
+        );
+    }
+    Ok(())
+}
+
+/// The `rag_rat_commit` provenance stamp for a resolution report: CI exports `RAG_RAT_COMMIT`
+/// (the building checkout's git SHA) so a number traces to an exact engine build; off CI it falls
+/// back to the crate version, which is enough to disambiguate published builds.
+fn rag_rat_commit_provenance() -> String {
+    std::env::var("RAG_RAT_COMMIT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
 pub(crate) fn models(config: &Config, args: &ModelsArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     match &args.command {
@@ -901,6 +1128,68 @@ mod tests {
             oracle: Default::default(),
         };
         (root, config)
+    }
+
+    #[test]
+    fn checkout_bindings_must_match_corpus() {
+        use std::collections::BTreeMap;
+
+        use rag_rat_core::index::oracle::{CorpusHealth, CorpusProfile};
+
+        // A target carrying the SAME default filters the simple `[target_bindings]` form renders
+        // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.
+        let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
+            root: PathBuf::from("/x"),
+            database: PathBuf::from("/x/db"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include,
+                exclude,
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        let config = config_with(vec!["**/*.rs".to_string()], Vec::new());
+        let profile = |dirs: &[&str]| {
+            let mut bindings = BTreeMap::new();
+            bindings.insert("rust".to_string(), dirs.iter().map(|d| d.to_string()).collect());
+            CorpusProfile {
+                corpus_id: "rust-semver".to_string(),
+                tier: "small".to_string(),
+                repo: "r".to_string(),
+                rev: "v".to_string(),
+                tool: "rust-analyzer".to_string(),
+                prepare: Vec::new(),
+                bindings,
+                health: CorpusHealth {
+                    expected_min_heuristic_edges: 1,
+                    expected_min_oracle_examined: 1,
+                    expected_max_skipped_drifted: 0,
+                    expected_min_symbols_with_moniker: 1,
+                    timeout_minutes: 1,
+                },
+            }
+        };
+        // Exact language+dirs match with default filters → ok.
+        assert!(super::ensure_checkout_matches_corpus(&config, &profile(&["src"])).is_ok());
+        // Same language, different directory → fail closed (a different population).
+        assert!(super::ensure_checkout_matches_corpus(&config, &profile(&["lib"])).is_err());
+        // Extra binding the checkout doesn't have → fail closed.
+        let mut two_langs = profile(&["src"]);
+        two_langs.bindings.insert("python".to_string(), vec!["pkg".to_string()]);
+        assert!(super::ensure_checkout_matches_corpus(&config, &two_langs).is_err());
+        // Same dirs but a custom `exclude` filters the population → fail closed (Codex #175).
+        let excluded =
+            config_with(vec!["**/*.rs".to_string()], vec!["**/generated/**".to_string()]);
+        assert!(super::ensure_checkout_matches_corpus(&excluded, &profile(&["src"])).is_err());
+        // Same dirs but a narrowed `include` → fail closed.
+        let narrowed = config_with(vec!["src/lib.rs".to_string()], Vec::new());
+        assert!(super::ensure_checkout_matches_corpus(&narrowed, &profile(&["src"])).is_err());
     }
 
     fn run_args() -> OracleArgs {
