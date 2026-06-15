@@ -27,6 +27,13 @@ Reach for these first:
 - **`important_symbols`** — load-bearing symbols by (SCIP-aware) PageRank; pass `personalize` to
   bias toward what you're editing. Compiler-grade once `rag-rat oracle run` has run.
 
+**Symbol handle:** symbol-returning tools emit `id`, an opaque `sym_<hex>` token — the stable handle
+to cache and pass back into graph/impact/memory tools as the `id` param (copy verbatim; never parse
+it as a number). There is no numeric `symbol_id` on the wire (it's an internal rowid reassigned on
+every reindex). Use `ref` (the `path::name` qualified name) for the human-readable identity. The
+symbol-tool params are `ref` / `id` / `lang` (formerly `symbol_path` / `logical_symbol_id` /
+`language`).
+
 Why this beats grep here:
 - Results carry **provenance**: confidence labels, coverage warnings, and raw evidence, so you can
   judge them rather than trust them blindly.
@@ -54,9 +61,9 @@ Codex's own store) is invisible to the others. rag-rat is the **cross-agent memo
 anything another agent would benefit from here.
 
 How to do it well:
-- **Anchor to the tightest stable target.** Prefer a `symbol_id`/`logical_symbol_id` binding (these
-  now self-heal across cross-file moves — see the relocation engine); fall back to a `path` binding
-  for file/area-level notes, or a commit/GitHub ref for historical rationale.
+- **Anchor to the tightest stable target.** Prefer an `id` binding (the `sym_<hex>` logical-symbol
+  handle — self-heals across cross-file moves via the relocation engine); fall back to a `path`
+  binding for file/area-level notes, or a commit/GitHub ref for historical rationale.
 - **Pick the right `kind`:** `Invariant` (must stay true), `Decision`/`RejectedAlternative` (why it's
   this way / why not the other), `Risk` / `BugPattern` (footguns), `PerformanceNote`, `PlatformQuirk`,
   `FFIBoundary`. Write a concrete title, and a body with the *why* and *how to apply* — not just *what*.

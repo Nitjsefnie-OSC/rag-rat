@@ -18,6 +18,7 @@ use crate::query::symbol::SymbolHit;
 #[derive(Debug, Serialize)]
 pub struct ImpactItem {
     pub path: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub kind: String,
     pub symbol: Option<String>,
@@ -54,16 +55,14 @@ pub struct ImpactSurfaceReport {
 
 #[derive(Debug, Serialize)]
 pub struct ImpactSurfaceQuery {
+    // Internal rowid — never serialized (reindex-churned, #149); `symbol_path` identifies the
+    // query.
+    #[serde(skip_serializing)]
     pub symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub query: Option<String>,
     pub resolution: String,
-    pub include_tests: bool,
-    pub include_docs: bool,
-    pub include_git: bool,
-    pub include_papertrail: bool,
-    pub include_text_fallback: bool,
-    pub include_memories: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -268,12 +267,6 @@ pub fn impact_surface_report_for_symbol(
             symbol_path: Some(symbol.qualified_name.clone()),
             query: None,
             resolution: options.resolution_mode.as_str().to_string(),
-            include_tests: options.include_tests,
-            include_docs: options.include_docs,
-            include_git: options.include_git,
-            include_papertrail: options.include_papertrail,
-            include_text_fallback: options.include_text_fallback,
-            include_memories: options.include_memories,
         },
         completeness_and_caveats: ImpactCompleteness {
             exact_graph_callers: u64::try_from(direct_semantic_callers.len()).unwrap_or(u64::MAX),

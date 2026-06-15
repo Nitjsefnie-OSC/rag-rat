@@ -95,7 +95,7 @@ impl McpGraphResolutionMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum McpGraphEdgeKind {
     CallsName,
@@ -121,6 +121,120 @@ impl McpGraphEdgeKind {
             Self::Implements => "implements",
         }
     }
+}
+
+/// Resolve one optional include-flag against the array form. `None` (the `include` key omitted)
+/// keeps the tool's historical `default`; a present `include` list is the EXACT on-set, so a
+/// default-on flag (e.g. impact's `tests`/`git`) is disabled simply by leaving it out. Presence in
+/// the list = on. This is why the surface is an array, not per-key booleans (#149 follow-up).
+fn included<T: PartialEq>(include: &Option<Vec<T>>, flag: T, default: bool) -> bool {
+    match include {
+        None => default,
+        Some(flags) => flags.contains(&flag),
+    }
+}
+
+/// Deserialize an optional `Vec<T>` that may arrive EITHER as a real JSON array (the schema form)
+/// OR as a JSON-string-encoded array (`"[\"git\"]"`). Some MCP clients serialize non-string args as
+/// strings — Claude Code does this for array/object params (anthropics/claude-code#24599) — so the
+/// array `include` surface is unusable from them unless the server also accepts the stringified
+/// form. We keep advertising a real array (schema unchanged) and rescue the stringified case here;
+/// `null`/absent -> `None`, `[]` -> `Some(vec![])` (the explicit empty on-set). Serialize stays the
+/// default (a real array), which round-trips back through this deserializer fine — so no
+/// `serialize_with` is needed (contrast the scalar `sym_handle` fields, which DO need symmetry).
+fn de_seq_or_json_string<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error as _;
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => serde_json::from_str(&raw).map(Some).map_err(D::Error::custom),
+        Some(other) => serde_json::from_value(other).map(Some).map_err(D::Error::custom),
+    }
+}
+
+/// Non-`Option` sibling of [`de_seq_or_json_string`] for a plain `Vec<T>` field (e.g.
+/// `personalize`): same array-or-JSON-string tolerance, with `null`/absent collapsing to an empty
+/// `Vec`.
+fn de_vec_or_json_string<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(de_seq_or_json_string(deserializer)?.unwrap_or_default())
+}
+
+/// `semantic_search` `include` flags. `git`/`papertrail` are on by default (omit `include` to keep
+/// them); `generated`/`fallback` are off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchInclude {
+    Generated,
+    Git,
+    Papertrail,
+    Fallback,
+}
+
+/// `repo_brief` / `repo_clusters` `include` flags. `memories` on by default; `generated` off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrientationInclude {
+    Generated,
+    Memories,
+}
+
+/// `symbol_lookup` / `read_chunk` `include` flags. `memories` on by default (pass `include: []` to
+/// suppress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoriesInclude {
+    Memories,
+}
+
+/// `find_callers` / `trace_callees` `include` flags. `memories` on by default; the rest off (they
+/// add unresolved/macro/common-method/reference noise or the coverage block on demand).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphInclude {
+    References,
+    Unresolved,
+    Macros,
+    CommonMethods,
+    Coverage,
+    Memories,
+}
+
+/// `compare_graph_to_text` `include` flags. `tests` on by default; the rest off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareInclude {
+    Tests,
+    References,
+    Unresolved,
+    Macros,
+    CommonMethods,
+}
+
+/// `impact_surface` `include` flags — ALL on by default (impact's value is the bundled evidence).
+/// Pass an explicit `include` to narrow it, e.g. `["git"]` for git history only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImpactInclude {
+    Tests,
+    Docs,
+    Git,
+    Papertrail,
+    TextFallback,
+    Memories,
+}
+
+/// `papertrail_for_commit` `include` flags. `fallback` off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PapertrailCommitInclude {
+    Fallback,
 }
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -169,19 +283,15 @@ pub struct SearchArgs {
     #[serde(default = "default_search_limit")]
     pub limit: u32,
     #[serde(default)]
-    pub include_generated: bool,
-    #[serde(default)]
     pub explain: bool,
-    #[serde(default = "default_true")]
-    pub include_git: bool,
-    #[serde(default = "default_true")]
-    pub include_papertrail: bool,
+    /// What to include: `git`, `papertrail` (both on by default), `generated`, `fallback` (off by
+    /// default). Omit to keep defaults; an explicit list is the exact on-set.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<SearchInclude>>,
     #[serde(default = "default_search_graph_mode")]
     pub include_graph: McpGraphMode,
     #[serde(default = "default_search_graph_limit")]
     pub graph_limit: u32,
-    #[serde(default)]
-    pub include_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -210,20 +320,18 @@ pub struct RepoBriefArgs {
     pub mode: McpRepoBriefMode,
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub include_generated: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default), `generated` (off). Omit to keep defaults.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<OrientationInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RepoClustersArgs {
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub include_generated: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default), `generated` (off). Omit to keep defaults.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<OrientationInclude>>,
     #[serde(default = "default_min_cluster_size")]
     pub min_cluster_size: u32,
 }
@@ -233,60 +341,67 @@ pub struct ImportantSymbolsArgs {
     /// Max load-bearing symbols to return.
     #[serde(default = "default_repo_brief_limit")]
     pub limit: u32,
-    /// Symbols to bias importance toward (the symbols you're editing/querying) — names, symbol
-    /// paths, or numeric ids; the random surfer teleports back to these, lifting the spine *they*
-    /// depend on. A numeric value is a raw symbol id; otherwise it's resolved by symbol path then
-    /// name (ambiguous/missing entries are skipped, never fatal). LEAVE EMPTY to auto-seed from
+    /// Symbols to bias importance toward (the symbols you're editing/querying) — names, refs
+    /// (`path::name`), or `sym_<hex>` handles; the random surfer teleports back to these, lifting
+    /// the spine *they* depend on. A `sym_<hex>` handle resolves to its logical symbol's members;
+    /// otherwise the entry is resolved by ref then name (ambiguous/missing entries are skipped,
+    /// never fatal). LEAVE EMPTY to auto-seed from
     /// your current git diff (the default — "importance relative to your current changes").
     /// Pass a single `"global"` to force whole-repo PageRank instead.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_vec_or_json_string")]
     pub personalize: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolArgs {
     pub symbol: Option<String>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
-    pub symbol_id: Option<i64>,
+    #[serde(rename = "lang")]
     pub language: Option<String>,
     #[serde(default)]
     pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default). Pass `include: []` to suppress.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<MemoriesInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
     pub symbol: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
-    pub symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
     #[serde(default)]
     pub allow_ambiguous: bool,
-    #[serde(default)]
-    pub include_references: bool,
-    #[serde(default)]
-    pub include_unresolved: bool,
-    #[serde(default)]
-    pub include_macros: bool,
-    #[serde(default)]
-    pub include_common_methods: bool,
-    #[serde(default)]
-    pub include_coverage: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default); `references`, `unresolved`, `macros`,
+    /// `common_methods`, `coverage` (all off by default). Omit to keep defaults; an explicit list
+    /// is the exact on-set (so listing `macros` alone also drops the default `memories`).
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<GraphInclude>>,
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -295,26 +410,27 @@ pub struct CompareGraphTextArgs {
     pub pattern: String,
     pub symbol: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
-    pub symbol_id: Option<i64>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_compare_limit")]
     pub limit: u32,
-    #[serde(default = "default_true")]
-    pub include_tests: bool,
     #[serde(default)]
     pub allow_ambiguous: bool,
-    #[serde(default)]
-    pub include_references: bool,
-    #[serde(default)]
-    pub include_unresolved: bool,
-    #[serde(default)]
-    pub include_macros: bool,
-    #[serde(default)]
-    pub include_common_methods: bool,
+    /// What to include: `tests` (on by default); `references`, `unresolved`, `macros`,
+    /// `common_methods` (off by default). Omit to keep defaults; an explicit list is the exact
+    /// on-set.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<CompareInclude>>,
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
     pub edge_kinds: Option<Vec<McpGraphEdgeKind>>,
 }
 
@@ -322,29 +438,27 @@ pub struct CompareGraphTextArgs {
 pub struct ImpactArgs {
     pub query: Option<String>,
     pub symbol: Option<String>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
-    pub symbol_id: Option<i64>,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default)]
     pub allow_ambiguous: bool,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
-    #[serde(default = "default_true")]
-    pub include_tests: bool,
-    #[serde(default = "default_true")]
-    pub include_docs: bool,
-    #[serde(default = "default_true")]
-    pub include_git: bool,
-    #[serde(default = "default_true")]
-    pub include_papertrail: bool,
-    #[serde(default = "default_true")]
-    pub include_text_fallback: bool,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, ALL on
+    /// by default (impact's value is the bundled evidence). Omit to keep them; pass an explicit
+    /// list to narrow, e.g. `["git"]` for git history only.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<ImpactInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -360,8 +474,9 @@ pub struct ReadChunkArgs {
     pub include_graph: McpGraphMode,
     #[serde(default = "default_read_chunk_graph_limit")]
     pub graph_limit: u32,
-    #[serde(default = "default_true")]
-    pub include_memories: bool,
+    /// What to include: `memories` (on by default). Pass `include: []` to suppress.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<MemoriesInclude>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
@@ -462,10 +577,14 @@ impl McpMemorySource {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryBindArgs {
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
-    pub symbol_id: Option<i64>,
     pub chunk_id: Option<i64>,
     pub edge_id: Option<i64>,
     pub path: Option<String>,
@@ -475,10 +594,20 @@ pub struct MemoryBindArgs {
     pub github_owner: Option<String>,
     pub github_repo: Option<String>,
     pub github_number: Option<i64>,
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "start_id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub start_logical_symbol_id: Option<i64>,
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "end_id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub end_logical_symbol_id: Option<i64>,
     pub edge_sequence_hash: Option<String>,
@@ -532,12 +661,17 @@ pub struct MemorySearchArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryForSymbolArgs {
     pub symbol: Option<String>,
+    #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
     // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(default, deserialize_with = "rag_rat_core::serde_big_id::big_id_opt::deserialize")]
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
     #[schemars(with = "Option<String>")]
     pub logical_symbol_id: Option<i64>,
-    pub symbol_id: Option<i64>,
     #[serde(default)]
     pub allow_ambiguous: bool,
     #[serde(default = "default_search_limit")]
@@ -587,8 +721,9 @@ pub struct PapertrailCommitArgs {
     pub commit_hash: String,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub include_fallback: bool,
+    /// What to include: `fallback` (off by default).
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<PapertrailCommitInclude>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -725,7 +860,7 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
     fn from(args: MemoryBindArgs) -> Self {
         Self {
             logical_symbol_id: args.logical_symbol_id,
-            symbol_id: args.symbol_id,
+            symbol_id: None,
             chunk_id: args.chunk_id,
             edge_id: args.edge_id,
             path: args.path,
@@ -755,8 +890,8 @@ pub fn description(name: &str) -> &'static str {
              without explain. Hits are validated against current source. Falls back to BM25-only \
              (every hit 'lexical') when no embedding model is present.",
         "symbol_lookup" =>
-            "Resolve a symbol name (or symbol_path/id) to its definition(s) in Rust, TypeScript, \
-             Kotlin, C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
+            "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
+             C, or C++ — exact or fuzzy. Returns candidates with signatures, locations, \
              logical-symbol grouping (cfg variants), and any bound repo memories. Use to \
              disambiguate before a graph or read call.",
         "find_callers" =>
@@ -766,8 +901,8 @@ pub fn description(name: &str) -> &'static str {
              symbol with symbol_lookup first when a name is ambiguous.",
         "trace_callees" =>
             "Find what a symbol calls (forward call graph). Same evidence shape as find_callers; \
-             unresolved std/common-method noise is filtered out by default (toggle with \
-             include_common_methods / include_unresolved).",
+             unresolved std/common-method noise is filtered out by default (add `common_methods` / \
+             `unresolved` to the `include` array to keep it).",
         "compare_graph_to_text" =>
             "Cross-check a symbol's graph caller edges against a regex text search of indexed \
              source — surfaces call sites the tree-sitter graph missed and flags likely false \
@@ -793,7 +928,7 @@ pub fn description(name: &str) -> &'static str {
              edge graph — what the rest of the code most depends on. Run before editing to see the \
              spine you shouldn't reinvent or break. By DEFAULT (no `personalize`) it auto-seeds \
              from your current git diff, returning importance relative to your current changes; \
-             pass `personalize` (names, symbol paths, or ids you're working on) to seed it \
+             pass `personalize` (names, refs, or `sym_<hex>` handles you're working on) to seed it \
              explicitly, or a single `\"global\"` to force whole-repo PageRank. The result is a \
              labeled object: `mode` (which scale), `seed_source` (seed provenance), and `symbols`.",
         "ffi_surface" =>

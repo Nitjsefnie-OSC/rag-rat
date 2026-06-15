@@ -53,30 +53,40 @@ To run from a checkout without installing, use a project-scoped server whose com
 
 ## Tools
 
-- `semantic_search`: `{ "query": string, "limit"?: number, "include_generated"?: boolean, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include_git"?: boolean, "include_papertrail"?: boolean, "explain"?: boolean }`
-- `symbol_lookup`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
-- `find_callers`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `trace_callees`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `compare_graph_to_text`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_unresolved"?: boolean, "include_macros"?: boolean, "include_common_methods"?: boolean, "include_references"?: boolean, "edge_kinds"?: string[] }`
-- `impact_surface`: `{ "query"?: string, "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "logical_symbol_id"?: number, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include_tests"?: boolean, "include_docs"?: boolean, "include_git"?: boolean, "include_papertrail"?: boolean, "include_text_fallback"?: boolean }`
+- `semantic_search`: `{ "query": string, "limit"?: number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("generated" | "git" | "papertrail" | "fallback")[], "explain"?: boolean }`
+- `symbol_lookup`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("memories")[] }`
+- `find_callers`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
+- `trace_callees`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("references" | "unresolved" | "macros" | "common_methods" | "coverage" | "memories")[], "edge_kinds"?: string[] }`
+- `compare_graph_to_text`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "pattern": string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "references" | "unresolved" | "macros" | "common_methods")[], "edge_kinds"?: string[] }`
+- `impact_surface`: `{ "query"?: string, "symbol"?: string, "ref"?: string, "id"?: string, "resolution"?: "exact" | "syntactic" | "fuzzy", "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("tests" | "docs" | "git" | "papertrail" | "text_fallback" | "memories")[] }`
 - `ffi_surface`: `{ "limit"?: number }`
-- `docs_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "allow_ambiguous"?: boolean, "limit"?: number }`
-- `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number }`
+- `docs_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `read_chunk`: `{ "chunk_id": number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("memories")[] }`
 - `commit_search`: `{ "query": string, "limit"?: number }`
 - `git_history_for_path`: `{ "path": string, "limit"?: number }`
-- `git_history_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `git_history_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 - `commits_touching_query`: `{ "query": string, "limit"?: number }`
 - `git_blame_chunk`: `{ "chunk_id": number }`
 - `papertrail_for_chunk`: `{ "chunk_id": number, "limit"?: number }`
-- `papertrail_for_symbol`: `{ "symbol"?: string, "symbol_path"?: string, "symbol_id"?: number, "language"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
-- `papertrail_for_commit`: `{ "commit_hash": string, "limit"?: number }`
+- `papertrail_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `papertrail_for_commit`: `{ "commit_hash": string, "limit"?: number, "include"?: ("fallback")[] }`
 - `github_issue_search`: `{ "query": string, "limit"?: number }`
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
-- `rationale_search`: `{ "query": string, "limit"?: number }`
+- `rationale_search`: `{ "query": string, "limit"?: number, "include"?: ("fallback")[] }`
 - `local_ai_status`: `{}`
 - `heal_index`: `{ "limit"?: number }`
 - `github_sync_status`: `{}`
 - `index_status`: `{}`
+
+**The `include` array** replaces the former `include_*` boolean params (#149 follow-up — shorter,
+token-cheaper). Presence in the list turns a section on. **Omit `include` entirely to keep each
+tool's defaults** (e.g. `impact_surface` returns tests/docs/git/papertrail/text_fallback/memories;
+graph tools return memories). A **present** list is the EXACT on-set — so it's also how you disable a
+default-on section: `impact_surface` with `"include": ["git"]` returns git history only, and any
+tool with `"include": []` returns the bare result. Each tool accepts only its own flags (see the
+signatures above). The server also accepts a JSON-string-encoded array (`"[\"git\"]"`) as well as a
+real array, so the surface works even from clients that serialize array params as strings
+([anthropics/claude-code#24599](https://github.com/anthropics/claude-code/issues/24599)).
 
 `tools/list` is served by `rmcp` and exposes typed JSON schemas derived from the same request structs
 used by the handlers. Existing tool names and response fields are kept stable for current MCP clients.
@@ -98,11 +108,10 @@ TOON and takes a global `--json` flag for JSON output.)
 {
   "candidates": [
     {
-      "symbol_id": 3150,
-      "logical_symbol_id": 98,
+      "id": "sym_a3f29c1b",
       "logical_variant_count": 2,
       "logical_group_reason": "cfg_variant",
-      "symbol_path": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
+      "ref": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
       "qualified_name": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
       "kind": "function",
       "signature": "pub(crate) async fn spawn_blocking<F, T>(...)"
@@ -112,13 +121,17 @@ TOON and takes a global `--json` flag for JSON output.)
 }
 ```
 
-Graph, docs, git-history, papertrail, and symbol-specific impact tools accept `logical_symbol_id`,
-`symbol_id`, `symbol_path`, or `symbol` and resolve them in that priority order. If a bare `symbol`
-maps to multiple candidates, the tool returns the same candidate object instead of guessing. Pass
-`allow_ambiguous: true` only for navigation/debugging when name fallback is acceptable.
+Graph, docs, git-history, papertrail, and symbol-specific impact tools accept `id`,
+`ref`, or `symbol` and resolve them in that priority order. `id` is the
+**opaque, stable handle** a `symbol_lookup` (or any symbol-returning tool) emits — a `sym_<hex>`
+token; copy it verbatim and pass it back, never parse it as a number. There is no numeric
+`symbol_id` on the wire: it's an internal rowid reassigned on every reindex, so it could not be
+cached safely across an edit (#149). If a bare `symbol` maps to multiple candidates, the tool
+returns the same candidate object instead of guessing. Pass `allow_ambiguous: true` only for
+navigation/debugging when name fallback is acceptable.
 
 Logical symbols group multiple concrete symbol rows that represent one source-level API, such as
-Rust `#[cfg]` variants of the same function in the same file. Use `logical_symbol_id` with
+Rust `#[cfg]` variants of the same function in the same file. Use `id` with
 `resolution: "exact"` when callers target the logical API rather than one cfg body. Exact logical
 mode only returns edges whose verified `target_symbol_id` is a member of the group. Graph envelopes
 include the selected `logical_symbol` and its `variants`; `cfg_expr` may be `null` until cfg
@@ -142,9 +155,9 @@ from an outdated FTS table.
 - `include_graph`: `none`, `compact`, or `full`. Default is `compact`.
 - `graph_limit`: maximum caller/callee/import/type evidence entries to attach. Default is `3` for
   search and `20` for `read_chunk`.
-- `include_git`: include git-history ranking boosts when available. Default is `true`.
-- `include_papertrail`: include cached GitHub papertrail ranking boosts when available. Default is
-  `true`.
+- `include`: array of `generated` (index generated files), `git` (git-history ranking boosts),
+  `papertrail` (cached GitHub papertrail boosts), `fallback`. `git` and `papertrail` are on by
+  default — omit `include` to keep them; pass an explicit list to override.
 - `explain`: include score components (`bm25`, `vector`, `symbol`, `graph`, `git`, `github`).
   Default is `false`.
 
@@ -163,18 +176,19 @@ entries include exact tree-sitter callsite spans: `callsite.path`, `callsite.lin
 
 Graph tools and `impact_surface` accept `resolution`:
 
-- `exact`: only verified target-symbol rows are returned. A row is allowed only when
-  `target_symbol_id` matches `symbol_id`, or the resolved fully-qualified symbol identity matches
-  `symbol`. Every returned row has `verified_target_symbol: true`.
+- `exact`: only verified target-symbol rows are returned. A row is allowed only when the edge's
+  verified target resolves to the selected symbol (its `id`/`ref`), or the
+  resolved fully-qualified symbol identity matches `symbol`. Every returned row has
+  `verified_target_symbol: true`.
 - `syntactic`: default. Exact matches plus qualified syntactic evidence are returned. Unresolved
   qualified call targets may be shown, but broad bare-name ambiguous fallback is excluded.
 - `fuzzy`: compatibility/navigation mode. Suffix and bare-name fallback are allowed, including
   ambiguous candidates. Treat these rows as possible evidence, not proof.
 
-Use `symbol_id` with `resolution: "exact"` when a previous `symbol_lookup` result selected one
-specific concrete symbol. Use `logical_symbol_id` with `resolution: "exact"` when the lookup result
-shows multiple cfg/duplicate variants of the same logical API. Bare names in `exact` mode
-intentionally return little or nothing unless `symbol_id` or `logical_symbol_id` is provided.
+Use `id` (the `sym_<hex>` handle from a previous `symbol_lookup`) with
+`resolution: "exact"` to target a resolved symbol — including the cfg/duplicate-variant case, where
+the handle addresses the whole logical group (all its members). Bare names in `exact` mode
+intentionally return little or nothing unless `id` is provided.
 
 `find_callers` and `trace_callees` return a graph envelope, not a bare row array:
 
@@ -182,8 +196,8 @@ intentionally return little or nothing unless `symbol_id` or `logical_symbol_id`
 {
   "query": {
     "tool": "find_callers",
-    "symbol_id": 3150,
-    "symbol_path": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
+    "id": "sym_a3f29c1b",
+    "ref": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
     "resolution": "exact"
   },
   "summary": {
@@ -222,12 +236,16 @@ verified/repo-local `constructs` edges. It hides unresolved calls, unresolved ma
 references, imports/exports, common method/combinator calls, and std/common constructors unless a
 caller asks for them explicitly:
 
-- `include_unresolved`: include unresolved qualified/name-only calls.
-- `include_macros`: include `uses_macro` edges such as `format!`, `json!`, and `vec!`.
-- `include_common_methods`: include common low-signal calls such as `clone`, `map`, `map_err`,
+Pass these in the `include` array (each off by default; `memories` is on by default):
+
+- `unresolved`: include unresolved qualified/name-only calls.
+- `macros`: include `uses_macro` edges such as `format!`, `json!`, and `vec!`.
+- `common_methods`: include common low-signal calls such as `clone`, `map`, `map_err`,
   `and_then`, `unwrap_or`, `unwrap_or_else`, `to_string`, `to_owned`, `as_ref`, `as_mut`, `get`,
   `insert`, and unresolved/common `new`.
-- `include_references`: include type references, imports, exports, `contains`, and `implements`.
+- `references`: include type references, imports, exports, `contains`, and `implements`.
+- `coverage` (graph tools): attach the parser/coverage block. `memories`: attach crossing repo
+  memories (on by default; pass `"include": []` to drop them).
 
 `find_callers` uses exact target resolution first, then qualified-name and target-name fallbacks;
 fallback hits are labeled with `resolution`, `verified_target_symbol`, raw `evidence`, and optional
@@ -242,12 +260,10 @@ currently indexed source files, then compares `(path, line)` sets:
 ```json
 {
   "query": {
-    "symbol_id": 3150,
-    "logical_symbol_id": 123,
-    "symbol_path": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
+    "id": "sym_a3f29c1b",
+    "ref": "crates/app/src/runtime/task_spawn.rs::spawn_blocking",
     "pattern": "crate::runtime::task_spawn::spawn_blocking\\(",
-    "resolution": "syntactic",
-    "include_tests": true
+    "resolution": "syntactic"
   },
   "summary": {
     "text_hits": 38,
@@ -276,8 +292,8 @@ rows are also listed in `likely_false_positives`. The tool includes the same `co
 graph traversal envelopes so audit output can be checked for stale source and parser failures before
 treating the counts as authoritative.
 
-`impact_surface` is the graph-backed rg replacement path for a selected symbol. For `symbol_id`,
-`symbol_path`, or `symbol` requests it returns sections instead of a flat list:
+`impact_surface` is the graph-backed rg replacement path for a selected symbol. For
+`id`, `ref`, or `symbol` requests it returns sections instead of a flat list:
 
 1. `direct_semantic_callers`
 2. `direct_semantic_callees`
@@ -290,10 +306,11 @@ treating the counts as authoritative.
 9. `completeness_and_caveats`
 
 Use the same disambiguation controls as graph tools. `resolution: "exact"` means direct graph
-callers/callees are verified against the selected `symbol_id`; `syntactic` allows qualified
-tree-sitter evidence; `fuzzy` is for navigation only. Optional section controls are `include_tests`,
-`include_docs`, `include_git`, `include_papertrail`, and `include_text_fallback`, all enabled by
-default. If exact graph callers are empty but text fallback finds symbol/path hits, the caveats
+callers/callees are verified against the selected symbol; `syntactic` allows qualified
+tree-sitter evidence; `fuzzy` is for navigation only. The sections are controlled by the `include`
+array — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, all on by default (omit
+`include` to keep them; pass e.g. `["git"]` to narrow to git history only). If exact graph callers
+are empty but text fallback finds symbol/path hits, the caveats
 section explicitly says that graph extraction or resolution gaps are likely. Free-text `query`
 requests retain the older flat impact item shape for compatibility.
 

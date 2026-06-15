@@ -9,15 +9,16 @@ pub(crate) fn call_tool_with_db(
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
             let graph_mode = GraphMetaMode::parse(args.include_graph.as_str())?;
+            let include_generated = included(&args.include, SearchInclude::Generated, false);
             let options = SearchOptions {
-                include_git: args.include_git,
-                include_papertrail: args.include_papertrail,
+                include_git: included(&args.include, SearchInclude::Git, true),
+                include_papertrail: included(&args.include, SearchInclude::Papertrail, true),
             };
             if args.explain {
                 json!(db.search_explain_with_graph_meta_options(
                     &args.query,
                     args.limit,
-                    args.include_generated,
+                    include_generated,
                     graph_mode,
                     args.graph_limit,
                     options
@@ -26,7 +27,7 @@ pub(crate) fn call_tool_with_db(
                 json!(db.search_with_graph_meta_options(
                     &args.query,
                     args.limit,
-                    args.include_generated,
+                    include_generated,
                     graph_mode,
                     args.graph_limit,
                     options
@@ -63,16 +64,16 @@ pub(crate) fn call_tool_with_db(
             json!(db.repo_brief(RepoBriefOptions {
                 mode: args.mode.core(),
                 limit: args.limit,
-                include_generated: args.include_generated,
-                include_memories: args.include_memories,
+                include_generated: included(&args.include, OrientationInclude::Generated, false),
+                include_memories: included(&args.include, OrientationInclude::Memories, true),
             })?)
         },
         "repo_clusters" => {
             let args: RepoClustersArgs = serde_json::from_value(arguments)?;
             json!(db.repo_clusters(RepoClustersOptions {
                 limit: args.limit,
-                include_generated: args.include_generated,
-                include_memories: args.include_memories,
+                include_generated: included(&args.include, OrientationInclude::Generated, false),
+                include_memories: included(&args.include, OrientationInclude::Memories, true),
                 min_cluster_size: args.min_cluster_size,
             })?)
         },
@@ -94,7 +95,7 @@ pub(crate) fn call_tool_with_db(
                 args.chunk_id,
                 GraphMetaMode::parse(args.include_graph.as_str())?,
                 args.graph_limit,
-                args.include_memories
+                included(&args.include, MemoriesInclude::Memories, true)
             )?)
         },
         "commit_search" => {
@@ -128,7 +129,7 @@ pub(crate) fn call_tool_with_db(
         "papertrail_for_commit" => {
             let args: PapertrailCommitArgs = serde_json::from_value(arguments)?;
             let mut value = json!(db.papertrail_for_commit(&args.commit_hash, args.limit)?);
-            if !args.include_fallback {
+            if !included(&args.include, PapertrailCommitInclude::Fallback, false) {
                 strip_fallback_github_evidence(&mut value);
             }
             value
@@ -144,7 +145,7 @@ pub(crate) fn call_tool_with_db(
         "rationale_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
             let mut value = json!(db.rationale_search(&args.query, args.limit)?);
-            if !args.include_fallback {
+            if !included(&args.include, SearchInclude::Fallback, false) {
                 keep_literal_github_refs_if_present(&mut value);
             }
             value
@@ -210,7 +211,7 @@ pub(crate) fn call_tool_with_db(
 }
 
 pub(crate) fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow::Result<Value> {
-    let include_memories = args.include_memories;
+    let include_memories = included(&args.include, MemoriesInclude::Memories, true);
     let lookup = db.symbol_candidates(&symbol_selector(args)?)?;
     let mut value = json!(lookup);
     if !include_memories {
@@ -219,25 +220,11 @@ pub(crate) fn symbol_lookup_tool(db: &IndexDatabase, args: SymbolArgs) -> anyhow
     let Some(candidates) = value.get_mut("candidates").and_then(Value::as_array_mut) else {
         return Ok(value);
     };
-    let selector = SymbolSelector {
-        logical_symbol_id: None,
-        symbol_id: None,
-        symbol_path: None,
-        symbol: None,
-        language: None,
-        allow_ambiguous: true,
-        limit: 1,
-    };
-    for candidate in candidates {
-        let Some(symbol_id) = candidate.get("symbol_id").and_then(Value::as_i64) else {
-            continue;
-        };
-        let mut selector = selector.clone();
-        selector.symbol_id = Some(symbol_id);
-        let Ok(Ok(Some(symbol))) = db.select_symbol(&selector) else {
-            continue;
-        };
-        let memories = db.memory_for_symbol(&symbol, 10)?;
+    // Resolve memories from the in-memory hits, which still carry the internal `symbol_id`. The
+    // serialized candidates no longer expose it (#149), so the old read of `candidate["symbol_id"]`
+    // found nothing and dropped every memory — zip by position against the source hits instead.
+    for (candidate, hit) in candidates.iter_mut().zip(&lookup.candidates) {
+        let memories = db.memory_for_symbol(hit, 10)?;
         if !memories.is_empty() {
             candidate["memories"] = json!(memories);
         }
@@ -252,11 +239,12 @@ pub(crate) fn graph_tool(
     reverse: bool,
 ) -> anyhow::Result<Value> {
     let limit = args.limit;
-    let include_references = args.include_references;
-    let include_unresolved = args.include_unresolved;
-    let include_macros = args.include_macros;
-    let include_common_methods = args.include_common_methods;
-    let include_memories = args.include_memories;
+    let include_references = included(&args.include, GraphInclude::References, false);
+    let include_unresolved = included(&args.include, GraphInclude::Unresolved, false);
+    let include_macros = included(&args.include, GraphInclude::Macros, false);
+    let include_common_methods = included(&args.include, GraphInclude::CommonMethods, false);
+    let include_coverage = included(&args.include, GraphInclude::Coverage, false);
+    let include_memories = included(&args.include, GraphInclude::Memories, true);
     let edge_kinds = graph_edge_kinds(args.edge_kinds.as_deref());
     let allow_ambiguous = args.allow_ambiguous;
     let selector = graph_symbol_selector(&args)?;
@@ -280,7 +268,7 @@ pub(crate) fn graph_tool(
                 limit,
                 &options
             )?);
-            compact_graph_coverage(&mut value, args.include_coverage);
+            compact_graph_coverage(&mut value, include_coverage);
             if include_memories {
                 let edge_ids = value["results"]
                     .as_array()
@@ -312,7 +300,7 @@ pub(crate) fn graph_tool(
                 include_common_methods,
                 edge_kinds,
                 resolution_mode,
-                symbol_id: args.symbol_id,
+                symbol_id: None,
                 logical_symbol_id: args.logical_symbol_id,
             };
             let hops = if reverse {
@@ -352,7 +340,7 @@ pub(crate) fn compare_graph_to_text_tool(
 ) -> anyhow::Result<Value> {
     let selector = SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
         language: None,
@@ -362,10 +350,14 @@ pub(crate) fn compare_graph_to_text_tool(
     match db.select_symbol(&selector)? {
         Ok(Some(symbol)) => {
             let options = GraphTraversalOptions {
-                include_references: args.include_references,
-                include_unresolved: args.include_unresolved,
-                include_macros: args.include_macros,
-                include_common_methods: args.include_common_methods,
+                include_references: included(&args.include, CompareInclude::References, false),
+                include_unresolved: included(&args.include, CompareInclude::Unresolved, false),
+                include_macros: included(&args.include, CompareInclude::Macros, false),
+                include_common_methods: included(
+                    &args.include,
+                    CompareInclude::CommonMethods,
+                    false,
+                ),
                 edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
@@ -376,7 +368,7 @@ pub(crate) fn compare_graph_to_text_tool(
                 &args.pattern,
                 args.limit,
                 &options,
-                args.include_tests
+                included(&args.include, CompareInclude::Tests, true)
             )?))
         },
         Ok(None) => Ok(Value::Null),
@@ -514,21 +506,17 @@ pub(crate) fn impact_tool(
 ) -> anyhow::Result<Value> {
     let options = ImpactSurfaceOptions {
         resolution_mode,
-        include_tests: args.include_tests,
-        include_docs: args.include_docs,
-        include_git: args.include_git,
-        include_papertrail: args.include_papertrail,
-        include_text_fallback: args.include_text_fallback,
-        include_memories: args.include_memories,
+        include_tests: included(&args.include, ImpactInclude::Tests, true),
+        include_docs: included(&args.include, ImpactInclude::Docs, true),
+        include_git: included(&args.include, ImpactInclude::Git, true),
+        include_papertrail: included(&args.include, ImpactInclude::Papertrail, true),
+        include_text_fallback: included(&args.include, ImpactInclude::TextFallback, true),
+        include_memories: included(&args.include, ImpactInclude::Memories, true),
     };
-    if args.logical_symbol_id.is_some()
-        || args.symbol_id.is_some()
-        || args.symbol_path.is_some()
-        || args.symbol.is_some()
-    {
+    if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
         let selector = SymbolSelector {
             logical_symbol_id: args.logical_symbol_id,
-            symbol_id: args.symbol_id,
+            symbol_id: None,
             symbol_path: args.symbol_path,
             symbol: args.symbol,
             language: None,
@@ -561,7 +549,7 @@ pub(crate) fn memory_for_symbol_tool(
 ) -> anyhow::Result<Value> {
     let selector = SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
         language: None,
@@ -604,7 +592,7 @@ fn important_symbols_tool(
 pub(crate) fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path,
         symbol: args.symbol,
         language: optional_language(args.language)?,
@@ -626,7 +614,7 @@ pub(crate) fn graph_edge_kinds(edge_kinds: Option<&[McpGraphEdgeKind]>) -> Optio
 pub(crate) fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<SymbolSelector> {
     Ok(SymbolSelector {
         logical_symbol_id: args.logical_symbol_id,
-        symbol_id: args.symbol_id,
+        symbol_id: None,
         symbol_path: args.symbol_path.clone(),
         symbol: args.symbol.clone(),
         language: None,

@@ -5,12 +5,17 @@ use crate::language::Language;
 
 #[derive(Debug, Serialize)]
 pub struct SymbolHit {
+    // The raw rowid is the internal handle + FK target, but it's reassigned on every reindex
+    // (#149), so it never crosses the wire — `logical_symbol_id` is the stable, opaque handle a
+    // consumer caches/passes back. Kept on the struct for in-process use; never serialized.
+    #[serde(skip_serializing)]
     pub symbol_id: i64,
-    // logical_symbol_id is a content-derived 64-bit hash > 2^53; emit as a string so JSON clients
-    // don't round it (#130). symbol_id/file_id are small rowids and stay numbers.
+    // The stable symbol handle: a content-derived id emitted as an opaque `sym_<hex>` token so a
+    // JSON client can't round it (>2^53) or mistake it for a number to compute on (#130/#149).
     #[serde(
+        rename = "id",
         skip_serializing_if = "Option::is_none",
-        serialize_with = "crate::serde_big_id::big_id_opt::serialize"
+        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
     )]
     pub logical_symbol_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20,9 +25,11 @@ pub struct SymbolHit {
     pub file_id: i64,
     pub path: String,
     pub file_kind: String,
+    #[serde(rename = "lang")]
     pub language: String,
     pub name: String,
     pub qualified_name: String,
+    #[serde(rename = "ref")]
     pub symbol_path: String,
     pub kind: String,
     pub start_byte: i64,
@@ -50,8 +57,9 @@ pub struct SymbolLookup {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbolHit {
-    #[serde(serialize_with = "crate::serde_big_id::big_id::serialize")]
+    #[serde(rename = "id", serialize_with = "crate::serde_big_id::sym_handle::serialize")]
     pub logical_symbol_id: i64,
+    #[serde(rename = "lang")]
     pub language: String,
     pub path: String,
     pub logical_name: String,
@@ -63,6 +71,9 @@ pub struct LogicalSymbolHit {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogicalSymbolMember {
+    // Internal rowid only — a member is identified on the wire by its cfg/signature/lines, never
+    // by the reindex-churned id (#149).
+    #[serde(skip_serializing)]
     pub symbol_id: i64,
     pub cfg_expr: Option<String>,
     pub signature_hash: Option<String>,
@@ -348,6 +359,18 @@ fn lookup_logical_members(
     let mut hits = Vec::new();
     for row in rows {
         hits.push(row?);
+    }
+    // Stamp the logical handle onto every member: callers selecting by `logical_symbol_id` (impact,
+    // graph, memory) build their graph options from `SymbolHit.logical_symbol_id`, and a `None`
+    // here silently narrows the exact caller/callee set to the first concrete row instead of
+    // the whole logical group (#149 review). We already know the id, so set it without a
+    // per-member query.
+    if let Some(logical) = lookup_logical_by_id(conn, logical_symbol_id)? {
+        for hit in &mut hits {
+            hit.logical_symbol_id = Some(logical.logical_symbol_id);
+            hit.logical_variant_count = Some(logical.variant_count);
+            hit.logical_group_reason = Some(logical.group_reason.clone());
+        }
     }
     Ok(hits)
 }

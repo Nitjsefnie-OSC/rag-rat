@@ -39,6 +39,82 @@ fn degraded_coverage_escalates_low_completeness_risk() {
 }
 
 #[test]
+fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
+    // rmcp's `Parameters` extractor round-trips tool args through serialize -> deserialize, so any
+    // custom serde on an arg field MUST be symmetric. A `deserialize_with` (sym_handle) without a
+    // matching `serialize_with` re-emits a bare i64 on the round-trip, which the second deserialize
+    // then rejects ("invalid type: integer, expected a symbol handle string") — breaking handle
+    // input on the LIVE MCP server while unit tests that call `call_tool` directly (bypassing rmcp)
+    // pass. This guards every arg struct that carries a `sym_<hex>` handle (#153 review).
+    const HANDLE: &str = "sym_23bad57dfb79ad5f";
+
+    macro_rules! assert_handle_round_trips {
+        ($ty:ty, $field:literal, $value:expr) => {{
+            let first: $ty = serde_json::from_value($value).expect("initial deserialize");
+            let reserialized = serde_json::to_value(&first).expect("serialize");
+            assert_eq!(
+                reserialized[$field],
+                HANDLE,
+                "{} must re-serialize {} as the sym_<hex> token, not a bare integer",
+                stringify!($ty),
+                $field
+            );
+            // The round-trip (what rmcp does) must deserialize again without error.
+            serde_json::from_value::<$ty>(reserialized).expect("round-trip deserialize");
+        }};
+    }
+
+    assert_handle_round_trips!(SymbolArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(SymbolGraphArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(CompareGraphTextArgs, "id", json!({ "pattern": "x", "id": HANDLE }));
+    assert_handle_round_trips!(ImpactArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(MemoryForSymbolArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(MemoryBindArgs, "id", json!({ "id": HANDLE }));
+    assert_handle_round_trips!(MemoryBindArgs, "start_id", json!({ "start_id": HANDLE }));
+    assert_handle_round_trips!(MemoryBindArgs, "end_id", json!({ "end_id": HANDLE }));
+}
+
+#[test]
+fn include_accepts_a_json_string_encoded_array_from_buggy_clients() {
+    // Some MCP clients serialize array args as JSON strings (Claude Code does this for array/object
+    // params — anthropics/claude-code#24599), so `include` arrives as `"[\"git\"]"` not `["git"]`.
+    // The server accepts both forms so the array surface stays usable; the schema still advertises
+    // a real array (#153 review).
+    let from_array: ImpactArgs = serde_json::from_value(json!({ "include": ["git"] })).unwrap();
+    let from_string: ImpactArgs =
+        serde_json::from_value(json!({ "include": "[\"git\"]" })).unwrap();
+    assert_eq!(from_string.include, Some(vec![ImpactInclude::Git]));
+    assert_eq!(from_array.include, from_string.include, "array and stringified array must agree");
+
+    // Omitted -> None (tool defaults apply); explicit empty (either form) -> Some(empty on-set).
+    assert_eq!(serde_json::from_value::<ImpactArgs>(json!({})).unwrap().include, None);
+    assert_eq!(
+        serde_json::from_value::<ImpactArgs>(json!({ "include": "[]" })).unwrap().include,
+        Some(vec![])
+    );
+
+    // The other array params get the same tolerance: edge_kinds (Option<Vec>) and personalize
+    // (Vec).
+    let edges_arr: SymbolGraphArgs =
+        serde_json::from_value(json!({ "edge_kinds": ["calls_name"] })).unwrap();
+    let edges_str: SymbolGraphArgs =
+        serde_json::from_value(json!({ "edge_kinds": "[\"calls_name\"]" })).unwrap();
+    assert_eq!(edges_str.edge_kinds, Some(vec![McpGraphEdgeKind::CallsName]));
+    assert_eq!(edges_arr.edge_kinds, edges_str.edge_kinds);
+
+    let seeds_arr: ImportantSymbolsArgs =
+        serde_json::from_value(json!({ "personalize": ["a", "b"] })).unwrap();
+    let seeds_str: ImportantSymbolsArgs =
+        serde_json::from_value(json!({ "personalize": "[\"a\",\"b\"]" })).unwrap();
+    assert_eq!(seeds_str.personalize, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(seeds_arr.personalize, seeds_str.personalize);
+    // personalize is non-Option: absent collapses to an empty Vec (global ranking).
+    assert!(
+        serde_json::from_value::<ImportantSymbolsArgs>(json!({})).unwrap().personalize.is_empty()
+    );
+}
+
+#[test]
 fn list_tools_exposes_complete_typed_schemas() {
     let tools = list_tools();
     let tools = tools.as_array().expect("tools/list shape");
@@ -91,17 +167,23 @@ fn list_tools_exposes_complete_typed_schemas() {
         "none", "compact", "full",
     ]);
     assert_schema_has_property(tools, "semantic_search", "graph_limit");
-    assert_schema_has_property(tools, "semantic_search", "include_git");
-    assert_schema_has_property(tools, "semantic_search", "include_papertrail");
-    assert_schema_has_property(tools, "semantic_search", "include_fallback");
+    assert_schema_array_item_enum(tools, "semantic_search", "include", &[
+        "generated",
+        "git",
+        "papertrail",
+        "fallback",
+    ]);
     assert_schema_has_property(tools, "semantic_search", "explain");
     assert_symbol_selector_schema(tools, "symbol_lookup");
-    assert_schema_has_property(tools, "find_callers", "include_references");
-    assert_schema_has_property(tools, "find_callers", "include_unresolved");
-    assert_schema_has_property(tools, "find_callers", "include_macros");
-    assert_schema_has_property(tools, "find_callers", "include_common_methods");
-    assert_schema_has_property(tools, "find_callers", "include_coverage");
-    assert_schema_has_property(tools, "find_callers", "include_memories");
+    assert_schema_array_item_enum(tools, "symbol_lookup", "include", &["memories"]);
+    assert_schema_array_item_enum(tools, "find_callers", "include", &[
+        "references",
+        "unresolved",
+        "macros",
+        "common_methods",
+        "coverage",
+        "memories",
+    ]);
     assert_schema_has_property(tools, "find_callers", "edge_kinds");
     assert_schema_has_property(tools, "find_callers", "resolution");
     assert_schema_property_enum(tools, "find_callers", "resolution", &[
@@ -119,35 +201,42 @@ fn list_tools_exposes_complete_typed_schemas() {
         "contains",
         "implements",
     ]);
-    assert_schema_has_property(tools, "find_callers", "logical_symbol_id");
+    assert_schema_has_property(tools, "find_callers", "id");
     assert_symbol_selector_schema(tools, "find_callers");
-    assert_schema_has_property(tools, "trace_callees", "include_references");
-    assert_schema_has_property(tools, "trace_callees", "include_unresolved");
-    assert_schema_has_property(tools, "trace_callees", "include_macros");
-    assert_schema_has_property(tools, "trace_callees", "include_common_methods");
-    assert_schema_has_property(tools, "trace_callees", "include_coverage");
-    assert_schema_has_property(tools, "trace_callees", "include_memories");
+    assert_schema_array_item_enum(tools, "trace_callees", "include", &[
+        "references",
+        "unresolved",
+        "macros",
+        "common_methods",
+        "coverage",
+        "memories",
+    ]);
     assert_schema_has_property(tools, "trace_callees", "edge_kinds");
     assert_schema_has_property(tools, "trace_callees", "resolution");
-    assert_schema_has_property(tools, "trace_callees", "logical_symbol_id");
+    assert_schema_has_property(tools, "trace_callees", "id");
     assert_symbol_selector_schema(tools, "trace_callees");
     assert_schema_requires(tools, "compare_graph_to_text", "pattern");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_unresolved");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_macros");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_common_methods");
-    assert_schema_has_property(tools, "compare_graph_to_text", "include_tests");
+    assert_schema_array_item_enum(tools, "compare_graph_to_text", "include", &[
+        "tests",
+        "references",
+        "unresolved",
+        "macros",
+        "common_methods",
+    ]);
     assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
     assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
-    assert_schema_has_property(tools, "compare_graph_to_text", "logical_symbol_id");
+    assert_schema_has_property(tools, "compare_graph_to_text", "id");
     assert_symbol_selector_schema(tools, "compare_graph_to_text");
     assert_schema_has_property(tools, "impact_surface", "resolution");
-    assert_schema_has_property(tools, "impact_surface", "include_tests");
-    assert_schema_has_property(tools, "impact_surface", "include_docs");
-    assert_schema_has_property(tools, "impact_surface", "include_git");
-    assert_schema_has_property(tools, "impact_surface", "include_papertrail");
-    assert_schema_has_property(tools, "impact_surface", "include_text_fallback");
-    assert_schema_has_property(tools, "impact_surface", "include_memories");
-    assert_schema_has_property(tools, "impact_surface", "logical_symbol_id");
+    assert_schema_array_item_enum(tools, "impact_surface", "include", &[
+        "tests",
+        "docs",
+        "git",
+        "papertrail",
+        "text_fallback",
+        "memories",
+    ]);
+    assert_schema_has_property(tools, "impact_surface", "id");
     assert_symbol_selector_schema(tools, "impact_surface");
     assert_schema_has_property(tools, "repo_brief", "mode");
     assert_schema_property_enum(tools, "repo_brief", "mode", &[
@@ -157,9 +246,9 @@ fn list_tools_exposes_complete_typed_schemas() {
         "refactor_candidates",
     ]);
     assert_schema_has_property(tools, "repo_brief", "limit");
-    assert_schema_has_property(tools, "repo_brief", "include_memories");
+    assert_schema_array_item_enum(tools, "repo_brief", "include", &["generated", "memories"]);
     assert_schema_has_property(tools, "repo_clusters", "limit");
-    assert_schema_has_property(tools, "repo_clusters", "include_memories");
+    assert_schema_array_item_enum(tools, "repo_clusters", "include", &["generated", "memories"]);
     assert_schema_has_property(tools, "repo_clusters", "min_cluster_size");
     assert_symbol_selector_schema(tools, "docs_for_symbol");
     assert_symbol_selector_schema(tools, "git_history_for_symbol");
@@ -168,10 +257,15 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_has_property(tools, "read_chunk", "include_graph");
     assert_schema_property_enum(tools, "read_chunk", "include_graph", &["none", "compact", "full"]);
     assert_schema_has_property(tools, "read_chunk", "graph_limit");
-    assert_schema_has_property(tools, "read_chunk", "include_memories");
+    assert_schema_array_item_enum(tools, "read_chunk", "include", &["memories"]);
     assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
-    assert_schema_has_property(tools, "papertrail_for_commit", "include_fallback");
-    assert_schema_has_property(tools, "rationale_search", "include_fallback");
+    assert_schema_array_item_enum(tools, "papertrail_for_commit", "include", &["fallback"]);
+    assert_schema_array_item_enum(tools, "rationale_search", "include", &[
+        "generated",
+        "git",
+        "papertrail",
+        "fallback",
+    ]);
     assert_schema_has_property(tools, "heal_index", "limit");
     assert_schema_requires(tools, "memory_create", "kind");
     assert_schema_requires(tools, "memory_create", "bind");
@@ -181,7 +275,7 @@ fn list_tools_exposes_complete_typed_schemas() {
     assert_schema_nested_property(tools, "memory_create", "bind", "path_summary");
     assert_schema_requires(tools, "memory_update", "memory_id");
     assert_schema_requires(tools, "memory_search", "query");
-    assert_schema_has_property(tools, "memory_for_symbol", "logical_symbol_id");
+    assert_schema_has_property(tools, "memory_for_symbol", "id");
     assert_schema_requires(tools, "memory_for_path", "path");
     assert_schema_requires(tools, "memory_for_call_path", "edge_sequence_hash");
     assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
@@ -305,8 +399,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     // logical_symbol_id crosses the MCP boundary as a STRING (#130: a 64-bit hash > 2^53 can't be a
     // JSON number without rounding). Read it as a string and pass it straight back to the other
     // tools — the round-trip the fix guarantees.
-    let logical_symbol_id =
-        lookup["candidates"].as_array().unwrap()[0]["logical_symbol_id"].as_str().unwrap();
+    let logical_symbol_id = lookup["candidates"].as_array().unwrap()[0]["id"].as_str().unwrap();
     let memory = call_tool(
             &config.database,
             "memory_create",
@@ -317,19 +410,15 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
                 "confidence": "high",
                 "created_by": "mcp-test",
                 "tags": ["cfg", "graph"],
-                "bind": {"logical_symbol_id": logical_symbol_id}
+                "bind": {"id": logical_symbol_id}
             }),
         )
         .unwrap();
     assert_eq!(memory["duplicate"], false);
     let memory_id = memory["memory"]["memory_id"].as_str().unwrap();
 
-    let for_symbol = call_tool(
-        &config.database,
-        "memory_for_symbol",
-        json!({"logical_symbol_id": logical_symbol_id}),
-    )
-    .unwrap();
+    let for_symbol =
+        call_tool(&config.database, "memory_for_symbol", json!({"id": logical_symbol_id})).unwrap();
     assert_eq!(for_symbol.as_array().unwrap()[0]["memory_id"], memory_id);
     let search =
         call_tool(&config.database, "memory_search", json!({"query": "logical helper"})).unwrap();
@@ -344,7 +433,7 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     let chunk = call_tool(
         &config.database,
         "read_chunk",
-        json!({"chunk_id": chunk_id, "include_memories": true}),
+        json!({"chunk_id": chunk_id, "include": ["memories"]}),
     )
     .unwrap();
     assert_eq!(chunk["memories"].as_array().unwrap()[0]["memory_id"], memory_id);
@@ -352,11 +441,25 @@ fn mcp_memory_tools_create_surface_validate_and_obsolete_symbol_memory() {
     let impact = call_tool(
         &config.database,
         "impact_surface",
-        json!({"logical_symbol_id": logical_symbol_id, "include_memories": true}),
+        json!({"id": logical_symbol_id, "include": ["memories"]}),
     )
     .unwrap();
     assert_eq!(impact["repo_memories"]["direct"].as_array().unwrap()[0]["memory_id"], memory_id);
     assert_eq!(impact["completeness_and_caveats"]["memory_status"]["active"], 1);
+
+    // symbol_lookup must still attach bound memories to each candidate. The enrichment resolves
+    // them from the in-memory hit's internal symbol_id, which no longer crosses the wire (#149/#153
+    // review) — reading it back off the serialized candidate would find nothing and drop them all.
+    let enriched = call_tool(
+        &config.database,
+        "symbol_lookup",
+        json!({"symbol": "cfg_helper", "allow_ambiguous": true}),
+    )
+    .unwrap();
+    let candidate_memories = enriched["candidates"].as_array().unwrap()[0]["memories"]
+        .as_array()
+        .expect("symbol_lookup candidate should carry its bound memory");
+    assert_eq!(candidate_memories[0]["memory_id"], memory_id);
 
     let validation = call_tool(&config.database, "memory_validate", json!({})).unwrap();
     assert_eq!(validation["current"], 1);
@@ -397,7 +500,7 @@ fn mcp_read_chunk_and_heal_index_do_not_return_stale_text() {
 }
 
 #[test]
-fn mcp_symbol_id_selection_disambiguates_graph_tools() {
+fn mcp_handle_selection_disambiguates_graph_tools() {
     let root = unique_temp_root();
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join("src/lib.rs"), "pub mod one;\npub mod two;\n").unwrap();
@@ -419,8 +522,12 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
     assert_eq!(lookup["disambiguation_required"], true);
     let candidates = lookup["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 2);
+    // #149: candidates carry the opaque `sym_<hex>` handle (not the ephemeral numeric symbol_id),
+    // plus the human-readable ref (symbol_path).
     assert!(candidates.iter().all(|candidate| {
-        candidate["symbol_id"].is_i64() && candidate["symbol_path"].as_str().is_some()
+        candidate.get("symbol_id").is_none()
+            && candidate["id"].as_str().is_some_and(|h| h.starts_with("sym_"))
+            && candidate["ref"].as_str().is_some()
     }));
 
     let ambiguous =
@@ -430,20 +537,20 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
 
     let one = candidates
         .iter()
-        .find(|candidate| candidate["symbol_path"].as_str().unwrap().contains("one.rs"))
+        .find(|candidate| candidate["ref"].as_str().unwrap().contains("one.rs"))
         .unwrap();
     let exact = call_tool(
         &config.database,
         "find_callers",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
         }),
     )
     .unwrap();
     assert_eq!(exact["query"]["tool"], "find_callers");
-    assert_eq!(exact["query"]["symbol_id"], one["symbol_id"]);
+    assert_eq!(exact["query"]["id"], one["id"]);
     assert_eq!(exact["query"]["resolution"], "exact");
     assert_eq!(exact["summary"]["returned_count"], 1);
     assert_eq!(exact["summary"]["total_matching_edges"], 1);
@@ -457,10 +564,10 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "find_callers",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
             "edge_kinds": ["calls_name"],
-            "include_coverage": true
+            "include": ["coverage"]
         }),
     )
     .unwrap();
@@ -479,14 +586,14 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "compare_graph_to_text",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "pattern": "    shared\\(",
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
         }),
     )
     .unwrap();
-    assert_eq!(comparison["query"]["symbol_id"], one["symbol_id"]);
+    assert_eq!(comparison["query"]["id"], one["id"]);
     assert_eq!(comparison["summary"]["graph_edges"], 1);
     assert_eq!(comparison["summary"]["graph_hits"], 1);
     assert_eq!(comparison["summary"]["text_hits"], 3);
@@ -515,7 +622,7 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "compare_graph_to_text",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "pattern": "shared",
             "resolution": "exact",
             "edge_kinds": ["calls_name"]
@@ -533,17 +640,13 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
         &config.database,
         "impact_surface",
         json!({
-            "symbol_id": one["symbol_id"].as_i64().unwrap(),
+            "id": one["id"].as_str().unwrap(),
             "resolution": "exact",
-            "include_tests": true,
-            "include_docs": true,
-            "include_git": true,
-            "include_papertrail": true,
-            "include_text_fallback": true
+            "include": ["tests", "docs", "git", "papertrail", "text_fallback"]
         }),
     )
     .unwrap();
-    assert_eq!(impact["query"]["symbol_id"], one["symbol_id"]);
+    assert_eq!(impact["query"]["ref"], one["ref"]);
     assert_eq!(impact["query"]["resolution"], "exact");
     assert!(impact["direct_semantic_callers"].as_array().unwrap().len() == 1);
     assert!(impact["direct_semantic_callees"].as_array().unwrap().is_empty());
@@ -559,7 +662,7 @@ fn mcp_symbol_id_selection_disambiguates_graph_tools() {
     let papertrail = call_tool(
         &config.database,
         "papertrail_for_symbol",
-        json!({"symbol_id": one["symbol_id"].as_i64().unwrap()}),
+        json!({"id": one["id"].as_str().unwrap()}),
     )
     .unwrap();
     assert!(papertrail["current_source"]["symbol"].as_str().unwrap().contains("shared"));
@@ -576,6 +679,11 @@ fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
 fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
     let schema = tool_schema(tools, name);
     assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
+}
+
+fn assert_schema_lacks_property(tools: &[Value], name: &str, field: &str) {
+    let schema = tool_schema(tools, name);
+    assert!(schema["properties"].get(field).is_none(), "{name} must not define {field}");
 }
 
 fn assert_schema_nested_property(tools: &[Value], name: &str, parent: &str, field: &str) {
@@ -651,9 +759,12 @@ fn assert_enum_values(schema: &Value, expected: &[&str], label: &str) {
 }
 
 fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
-    for field in ["symbol", "symbol_path", "symbol_id", "logical_symbol_id", "allow_ambiguous"] {
+    // #149: the wire selector is symbol/ref/id (the opaque handle); the
+    // ephemeral numeric symbol_id is no longer an accepted input.
+    for field in ["symbol", "ref", "id", "allow_ambiguous"] {
         assert_schema_has_property(tools, name, field);
     }
+    assert_schema_lacks_property(tools, name, "symbol_id");
 }
 
 #[test]
