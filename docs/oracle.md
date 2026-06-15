@@ -3,8 +3,8 @@
 The code graph is tree-sitter-derived, so edges are heuristic and confidence-labeled
 (`Exact` / `Syntactic` / `NameOnly` / `Ambiguous`). The **oracle** is an opt-in pass that consumes a
 pre-built [SCIP](https://docs.sourcegraph.com/code_navigation/explanations/scip) index from a real
-language tool (`rust-analyzer scip`, `scip-typescript`, …) and uses it as a *resolution oracle* to
-upgrade those edges to a `Compiler` confidence tier.
+language tool (`rust-analyzer scip` for Rust, `scip-clang` for C/C++, `scip-python` for Python) and
+uses it as a *resolution oracle* to upgrade those edges to a `Compiler` confidence tier.
 
 It is opt-in, batch, content-addressed, and network-free — indexing stays fast and dependency-free
 without it.
@@ -39,10 +39,17 @@ One-shot, by hand:
 
 ```bash
 rag-rat oracle run                 # uses rust-analyzer by default
-rag-rat oracle run --tool rust-analyzer
+rag-rat oracle run --tool rust-analyzer        # Rust
+rag-rat oracle run --tool scip-clang           # C/C++ (needs a compile_commands.json)
+rag-rat oracle run --tool scip-python          # Python (resolves against installed deps)
 rag-rat oracle run --scip path/to/index.scip   # consume a pre-built SCIP index directly
 rag-rat oracle status
 ```
+
+`scip-python` resolves imports against the project's **installed** dependencies, so the checkout's
+deps must be importable (e.g. installed into a virtualenv) for cross-package edges to resolve. Its
+SCIP project version is pinned to a constant (not the git revision) so a symbol's moniker stays
+stable across commits — keeping moniker-anchored memory relocation working.
 
 A missing/unrunnable tool degrades to `Blocked` with an install hint and exit 0 — never an error.
 

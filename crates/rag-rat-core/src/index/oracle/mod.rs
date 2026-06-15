@@ -510,6 +510,27 @@ pub fn latest_run_tool_version(
     store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)
 }
 
+/// Every oracle tool that has at least one run in this checkout, paired with its latest
+/// `tool_version`. The multi-language surfacing seam (#176): the graph read paths
+/// (`enrich_hops_with_oracle`, `compare_graph_to_scip`) iterate THIS rather than hardcoding
+/// `RustAnalyzer`, so a repo indexed in several languages surfaces each backend's verdicts on its
+/// own edges. An edge belongs to one language, so at most one tool ever has a verdict for it — the
+/// per-tool verdict sets are disjoint and merge cleanly. Tools with no run in scope are skipped.
+pub fn latest_runs_in_scope(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Vec<(OracleTool, String)>> {
+    let mut runs = Vec::new();
+    for &tool in OracleTool::ALL {
+        if let Some(version) = store::latest_run_tool_version(conn, tool, commit_sha, worktree_id)?
+        {
+            runs.push((tool, version));
+        }
+    }
+    Ok(runs)
+}
+
 /// The `started_at` (Unix-epoch ms) of the most recent run for `tool` in the active checkout, or
 /// `None` when no run exists — the staleness clock the background auto-fresh oracle compares
 /// against the index's `indexed_at_ms`. See [`auto_run_decision`].
@@ -546,17 +567,22 @@ pub enum OracleTool {
     /// database rather than a source root, and is the SCIP emitter directly (no `scip`
     /// subcommand), so its probe + invocation differ from rust-analyzer's — see `ToolManifest`.
     ScipClang,
+    /// `scip-python index` — Python (#164 B6). Resolves imports against the project's INSTALLED
+    /// dependencies, so the corpus must install them (a venv) first; an unresolved environment
+    /// shows up as a near-zero moniker count the report's health gate catches.
+    ScipPython,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
     /// `--tool`). Later language backends (#72 Kotlin) extend this alongside the enum.
-    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer, Self::ScipClang];
+    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer, Self::ScipClang, Self::ScipPython];
 
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::RustAnalyzer => "rust-analyzer",
             Self::ScipClang => "scip-clang",
+            Self::ScipPython => "scip-python",
         }
     }
 
@@ -564,6 +590,7 @@ impl OracleTool {
         match value {
             "rust-analyzer" => Some(Self::RustAnalyzer),
             "scip-clang" => Some(Self::ScipClang),
+            "scip-python" => Some(Self::ScipPython),
             _ => None,
         }
     }
