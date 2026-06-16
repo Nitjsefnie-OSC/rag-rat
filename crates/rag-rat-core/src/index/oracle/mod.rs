@@ -571,18 +571,24 @@ pub enum OracleTool {
     /// dependencies, so the corpus must install them (a venv) first; an unresolved environment
     /// shows up as a near-zero moniker count the report's health gate catches.
     ScipPython,
+    /// `scip-typescript index` — TypeScript / TSX (#71). Like scip-python, resolves cross-package
+    /// references against the project's installed `node_modules`, so the corpus must `npm install`
+    /// first; an unresolved environment shows up as a low moniker count the health gate catches.
+    ScipTypescript,
 }
 
 impl OracleTool {
     /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
     /// `--tool`). Later language backends (#72 Kotlin) extend this alongside the enum.
-    pub const ALL: &[OracleTool] = &[Self::RustAnalyzer, Self::ScipClang, Self::ScipPython];
+    pub const ALL: &[OracleTool] =
+        &[Self::RustAnalyzer, Self::ScipClang, Self::ScipPython, Self::ScipTypescript];
 
     pub fn as_db_str(self) -> &'static str {
         match self {
             Self::RustAnalyzer => "rust-analyzer",
             Self::ScipClang => "scip-clang",
             Self::ScipPython => "scip-python",
+            Self::ScipTypescript => "scip-typescript",
         }
     }
 
@@ -591,7 +597,23 @@ impl OracleTool {
             "rust-analyzer" => Some(Self::RustAnalyzer),
             "scip-clang" => Some(Self::ScipClang),
             "scip-python" => Some(Self::ScipPython),
+            "scip-typescript" => Some(Self::ScipTypescript),
             _ => None,
+        }
+    }
+
+    /// The position encoding to assume for SCIP documents this tool emits **without** an explicit
+    /// `position_encoding` (the protobuf default `Unspecified`). scip-typescript reports ranges in
+    /// UTF-16 code units (TypeScript's internal string offsets) but never sets the field, so
+    /// reading it as the generic UTF-32 fallback mis-converts columns after any astral
+    /// character. The other backends either set the field or are unaffected, so they keep the
+    /// conservative `Unspecified` (UTF-32-equivalent) default.
+    pub(crate) fn default_position_encoding(self) -> ::scip::types::PositionEncoding {
+        use ::scip::types::PositionEncoding;
+        match self {
+            Self::ScipTypescript => PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
+            Self::RustAnalyzer | Self::ScipClang | Self::ScipPython =>
+                PositionEncoding::UnspecifiedPositionEncoding,
         }
     }
 }

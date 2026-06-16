@@ -1441,6 +1441,48 @@ fn parse_document_with_no_occurrences_registers_empty_entry() {
     assert!(idx.definitions.is_empty());
 }
 
+/// scip-typescript leaves `position_encoding` UNSET (Unspecified) but emits UTF-16 column offsets.
+/// `parse_with_default(UTF16, …)` must read those columns as UTF-16 so an identifier after an
+/// astral character lands on the right bytes; the historical Unspecified→UTF-32 fallback misaligns
+/// it.
+#[test]
+fn unspecified_encoding_uses_the_supplied_default() {
+    // "😀foo\n": the emoji is 4 UTF-8 bytes = 2 UTF-16 units = 1 UTF-32 unit; "foo" is bytes 4..7.
+    let source = "😀foo\n".as_bytes().to_vec();
+    // UTF-16 columns [2,5] (past the 2-unit emoji).
+    let occ =
+        occurrence(0, 2, 5, "scip-typescript npm p 1 `a.ts`/foo().", SymbolRole::Definition as i32);
+    // Document with NO position_encoding set (serialized as the protobuf default = Unspecified).
+    let bytes = scip_bytes("a.ts", PositionEncoding::UnspecifiedPositionEncoding, vec![occ]);
+
+    let s = source.clone();
+    let idx = ScipIndex::parse_with_default(
+        &bytes,
+        PositionEncoding::UTF16CodeUnitOffsetFromLineStart,
+        move |_| Some(s.clone()),
+    )
+    .unwrap();
+    let occ16 = &idx.occurrences_by_path.get("a.ts").unwrap()[0];
+    assert_eq!((occ16.start_byte, occ16.end_byte), (4, 7));
+    assert_eq!(&source[occ16.start_byte..occ16.end_byte], b"foo");
+
+    // The plain 2-arg parse (Unspecified → UTF-32 fallback) misaligns onto the wrong bytes.
+    let s = source.clone();
+    let idx32 = ScipIndex::parse(&bytes, move |_| Some(s.clone())).unwrap();
+    let occ32 = &idx32.occurrences_by_path.get("a.ts").unwrap()[0];
+    assert_ne!(&source[occ32.start_byte..occ32.end_byte], b"foo", "UTF-32 fallback misaligns");
+}
+
+/// `symbol_is_module` recognizes the SCIP namespace/module/package suffix (`/`) and nothing else.
+#[test]
+fn symbol_is_module_matches_only_namespace_suffix() {
+    use super::scip::symbol_is_module;
+    assert!(symbol_is_module("scip-typescript npm p 1 `a.ts`/"));
+    assert!(!symbol_is_module("scip-typescript npm p 1 `a.ts`/foo().")); // method
+    assert!(!symbol_is_module("scip-typescript npm p 1 `a.ts`/Bar#")); // type
+    assert!(!symbol_is_module("local 1"));
+}
+
 /// A multi-line occurrence range (`[start_line, start_char, end_line, end_char]`) parses to the
 /// byte span crossing the newline.
 #[test]
@@ -1633,8 +1675,10 @@ fn map_definition_to_symbol_requires_real_containment_not_just_start() {
 /// reject an unknown string — the `rust-modern-style` closed-enum contract.
 #[test]
 fn persisted_enums_round_trip_through_db_strings() {
-    assert_eq!(OracleTool::from_db_str(OracleTool::RustAnalyzer.as_db_str()), Some(TOOL));
-    assert_eq!(OracleTool::from_db_str("scip-typescript"), None);
+    for &tool in OracleTool::ALL {
+        assert_eq!(OracleTool::from_db_str(tool.as_db_str()), Some(tool));
+    }
+    assert_eq!(OracleTool::from_db_str("no-such-tool"), None);
 
     for kind in [
         OracleResolutionKind::Upgrade,
@@ -3667,6 +3711,33 @@ fn moniker_for_symbol_with_member_defs_is_the_symbols_own() {
     assert_eq!(moniker, struct_moniker, "the symbol's own (shortest) moniker wins");
 }
 
+/// A synthetic zero-width per-file definition (scip-typescript emits one ending in `/` at byte
+/// `0..0`) must NOT become a symbol's moniker: it containment-maps to the first symbol (whose span
+/// starts at 0) and, being shorter, would win shortest-moniker selection and clobber the real one.
+/// The namespace-suffix filter in the moniker pass drops it.
+#[test]
+fn synthetic_file_definition_does_not_overwrite_a_symbols_moniker() {
+    let h = Harness::new();
+    // `greet`'s span starts at byte 0, so a 0..0 file def would containment-map to it.
+    let defs = h.add_file("a.ts", "function greet() {}\n");
+    let sym = h.add_symbol_qualified(defs, "greet", "a.ts::greet", "function", 0, 19);
+    h.add_logical_symbol(4004, "a.ts", "greet", "a.ts::greet", sym);
+
+    let greet_moniker = "rust-analyzer cargo test_crate 0.1.0 greet().";
+    let file_moniker = "rust-analyzer cargo test_crate 0.1.0 `a.ts`/"; // shorter; ends in `/`
+    let bytes = scip_bytes_docs(vec![("a.ts", vec![
+        // File def first + at 0..0 so a naive containment+shortest winner would pick it.
+        occurrence(0, 0, 0, file_moniker, SymbolRole::Definition as i32),
+        occurrence(0, 9, 14, greet_moniker, SymbolRole::Definition as i32),
+    ])]);
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+
+    assert_eq!(report.monikers_written, 1, "the namespace symbol must not add a second row");
+    let (moniker, ..) = h.moniker(4004).expect("moniker row written");
+    assert_eq!(moniker, greet_moniker, "the symbol's own moniker wins, not the file's");
+}
+
 /// Moniker-STRING drift (Codex P2): rust-analyzer monikers embed the Cargo package version, so a
 /// routine version bump rewrites every string while no symbol changes. The binding's stored
 /// content-derived logical id is still live, so validation re-anchors the binding to the new
@@ -4262,4 +4333,31 @@ fn resolution_report_assembles_before_after_from_index() {
     assert_eq!(report.corpus_profile_hash, profile.hash());
     assert_eq!(report.tool_version, VERSION);
     assert_eq!(report.tool, TOOL.as_db_str());
+}
+
+/// `scip::stabilize_moniker_version` pins a scip-typescript local moniker's version to `_` so a
+/// `package.json` version bump doesn't churn it (the basis for moniker-anchored memory relocation),
+/// while leaving every other tool's symbols — and unparsable / package-less / local ones —
+/// untouched.
+#[test]
+fn stabilize_moniker_version_pins_typescript_package_version() {
+    use super::scip::stabilize_moniker_version as norm;
+
+    // The version (3rd package field) is rewritten to `_`; name + descriptors are preserved.
+    let v1 = "scip-typescript npm tsmon 9.9.9 `src/a.ts`/greet().";
+    let v2 = "scip-typescript npm tsmon 9.9.10 `src/a.ts`/greet().";
+    let normed = norm(OracleTool::ScipTypescript, v1);
+    assert_eq!(normed, "scip-typescript npm tsmon _ `src/a.ts`/greet().");
+    // Two different package versions normalize to the SAME moniker — the relocation invariant.
+    assert_eq!(norm(OracleTool::ScipTypescript, v1), norm(OracleTool::ScipTypescript, v2));
+    // Already `_` is borrowed unchanged (idempotent).
+    let already = "scip-typescript npm tsmon _ `src/a.ts`/greet().";
+    assert!(matches!(norm(OracleTool::ScipTypescript, already), std::borrow::Cow::Borrowed(_)));
+
+    // Other tools pass through verbatim — scip-python already pins via `--project-version _`.
+    assert_eq!(norm(OracleTool::ScipPython, v1), v1);
+    assert_eq!(norm(OracleTool::RustAnalyzer, v1), v1);
+    // A local symbol (no package) is left alone.
+    let local = "local 42";
+    assert_eq!(norm(OracleTool::ScipTypescript, local), local);
 }
