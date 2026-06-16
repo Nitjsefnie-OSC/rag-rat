@@ -191,6 +191,111 @@ fn references_type_does_not_resolve_to_a_non_type_symbol() {
     assert_eq!(to, Some(gadget), "a type reference still resolves to a struct definition");
 }
 
+/// A Rust `references_type` to a generic parameter (`T`) or an associated-type projection
+/// (`Self::Value`, `V::Value`) must NOT bind to a same-named concrete type — name-based resolution
+/// can't know the concrete type, and an arbitrary confident bind is a pure oracle contradiction. A
+/// real type reference (`Gadget`) and a module-qualified path (lowercase root) still resolve.
+#[test]
+fn references_type_does_not_bind_generic_params_or_projections() {
+    let conn = seeded_conn();
+    let user = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "b.rs", NEW);
+    add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
+    // Same-named concrete types exist in-corpus — the pre-fix resolver would bind to these.
+    add_symbol_kind(&conn, defs, "T", "crate::b::T", "struct");
+    add_symbol_kind(&conn, defs, "Value", "crate::b::Value", "struct");
+    let gadget = add_symbol_kind(&conn, defs, "Gadget", "crate::b::Gadget", "struct");
+
+    let generic = add_type_ref_edge(&conn, user, "T"); // generic parameter
+    let projection = add_type_ref_edge(&conn, user, "Self::Value"); // associated-type projection
+    let v_projection = add_type_ref_edge(&conn, user, "V::Value"); // type-param projection
+    let real = add_type_ref_edge(&conn, user, "Gadget"); // genuine type reference
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    for (edge, what) in [(generic, "T"), (projection, "Self::Value"), (v_projection, "V::Value")] {
+        let (to, _, resolution) = edge_state(&conn, edge);
+        assert_eq!(to, None, "{what} must stay unresolved, not bind a same-named concrete type");
+        assert_eq!(resolution, "unresolved", "{what}");
+    }
+    let (to, _, _) = edge_state(&conn, real);
+    assert_eq!(to, Some(gadget), "a genuine type reference still resolves");
+}
+
+/// The PRODUCTION projection path: the Rust extractor emits `Self::Value` / `T::Output` as a
+/// `references_type` to the bare LAST segment (`Value` / `Output`), no `::`. When several
+/// distinct same-named type definitions exist in DIFFERENT files (different `qualified_name` and
+/// `scope_path`), they're not one logical symbol, so a bare reference from a third file stays
+/// unresolved rather than guessing. A UNIQUE same-named type still resolves.
+#[test]
+fn references_type_multi_candidate_across_files_does_not_guess() {
+    let conn = seeded_conn();
+    let user = add_file(&conn, "a.rs", NEW);
+    let f1 = add_file(&conn, "b.rs", NEW);
+    let f2 = add_file(&conn, "c.rs", NEW);
+    add_symbol(&conn, user, "user_fn", "crate::a::user_fn");
+    // Two distinct `Value` types in different files — a bare `Value` ref can't disambiguate.
+    add_symbol_kind(&conn, f1, "Value", "b.rs::Value", "type");
+    add_symbol_kind(&conn, f2, "Value", "c.rs::Value", "type");
+    // A uniquely-named type (positive control).
+    let only = add_symbol_kind(&conn, f1, "Config", "b.rs::Config", "struct");
+
+    let ambiguous = add_type_ref_edge(&conn, user, "Value");
+    let unique = add_type_ref_edge(&conn, user, "Config");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    assert_eq!(
+        edge_state(&conn, ambiguous).0,
+        None,
+        "ambiguous cross-file type ref stays unresolved"
+    );
+    assert_eq!(edge_state(&conn, unique).0, Some(only), "a uniquely-named type still resolves");
+}
+
+/// `#[cfg]`-split twin types (`#[cfg(unix)] struct Thing` / `#[cfg(windows)] struct Thing`) share
+/// `qualified_name` AND `scope_path` — they ARE one logical symbol. A `references_type` to `Thing`
+/// must still resolve via `logical_variant` (multi-candidate suppression must not block true
+/// logical variants).
+#[test]
+fn references_type_resolves_cfg_split_twin_types() {
+    let conn = seeded_conn();
+    let home = add_file(&conn, "a.rs", NEW);
+    // Two cfg-gated `Thing` structs in one file: same qualified_name, same (empty) scope_path.
+    let first = add_symbol_kind(&conn, home, "Thing", "a.rs::Thing", "struct");
+    add_symbol_kind(&conn, home, "Thing", "a.rs::Thing", "struct");
+    let edge = add_type_ref_edge(&conn, home, "Thing");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(first), "cfg-twin type variants resolve via logical_variant");
+    assert_eq!(resolution, "logical_variant");
+}
+
+/// The multi-candidate `references_type` suppression must NOT drop a type defined AND used in its
+/// OWN file just because the name recurs elsewhere — `same_file_name` still resolves it locally.
+#[test]
+fn references_type_resolves_same_file_definition_despite_name_collision() {
+    let conn = seeded_conn();
+    let home = add_file(&conn, "a.rs", NEW);
+    let other = add_file(&conn, "b.rs", NEW);
+    // `Error` defined in BOTH files; a reference inside a.rs should bind to a.rs's own `Error`.
+    let local = add_symbol_kind(&conn, home, "Error", "a.rs::Error", "struct");
+    add_symbol_kind(&conn, other, "Error", "b.rs::Error", "struct");
+    let edge = add_type_ref_edge(&conn, home, "Error");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(local), "a same-file type definition still resolves locally");
+    assert_eq!(resolution, "same_file_name");
+}
+
 fn add_symbol_scope(
     conn: &Connection,
     file_id: i64,
@@ -244,6 +349,49 @@ fn scope_exact_binds_a_unique_scope_path() {
     let (to, _, resolution) = edge_state(&conn, edge);
     assert_eq!(to, Some(target));
     assert_eq!(resolution, "scope_exact");
+}
+
+/// Distinct same-(file, name, kind) items that differ only by `scope_path` (e.g. two `impl` blocks
+/// each defining `build`, or serde's many `impl Visitor { type Value }`) are NOT one logical
+/// symbol. `same_logical_symbol` must split them so the resolver falls through to unresolved
+/// instead of picking one arbitrarily at `Syntactic` (`logical_variant`) — that overconfidence made
+/// the SCIP oracle count the wrong pick as a contradiction, tanking Rust precision on trait-heavy
+/// crates.
+#[test]
+fn same_file_distinct_scopes_do_not_collapse_to_logical_variant() {
+    let conn = seeded_conn();
+    let defs = add_file(&conn, "a.rs", NEW);
+    let caller = add_file(&conn, "c.rs", NEW);
+    // Two distinct `build`s in ONE file (so same qualified_name a.rs::build), different impls.
+    add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
+    add_symbol_scope(&conn, defs, "build", "a.rs::build", "B::build");
+    let edge = add_edge(&conn, caller, "build", ""); // bare name — nothing disambiguates
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, None, "distinct same-file scopes must not collapse to an arbitrary pick");
+    assert_eq!(resolution, "unresolved");
+}
+
+/// Positive control: GENUINE variants — same file, name, kind AND scope_path (e.g. `#[cfg]`-gated
+/// copies) — still group, so the resolver binds the first at `Syntactic` via `logical_variant`.
+#[test]
+fn same_file_same_scope_variants_still_bind_via_logical_variant() {
+    let conn = seeded_conn();
+    let defs = add_file(&conn, "a.rs", NEW);
+    let caller = add_file(&conn, "c.rs", NEW);
+    let first = add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
+    add_symbol_scope(&conn, defs, "build", "a.rs::build", "A::build");
+    let edge = add_edge(&conn, caller, "build", "");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, edge);
+    assert_eq!(to, Some(first), "true variants (shared scope_path) still bind the first");
+    assert_eq!(resolution, "logical_variant");
 }
 
 fn set_local_crate_roots(conn: &Connection, roots: &str) {
