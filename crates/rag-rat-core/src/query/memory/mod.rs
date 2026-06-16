@@ -210,6 +210,107 @@ pub struct RepoMemoryEvidence {
     pub stale: Vec<RepoMemory>,
 }
 
+impl RepoMemoryEvidence {
+    /// Project to the scannable compact view (#37): drops bodies, extra bindings, and call paths,
+    /// keeping the per-lane header an agent skims during preflight. Field names match the full
+    /// evidence so the wire shape is identical apart from per-memory detail.
+    pub fn compact(&self) -> CompactRepoMemoryEvidence {
+        let project =
+            |memories: &[RepoMemory]| memories.iter().map(CompactRepoMemory::from).collect();
+        CompactRepoMemoryEvidence {
+            direct: project(&self.direct),
+            path_crossed: project(&self.path_crossed),
+            call_path_crossed: project(&self.call_path_crossed),
+            stale: project(&self.stale),
+        }
+    }
+}
+
+/// Compact (default) view of `RepoMemoryEvidence` for `impact_surface` (#37) — same lane layout,
+/// each memory summarized to its high-signal header by [`CompactRepoMemory`].
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactRepoMemoryEvidence {
+    pub direct: Vec<CompactRepoMemory>,
+    pub path_crossed: Vec<CompactRepoMemory>,
+    #[serde(default)]
+    pub call_path_crossed: Vec<CompactRepoMemory>,
+    pub stale: Vec<CompactRepoMemory>,
+}
+
+/// A one-line-scannable projection of a [`RepoMemory`] for `impact_surface`'s default output (#37):
+/// what the memory says (kind/title/confidence/status) and where its *primary* binding
+/// (`bindings.first()`) is anchored — without the full body, the remaining bindings, or call paths.
+/// Full detail stays available via `memory_for_symbol` / `memory_for_path` /
+/// `memory_for_call_path`, or `impact_surface` full mode (`include` unaffected; `full_memories:
+/// true`).
+///
+/// Future direction: this header could carry a short LLM-generated `summary` of the full body,
+/// produced by an out-of-process local model (Ollama) rather than truncating the title — see the
+/// local-AI memory-maintenance spike (#122), which already commits to keeping Ollama out of the
+/// binary. Until that lands, the projection stays purely mechanical (no model dependency here).
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactRepoMemory {
+    pub memory_id: String,
+    pub kind: String,
+    pub title: String,
+    pub confidence: String,
+    pub status: String,
+    /// Anchor status of the primary binding (`current` / `stale` / …); `None` when unbound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `[start_line, end_line]` of the primary binding when both are known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span: Option<[i64; 2]>,
+    // Opaque `sym_<hex>` handle of the primary binding when it's a symbol binding — the actionable
+    // key for a follow-up `memory_for_symbol` / `impact_surface` full lookup (#149).
+    #[serde(
+        rename = "id",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::serde_big_id::sym_handle_opt::serialize"
+    )]
+    pub logical_symbol_id: Option<i64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+impl From<&RepoMemory> for CompactRepoMemory {
+    fn from(memory: &RepoMemory) -> Self {
+        // Pick the first NON-moniker binding for the header. The auxiliary `scip_moniker` binding
+        // is an identity anchor that lags between (opt-in) oracle runs and is NOT the
+        // memory's real content anchor — `split_active_stale` excludes it from staleness
+        // for exactly this reason. But `attach_memory_children` orders bindings by
+        // `binding_kind`, and `"scip_moniker"` sorts before `"symbol"`, so a naive
+        // `bindings.first()` could surface a lagging `unverified`/`gone` moniker and make
+        // an ACTIVE memory read as stale in the compact view (Codex on #194). Fall back to
+        // the first binding only if every binding is a moniker.
+        let primary = memory
+            .bindings
+            .iter()
+            .find(|binding| binding.binding_kind != SCIP_MONIKER_BINDING_KIND)
+            .or_else(|| memory.bindings.first());
+        Self {
+            memory_id: memory.memory_id.clone(),
+            kind: memory.kind.clone(),
+            title: memory.title.clone(),
+            confidence: memory.confidence.clone(),
+            status: memory.status.clone(),
+            anchor_status: primary.map(|binding| binding.anchor_status.clone()),
+            binding_kind: primary.map(|binding| binding.binding_kind.clone()),
+            path: primary.and_then(|binding| binding.path.clone()),
+            span: primary.and_then(|binding| match (binding.start_line, binding.end_line) {
+                (Some(start), Some(end)) => Some([start, end]),
+                _ => None,
+            }),
+            logical_symbol_id: primary.and_then(|binding| binding.logical_symbol_id),
+            tags: memory.tags.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedBinding {
     binding_kind: String,
@@ -285,4 +386,84 @@ pub(crate) struct EdgeFingerprintParts<'a> {
     edge_kind: &'a str,
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(kind: &str, anchor_status: &str, path: Option<&str>) -> RepoMemoryBinding {
+        RepoMemoryBinding {
+            memory_id: "mem_x".to_string(),
+            binding_kind: kind.to_string(),
+            binding_id: format!("{kind}-id"),
+            path: path.map(str::to_string),
+            start_line: path.map(|_| 10),
+            end_line: path.map(|_| 20),
+            logical_symbol_id: Some(42),
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            commit_hash: None,
+            github_owner: None,
+            github_repo: None,
+            github_number: None,
+            symbol_kind: None,
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+            relocation_reason: None,
+            anchor_status: anchor_status.to_string(),
+            created_at_ms: 0,
+        }
+    }
+
+    fn memory(bindings: Vec<RepoMemoryBinding>) -> RepoMemory {
+        RepoMemory {
+            memory_id: "mem_x".to_string(),
+            kind: "Invariant".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            confidence: "high".to_string(),
+            status: "active".to_string(),
+            created_by: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            source: "agent".to_string(),
+            source_text_hash: None,
+            input_hash: None,
+            memory_version: String::new(),
+            bindings,
+            call_paths: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compact_header_skips_a_lagging_moniker_binding_for_the_real_anchor() {
+        // `attach_memory_children` orders bindings by `binding_kind`, so a `scip_moniker` companion
+        // (which can be `unverified`/`gone` between oracle runs, and which `split_active_stale`
+        // deliberately ignores) sorts BEFORE the real `symbol` anchor. The compact header must skip
+        // it, or an ACTIVE memory reads as stale (Codex on #194).
+        let compact = CompactRepoMemory::from(&memory(vec![
+            binding(SCIP_MONIKER_BINDING_KIND, "unverified", None),
+            binding("symbol", "current", Some("src/lib.rs")),
+        ]));
+        assert_eq!(compact.binding_kind.as_deref(), Some("symbol"));
+        assert_eq!(compact.anchor_status.as_deref(), Some("current"));
+        assert_eq!(compact.path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(compact.span, Some([10, 20]));
+    }
+
+    #[test]
+    fn compact_header_falls_back_to_a_moniker_only_binding_set() {
+        // A memory anchored ONLY by a moniker still gets a header (no non-moniker binding to
+        // prefer).
+        let compact = CompactRepoMemory::from(&memory(vec![binding(
+            SCIP_MONIKER_BINDING_KIND,
+            "current",
+            None,
+        )]));
+        assert_eq!(compact.binding_kind.as_deref(), Some(SCIP_MONIKER_BINDING_KIND));
+    }
 }
