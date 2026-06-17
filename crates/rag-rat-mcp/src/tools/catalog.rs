@@ -67,7 +67,8 @@ pub fn description(name: &str) -> &'static str {
             "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
              C, C++, or Python — exact or fuzzy. Returns candidates with signatures, locations, \
              logical-symbol grouping (cfg variants), and any bound repo memories. Use to \
-             disambiguate before a graph or read call.",
+             disambiguate before a graph or read call. Generated bindings (codegen, ubrn FFI \
+             output) are excluded by default; pass include: [\"generated\"] to see them.",
         "find_callers" =>
             "Find what calls a symbol (reverse call graph), instead of grepping for call sites. \
              Returns call sites with confidence + target verification, a completeness / \
@@ -195,8 +196,10 @@ pub fn schema(name: &str) -> Value {
         | "commits_touching_query"
         | "github_issue_search"
         | "rationale_search" => schema_for::<SearchArgs>(),
-        "symbol_lookup" | "git_history_for_symbol" | "papertrail_for_symbol" =>
-            schema_for::<SymbolArgs>(),
+        "symbol_lookup" => schema_for::<SymbolArgs>(),
+        // Pure selector args, no `include` — these resolve via select_symbol (source-only) and
+        // don't honor a generated opt-in, so they must not advertise one (#202 review).
+        "git_history_for_symbol" | "papertrail_for_symbol" => schema_for::<SymbolRefArgs>(),
         "find_callers" | "trace_callees" | "docs_for_symbol" => schema_for::<SymbolGraphArgs>(),
         "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
         "compare_graph_to_scip" => schema_for::<EmptyArgs>(),

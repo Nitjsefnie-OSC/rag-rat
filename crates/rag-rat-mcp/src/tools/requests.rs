@@ -161,12 +161,21 @@ pub enum OrientationInclude {
     Memories,
 }
 
-/// `symbol_lookup` / `read_chunk` `include` flags. `memories` on by default (pass `include: []` to
-/// suppress).
+/// `read_chunk` `include` flags. `memories` on by default (pass `include: []` to suppress).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoriesInclude {
     Memories,
+}
+
+/// `symbol_lookup` `include` flags. `memories` on by default (pass `include: []` to suppress);
+/// `generated` opts generated bindings (ubrn FFI output, codegen) back into the results — they're
+/// excluded by default because they bury the source symbol a search is after (#202).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolInclude {
+    Memories,
+    Generated,
 }
 
 /// `find_callers` / `trace_callees` `include` flags. `memories` on by default; the rest off (they
@@ -308,9 +317,36 @@ pub struct SymbolArgs {
     pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
-    /// What to include: `memories` (on by default). Pass `include: []` to suppress.
+    /// What to include: `memories` (on by default) and/or `generated` (off by default — opts
+    /// generated bindings back into the results). Pass `include: []` to suppress memories.
     #[serde(default, deserialize_with = "de_seq_or_json_string")]
-    pub include: Option<Vec<MemoriesInclude>>,
+    pub include: Option<Vec<SymbolInclude>>,
+}
+
+/// Pure symbol-selector args (symbol/ref/id/lang) with no `include` — for tools that resolve ONE
+/// symbol and never opt generated rows back in (`git_history_for_symbol`, `papertrail_for_symbol`).
+/// These go through `select_symbol`, which always excludes generated; advertising a `generated`
+/// include they silently ignore would be a lie, so they don't carry one (#202 review).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SymbolRefArgs {
+    pub symbol: Option<String>,
+    #[serde(rename = "ref")]
+    pub symbol_path: Option<String>,
+    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
+    #[serde(
+        rename = "id",
+        default,
+        serialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::serialize",
+        deserialize_with = "rag_rat_core::serde_big_id::sym_handle_opt::deserialize"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "lang")]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub allow_ambiguous: bool,
+    #[serde(default = "default_symbol_limit")]
+    pub limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
