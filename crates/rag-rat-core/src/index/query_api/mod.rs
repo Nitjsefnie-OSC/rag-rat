@@ -503,8 +503,14 @@ impl IndexDatabase {
 /// isn't a "just added" symbol, just a stale or wrong id, so re-indexing the change set wouldn't
 /// recover it and would put a `git status` on every such miss.
 fn selector_is_name_based(selector: &crate::query::symbol::SymbolSelector) -> bool {
+    // A `sym_<hex>` handle in the ref/symbol_path slot is id-based (#201), not a name — exclude
+    // both a handle that RESOLVES and one that's merely handle-SHAPED but malformed (typo/bad
+    // hex). Either way it must fail cheaply like `id`, never be misread as a name/path miss
+    // that trips the #152 zero-hit heal + reindex (which can't recover a handle anyway) on
+    // every bad handle.
     selector.symbol_id.is_none()
-        && selector.logical_symbol_id.is_none()
+        && selector.effective_logical_symbol_id().is_none()
+        && !selector.ref_is_handle_shaped()
         && (selector.symbol.is_some() || selector.symbol_path.is_some())
 }
 
@@ -559,3 +565,40 @@ fn annotate_completeness_with_externals(
 
 #[cfg(test)]
 mod oracle_surfacing_tests;
+
+#[cfg(test)]
+mod name_based_tests {
+    use crate::query::symbol::SymbolSelector;
+
+    fn selector(symbol: Option<&str>, symbol_path: Option<&str>) -> SymbolSelector {
+        SymbolSelector {
+            logical_symbol_id: None,
+            symbol_id: None,
+            symbol_path: symbol_path.map(str::to_string),
+            symbol: symbol.map(str::to_string),
+            language: None,
+            allow_ambiguous: false,
+            limit: 10,
+        }
+    }
+
+    #[test]
+    fn ref_slot_handle_is_not_name_based() {
+        // #201 review (P2): a `sym_<hex>` handle in the ref/symbol_path slot resolves as a logical
+        // id, so it must be treated as id-based — a stale handle then fails cheaply instead of
+        // tripping the #152 zero-hit heal/reindex meant for genuinely-new name/path lookups.
+        let token = crate::serde_big_id::format_sym_handle(0x688b_7144_3793_b726_u64 as i64);
+        assert!(!super::selector_is_name_based(&selector(None, Some(&token))));
+        // A MALFORMED handle (typo/bad hex) is still handle-SHAPED → id-based, so it also cannot
+        // trip the heal even though it doesn't parse (#201 review follow-up).
+        assert!(!super::selector_is_name_based(&selector(None, Some("sym_zzzz"))));
+        // A real qualified name in the same slot stays name-based (heal-eligible).
+        assert!(super::selector_is_name_based(&selector(None, Some("crates/x/src/a.rs::foo"))));
+        // A qualified name that merely STARTS with `sym_` (path-qualified, or a `sym_…/` path) is a
+        // name, not a handle — it keeps the #152 heal (P3 review follow-up).
+        assert!(super::selector_is_name_based(&selector(None, Some("sym_helpers.rs::build"))));
+        assert!(super::selector_is_name_based(&selector(None, Some("sym_dir/mod.rs::build"))));
+        // A bare name is name-based.
+        assert!(super::selector_is_name_based(&selector(Some("foo"), None)));
+    }
+}
