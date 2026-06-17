@@ -313,6 +313,22 @@ pub fn produce_scip_with_tool(
     // `[N/M] Indexed …`) would otherwise corrupt that JSON. A piped child + a copy thread keeps
     // the progress live on stderr (where rust-analyzer's already goes) while stdout stays clean.
     command.stdout(std::process::Stdio::piped());
+    // Remove any pre-existing file at the output path BEFORE spawning, so the bytes we read after
+    // the run are provably THIS child's. Otherwise a stale `.scip` (a killed prior run left its
+    // PID-named file in the db dir, or an API caller reused the path) that the new indexer exits
+    // non-zero without overwriting would be read, parse fine, and — under the diagnostic-exit
+    // tolerance below — get its production hash captured against the CURRENT checkout and joined as
+    // if it were this run's output (#198 review). A removal failure other than "wasn't there" is
+    // fatal: proceeding would risk reading exactly that stale file (a locked/permission-denied
+    // unlink leaves it in place).
+    match std::fs::remove_file(scip_output) {
+        Ok(()) => {},
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+        Err(err) => anyhow::bail!(
+            "failed to clear stale oracle output at {} before indexing: {err}",
+            scip_output.display()
+        ),
+    }
     let mut child = command
         .spawn()
         .map_err(|err| anyhow::anyhow!("failed to invoke {}: {err}", manifest.program))?;
@@ -327,16 +343,16 @@ pub fn produce_scip_with_tool(
         .wait()
         .map_err(|err| anyhow::anyhow!("failed waiting for {}: {err}", manifest.program))?;
     let _ = forwarder.join();
-    if !status.success() {
-        anyhow::bail!("{} scip exited with status {status}", manifest.program);
+    let bytes = std::fs::read(scip_output).unwrap_or_default();
+    if let Some(note) = accept_produced_index(
+        status.success(),
+        tool.exit_code_reflects_diagnostics(),
+        &bytes,
+        manifest.program,
+        scip_output,
+    )? {
+        eprintln!("{note}");
     }
-    let bytes = std::fs::read(scip_output).map_err(|err| {
-        anyhow::anyhow!(
-            "{} produced no readable index at {}: {err}",
-            manifest.program,
-            scip_output.display()
-        )
-    })?;
     // Snapshot each document's disk hash NOW, the instant the subprocess finished — this is the
     // content the `.scip` describes. The join later pins its occurrence offsets to these hashes so
     // a file the watcher reindexes in the lock-free window before the join is skipped instead
@@ -345,6 +361,58 @@ pub fn produce_scip_with_tool(
     // omitted (its candidate then fails the gate and is skipped — the safe direction).
     let production_sha = snapshot_document_disk_hashes(&bytes, checkout_root);
     Ok(ScipProduction::Produced { version, bytes, production_sha })
+}
+
+/// Decide whether a finished tool run's output `bytes` is an acceptable SCIP index. `Err` → bail
+/// (no usable index); `Ok(None)` → accept silently (clean exit); `Ok(Some(note))` → accept but the
+/// caller should print `note` (a non-zero exit that was TOLERATED).
+///
+/// `tolerate_diagnostic_exit` (= [`OracleTool::exit_code_reflects_diagnostics`]) gates the only
+/// relaxation: a non-zero exit is accepted ONLY for a backend whose exit code reflects source
+/// DIAGNOSTICS rather than indexing failure (scip-python/pyright exits 1 on type errors — true of
+/// most real-world Python — while still emitting a complete, valid index), AND only when the tool
+/// produced JOIN-USABLE data (a parseable index with ≥1 occurrence). Stricter than "≥1 document" on
+/// purpose — an early-bailing indexer can leave an empty doc shell, and on the non-health-gated
+/// paths (`oracle run`, auto-run) that would otherwise be recorded as a completed run with no
+/// compiler data, suppressing the "no oracle run" hint. For every other backend a non-zero exit is
+/// a genuine failure (a crashed/killed rust-analyzer/scip-clang that left a partial-but-parseable
+/// `.scip` must NOT be accepted) and bails. A clean exit needs only non-empty bytes (the downstream
+/// join and health gate validate the rest). Pure fn so the accept/bail branches are unit-testable
+/// without spawning a tool (#198 review).
+fn accept_produced_index(
+    status_success: bool,
+    tolerate_diagnostic_exit: bool,
+    bytes: &[u8],
+    program: &str,
+    output: &Path,
+) -> anyhow::Result<Option<String>> {
+    if status_success {
+        if bytes.is_empty() {
+            anyhow::bail!("{program} produced no readable index at {}", output.display());
+        }
+        return Ok(None);
+    }
+    if !tolerate_diagnostic_exit {
+        anyhow::bail!(
+            "{program} scip exited non-zero (its exit code signals a real failure, not source \
+             diagnostics) — no usable index at {}",
+            output.display()
+        );
+    }
+    let occurrences = scip::ScipIndex::total_occurrences(bytes).unwrap_or(0);
+    if bytes.is_empty() || occurrences == 0 {
+        anyhow::bail!(
+            "{program} scip exited non-zero and produced no usable index at {} ({} bytes, \
+             {occurrences} occurrences)",
+            output.display(),
+            bytes.len()
+        );
+    }
+    Ok(Some(format!(
+        "note: {program} exited non-zero but produced a usable index ({occurrences} occurrences) \
+         — proceeding (this backend's exit code reflects source diagnostics, not indexing \
+         failure); the health gate still guards the numbers"
+    )))
 }
 
 /// Hash each `.scip` document's CURRENT disk bytes under `checkout_root`, returning `relative_path
@@ -613,6 +681,20 @@ impl OracleTool {
             "scip-java" => Some(Self::ScipJava),
             _ => None,
         }
+    }
+
+    /// Whether this backend's non-zero EXIT CODE reflects source DIAGNOSTICS rather than indexing
+    /// failure — i.e. it can exit non-zero while still emitting a complete, valid index. Only such
+    /// tools get the diagnostic-exit tolerance in [`produce_scip_with_tool`]; for every other
+    /// backend a non-zero exit is a genuine failure and bails, so a crashed/killed
+    /// rust-analyzer/scip-clang that leaves a partial-but-parseable `.scip` is NOT recorded as a
+    /// completed run on the non-health-gated paths (#198 review).
+    ///
+    /// `scip-python` (pyright) exits 1 whenever the analyzed project has type errors — true of most
+    /// real-world Python. Restricted to this one verified case; broaden (e.g. scip-typescript, also
+    /// a compiler frontend) only with evidence a real corpus needs it.
+    pub(crate) fn exit_code_reflects_diagnostics(self) -> bool {
+        matches!(self, Self::ScipPython)
     }
 
     /// The position encoding to assume for SCIP documents this tool emits **without** an explicit
