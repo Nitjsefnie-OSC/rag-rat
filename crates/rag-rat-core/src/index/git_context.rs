@@ -9,8 +9,27 @@ pub(crate) struct GitChangedPaths {
     pub(crate) deleted: BTreeSet<PathBuf>,
 }
 
+/// Open the git repository for `root` via gix, honoring `GIT_DIR` / `GIT_WORK_TREE` — a bare git
+/// dir plus an external worktree (e.g. in CI) is configured purely through those env vars, and
+/// plain `gix::discover` only searches upward from `root`, so it would miss such a repo and leave
+/// git history "unavailable" (clearing the historical tables). All gix discovery goes through here
+/// (#213 review).
+///
+/// Known limitation (#218): gix resolves a RELATIVE `GIT_DIR`/`GIT_WORK_TREE` against the process
+/// cwd, not against `root` (the old `git -C root` resolved them against `root`). Absolute env
+/// values, and relative ones when cwd == `root`, work; relative values from a foreign cwd don't.
+/// gix exposes no way to open with an explicit (git-dir, worktree) pair from outside the crate, so
+/// re-rooting cleanly isn't possible without process-global cwd/env mutation (racy under the
+/// parallel indexer).
+pub(crate) fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::Error>> {
+    // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats
+    // every `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?`
+    // (anyhow), both of which handle the box transparently.
+    gix::discover_with_environment_overrides(root).map_err(Box::new)
+}
+
 pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
-    let repo = gix::discover(root)?;
+    let repo = discover_repo(root)?;
     let worktree_root = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("git repository has no worktree"))?
@@ -71,39 +90,109 @@ pub(crate) fn matches_simple_pattern(path: &str, pattern: &str) -> bool {
     path == pattern || path.contains(pattern.trim_matches('*'))
 }
 
-pub(crate) fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).current_dir(root).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+/// HEAD commit sha for `root` via gix, or empty if unborn / not a repo (matching the old
+/// `rev-parse HEAD` failure behavior).
+pub(crate) fn head_sha(root: &Path) -> String {
+    discover_repo(root)
+        .ok()
+        .and_then(|repo| repo.head_id().ok().map(|id| id.to_hex().to_string()))
+        .unwrap_or_default()
+}
+
+/// Whether the worktree has any uncommitted change (tracked modifications + untracked files), the
+/// gix equivalent of a non-empty `git status --porcelain`. Lazy: stops at the first change.
+pub(crate) fn is_worktree_dirty(root: &Path) -> bool {
+    let Ok(repo) = discover_repo(root) else {
+        return false;
+    };
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return false;
+    };
+    // No pathspec → the whole worktree; lazy, so `.next()` stops at the first change.
+    let Ok(mut changes) =
+        platform.untracked_files(UntrackedFiles::Files).into_iter(None::<gix::bstr::BString>)
+    else {
+        return false;
+    };
+    changes.next().is_some()
+}
+
+/// Whether `relative` (a worktree-root-relative path) is modified in the worktree — the per-path,
+/// filter-aware analog of [`is_worktree_dirty`]. gix status respects `.gitattributes` / autocrlf /
+/// LFS normalization, so a clean-but-normalized file is NOT flagged (unlike a raw byte compare).
+/// Conservative: a status error reports "not dirty" so callers (blame) don't lose results on a
+/// transient status hiccup.
+pub(crate) fn path_is_dirty(repo: &gix::Repository, relative: &Path) -> bool {
+    let Ok(platform) = repo.status(gix::progress::Discard) else {
+        return false;
+    };
+    let pathspec = gix::path::into_bstr(relative).into_owned();
+    let Ok(mut changes) = platform.untracked_files(UntrackedFiles::Files).into_iter([pathspec])
+    else {
+        return false;
+    };
+    changes.next().is_some()
 }
 
 /// The active-checkout `(commit_sha, worktree_id)` keys for `root`, as `open_config` derives them.
 /// `pub` so out-of-crate callers that open an index by path (benches mirroring the production
 /// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
 pub fn resolve_git_context(root: &Path) -> (String, String) {
-    let commit_sha =
-        git_output(root, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default();
+    let commit_sha = head_sha(root);
     let worktree_id = root.to_string_lossy().trim_end_matches('/').to_string();
     (commit_sha, worktree_id)
 }
 
-/// The live (commit_sha, worktree_id) keys across every worktree that shares this repo, from
-/// `git worktree list --porcelain`. Each worktree contributes its HEAD commit (for clean rows)
-/// and its path (for dirty/overlay rows). Returns empty vecs outside a git worktree.
+/// The live (commit_sha, worktree_id) keys across every worktree that shares this repo (the gix
+/// equivalent of `git worktree list --porcelain`). Each worktree contributes its HEAD commit (for
+/// clean rows) and its path (for dirty/overlay rows). Returns empty vecs outside a git worktree.
 pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) {
     let mut commits = Vec::new();
     let mut worktrees = Vec::new();
-    let Some(output) = git_output(root, &["worktree", "list", "--porcelain"]) else {
+    let Ok(repo) = discover_repo(root) else {
         return (commits, worktrees);
     };
-    for line in output.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            worktrees.push(path.trim().trim_end_matches('/').to_string());
-        } else if let Some(sha) = line.strip_prefix("HEAD ") {
-            commits.push(sha.trim().to_string());
+    let add_repo =
+        |worktrees: &mut Vec<String>, commits: &mut Vec<String>, repo: &gix::Repository| {
+            if let Some(workdir) = repo.workdir() {
+                worktrees.push(workdir.to_string_lossy().trim_end_matches('/').to_string());
+            }
+            if let Ok(id) = repo.head_id() {
+                commits.push(id.to_hex().to_string());
+            }
+        };
+    // The current worktree (may itself be the main one or a linked one).
+    add_repo(&mut worktrees, &mut commits, &repo);
+    // The MAIN worktree, ALWAYS — `worktrees()` enumerates only LINKED worktrees and
+    // `repo.workdir()` is whichever checkout we were launched from, so when that's a linked
+    // worktree the main one would otherwise be missing. A GC reading this set must keep the
+    // main worktree's path/HEAD live or it could prune the main checkout's indexed rows (#213
+    // review). The common dir IS the main repo's git dir.
+    if let Ok(main) = gix::open(repo.common_dir()) {
+        add_repo(&mut worktrees, &mut commits, &main);
+    }
+    // Linked worktrees: path from the proxy (robust even if the checkout is gone), HEAD from
+    // opening the worktree's git dir. Use the inaccessible-tolerant open so a
+    // temporarily-missing checkout STILL contributes its registered HEAD — otherwise a clean
+    // row keyed by that commit could be GC-pruned even though the worktree is still registered
+    // and may return (#213 review).
+    if let Ok(proxies) = repo.worktrees() {
+        for proxy in proxies {
+            if let Ok(base) = proxy.base() {
+                worktrees.push(base.to_string_lossy().trim_end_matches('/').to_string());
+            }
+            if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree()
+                && let Ok(id) = linked.head_id()
+            {
+                commits.push(id.to_hex().to_string());
+            }
         }
     }
+    // The current/main/linked sets overlap (e.g. launched from the main worktree); dedup so each
+    // live worktree path + HEAD appears once.
+    worktrees.sort();
+    worktrees.dedup();
+    commits.sort();
+    commits.dedup();
     (commits, worktrees)
 }
