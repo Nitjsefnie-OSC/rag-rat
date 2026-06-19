@@ -9,23 +9,35 @@ pub(crate) struct GitChangedPaths {
     pub(crate) deleted: BTreeSet<PathBuf>,
 }
 
-/// Open the git repository for `root` via gix, honoring `GIT_DIR` / `GIT_WORK_TREE` — a bare git
-/// dir plus an external worktree (e.g. in CI) is configured purely through those env vars, and
-/// plain `gix::discover` only searches upward from `root`, so it would miss such a repo and leave
-/// git history "unavailable" (clearing the historical tables). All gix discovery goes through here
-/// (#213 review).
+/// Open the git repository for `root` via gix. Resolves from `root` (the configured PATH) FIRST,
+/// searching upward for a `.git`, and IGNORING `GIT_DIR` / `GIT_WORK_TREE` on that path. The
+/// index's git context is defined by `config.root`, so an inherited `GIT_DIR`/`GIT_WORK_TREE` from
+/// the launching shell (e.g. a tool operating in a linked worktree — Claude Code, an IDE) must NOT
+/// hijack resolution. With the env honored unconditionally, `discover_repo(config.root)` and
+/// `discover_repo(linked_path)` BOTH returned the single env-specified repo, regardless of their
+/// path argument — collapsing the base↔linked overlay delta to empty and PRUNING/tombstoning every
+/// overlay row (the field-reported worktree flip-flop, #219). All gix discovery goes through here.
 ///
-/// Known limitation (#218): gix resolves a RELATIVE `GIT_DIR`/`GIT_WORK_TREE` against the process
-/// cwd, not against `root` (the old `git -C root` resolved them against `root`). Absolute env
-/// values, and relative ones when cwd == `root`, work; relative values from a foreign cwd don't.
-/// gix exposes no way to open with an explicit (git-dir, worktree) pair from outside the crate, so
-/// re-rooting cleanly isn't possible without process-global cwd/env mutation (racy under the
-/// parallel indexer).
+/// Only when no repository is found upward from `root` (a bare git dir + external worktree
+/// configured purely through `GIT_DIR`/`GIT_WORK_TREE`, e.g. CI — #213) do we fall back to the
+/// environment-override discovery, so that legitimate env-configured layout still resolves instead
+/// of leaving git history "unavailable".
+///
+/// LIMITATION (accepted, #219 review): the env fallback fires only when plain discovery ERRORS. If
+/// `config.root` has no `.git` of its own but sits INSIDE an enclosing repo (a monorepo above, a
+/// `$HOME` dotfiles repo), plain discovery succeeds on that enclosing repo and the `GIT_DIR`-
+/// configured external worktree is silently ignored. We do NOT re-prefer `GIT_DIR` here: that is
+/// exactly the env-hijack this fix removed (a worktree shell / git hook exports `GIT_DIR` and would
+/// re-capture resolution). The contract is: the index's repo is the one discoverable from
+/// `config.root` — don't nest a `GIT_DIR`-only external worktree inside another repo.
 pub(crate) fn discover_repo(root: &Path) -> Result<gix::Repository, Box<gix::discover::Error>> {
     // Box the error: gix's `discover::Error` is a large enum, and an unboxed large `Err` bloats
     // every `Result` this returns (clippy::result_large_err). Callers use `.ok()` or `?`
     // (anyhow), both of which handle the box transparently.
-    gix::discover_with_environment_overrides(root).map_err(Box::new)
+    match gix::discover(root) {
+        Ok(repo) => Ok(repo),
+        Err(_) => gix::discover_with_environment_overrides(root).map_err(Box::new),
+    }
 }
 
 pub(crate) fn git_changed_paths(root: &Path) -> anyhow::Result<GitChangedPaths> {
@@ -139,8 +151,62 @@ pub(crate) fn path_is_dirty(repo: &gix::Repository, relative: &Path) -> bool {
 /// `open_config` path, integration tests) can install the same active-checkout scope `search` uses.
 pub fn resolve_git_context(root: &Path) -> (String, String) {
     let commit_sha = head_sha(root);
-    let worktree_id = root.to_string_lossy().trim_end_matches('/').to_string();
-    (commit_sha, worktree_id)
+    (commit_sha, worktree_id_of(root))
+}
+
+/// Format a worktree checkout path into the `worktree_id` string scope rows are keyed by — shared
+/// by `resolve_git_context`, `resolve_worktree_scope`, and (for liveness) `live_worktree_contexts`,
+/// so the overlay WRITE key, the query scope, and the GC live set can't drift.
+///
+/// CANONICALIZES the path so the SAME physical worktree yields the SAME id no matter how it's
+/// spelled — a symlinked or relative reference, or a trailing slash. Without this, indexing via one
+/// spelling (CLI `--worktree`, the watcher's `proxy.base()`) and querying via another (the MCP
+/// `worktree` param / cwd fallback) produced DIFFERENT ids: the query silently missed the overlay,
+/// and GC — whose live set is canonical — pruned the live overlay as dead on every maintenance pass
+/// (#219 review). Falls back to the literal path when it can't be resolved (a removed
+/// worktree mid-GC), trailing slash trimmed either way.
+pub(crate) fn worktree_id_of(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    resolved.to_string_lossy().trim_end_matches('/').to_string()
+}
+
+/// Resolve the active scope `(commit_sha, worktree_id)` for a query, honoring an optional caller
+/// `worktree` (a linked-worktree checkout the caller is working in). The scope's BASE commit is
+/// always `root`'s indexed HEAD (the shared base index) — a linked worktree is served as an OVERLAY
+/// on that base, never as a separate index, and config/db stay anchored to `root` (#219). When
+/// `worktree` names a valid linked sibling of `root`'s repo, the `worktree_id` selects that
+/// worktree's overlay; otherwise (absent / main / foreign / unreadable) it falls back to `root`'s
+/// own scope — never the wrong repo.
+pub(crate) fn resolve_worktree_scope(root: &Path, worktree: Option<&Path>) -> (String, String) {
+    let (base_sha, base_id) = resolve_git_context(root);
+    match worktree.and_then(|candidate| validated_sibling_worktree(root, candidate)) {
+        Some(linked) => (base_sha, worktree_id_of(&linked)),
+        None => (base_sha, base_id),
+    }
+}
+
+/// If `candidate` is a LINKED worktree (`git_dir != common_dir`) sharing `root`'s repository (same
+/// common dir), return its checkout dir; otherwise `None`. Server-side validation of an UNTRUSTED
+/// caller-supplied path (e.g. a cwd that on macOS can be `/`): a main-worktree, foreign-repo, or
+/// unreadable path returns `None` so the caller falls back to the base scope rather than serving
+/// the wrong repo (#219). The comparison canonicalizes git/common dirs; the returned checkout path
+/// is gix's raw `workdir()` so its `worktree_id` matches the GC live set from
+/// `live_worktree_contexts`.
+fn validated_sibling_worktree(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let repo = discover_repo(candidate).ok()?;
+    let git_dir = repo.git_dir().canonicalize().ok()?;
+    let common_dir = repo.common_dir().canonicalize().ok()?;
+    // The main worktree's per-worktree git dir IS the common dir; a linked worktree's differs. Main
+    // → None → base scope (which already serves the main checkout).
+    if git_dir == common_dir {
+        return None;
+    }
+    // Same repository as `root` iff they share a common dir — rejects an unrelated repo's worktree.
+    let root_common = discover_repo(root).ok()?.common_dir().canonicalize().ok()?;
+    if common_dir != root_common {
+        return None;
+    }
+    repo.workdir().map(Path::to_path_buf)
 }
 
 /// The live (commit_sha, worktree_id) keys across every worktree that shares this repo (the gix
@@ -155,7 +221,7 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
     let add_repo =
         |worktrees: &mut Vec<String>, commits: &mut Vec<String>, repo: &gix::Repository| {
             if let Some(workdir) = repo.workdir() {
-                worktrees.push(workdir.to_string_lossy().trim_end_matches('/').to_string());
+                worktrees.push(worktree_id_of(workdir));
             }
             if let Ok(id) = repo.head_id() {
                 commits.push(id.to_hex().to_string());
@@ -179,7 +245,7 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
     if let Ok(proxies) = repo.worktrees() {
         for proxy in proxies {
             if let Ok(base) = proxy.base() {
-                worktrees.push(base.to_string_lossy().trim_end_matches('/').to_string());
+                worktrees.push(worktree_id_of(&base));
             }
             if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree()
                 && let Ok(id) = linked.head_id()
@@ -195,4 +261,99 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
     commits.sort();
     commits.dedup();
     (commits, worktrees)
+}
+
+#[cfg(test)]
+mod worktree_scope_tests {
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ragrat-wtscope-{}-{tag}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn init_repo(tag: &str) -> PathBuf {
+        let dir = temp_dir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn none_is_the_base_scope() {
+        let main = init_repo("none");
+        assert_eq!(resolve_worktree_scope(&main, None), resolve_git_context(&main));
+    }
+
+    #[test]
+    fn linked_worktree_selects_its_overlay_on_the_base_commit() {
+        let main = init_repo("linked-main");
+        let linked = temp_dir("linked-wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        // A commit on the branch so the linked HEAD diverges from the base.
+        std::fs::write(linked.join("b.txt"), "branch").unwrap();
+        git(&linked, &["add", "."]);
+        git(&linked, &["commit", "-q", "-m", "branch"]);
+
+        let (base_sha, base_id) = resolve_git_context(&main);
+        let (sha, wt) = resolve_worktree_scope(&main, Some(&linked));
+        // Overlay-on-base: the base commit stays the rooted checkout's HEAD; only the worktree_id
+        // changes, selecting the linked worktree's overlay.
+        assert_eq!(sha, base_sha, "base commit must remain the rooted checkout's HEAD");
+        assert_ne!(wt, base_id, "worktree_id must select the linked worktree");
+        assert_eq!(PathBuf::from(&wt).canonicalize().unwrap(), linked.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn main_worktree_path_falls_back_to_base() {
+        let main = init_repo("main-fallback");
+        // Passing the MAIN checkout (git_dir == common_dir) is not a linked worktree → base scope.
+        assert_eq!(resolve_worktree_scope(&main, Some(&main)), resolve_git_context(&main));
+    }
+
+    #[test]
+    fn foreign_repo_worktree_falls_back_to_base() {
+        let main = init_repo("foreign-main");
+        let other = init_repo("foreign-other");
+        let other_linked = temp_dir("foreign-linked");
+        git(&other, &["worktree", "add", "-q", other_linked.to_str().unwrap()]);
+        // A genuine linked worktree, but of a DIFFERENT repo (common dir differs) → base scope,
+        // never the foreign repo.
+        assert_eq!(resolve_worktree_scope(&main, Some(&other_linked)), resolve_git_context(&main));
+    }
+
+    #[test]
+    fn unreadable_path_falls_back_to_base() {
+        let main = init_repo("unreadable");
+        // The macOS bogus cwd `/` and a nonexistent path both resolve to base — no panic, no wrong
+        // repo (untrusted-input guard).
+        assert_eq!(resolve_worktree_scope(&main, Some(Path::new("/"))), resolve_git_context(&main));
+        assert_eq!(
+            resolve_worktree_scope(&main, Some(&main.join("nope"))),
+            resolve_git_context(&main)
+        );
+    }
 }

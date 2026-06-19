@@ -38,6 +38,30 @@ pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     let _lock = rag_rat_core::locks::FileLock::acquire_blocking(
         &rag_rat_core::locks::write_lock_path(&config.database),
     )?;
+    // `--worktree`: index a linked worktree's branch overlay on top of the existing base index
+    // (#219). A distinct mode — the delta vs the base, not a base (re)build — so handle it before
+    // the full/discover/changed branches.
+    if let Some(worktree) = &args.worktree {
+        let mut db = open_index(config)?;
+        let mut progress = render_index_progress;
+        // Index the overlay with the LINKED worktree's OWN target set (its branch `rag-rat.toml`),
+        // not the launching process's base targets — a branch that adds/narrows targets must be
+        // indexed by its own config or its overlay rows are filtered/pruned (#219 review).
+        let overlay_config = config.for_linked_worktree_overlay(worktree);
+        let report = db.index_worktree_overlay(&overlay_config, worktree, &mut progress)?;
+        if report.worktree_id.is_empty() {
+            anyhow::bail!(
+                "{} is not a linked worktree of {} — nothing indexed",
+                worktree.display(),
+                config.root.display()
+            );
+        }
+        eprintln!(
+            "worktree overlay [{}]: {} indexed, {} tombstoned, {} pruned",
+            report.worktree_id, report.indexed, report.tombstoned, report.pruned
+        );
+        return Ok(());
+    }
     let db = if args.full {
         IndexDatabase::rebuild_with_progress(config, render_index_progress)?
     } else if args.discover {
@@ -1055,24 +1079,43 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         &rag_rat_core::locks::write_lock_path(&config.database),
     )?;
 
-    let db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
-    let elapsed = started.elapsed().as_secs();
-    let remaining_seconds = max_seconds.saturating_sub(elapsed);
-    let reconcile_report = if remaining_seconds > 0 {
-        let options = rag_rat_core::index::ai::ReconcileOptions {
-            limit: None,
-            batch_size: Some(config.local_ai.embedding.runtime.batch_size),
-            force: false,
-            until_clean: false,
-            changed_first: true,
-            max_seconds: Some(remaining_seconds),
-            max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
-            intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+    let mut db = IndexDatabase::index_discover_with_progress(config, render_index_progress)?;
+    // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
+    // reconcile below — measured from `started` so discovery already counts against it. Without a
+    // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could
+    // spend the full `--max-seconds`, holding the write lock (N+1)× past the advertised limit (#219
+    // review). A `0` cap means the caller asked to skip embedding work entirely.
+    let budget = (max_seconds > 0).then(|| {
+        rag_rat_core::watch::ReconcileBudget::new(
+            rag_rat_core::index::ai::ReconcileOptions {
+                limit: None,
+                batch_size: Some(config.local_ai.embedding.runtime.batch_size),
+                force: false,
+                until_clean: false,
+                changed_first: true,
+                max_seconds: Some(max_seconds),
+                max_embedding_chars: config.local_ai.embedding.runtime.max_embedding_chars,
+                intra_threads: config.local_ai.embedding.runtime.ort_threads.map(|n| n as usize),
+            },
+            started,
+        )
+    });
+    // Keep every live linked worktree's branch overlay fresh (#219). The git hooks run THIS command
+    // (not the foreground watcher), so without this a commit/checkout/merge in a linked worktree
+    // would index the base `config.root` but leave that worktree's overlay stale until a watcher
+    // pass or a manual `index --worktree`. Delta-only + idle-safe, like the watcher's pass; a
+    // CHANGED overlay's embeddings are reconciled INLINE (while scoped to it) so worktree queries
+    // aren't BM25-only for branch content. It restores the base scope afterward so the base
+    // reconcile/gc/memory-validate below run unscoped.
+    rag_rat_core::watch::refresh_worktree_overlays(&mut db, config, budget.as_ref());
+    // The base reconcile gets whatever budget the overlays left; `None` → exhausted (or no cap left
+    // at all), so skip it rather than start a fresh full-budget reconcile.
+    let reconcile_report =
+        match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
+            Some(options) =>
+                Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?),
+            None => None,
         };
-        Some(db.reconcile_with_options_progress(options, render_reconcile_progress)?)
-    } else {
-        None
-    };
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();
@@ -1167,6 +1210,77 @@ mod tests {
             oracle: Default::default(),
         };
         (root, config)
+    }
+
+    #[test]
+    fn maintenance_command_refreshes_a_linked_worktree_overlay() {
+        // #219 review: the git hooks invoke `rag-rat maintenance` (NOT the foreground watcher), so
+        // this command — not just `watch::maintenance_pass` — must refresh every live linked
+        // worktree's branch overlay. Without it, a commit/checkout/merge in a linked worktree
+        // indexes the base `config.root` but leaves the worktree overlay stale.
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap()
+        };
+        let root = std::env::temp_dir().join(format!(
+            "rag-rat-cli-maint-overlay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::write(main.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "base"]);
+        let config = Config {
+            root: main.clone(),
+            database: main.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["src/".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: Default::default(),
+            watch: Default::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        IndexDatabase::rebuild(&config).unwrap();
+
+        let linked = root.join("wt");
+        git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+        std::fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "branch"]);
+
+        // Run the actual CLI maintenance command (the hook entry point).
+        let args = super::MaintenanceArgs {
+            trigger: Some("post-merge".to_string()),
+            max_seconds: Some(0), // skip the embedding reconcile; we only assert the overlay
+            branch_checkout: None,
+            old_head: None,
+            new_head: None,
+        };
+        super::maintenance(&config, &args).unwrap();
+
+        // The worktree-scoped query now sees the branch version, populated by the maintenance pass.
+        let mut db = IndexDatabase::open_config(&config).unwrap();
+        db.use_worktree_scope(&config.root, Some(&linked)).unwrap();
+        let names: Vec<String> =
+            db.symbols("linked_fn", None, 10).unwrap().into_iter().map(|h| h.name).collect();
+        assert!(
+            names.contains(&"linked_fn".to_string()),
+            "the maintenance command must populate the worktree overlay: {names:?}",
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

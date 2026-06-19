@@ -69,6 +69,15 @@ impl IndexDatabase {
         edges::resolve_all_edges(self.storage.connection())
     }
 
+    /// Resolve edges for a LINKED-WORKTREE OVERLAY pass (#219 P1): re-resolve / re-synthesize ONLY
+    /// the worktree's own overlay source files, never the SHARED committed (base) rows that are
+    /// merely visible in the overlay scope view. Resolution targets still span the full overlay
+    /// view, so an overlay edge into a base symbol resolves correctly. The plain `resolve_edges`
+    /// (base/incremental/full-rebuild) owns its scope and rewrites everything in view.
+    pub(super) fn resolve_overlay_edges(&self, worktree_id: &str) -> anyhow::Result<()> {
+        edges::resolve_overlay_edges(self.storage.connection(), worktree_id)
+    }
+
     pub(super) fn rebuild_logical_symbols(&self) -> anyhow::Result<()> {
         // The insert below re-derives the COMPLETE logical-symbol table from all current symbols,
         // so clear it entirely first. A member-join "rebuild set" misses logical_symbols whose
@@ -94,14 +103,25 @@ impl IndexDatabase {
         // current group's members (kilobytes). Byte-identical: same grouping, same
         // `logical_symbols` insert order (ids are content-derived via `stable_id`, not rowids), and
         // the same member order, verified against the golden index.
+        // Read RAW `main.files` (all scopes), NOT the per-connection `files` scope VIEW.
+        // logical_symbols is a GLOBAL table; building it must not depend on whichever scope happens
+        // to be active. When this runs in a worktree-overlay context (a scope view IS installed),
+        // an unqualified `files` resolves to the scoped temp view, so the wholesale DELETE
+        // + repopulate would WIPE every other scope's grouping (base + sibling worktrees)
+        // and restore only the active scope's — persistently breaking `sym_<hex>`-handle
+        // graph nav for base symbols (the #219 review finding). Reading `main.files`
+        // groups every symbol in every live scope; the content-derived `stable_id`
+        // collapses cross-scope duplicates into one logical symbol with per-scope members,
+        // and downstream reads stay scope-filtered via the `files` view.
         let conn = self.storage.connection();
         let mut stmt = conn.prepare(
             "
-            SELECT symbols.id, files.path, symbols.language, symbols.name, symbols.qualified_name,
-                   symbols.kind, symbols.signature, symbols.start_line, symbols.end_line
-            FROM symbols
-            JOIN files ON files.id = symbols.file_id
-            ORDER BY symbols.language, files.path, symbols.name, symbols.qualified_name,
+            SELECT symbols.id, main.files.path, symbols.language, symbols.name,
+                   symbols.qualified_name, symbols.kind, symbols.signature, symbols.start_line,
+                   symbols.end_line
+            FROM main.symbols AS symbols
+            JOIN main.files ON main.files.id = symbols.file_id
+            ORDER BY symbols.language, main.files.path, symbols.name, symbols.qualified_name,
                      symbols.kind, symbols.signature, symbols.start_byte, symbols.end_byte
             ",
         )?;

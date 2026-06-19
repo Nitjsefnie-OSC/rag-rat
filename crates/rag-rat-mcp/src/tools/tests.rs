@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_core::language::Language;
@@ -924,6 +924,224 @@ fn rust_config(root: PathBuf) -> Config {
 fn unique_temp_root() -> PathBuf {
     let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("rag-rat-mcp-test-{}-{id}", std::process::id()))
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+fn candidate_count(value: &Value) -> usize {
+    value.get("candidates").and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+#[test]
+fn worktree_arg_prefers_request_then_falls_back_to_cwd() {
+    let cwd = Some(PathBuf::from("/server/cwd"));
+    // Explicit request field wins.
+    assert_eq!(
+        worktree_arg_or_cwd(&json!({"worktree": "/explicit"}), cwd.clone()),
+        Some(PathBuf::from("/explicit"))
+    );
+    // Absent / blank request field → fall back to the server cwd (validated downstream).
+    assert_eq!(worktree_arg_or_cwd(&json!({}), cwd.clone()), Some(PathBuf::from("/server/cwd")));
+    assert_eq!(worktree_arg_or_cwd(&json!({"worktree": "  "}), cwd.clone()), cwd);
+    // No request field and no cwd → None (base scope).
+    assert_eq!(worktree_arg_or_cwd(&json!({}), None), None);
+}
+
+#[test]
+fn worktree_param_routes_query_to_branch_overlay() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let linked_str = linked.to_str().unwrap();
+    // With the `worktree` param the query resolves against that worktree's branch overlay.
+    let hit = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "linked_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert!(candidate_count(&hit) > 0, "worktree-scoped lookup finds the branch symbol");
+
+    // Without it the base scope is queried — the branch symbol isn't there.
+    let base =
+        call_tool_for_config(&config, "symbol_lookup", json!({"symbol": "linked_fn"})).unwrap();
+    assert_eq!(candidate_count(&base), 0, "base scope does not see the branch symbol");
+
+    // And within the worktree scope the overlay shadows the base symbol.
+    let shadowed = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "base_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert_eq!(
+        candidate_count(&shadowed),
+        0,
+        "the overlay shadows the base symbol in the worktree scope"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn compare_graph_to_text_stays_base_scoped_under_a_worktree_param() {
+    // #219 review (3440746678): `compare_graph_to_text` reads LIVE source text through
+    // `source_root` (the MAIN checkout). Under an overlay scope its GRAPH side would be the branch
+    // overlay while its TEXT side stayed main — mismatched. It must stay BASE-scoped even with a
+    // `worktree` arg, so a `worktree`-passed call matches the base call exactly.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Base: `caller` calls `target`.
+    fs::write(root.join("src/a.rs"), "pub fn target() {}\npub fn caller() {\n    target();\n}\n")
+        .unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Branch: `caller` no longer calls `target` (the callsite is gone on the branch). An
+    // overlay-scoped compare would see 0 graph edges; the base sees 1.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/a.rs"), "pub fn target() {}\npub fn caller() {\n}\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "branch drops call"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let lookup =
+        call_tool_for_config(&config, "symbol_lookup", json!({"symbol": "target"})).unwrap();
+    let id = lookup["candidates"][0]["id"].as_str().unwrap().to_string();
+    let args = |worktree: Option<&str>| {
+        let mut a = json!({"id": id, "pattern": "target\\(", "resolution": "exact",
+            "edge_kinds": ["calls_name"]});
+        if let Some(w) = worktree {
+            a["worktree"] = json!(w);
+        }
+        a
+    };
+
+    let base = call_tool_for_config(&config, "compare_graph_to_text", args(None)).unwrap();
+    let with_worktree = call_tool_for_config(
+        &config,
+        "compare_graph_to_text",
+        args(Some(linked.to_str().unwrap())),
+    )
+    .unwrap();
+    // The `worktree` call is identical to the base call: graph + text both from main, never the
+    // overlay (which would have dropped the graph edge).
+    assert_eq!(
+        base["summary"], with_worktree["summary"],
+        "compare_graph_to_text must stay base-scoped regardless of the worktree param",
+    );
+    assert!(
+        base["summary"]["graph_edges"].as_u64().unwrap() >= 1,
+        "the base call sees the committed callsite edge: {base:?}",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn heal_index_from_a_linked_worktree_does_not_corrupt_the_overlay() {
+    // #219 review: `heal_index` (a WRITE tool) reads file bytes from the stored `source_root` (the
+    // MAIN checkout). If the read-write connection were scoped to the linked worktree, the heal
+    // would reindex the overlay with MAIN's contents or — for a BRANCH-ONLY file, absent from main
+    // — tombstone it in the overlay scope. The fix keeps write tools in the BASE scope and
+    // makes the heal paths refuse to write under a linked overlay scope, so the overlay
+    // survives a `heal_index` invoked from the worktree cwd.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn base_fn() {}\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.email", "t@e"]);
+    git(&root, &["config", "user.name", "t"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    let config = rust_config(root.clone());
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    git(&root, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Branch modifies one file AND adds a branch-only file (the file absent from main is the strong
+    // corruption vector: a worktree-scoped heal can't read it from `source_root`, so it
+    // tombstones).
+    fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
+    fs::write(linked.join("src/only.rs"), "pub fn branch_only_fn() {}\n").unwrap();
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "branch"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    drop(db);
+
+    let linked_str = linked.to_str().unwrap();
+    // Run `heal_index` from the worktree cwd (the `worktree` param the dispatcher would honor).
+    call_tool_for_config(&config, "heal_index", json!({"worktree": linked_str})).unwrap();
+
+    // The overlay is intact: the worktree scope still serves the modified BRANCH version, not
+    // main's.
+    let modified = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "linked_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert!(
+        candidate_count(&modified) > 0,
+        "heal_index from the worktree must NOT overwrite the modified branch overlay",
+    );
+    // The branch-only file is still served — NOT tombstoned by a heal that couldn't read it in
+    // main.
+    let only = call_tool_for_config(
+        &config,
+        "symbol_lookup",
+        json!({"symbol": "branch_only_fn", "worktree": linked_str}),
+    )
+    .unwrap();
+    assert!(
+        candidate_count(&only) > 0,
+        "heal_index must NOT tombstone the branch-only overlay file",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&linked);
 }
 
 #[test]

@@ -187,6 +187,57 @@ impl IndexDatabase {
         install_scope_view(self.storage.connection(), commit_sha, worktree_id)?;
         Ok(())
     }
+
+    /// Whether this connection is scoped to a LINKED-worktree overlay (a non-empty
+    /// `active_worktree_id` that differs from the base checkout's own id, derived from
+    /// `source_root`). The lazy heal paths (`heal_file`, `heal_index`) read file bytes from
+    /// `source_root` (the MAIN checkout), so writing under a linked overlay scope would shadow the
+    /// branch's rows with MAIN's content; they SKIP the write in that case and leave the overlay to
+    /// `index_worktree_overlay`, the one writer allowed to maintain it (#219 review).
+    pub(crate) fn active_scope_is_linked_overlay(&self) -> bool {
+        if self.active_worktree_id.is_empty() {
+            return false;
+        }
+        match self.storage.source_root() {
+            Some(root) => self.active_worktree_id != worktree_id_of(root),
+            None => false,
+        }
+    }
+
+    /// Re-scope this connection to a caller's `worktree` (a linked-worktree checkout), serving its
+    /// overlay over the base. The base commit stays `root`'s indexed HEAD; only the `worktree_id`
+    /// selects the overlay. A `None`, main, foreign, or unreadable `worktree` resolves to `root`'s
+    /// own scope — never the wrong repo (the validation lives in `resolve_worktree_scope`). The
+    /// query open path calls this after opening so a `worktree`-scoped request serves the
+    /// overlay (#219 stage 3); the overlay rows themselves are maintained by
+    /// `index_worktree_overlay` (#219 stages 2/5). `root` is passed explicitly (not read from
+    /// `self.config`) so it works on every open.
+    pub fn use_worktree_scope(
+        &mut self,
+        root: &Path,
+        worktree: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let (commit_sha, worktree_id) = resolve_worktree_scope(root, worktree);
+        self.set_context(&commit_sha, &worktree_id)
+    }
+}
+
+/// Install the per-connection scope view for a worktree-aware query on a RAW connection — the
+/// Claude Code hooks (SessionStart orientation, PreToolUse grep-augmentation) and the MCP hook
+/// listener open an `IndexConnection` directly, not `IndexDatabase`, so they can't use
+/// `use_worktree_scope`. Resolves the OVERLAY scope from `config_root` (the main worktree, where
+/// the base index lives) and `cwd` (the session's working dir): when `cwd` is a linked worktree of
+/// `config_root`'s repo, the view serves that branch's overlay on the base; otherwise (main /
+/// foreign / unreadable) it is the base scope. `pub` so the CLI hook + the MCP listener (other
+/// crates) can scope their context to the worktree the session is actually in (#219).
+pub fn install_worktree_scope_view(
+    conn: &rusqlite::Connection,
+    config_root: &Path,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    let (commit_sha, worktree_id) = resolve_worktree_scope(config_root, Some(cwd));
+    install_scope_view(conn, &commit_sha, &worktree_id)?;
+    Ok(())
 }
 
 /// Installs the per-connection commit/worktree scoping view; callers query `files` afterward and

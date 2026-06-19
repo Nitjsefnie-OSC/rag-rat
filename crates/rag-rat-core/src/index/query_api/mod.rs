@@ -204,6 +204,16 @@ impl IndexDatabase {
     /// (bare/copied index). One file read + hash per distinct path — callers pass the small
     /// result set, not the whole corpus.
     fn stale_source_paths(&self, paths: &[String]) -> anyhow::Result<Vec<String>> {
+        // Under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the
+        // branch these rows came from. Hashing the overlay rows against main's copy reports every
+        // branch-changed file as stale even though the overlay is current, which makes
+        // symbol_lookup's matched-file heal trip `NeedsReindex` (and `heal_file` no-ops under the
+        // overlay anyway) and impact's `stale_files` caveat lie. The overlay rows are authoritative
+        // (maintained by `index_worktree_overlay`), so report nothing stale — same rationale as the
+        // read_chunk overlay skip (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(Vec::new());
+        }
         let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
             return Ok(Vec::new());
         };
@@ -253,6 +263,13 @@ impl IndexDatabase {
     /// No-op without a stored `Config` (rebuild/open/tests) or a git root — a genuine miss on a
     /// clean tree costs at most one `git status` and no write.
     fn heal_changed_for_zero_hit(&self) -> anyhow::Result<bool> {
+        // Under a LINKED-WORKTREE OVERLAY scope this would scan `config.root` (the MAIN checkout)
+        // for working-tree changes and index them into the overlay scope — main's edits, not the
+        // branch's. The overlay is maintained by `index_worktree_overlay`; leave the heal to it
+        // (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(false);
+        }
         let Some(config) = self.config.as_ref() else {
             return Ok(false);
         };
@@ -378,6 +395,17 @@ impl IndexDatabase {
         let Some(mut chunk) = crate::query::read_chunk(self.storage.connection(), chunk_id)? else {
             return Ok(None);
         };
+        // Under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the
+        // branch the chunk came from. Live-revalidating against main would slice the chunk
+        // text out of main's copy of the file (returning BASE text for a branch chunk
+        // whenever the anchor still matches), or call the overlay-guarded `heal_file`
+        // no-op. The overlay rows are maintained by `index_worktree_overlay` (read from the
+        // linked checkout), so the STORED text is already the branch's — return it as-is
+        // and skip live revalidation (#219 review). The base/main scope keeps full live
+        // revalidation below.
+        if self.active_scope_is_linked_overlay() {
+            return Ok(Some(chunk));
+        }
         let Some(root) = self.storage.source_root() else {
             return Ok(Some(chunk));
         };
@@ -429,6 +457,22 @@ impl IndexDatabase {
     }
 
     pub fn heal_index(&self, limit: Option<u32>) -> anyhow::Result<HealIndexReport> {
+        // `heal_index` reads file bytes from `source_root` (the MAIN checkout) and would write into
+        // the active scope. Under a linked-worktree overlay scope that reindexes the overlay with
+        // MAIN's contents or tombstones branch-only files, so refuse — the overlay is owned by
+        // `index_worktree_overlay`. Callers scope writes to the base (#219 review).
+        if self.active_scope_is_linked_overlay() {
+            return Ok(HealIndexReport {
+                checked_files: 0,
+                healed_files: 0,
+                removed_files: 0,
+                skipped_files: 0,
+                fts_fresh: !self.fts_dirty()?,
+                message: Some(
+                    "skipped: heal does not run under a linked-worktree overlay scope".to_string(),
+                ),
+            });
+        }
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
         };

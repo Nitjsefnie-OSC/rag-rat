@@ -101,16 +101,8 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 }
 
 fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
-    let (db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
-    // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
-    // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
-    // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
-    // still caught within that bound: a freshly-installed embedder, an embedding backlog left by a
-    // time-capped reconcile (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real
-    // content change runs the full tail immediately.
-    if !content_changed && !run_gc {
-        return Ok(());
-    }
+    let started = Instant::now();
+    let (mut db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
     let runtime = &config.local_ai.embedding.runtime;
     let options = ReconcileOptions {
         batch_size: Some(runtime.batch_size),
@@ -120,12 +112,156 @@ fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
         intra_threads: runtime.ort_threads.map(|n| n as usize),
         ..ReconcileOptions::default()
     };
-    db.reconcile_with_options_progress(options, |_| {})?;
+    // One time budget shared by the per-overlay reconciles AND the base reconcile below, so a pass
+    // with several changed overlays can't blow past `PASS_RECONCILE_MAX_SECONDS` (N+1)× over (#219
+    // review). Measured from `started` so discovery time already counts against it.
+    let budget = ReconcileBudget::new(options, started);
+    // Keep every live linked worktree's branch overlay fresh (#219), so a `worktree`-scoped query
+    // sees that branch's changes without a manual `index --worktree`. Delta-only and idle-safe (the
+    // overlay pass writes nothing when a worktree is unchanged), so it can run every pass; a
+    // worktree change counts toward running the tail below even when config.root itself didn't
+    // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
+    // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
+    let overlays_changed = refresh_worktree_overlays(&mut db, config, Some(&budget));
+    // Idle backstop (issue #63, facet 2): when the sweep changed no content, skip the reconcile /
+    // gc / memory-validate tail — an idle server should do no work past discovery. `run_gc` (every
+    // GC_EVERY_PASSES) still forces a full tail, so the cases that DON'T flip content_changed are
+    // still caught within that bound: a freshly-installed embedder, an embedding backlog left by a
+    // time-capped reconcile (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real
+    // content change runs the full tail immediately.
+    if !content_changed && !overlays_changed && !run_gc {
+        return Ok(());
+    }
+    // The base reconcile gets only the budget the overlays left behind; `None` → already exhausted,
+    // so skip it (the embedding backlog rides the next pass) rather than spend a fresh full budget.
+    if let Some(options) = budget.next_options() {
+        db.reconcile_with_options_progress(options, |_| {})?;
+    }
     if run_gc {
         let _ = db.garbage_collect();
     }
     let _ = db.memory_validate();
     Ok(())
+}
+
+/// Refresh the branch overlay of every live LINKED worktree of `config.root`'s repo (#219), so a
+/// `worktree`-scoped query stays current without a manual `index --worktree`. Returns whether any
+/// overlay actually changed. `index_worktree_overlay` is delta-only and idle-safe (a static
+/// worktree writes nothing), and the connection is restored to the base scope afterward so the rest
+/// of the pass (reconcile / gc / memory-validate) runs unscoped as before. Best-effort per worktree
+/// — a failure on one worktree is logged and doesn't abort the pass.
+///
+/// `reconcile` (when `Some`): after a CHANGED overlay is indexed — while the connection is STILL
+/// scoped to that overlay — reconcile its embeddings, so worktree-scoped `semantic_search` is not
+/// BM25-only for branch content. The pass's trailing reconcile runs AFTER this returns, when the
+/// connection is back on the base scope (the `files` view = base rows), so it never sees overlay
+/// chunks; reconciling here is the only point the overlay scope is active (#219 review). Embeddings
+/// for a NEW/MODIFIED overlay chunk are written keyed by chunk id (shared `chunk_embeddings`
+/// table), which the overlay scope reads through its own `files` view. `None` skips overlay
+/// reconcile (the caller has no embedder/options).
+///
+/// `pub` so the hook-driven CLI `maintenance` command shares this exact path: the git hooks invoke
+/// `rag-rat maintenance` (not the foreground watcher), so without calling this a commit/checkout/
+/// merge in a linked worktree would index the base `config.root` but leave that worktree's overlay
+/// stale until a watcher pass or a manual `index --worktree` (#219 review).
+pub fn refresh_worktree_overlays(
+    db: &mut IndexDatabase,
+    config: &Config,
+    reconcile: Option<&ReconcileBudget>,
+) -> bool {
+    let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
+    // The base id is the ENCLOSING worktree root, not `config.root` itself — see
+    // `enclosing_worktree_id` (a repo-SUBDIR `config.root` would otherwise mis-classify the main
+    // checkout as a linked overlay and re-index it as one) (#219 review).
+    let base_id = enclosing_worktree_id(&config.root);
+    let mut changed = false;
+    for worktree in worktrees {
+        if worktree == base_id {
+            continue; // the rooted checkout is the base scope, not an overlay
+        }
+        // Refresh the overlay with the LINKED worktree's OWN config targets, not the sweeping
+        // process's. A branch whose `rag-rat.toml` ADDS a target (e.g. `extra/`) would otherwise be
+        // filtered against the sweeper's targets, and a complete-status pass would PRUNE the
+        // overlay rows a branch-launched hook indexed for it. `for_linked_worktree_overlay`
+        // keeps the shared base `root`/`database` but swaps in the branch's target set
+        // (#219 review).
+        let overlay_config = config.for_linked_worktree_overlay(Path::new(&worktree));
+        match db.index_worktree_overlay(&overlay_config, Path::new(&worktree), &mut |_| {}) {
+            Ok(report) => {
+                let this_changed = report.indexed > 0 || report.tombstoned > 0 || report.pruned > 0;
+                changed |= this_changed;
+                // Embed the overlay's chunks NOW, while the connection is still scoped to this
+                // overlay (index_worktree_overlay left it there) — the trailing base reconcile
+                // won't see them (#219 review). Run when the overlay CHANGED, OR
+                // when it has a BACKLOG of un-embedded chunks: an earlier pass's
+                // inline reconcile may have returned `Partial` (the shared time
+                // budget ran out mid-pass), leaving overlay chunks un-embedded. The
+                // next pass sees the overlay rows as unchanged and would skip the embed forever, so
+                // a worktree-scoped `semantic_search` would stay BM25-only for that
+                // branch content until an unrelated file change.
+                // `pending_embedding_jobs` (active overlay scope) retries that
+                // backlog (#219 review). `budget.next_options()` recomputes `max_seconds`
+                // from the time left in the SHARED budget so overlays + base can't each spend the
+                // full `--max-seconds`; `None` → budget exhausted, skip and let the NEXT pass
+                // retry.
+                let needs_embed = this_changed
+                    || reconcile.is_some()
+                        && db.pending_embedding_jobs().is_ok_and(|pending| pending > 0);
+                if needs_embed
+                    && let Some(budget) = reconcile
+                    && let Some(options) = budget.next_options()
+                    && let Err(err) = db.reconcile_with_options_progress(options, |_| {})
+                {
+                    eprintln!("watch: worktree overlay reconcile failed for {worktree}: {err}");
+                }
+            },
+            Err(err) => eprintln!("watch: worktree overlay refresh failed for {worktree}: {err}"),
+        }
+    }
+    // Restore the base scope for the rest of the pass (index_worktree_overlay leaves the connection
+    // scoped to the last worktree it touched).
+    let _ = db.use_worktree_scope(&config.root, None);
+    changed
+}
+
+/// A time budget shared across the per-overlay embedding reconciles AND the trailing base reconcile
+/// of one maintenance/watcher pass. Each reconcile call starts its own `Instant` timer against its
+/// `max_seconds`, so handing every overlay (and the base) the same `ReconcileOptions` would let
+/// each spend the FULL advertised budget — N overlays + base = (N+1)×`max_seconds` of held write
+/// lock. `next_options` recomputes `max_seconds` from the time remaining since `start`, so the
+/// whole pass stays within a single budget (#219 review). A budget with no `max_seconds` cap
+/// (`None`) is unbounded and every `next_options` returns the base options unchanged.
+pub struct ReconcileBudget {
+    options: ReconcileOptions,
+    start: Instant,
+    total_seconds: Option<u64>,
+}
+
+impl ReconcileBudget {
+    /// Build a shared budget. `start` is the pass's clock origin — pass the SAME instant the
+    /// surrounding command measured its own setup against (so discovery time already spent counts
+    /// toward the budget); the per-call `max_seconds` is `options.max_seconds` minus elapsed.
+    pub fn new(options: ReconcileOptions, start: Instant) -> Self {
+        let total_seconds = options.max_seconds;
+        Self { options, start, total_seconds }
+    }
+
+    /// The options for the NEXT reconcile in this pass, with `max_seconds` reduced to the time left
+    /// in the shared budget. `None` when the budget is exhausted (so the caller skips the reconcile
+    /// entirely rather than running it with a zero budget). An uncapped budget always yields the
+    /// base options.
+    pub fn next_options(&self) -> Option<ReconcileOptions> {
+        let Some(total) = self.total_seconds else {
+            return Some(self.options.clone());
+        };
+        let remaining = total.saturating_sub(self.start.elapsed().as_secs());
+        if remaining == 0 {
+            return None;
+        }
+        let mut options = self.options.clone();
+        options.max_seconds = Some(remaining);
+        Some(options)
+    }
 }
 
 /// Whether an event KIND should ever fire a pass. Only content mutations do — `Create`, `Remove`,
@@ -212,6 +348,86 @@ fn event_is_relevant(config: &Config, ignore: &IgnoreMatcher, event: &Event) -> 
             .ok()
             .is_some_and(|relative| target_for_path(config, relative).is_some())
     })
+}
+
+/// Whether `event` should fire a pass for the LINKED-worktree layer (#219): a content mutation to a
+/// configured target inside a linked worktree checkout (its overlay needs refreshing), or any
+/// change in the worktree registry (`<common_dir>/worktrees`, i.e. a worktree add/remove). Separate
+/// from [`event_is_relevant`] so the base-tree classification — and its tests — stay untouched. The
+/// `config.root` ignore matcher doesn't govern paths outside `config.root`, so a worktree path is
+/// matched by the target globs alone (the overlay pass does its own delta + target filtering).
+fn event_touches_worktree(
+    config: &Config,
+    event: &Event,
+    worktree_roots: &[PathBuf],
+    registry: Option<&Path>,
+) -> bool {
+    if !kind_is_mutation(&event.kind) {
+        return false;
+    }
+    // `config.root` may be a SUBDIR of the repo. A linked checkout mirrors that layout, so its
+    // event paths are `<checkout_root>/<config_subdir>/<target>/…`. After stripping the
+    // checkout root the remainder is still `<config_subdir>/<target>/…`, but `target_for_path`
+    // expects a CONFIG-ROOT- relative path (`<target>/…`) — so a subdir-rooted config would
+    // reject every linked edit and never debounce an overlay refresh. Strip the config subdir
+    // too (#219 review).
+    let config_subdir = config_subdir_prefix(config);
+    event.paths.iter().any(|path| {
+        if registry.is_some_and(|reg| path.starts_with(reg)) {
+            return true;
+        }
+        // A `.gitignore` edit in the linked checkout changes its ignored/unignored set, so the
+        // overlay must refresh — mirror the base classifier's `.gitignore` handling (#219 review).
+        // Bound it to the watched checkout roots so an unrelated repo's `.gitignore` is ignored.
+        if is_gitignore_path(path) && worktree_roots.iter().any(|root| path.starts_with(root)) {
+            return true;
+        }
+        worktree_roots.iter().any(|root| {
+            let Ok(rel) = path.strip_prefix(root) else {
+                return false;
+            };
+            let rel = rel.strip_prefix(&config_subdir).unwrap_or(rel);
+            target_for_path(config, rel).is_some()
+        })
+    })
+}
+
+/// `config.root` relative to its own checkout's worktree root — the SUBDIR prefix to strip off a
+/// linked checkout's event paths before applying `target_for_path` (config-root-relative). Empty
+/// when `config.root` IS the worktree root (the common case) or in a non-git tree.
+fn config_subdir_prefix(config: &Config) -> PathBuf {
+    crate::index::git_history::worktree_root(&config.root)
+        .and_then(|wt| config.root.strip_prefix(&wt).ok().map(Path::to_path_buf))
+        .unwrap_or_default()
+}
+
+/// The `worktree_id` of the worktree that ENCLOSES `root`, canonicalized to match the ids
+/// `live_worktree_contexts` reports. When `root` is a repo SUBDIR (`<repo>/crate`), the enclosing
+/// worktree root is `<repo>` — which is the spelling the main checkout contributes to
+/// `live_worktree_contexts`. Filtering live worktrees by `worktree_id_of(root)` (the subdir path)
+/// instead would never match that entry, so the main checkout would be misread as a LINKED overlay.
+/// Falls back to `root`'s own id outside a git worktree (#219 review).
+fn enclosing_worktree_id(root: &Path) -> String {
+    crate::index::git_history::worktree_root(root)
+        .map_or_else(|| crate::index::worktree_id_of(root), |wt| crate::index::worktree_id_of(&wt))
+}
+
+/// Live linked-worktree checkout roots (excluding the base `config.root`) plus the worktree
+/// registry dir (`<common_dir>/worktrees`), for the watcher to subscribe to — branch checkouts for
+/// edits, the registry for add/remove.
+fn worktree_watch_targets(config: &Config) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let (_, worktrees) = crate::index::live_worktree_contexts(&config.root);
+    // The base id is the ENCLOSING worktree root, not `config.root` itself. When `config.root` is a
+    // repo SUBDIR (`<repo>/crate`), `live_worktree_contexts` reports the main checkout as `<repo>`
+    // (its workdir), but `worktree_id_of(config.root)` is `<repo>/crate` — they wouldn't match, so
+    // the main checkout would be treated as a linked worktree and the watcher would recursively
+    // subscribe to the whole repo root outside the configured target (#219 review).
+    let base = enclosing_worktree_id(&config.root);
+    let roots = worktrees.into_iter().filter(|w| *w != base).map(PathBuf::from).collect();
+    let registry = crate::index::discover_repo(&config.root)
+        .ok()
+        .map(|repo| repo.common_dir().join("worktrees"));
+    (roots, registry)
 }
 
 /// Whether `event` touches the installed binary path — the fleet hot-upgrade trigger. Matches by
@@ -335,6 +551,16 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
     if let Some(dir) = fleet_dir {
         let _ = notify_watcher.watch(dir, RecursiveMode::NonRecursive);
     }
+    // Linked worktrees (#219): watch each branch checkout recursively so its edits refresh the
+    // overlay, and the worktree registry non-recursively so a `git worktree add`/`remove` fires a
+    // pass. `linked_worktrees` is reconciled after each pass to pick up newly-added worktrees.
+    let (mut linked_worktrees, worktree_registry) = worktree_watch_targets(&config);
+    for worktree in &linked_worktrees {
+        let _ = notify_watcher.watch(worktree, RecursiveMode::Recursive);
+    }
+    if let Some(registry) = &worktree_registry {
+        let _ = notify_watcher.watch(registry, RecursiveMode::NonRecursive);
+    }
 
     let mut debounce = Debounce::new(
         Duration::from_millis(config.watch.debounce_ms),
@@ -360,7 +586,14 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
         match rx.recv_timeout(wait) {
             Ok(Ok(event)) => {
                 let now = Instant::now();
-                if event_is_relevant(&config, &ignore, &event) {
+                if event_is_relevant(&config, &ignore, &event)
+                    || event_touches_worktree(
+                        &config,
+                        &event,
+                        &linked_worktrees,
+                        worktree_registry.as_deref(),
+                    )
+                {
                     debounce.on_event(now);
                     // A `.gitignore` mutation changed the rules — recompile so subsequent events
                     // are classified against current rules, not the matcher
@@ -387,6 +620,16 @@ fn watcher_main(config: Config, fleet_bin: Option<PathBuf>, stop: &AtomicBool) {
             let _ = maintenance_pass(&config, passes.is_multiple_of(GC_EVERY_PASSES));
             debounce.reset();
             last_pass = Instant::now();
+            // Pick up newly-added worktrees (a registry event fired this pass): watch any live
+            // linked checkout we aren't watching yet. Removed ones keep a now-stale watch
+            // (harmless; their overlay is GC-pruned) — avoids unwatch bookkeeping.
+            let (current, _) = worktree_watch_targets(&config);
+            for worktree in current {
+                if !linked_worktrees.contains(&worktree) {
+                    let _ = notify_watcher.watch(&worktree, RecursiveMode::Recursive);
+                    linked_worktrees.push(worktree);
+                }
+            }
         }
         if fleet_debounce.should_fire(now)
             && let Some(bin) = fleet_bin.as_deref()
@@ -429,6 +672,136 @@ mod tests {
 
     fn mutation_event(path: PathBuf) -> Event {
         Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path)
+    }
+
+    #[test]
+    fn event_touches_worktree_matches_checkout_targets_and_registry() {
+        let config = Config {
+            root: PathBuf::from("/main"),
+            database: PathBuf::from("/main/.rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        let worktree = PathBuf::from("/wt/feat");
+        let registry = PathBuf::from("/main/.git/worktrees");
+        let roots = [worktree.clone()];
+
+        // A target file in a linked worktree fires (its overlay needs refreshing).
+        assert!(event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join("src/a.rs")),
+            &roots,
+            Some(&registry),
+        ));
+        // A non-target file in the worktree does not.
+        assert!(!event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join("README.md")),
+            &roots,
+            Some(&registry),
+        ));
+        // A change in the worktree registry (a `git worktree add`/`remove`) fires.
+        assert!(event_touches_worktree(
+            &config,
+            &mutation_event(registry.join("feat/HEAD")),
+            &roots,
+            Some(&registry),
+        ));
+        // A `.gitignore` edit in the linked checkout fires (it changes the overlay's ignored set),
+        // mirroring the base classifier (#219 review).
+        assert!(event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join(".gitignore")),
+            &roots,
+            Some(&registry),
+        ));
+        // A `.gitignore` OUTSIDE any watched checkout does not.
+        assert!(!event_touches_worktree(
+            &config,
+            &mutation_event(PathBuf::from("/elsewhere/.gitignore")),
+            &roots,
+            Some(&registry),
+        ));
+        // A read event never fires (anti-feedback, same as the base watcher).
+        let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)))
+            .add_path(worktree.join("src/a.rs"));
+        assert!(!event_touches_worktree(&config, &read, &roots, Some(&registry)));
+        // No worktrees and no registry → nothing fires.
+        assert!(!event_touches_worktree(
+            &config,
+            &mutation_event(worktree.join("src/a.rs")),
+            &[],
+            None,
+        ));
+    }
+
+    #[test]
+    fn event_touches_worktree_rebases_subdir_rooted_config() {
+        // #219 review: when `config.root` is a repo SUBDIR (`<repo>/crate`), a linked checkout's
+        // edit arrives as `<checkout>/crate/src/a.rs`. Stripping only the checkout root leaves
+        // `crate/src/a.rs`, which `target_for_path` (config-root-relative, expecting `src/a.rs`)
+        // rejects — so the subdir prefix must be stripped too.
+        use std::process::Command;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let repo =
+            std::env::temp_dir().join(format!("ragrat-wt-subdir-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("crate/src")).unwrap();
+        std::fs::write(repo.join("crate/src/a.rs"), "fn a() {}\n").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@e"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "base"],
+        ] {
+            Command::new("git").args(&args).current_dir(&repo).output().unwrap();
+        }
+        // `config.root` is the `crate` SUBDIR of the repo.
+        let config_root = repo.join("crate").canonicalize().unwrap();
+        let config = Config {
+            root: config_root,
+            database: repo.join("crate/.rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+        // A linked checkout mirrors the layout: `<checkout>/crate/src/a.rs`.
+        let checkout =
+            std::env::temp_dir().join(format!("ragrat-wt-subdir-co-{}-{id}", std::process::id()));
+        let roots = [checkout.clone()];
+        assert!(
+            event_touches_worktree(
+                &config,
+                &mutation_event(checkout.join("crate/src/a.rs")),
+                &roots,
+                None,
+            ),
+            "a subdir-rooted config must fire on a linked edit under <checkout>/<subdir>/<target>"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -660,6 +1033,85 @@ mod tests {
         let d = Debounce::new(Duration::from_millis(400), Duration::from_millis(2500));
         assert!(d.due_in(Instant::now()).is_none());
         assert!(!d.should_fire(Instant::now()));
+    }
+
+    #[test]
+    fn reconcile_budget_is_shared_across_overlays_and_base() {
+        // #219 review: each overlay reconcile (and the base) starts its OWN `max_seconds` timer, so
+        // handing every one the same options lets the pass spend (N+1)× the advertised budget.
+        // `next_options` recomputes `max_seconds` from the time remaining in the shared budget.
+        let options = ReconcileOptions { max_seconds: Some(30), ..ReconcileOptions::default() };
+        // A budget whose clock STARTED 30s ago is already exhausted → skip the reconcile.
+        let spent = ReconcileBudget::new(
+            options.clone(),
+            Instant::now() - std::time::Duration::from_secs(30),
+        );
+        assert!(spent.next_options().is_none(), "an exhausted budget yields no reconcile");
+
+        // A fresh budget yields options whose `max_seconds` is at most the total (the remaining
+        // time), never a fresh full budget per call.
+        let fresh = ReconcileBudget::new(options, Instant::now());
+        let next = fresh.next_options().expect("a fresh budget has time left");
+        assert!(
+            next.max_seconds.is_some_and(|s| s <= 30),
+            "the per-call budget is bounded by the time remaining, not a fresh full budget: {:?}",
+            next.max_seconds,
+        );
+
+        // An uncapped budget (`max_seconds: None`) always yields the base options.
+        let uncapped = ReconcileBudget::new(ReconcileOptions::default(), Instant::now());
+        assert_eq!(uncapped.next_options().and_then(|o| o.max_seconds), None);
+    }
+
+    #[test]
+    fn worktree_watch_targets_excludes_the_main_checkout_for_a_subdir_config_root() {
+        // #219 review: when `config.root` is a repo SUBDIR (`<repo>/crate`),
+        // `live_worktree_contexts` reports the main checkout as `<repo>` (its workdir), but
+        // filtering by `worktree_id_of(config.root)` (`<repo>/crate`) wouldn't match — so
+        // the main checkout would be misread as a LINKED worktree and the watcher would
+        // recursively subscribe to the whole repo root. The base id must be the ENCLOSING
+        // worktree root.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let main = std::env::temp_dir().join(format!("ragrat-wwt-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(main.join("crate/src")).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap()
+        };
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "t@e"]);
+        git(&main, &["config", "user.name", "t"]);
+        std::fs::write(main.join("crate/src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "seed"]);
+
+        let sub = main.join("crate").canonicalize().unwrap(); // config.root is the subdir.
+        let config = Config {
+            root: sub.clone(),
+            database: sub.join(".rag-rat/index.sqlite"),
+            targets: vec![ResolvedTarget {
+                name: "rust".to_string(),
+                language: Language::Rust,
+                directories: vec![PathBuf::from("src")],
+                include: vec!["**/*.rs".to_string()],
+                exclude: Vec::new(),
+                kind: TargetKind::Source,
+            }],
+            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            watch: WatchConfig::default(),
+            version_check: Default::default(),
+            oracle: Default::default(),
+        };
+
+        let (roots, _registry) = worktree_watch_targets(&config);
+        let main_id = crate::index::worktree_id_of(&main.canonicalize().unwrap());
+        assert!(
+            !roots.iter().any(|r| crate::index::worktree_id_of(r) == main_id),
+            "the main checkout must NOT be watched as a linked worktree: {roots:?}",
+        );
+
+        std::fs::remove_dir_all(&main).ok();
     }
 
     #[test]
