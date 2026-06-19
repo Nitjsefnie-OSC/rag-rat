@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use crate::index::ai;
+use crate::index::text_compression::ChunkTextRow;
+use crate::index::{ai, text_compression};
 use crate::query::graph_meta::GraphEvidence;
 
 const BM25_WEIGHT: f64 = 0.45;
@@ -173,17 +174,29 @@ fn search_with_query_embedding(
     let candidate_limit = i64::from(limit.max(10)).saturating_mul(8);
     let vector_available = query_embedding.is_some();
     let mut ranked = BTreeMap::<i64, RankedHit>::new();
+    // One dict decoder shared by both candidate passes (#77 Phase 2): bm25 and vector each
+    // decompress a batch of snippet text and run sequentially, so loading the dict versions once
+    // here avoids the duplicate SELECT + dictionary prep the two passes used to do independently.
+    let dicts = crate::query::chunk_text_dicts(conn)?;
+    let mut decoder = text_compression::ChunkTextDecoder::new(&dicts);
 
     for (rank, hit) in
-        bm25_candidates(conn, query, candidate_limit, include_generated)?.into_iter().enumerate()
+        bm25_candidates(conn, query, candidate_limit, include_generated, &mut decoder)?
+            .into_iter()
+            .enumerate()
     {
         let entry = ranked.entry(hit.chunk_id).or_insert_with(|| RankedHit::new(hit));
         entry.components.bm25 = BM25_WEIGHT * lexical_rank_score(rank);
     }
 
-    for (hit, similarity) in
-        vector_candidates(conn, query, candidate_limit, include_generated, query_embedding)?
-    {
+    for (hit, similarity) in vector_candidates(
+        conn,
+        query,
+        candidate_limit,
+        include_generated,
+        query_embedding,
+        &mut decoder,
+    )? {
         let entry = ranked.entry(hit.chunk_id).or_insert_with(|| RankedHit::new(hit));
         entry.components.vector = VECTOR_WEIGHT * f64::from(similarity).clamp(0.0, 1.0);
     }
@@ -255,6 +268,7 @@ fn bm25_candidates(
     query: &str,
     limit: i64,
     include_generated: bool,
+    decoder: &mut text_compression::ChunkTextDecoder,
 ) -> anyhow::Result<Vec<SearchHit>> {
     let fts_query = fts_query(query);
     if fts_query == "\"\"" {
@@ -266,10 +280,11 @@ fn bm25_candidates(
         SELECT chunks.id, files.path, files.language, files.kind,
                chunks.start_line, chunks.end_line, chunks.symbol_path,
                bm25(chunk_fts) AS score,
-               chunks.text
+               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
         FROM chunk_fts
         JOIN chunks ON chunks.id = chunk_fts.rowid
         JOIN files ON files.id = chunks.file_id
+        JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         WHERE chunk_fts MATCH ?1
           AND {generated_filter}
         ORDER BY score
@@ -277,27 +292,37 @@ fn bm25_candidates(
         "
     );
     let mut stmt = conn.prepare(&sql)?;
+    // Snippet text comes from the compressed store (#77); collect blob + raw_len here and
+    // decompress in the post-loop — decompress returns anyhow::Result, which can't cross the
+    // rusqlite closure.
     let rows = stmt.query_map(params![fts_query, limit], |row| {
-        let text: String = row.get(8)?;
-        Ok(SearchHit {
-            chunk_id: row.get(0)?,
-            path: row.get(1)?,
-            language: row.get(2)?,
-            kind: row.get(3)?,
-            start_line: row.get(4)?,
-            end_line: row.get(5)?,
-            symbol_path: row.get(6)?,
-            score: row.get(7)?,
-            // Placeholder — RankedHit::finish sets the real mode from the scored components.
-            retrieval_mode: String::new(),
-            summary: snippet(&text, query),
-            graph: None,
-            score_components: None,
-            importance: None,
-        })
+        Ok((
+            SearchHit {
+                chunk_id: row.get(0)?,
+                path: row.get(1)?,
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                start_line: row.get(4)?,
+                end_line: row.get(5)?,
+                symbol_path: row.get(6)?,
+                score: row.get(7)?,
+                // Placeholder — RankedHit::finish sets the real mode from the scored components.
+                retrieval_mode: String::new(),
+                summary: String::new(),
+                graph: None,
+                score_components: None,
+                importance: None,
+            },
+            ChunkTextRow { blob: row.get(8)?, raw_len: row.get(9)?, dict_version: row.get(10)? },
+        ))
     })?;
-
-    collect_rows(rows)
+    let collected = collect_rows(rows)?;
+    let mut hits = Vec::with_capacity(collected.len());
+    for (mut hit, text_row) in collected {
+        hit.summary = snippet(&text_row.resolve(decoder)?, query);
+        hits.push(hit);
+    }
+    Ok(hits)
 }
 
 fn vector_candidates(
@@ -306,6 +331,7 @@ fn vector_candidates(
     limit: i64,
     include_generated: bool,
     query_embedding: Option<ai::QueryEmbedding>,
+    decoder: &mut text_compression::ChunkTextDecoder,
 ) -> anyhow::Result<Vec<(SearchHit, f32)>> {
     let Some(query_embedding) = query_embedding else {
         return Ok(Vec::new());
@@ -316,11 +342,13 @@ fn vector_candidates(
         "
         SELECT chunks.id, files.path, files.language, files.kind,
                chunks.start_line, chunks.end_line, chunks.symbol_path,
-               chunks.text, chunk_embeddings.vector_blob
+               chunk_embeddings.vector_blob, chunk_text.blob, chunk_text.raw_len,
+               chunk_text.dict_version
         FROM chunk_embeddings
         JOIN ai_models ON ai_models.model_id = chunk_embeddings.model_id
         JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
         JOIN files ON files.id = chunks.file_id
+        JOIN chunk_text ON chunk_text.chunk_id = chunks.id
         WHERE chunk_embeddings.model_id = ?1
           AND ai_models.installed = 1
           AND ai_models.disabled = 0
@@ -344,8 +372,7 @@ fn vector_candidates(
             ai::EMBEDDING_TEXT_VERSION
         ],
         |row| {
-            let text: String = row.get(7)?;
-            let blob: Vec<u8> = row.get(8)?;
+            let vector_blob: Vec<u8> = row.get(7)?;
             Ok((
                 SearchHit {
                     chunk_id: row.get(0)?,
@@ -359,28 +386,43 @@ fn vector_candidates(
                     // Placeholder — RankedHit::finish sets the real mode from the scored
                     // components.
                     retrieval_mode: String::new(),
-                    summary: snippet(&text, query),
+                    // Filled from the compressed store in the post-loop (decompress can't cross the
+                    // rusqlite closure).
+                    summary: String::new(),
                     graph: None,
                     score_components: None,
                     importance: None,
                 },
-                blob,
+                vector_blob,
+                ChunkTextRow {
+                    blob: row.get(8)?,
+                    raw_len: row.get(9)?,
+                    dict_version: row.get(10)?,
+                },
             ))
         },
     )?;
-    let mut hits = Vec::new();
-    for row in rows {
-        let (hit, blob) = row?;
-        let Some(vector) = ai::decode_vector(&blob, query_embedding.dim) else {
+    // Score first (decode + dot), then truncate, THEN decompress only the survivors' snippets. This
+    // is a brute-force flat scan, so many rows can clear `similarity > 0`, but only the top `limit`
+    // are kept — decompressing snippet text before the truncate would decompress (and discard) all
+    // the rest (#77 Phase 2 read-path perf).
+    let mut scored: Vec<(SearchHit, f32, ChunkTextRow)> = Vec::new();
+    for (hit, vector_blob, text_row) in collect_rows(rows)? {
+        let Some(vector) = ai::decode_vector(&vector_blob, query_embedding.dim) else {
             continue;
         };
         let similarity = dot(&query_embedding.vector, &vector);
         if similarity > 0.0 {
-            hits.push((hit, similarity));
+            scored.push((hit, similarity, text_row));
         }
     }
-    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    hits.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    let mut hits = Vec::with_capacity(scored.len());
+    for (mut hit, similarity, text_row) in scored {
+        hit.summary = snippet(&text_row.resolve(decoder)?, query);
+        hits.push((hit, similarity));
+    }
     Ok(hits)
 }
 
@@ -634,26 +676,23 @@ mod tests {
             [],
         )
         .unwrap();
+        let text = "fn watcher_main() { /* election retry loop */ }";
         let chunk_id: i64 = conn
             .query_row(
                 "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
-                                    start_line, end_line, text, text_hash)
-                 VALUES (1, 'symbol', 'watcher_main', 0, 10, 1, 20,
-                         'fn watcher_main() { /* election retry loop */ }', 'h1')
+                                    start_line, end_line, text_hash)
+                 VALUES (1, 'symbol', 'watcher_main', 0, 10, 1, 20, 'h1')
                  RETURNING id",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        // Populate the FTS index directly — external-content FTS5 tables need an explicit
-        // INSERT on the FTS virtual table to build shadow-table entries (or a 'rebuild', as
-        // schema::rebuild_fts now does). A direct INSERT keeps this seed self-contained.
-        conn.execute(
-            "INSERT INTO chunk_fts(rowid, text)
-             VALUES (?1, 'fn watcher_main() { /* election retry loop */ }')",
-            [chunk_id],
-        )
-        .unwrap();
+        // chunks.text is gone (#77 Phase 2): seed the compressed chunk_text blob (readers INNER
+        // JOIN it) and the contentless chunk_fts tokens directly, keeping this seed
+        // self-contained.
+        crate::index::chunk_text_store::seed_chunk_text(&conn, chunk_id, text).unwrap();
+        conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (?1, ?2)", params![chunk_id, text])
+            .unwrap();
         conn
     }
 

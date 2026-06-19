@@ -11,6 +11,7 @@ pub mod schema;
 pub mod symbols;
 pub mod walker;
 
+pub(crate) mod chunk_text_store;
 mod discovery;
 mod file_index;
 mod file_rows;
@@ -28,6 +29,9 @@ mod prep;
 mod query_api;
 mod rebuild;
 mod staleness;
+// #77 Phase 2 chunk-text compression. pub(crate) so the read layer (`crate::query`) can decompress
+// stored blobs, not just the index write path.
+pub(crate) mod text_compression;
 mod util;
 mod worktree_overlay;
 pub use discovery::DiscoveryStatus;

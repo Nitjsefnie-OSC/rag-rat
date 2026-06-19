@@ -351,12 +351,12 @@ fn evaluate_query(
     let started = Instant::now();
     let mut hits = search(db, mode, &query.text)?;
     let mut latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut current_source_violations = find_current_source_violations(config, db, &hits);
+    let mut current_source_violations = find_current_source_violations(config, db, &hits)?;
     if !current_source_violations.is_empty() {
         let retry_started = Instant::now();
         hits = search(db, mode, &query.text)?;
         latency_ms += retry_started.elapsed().as_secs_f64() * 1000.0;
-        current_source_violations = find_current_source_violations(config, db, &hits);
+        current_source_violations = find_current_source_violations(config, db, &hits)?;
     }
     let top_hits = top_hits(&hits);
 
@@ -650,14 +650,18 @@ fn find_current_source_violations(
     config: &Config,
     db: &IndexDatabase,
     hits: &[crate::search::lexical::SearchHit],
-) -> Vec<CurrentSourceViolation> {
+) -> anyhow::Result<Vec<CurrentSourceViolation>> {
+    // `read_chunk_current` builds its own dict decoder per call; this eval pass is a cold CLI
+    // diagnostic (not the hot retrieval path), so the per-call dict load is fine. It also drops the
+    // graph + memory work the public `read_chunk` would do — the violation check only reads
+    // path/text/line span (#77 Phase 2).
     let mut violations = Vec::new();
     let mut checked = BTreeSet::new();
     for hit in hits {
         if !checked.insert(hit.chunk_id) {
             continue;
         }
-        match db.read_chunk(hit.chunk_id) {
+        match db.read_chunk_current(hit.chunk_id) {
             Ok(Some(chunk)) => {
                 let source_path = config.root.join(&chunk.path);
                 match fs::read_to_string(&source_path) {
@@ -691,7 +695,7 @@ fn find_current_source_violations(
             }),
         }
     }
-    violations
+    Ok(violations)
 }
 
 fn slice_lines(source: &str, start_line: i64, end_line: i64) -> Option<String> {

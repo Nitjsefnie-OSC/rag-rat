@@ -506,11 +506,11 @@ fn full_rebuild_preserves_other_worktree_contexts() {
             "
                 INSERT INTO main.chunks(
                     file_id, chunk_kind, symbol_path, start_byte, end_byte, start_line, end_line,
-                    text, text_hash, source_revision, anchor_version, normalized_hash,
+                    text_hash, source_revision, anchor_version, normalized_hash,
                     start_boundary_hash, end_boundary_hash, start_context_hash, end_context_hash,
                     context_radius, embedding_policy, embedding_priority
                 )
-                VALUES (?1, 'symbol', 'other_context', 0, 12, 1, 1, 'other context', 'other-text',
+                VALUES (?1, 'symbol', 'other_context', 0, 12, 1, 1, 'other-text',
                     'other-sha', 1, '', '', '', '', '', 2, 'Embed', 1)
                 RETURNING id
                 ",
@@ -518,6 +518,14 @@ fn full_rebuild_preserves_other_worktree_contexts() {
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
+    // chunks.text is gone (#77 Phase 2); seed the chunk_text blob readers INNER JOIN. (The
+    // chunk_fts row for this other-context chunk is seeded a few lines below.)
+    crate::index::chunk_text_store::seed_chunk_text(
+        db.storage.connection(),
+        other_chunk_id,
+        "other context",
+    )
+    .unwrap();
     db.storage
         .connection()
         .execute(
@@ -10164,12 +10172,351 @@ fn conn_table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
 /// persisted pointer). The oracle's `callee_*` columns are untouched (the columns are dedicated,
 /// not a callee overload).
 #[test]
+fn v025_creates_chunk_text_compression_tables() {
+    // #77 Phase 2: the chunk_text (zstd blob) + chunk_text_dict (shared dictionary) tables exist
+    // after a fresh apply (baseline) AND a forward-migrate (V025).
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
+    for t in ["chunk_text", "chunk_text_dict"] {
+        assert!(conn_table_exists(&conn, t), "{t} created on fresh apply");
+    }
+    let cols = conn_table_columns(&conn, "chunk_text");
+    for expected in ["chunk_id", "blob", "raw_len", "dict_version"] {
+        assert!(cols.contains(&expected.to_string()), "chunk_text missing {expected}");
+    }
+    // Forward-migrate path: drop the tables + the V025 ledger row, re-apply → recreated.
+    conn.execute_batch(
+        "DROP TABLE chunk_text; DROP TABLE chunk_text_dict;
+         DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';",
+    )
+    .unwrap();
+    schema::apply(&conn).unwrap();
+    assert!(conn_table_exists(&conn, "chunk_text"), "V025 recreates chunk_text on forward migrate");
+    assert!(conn_table_exists(&conn, "chunk_text_dict"));
+
+    // Dicts are immutable + versioned (#77 Phase 2): MULTIPLE versions coexist (the prior
+    // CHECK(id=1) single-row constraint is gone — that was the mutable-global-slot footgun a
+    // retrain would hit).
+    conn.execute("INSERT INTO chunk_text_dict(version, dict) VALUES (1, x'00')", []).unwrap();
+    conn.execute("INSERT INTO chunk_text_dict(version, dict) VALUES (2, x'00')", [])
+        .expect("multiple dict versions coexist");
+    // raw_len is the decompress capacity; a negative value would cast to a huge usize.
+    assert!(
+        conn.execute(
+            "INSERT INTO chunk_text(chunk_id, blob, raw_len, dict_version) VALUES (1, x'00', -1, \
+             1)",
+            [],
+        )
+        .is_err(),
+        "chunk_text rejects negative raw_len"
+    );
+}
+
+#[test]
+fn v026_recreates_chunk_fts_contentless_and_repopulates() {
+    // #77 Phase 2: chunk_fts becomes a CONTENTLESS FTS5 index. Fresh apply yields a contentless
+    // table that supports delete-by-rowid (contentless_delete=1); the forward-migrate (V026)
+    // converts an existing external-content table and repopulates it from chunks.text.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+
+    let fts_sql: String = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
+        .unwrap();
+    assert!(fts_sql.contains("content=''"), "chunk_fts must be contentless: {fts_sql}");
+    assert!(
+        fts_sql.contains("contentless_delete=1"),
+        "chunk_fts needs contentless_delete: {fts_sql}"
+    );
+    // Contentless delete-by-rowid round-trip (the incremental delete path relies on this).
+    conn.execute("INSERT INTO chunk_fts(rowid, text) VALUES (1, 'alpha beta')", []).unwrap();
+    let before: i64 = conn
+        .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 1);
+    conn.execute("DELETE FROM chunk_fts WHERE rowid = 1", []).unwrap();
+    let after: i64 = conn
+        .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "contentless_delete=1 removes the row by rowid");
+
+    // Forward-migrate from a pre-V026 index: re-add the old chunks.text column, seed a chunk + an
+    // external-content chunk_fts, and drop the V026 + V027 ledger rows. Re-applying runs V026
+    // (convert chunk_fts to contentless + repopulate from chunks.text) then V027 (build the
+    // chunk_text store from chunks.text + drop the column) — the full retirement path as a unit.
+    conn.execute("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT ''", []).unwrap();
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms)
+         VALUES ('src/a.rs', 'rust', 'source', 'h', 0, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chunks(file_id, chunk_kind, symbol_path, start_byte, end_byte,
+                            start_line, end_line, text_hash, text)
+         VALUES (1, 'symbol', 'gamma', 0, 10, 1, 5, 'th', 'fn gamma() { delta() }')",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "DROP TABLE chunk_fts;
+         CREATE VIRTUAL TABLE chunk_fts USING fts5(text, content='chunks', content_rowid='id', \
+         tokenize='porter');
+         INSERT INTO chunk_fts(chunk_fts) VALUES('rebuild');
+         DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
+         DELETE FROM schema_version WHERE id = '027_drop_chunks_text';",
+    )
+    .unwrap();
+    schema::apply(&conn).unwrap();
+
+    let migrated_sql: String = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        migrated_sql.contains("content=''"),
+        "V026 makes chunk_fts contentless: {migrated_sql}"
+    );
+    let hits: i64 = conn
+        .query_row("SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'gamma'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(hits, 1, "V026 repopulates chunk_fts from chunks.text before V027 drops it");
+    // V027 retired the column and built the compressed store from it.
+    assert!(!schema::column_exists(&conn, "chunks", "text").unwrap(), "V027 drops chunks.text");
+    let blobs: i64 = conn.query_row("SELECT count(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert_eq!(blobs, 1, "V027 builds the chunk_text store from chunks.text");
+}
+
+#[test]
+fn rebuild_fts_repopulates_contentless_chunk_fts_from_the_store() {
+    // #77 Phase 2 recovery path: if the contentless chunk_fts is emptied/desynced,
+    // IndexDatabase::rebuild_fts repopulates it by decompressing the chunk_text store (it does not
+    // re-read chunks.text), and search works again.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn alpha_recovery() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let match_count = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'alpha_recovery'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    // The full rebuild writes chunk_fts inline.
+    assert_eq!(match_count(&db), 1, "full rebuild writes chunk_fts inline");
+
+    // Simulate a desync: clear the contentless index, then recover.
+    db.storage
+        .connection()
+        .execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')", [])
+        .unwrap();
+    assert_eq!(match_count(&db), 0);
+    db.rebuild_fts().unwrap();
+    assert_eq!(
+        match_count(&db),
+        1,
+        "rebuild_fts repopulates contentless chunk_fts from chunk_text"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn full_rebuild_populates_the_chunk_text_store() {
+    // #77 Phase 2: a full rebuild compresses every chunk into chunk_text against the shared dict,
+    // and every stored blob round-trips to its chunks.text.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn alpha() {}\npub fn beta(x: u8) -> u8 { x }\n")
+        .unwrap();
+    fs::write(root.join("src/b.rs"), "pub fn gamma() -> u8 { 3 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert!(chunks > 0, "the rebuild indexed some chunks");
+    assert_eq!(stored, chunks, "every chunk is compressed into chunk_text");
+    let dict: Vec<u8> = conn
+        .query_row("SELECT dict FROM chunk_text_dict WHERE version = 1", [], |r| r.get(0))
+        .unwrap();
+
+    // The chunks.text column is gone (#77 Phase 2), so verify the store is self-consistent: every
+    // blob decompresses to valid UTF-8 and the decompressed corpus contains the indexed source.
+    let mut stmt = conn.prepare("SELECT ct.blob, ct.raw_len FROM chunk_text ct").unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    let mut corpus = String::new();
+    let mut checked = 0;
+    for row in rows {
+        let (blob, raw_len) = row.unwrap();
+        let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
+        corpus.push_str(std::str::from_utf8(&back).expect("chunk_text blob decompresses to UTF-8"));
+        checked += 1;
+    }
+    assert_eq!(checked, chunks);
+    assert!(
+        corpus.contains("alpha") && corpus.contains("beta") && corpus.contains("gamma"),
+        "the decompressed store contains the indexed source"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn incremental_heal_maintains_the_chunk_text_store() {
+    // #77 Phase 2 (2b-2a): the incremental/heal path writes chunk_text inline with the existing
+    // dict, so a healed file's compressed blobs match its NEW text (the old rows cascade out with
+    // the chunks). Without this, chunk_text would go stale on every incremental update.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn original() -> u8 { 1 }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Change the file on disk, then heal it (the incremental path: remove + re-index).
+    fs::write(root.join("src/a.rs"), "pub fn changed() -> u8 { 2 }\npub fn added() {}\n").unwrap();
+    db.heal_file(std::path::Path::new("src/a.rs")).unwrap();
+
+    let conn = db.storage.connection();
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        stored, chunks,
+        "heal kept chunk_text one-to-one with chunks (no stale/orphan rows)"
+    );
+    let dict: Vec<u8> = conn
+        .query_row("SELECT dict FROM chunk_text_dict WHERE version = 1", [], |r| r.get(0))
+        .unwrap();
+    // chunks.text is gone (#77 Phase 2): decompress the store and assert it reflects the healed
+    // NEW text and not the stale pre-heal text.
+    let mut stmt = conn.prepare("SELECT ct.blob, ct.raw_len FROM chunk_text ct").unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    let mut corpus = String::new();
+    for row in rows {
+        let (blob, raw_len) = row.unwrap();
+        let back = super::text_compression::decompress(&blob, &dict, raw_len as usize).unwrap();
+        corpus.push_str(std::str::from_utf8(&back).expect("chunk_text blob decompresses to UTF-8"));
+    }
+    assert!(
+        corpus.contains("changed") && corpus.contains("added"),
+        "the healed file's NEW text is what's stored"
+    );
+    assert!(!corpus.contains("original"), "stale pre-heal text is gone from the store");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rebuild_with_files_but_no_chunks_still_trains_a_dict_so_incrementals_dont_orphan() {
+    // #77 Phase 2 regression (adversarial finding). A full rebuild that indexes a file producing
+    // ZERO chunks — a whitespace-only markdown file (markdown_chunks has no whole-file fallback) —
+    // must still establish dict version 1. Pre-fix, build_store early-returned on an empty corpus,
+    // leaving the index dict-less with files present; the next incremental/heal then hit
+    // insert_chunks' "no dict" branch, which stages into the rebuild-only `temp.rebuild_chunk_text`
+    // and either ORPHANED the new chunk (same connection: a live chunk with no chunk_text row,
+    // which every reader's INNER JOIN silently drops) or errored "no such table" (fresh
+    // connection).
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/empty.md"), "   \n\t\n  \n").unwrap();
+    let config = source_config(root.clone(), Language::Markdown);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    {
+        let conn = db.storage.connection();
+        let files: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+        let dicts: i64 =
+            conn.query_row("SELECT COUNT(*) FROM chunk_text_dict", [], |r| r.get(0)).unwrap();
+        assert!(files >= 1, "the whitespace-only markdown file was indexed");
+        assert_eq!(chunks, 0, "it produced zero chunks");
+        assert_eq!(dicts, 1, "version 1 is established even with zero chunks (the fix)");
+    }
+
+    // The (already-tracked) file gains real content; heal it on the SAME connection. Pre-fix this
+    // orphaned the resulting chunk; post-fix it compresses inline against the established v1 dict.
+    fs::write(root.join("src/empty.md"), "# Title\n\nReal content that yields a chunk.\n").unwrap();
+    db.heal_file(std::path::Path::new("src/empty.md")).unwrap();
+    let conn = db.storage.connection();
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)).unwrap();
+    let stored: i64 = conn.query_row("SELECT COUNT(*) FROM chunk_text", [], |r| r.get(0)).unwrap();
+    assert!(chunks >= 1, "the real markdown file produced a chunk");
+    let orphans: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunks
+             LEFT JOIN chunk_text ON chunk_text.chunk_id = chunks.id
+             WHERE chunk_text.chunk_id IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0, "no live chunk lacks a chunk_text blob (readers INNER JOIN it)");
+    assert_eq!(stored, chunks, "chunk_text is one-to-one with chunks");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
+    // #226 regression: a CLI write command (index/maintenance/oracle) and a watcher pass hold the
+    // per-DB write lock, then open the index — which may migrate an Older schema UNDER the same
+    // lock. With a raw file lock that self-deadlocks (same process, second fd → flock blocks → 30s
+    // timeout, schema never migrates). WriteLock is reentrant on the holding thread, so the
+    // open-time migrate re-enters instead of blocking.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn f() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db_path = config.database.clone();
+
+    // Build a current index, then make it look Older by removing the newest migration's ledger row
+    // (the DDL stays applied; only the version regresses, so the re-run is an idempotent no-op).
+    {
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        db.storage
+            .connection()
+            .execute("DELETE FROM schema_version WHERE id = '027_drop_chunks_text'", [])
+            .unwrap();
+        assert_eq!(
+            schema::status(db.storage.connection()).unwrap().state,
+            schema::SchemaState::Older,
+            "removing the V027 ledger row makes the schema Older"
+        );
+    }
+
+    // Hold the write lock exactly as the CLI `index` command does, then open under it. Pre-#226
+    // this blocked 30s on the migrate lock and errored; now it migrates immediately.
+    let _lock = crate::locks::WriteLock::acquire_blocking(&db_path).unwrap();
+    let db =
+        IndexDatabase::open(&db_path).expect("open migrates the Older schema under the held lock");
+    assert_eq!(
+        schema::status(db.storage.connection()).unwrap().state,
+        schema::SchemaState::Compatible,
+        "open re-ran the migration under the held lock; the schema is current"
+    );
+
+    drop(_lock);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 24);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 27);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10239,6 +10586,9 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         -- the parts already present.)
         DELETE FROM schema_version WHERE id = '023_dispatch_edge_facts_view_exclusion';
         DELETE FROM schema_version WHERE id = '024_files_has_test_code';
+        DELETE FROM schema_version WHERE id = '025_chunk_text_compression_tables';
+        DELETE FROM schema_version WHERE id = '026_contentless_chunk_fts';
+        DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
         ",
     )
     .unwrap();
@@ -10331,6 +10681,9 @@ fn has_test_code_backfill_is_case_sensitive() {
     // is case-sensitive, so they agree.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();
+    // V024's backfill reads chunks.text, which V027 retired; this test exercises the backfill as a
+    // pre-V027 forward-migrate would, so re-add the column it reads.
+    conn.execute("ALTER TABLE chunks ADD COLUMN text TEXT NOT NULL DEFAULT ''", []).unwrap();
     for (id, path) in [(1, "a.rs"), (2, "b.rs")] {
         conn.execute(
             "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms) \

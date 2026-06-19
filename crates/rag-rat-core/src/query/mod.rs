@@ -40,30 +40,82 @@ pub struct ReadChunk {
 }
 
 pub fn read_chunk(conn: &Connection, chunk_id: i64) -> anyhow::Result<Option<ReadChunk>> {
-    Ok(conn
+    // One-shot read: load the dict versions and build a decoder for this call. Batch readers that
+    // loop over many chunk ids (`stale_hit_paths`, eval) should build ONE decoder and call
+    // [`read_chunk_with`] instead — the per-call dict SELECT + dictionary prep is ~20x the
+    // decompress itself, so reusing it across a batch is the win (#77 Phase 2 read-path perf).
+    let dicts = chunk_text_dicts(conn)?;
+    let mut decoder = crate::index::text_compression::ChunkTextDecoder::new(&dicts);
+    read_chunk_with(conn, chunk_id, &mut decoder)
+}
+
+/// Read one chunk, resolving its text through a caller-owned dict decoder (reused across a batch).
+/// Text comes from the compressed `chunk_text` store (#77 Phase 2) — the `chunks.text` column is
+/// gone, so this INNER JOINs `chunk_text` (every live chunk has exactly one blob), and each blob is
+/// decoded against its own `dict_version`.
+pub(crate) fn read_chunk_with(
+    conn: &Connection,
+    chunk_id: i64,
+    decoder: &mut crate::index::text_compression::ChunkTextDecoder,
+) -> anyhow::Result<Option<ReadChunk>> {
+    use crate::index::text_compression::ChunkTextRow;
+    let row = conn
         .query_row(
             "
             SELECT chunks.id, files.path, files.language, files.kind,
-                   chunks.start_line, chunks.end_line, chunks.symbol_path, chunks.text
+                   chunks.start_line, chunks.end_line, chunks.symbol_path,
+                   chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
             FROM chunks
             JOIN files ON files.id = chunks.file_id
+            JOIN chunk_text ON chunk_text.chunk_id = chunks.id
             WHERE chunks.id = ?1
             ",
             [chunk_id],
             |row| {
-                Ok(ReadChunk {
-                    chunk_id: row.get(0)?,
-                    path: row.get(1)?,
-                    language: row.get(2)?,
-                    kind: row.get(3)?,
-                    start_line: row.get(4)?,
-                    end_line: row.get(5)?,
-                    symbol_path: row.get(6)?,
-                    text: row.get(7)?,
-                    graph: None,
-                    memories: Vec::new(),
-                })
+                Ok((
+                    ReadChunk {
+                        chunk_id: row.get(0)?,
+                        path: row.get(1)?,
+                        language: row.get(2)?,
+                        kind: row.get(3)?,
+                        start_line: row.get(4)?,
+                        end_line: row.get(5)?,
+                        symbol_path: row.get(6)?,
+                        text: String::new(),
+                        graph: None,
+                        memories: Vec::new(),
+                    },
+                    ChunkTextRow {
+                        blob: row.get(7)?,
+                        raw_len: row.get(8)?,
+                        dict_version: row.get(9)?,
+                    },
+                ))
             },
         )
-        .optional()?)
+        .optional()?;
+    let Some((mut chunk, text_row)) = row else {
+        return Ok(None);
+    };
+    chunk.text = text_row.resolve(decoder)?;
+    Ok(Some(chunk))
+}
+
+/// All chunk-text dictionary versions (version → dict bytes), loaded once and reused across a batch
+/// via [`crate::index::text_compression::ChunkTextDecoder`]. Each `chunk_text` blob records the
+/// version it was compressed against (#77 Phase 2); a dict is an immutable decode key and a retrain
+/// adds a version rather than replacing one, so a read may span multiple resident versions. An
+/// empty map (fresh DB, no dicts yet) decodes nothing — every chunk has a blob only once a dict
+/// exists.
+pub(crate) fn chunk_text_dicts(
+    conn: &Connection,
+) -> anyhow::Result<std::collections::HashMap<i64, Vec<u8>>> {
+    let mut stmt = conn.prepare("SELECT version, dict FROM chunk_text_dict")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+    let mut dicts = std::collections::HashMap::new();
+    for row in rows {
+        let (version, dict) = row?;
+        dicts.insert(version, dict);
+    }
+    Ok(dicts)
 }

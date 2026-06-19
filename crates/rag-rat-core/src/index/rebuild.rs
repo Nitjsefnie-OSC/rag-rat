@@ -79,9 +79,15 @@ impl IndexDatabase {
             // flags version current and skip a redundant re-derive on next open (#202).
             db.mark_generated_flags_current()?;
             mem_trace("after mark_graph_index_current");
+            // Derive the compressed chunk_text store (#77 Phase 2) from chunks.text inside the same
+            // transaction, so the dict row + the blobs that use it are committed atomically.
+            db.build_chunk_text_store()?;
+            mem_trace("after build_chunk_text_store");
             progress(IndexProgress::RebuildingFts);
-            db.rebuild_fts()?;
-            mem_trace("after rebuild_fts");
+            // chunk_fts was written inline during chunk insert; only commit_fts
+            // needs the bulk 'rebuild' here (#77 Phase 2).
+            db.finalize_full_rebuild_fts()?;
+            mem_trace("after finalize_full_rebuild_fts");
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
             db.storage.execute_batch("COMMIT")?;
             mem_trace("after COMMIT");
@@ -131,6 +137,21 @@ impl IndexDatabase {
             ",
         )?;
         self.delete_staged_files_cascade()?;
+        // Do NOT clear chunk_text_dict: dicts are IMMUTABLE decode keys (#77 Phase 2). Other
+        // worktree contexts' blobs reference existing versions, and deleting a version would orphan
+        // them. The staged cascade above already removed THIS context's chunk_text rows;
+        // insert_chunks recompresses them against the latest existing dict version (or, on
+        // the very first index when no dict exists yet, stages the text so
+        // build_chunk_text_store trains version 1). Per-connection staging table for that
+        // first-index path: insert_chunks writes the in-memory text here (there is no
+        // chunks.text column) and build_chunk_text_store reads + clears it.
+        self.storage.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS rebuild_chunk_text(
+                 chunk_id INTEGER PRIMARY KEY,
+                 text TEXT NOT NULL
+             );
+             DELETE FROM temp.rebuild_chunk_text;",
+        )?;
         self.storage.execute_batch("DELETE FROM temp.staged_file_ids;")?;
         Ok(())
     }
@@ -203,6 +224,16 @@ impl IndexDatabase {
                 JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
             );
             DELETE FROM main.docs
+            WHERE chunk_id IN (
+                SELECT chunks.id
+                FROM main.chunks
+                JOIN temp.staged_file_ids ON staged_file_ids.id = chunks.file_id
+            );
+            -- chunk_text cascades from chunks via FK, but enumerate it explicitly like the other
+            -- chunk-child tables (#77): the migration runner toggles foreign_keys = OFF, so a \
+             delete
+            -- that ran while FK was off would orphan compressed blobs.
+            DELETE FROM main.chunk_text
             WHERE chunk_id IN (
                 SELECT chunks.id
                 FROM main.chunks
