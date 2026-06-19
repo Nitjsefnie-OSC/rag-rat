@@ -11,6 +11,12 @@ struct ChunkInsertFile<'a> {
     source_revision: &'a str,
 }
 
+/// Whether `write_symbol_fingerprints` should bump `clone_token_df` per token (#215). Named so the
+/// call site reads its intent: `BumpDf(false)` on the full-rebuild path (df is recomputed
+/// authoritatively at finalize, so the per-token bump is wasted work), `BumpDf(true)` on the
+/// incremental/heal path (no finalize runs there, so the bump keeps df current).
+struct BumpDf(bool);
+
 impl IndexDatabase {
     pub fn heal_file(&self, path: &Path) -> anyhow::Result<()> {
         // A heal reads bytes from `source_root` (the MAIN checkout). Under a linked-worktree
@@ -118,7 +124,8 @@ impl IndexDatabase {
         // Inline/heal path: keep chunk_fts in sync per row (partial file replace would otherwise
         // desync the external-content index until the next forced rebuild).
         self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks)?;
-        self.insert_symbols(file_id, language, &symbols)?;
+        let symbol_ids = self.insert_symbols(file_id, language, &symbols)?;
+        self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
         }
@@ -183,6 +190,18 @@ impl IndexDatabase {
             &prepared.chunks,
         )?;
         let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
+        // Clone fingerprints were computed in the parallel prepare phase from the same parse used
+        // for symbols/edges (#230) — no second read, no second parse here, just the DB write.
+        // bump_df = graph.is_none(): the full-rebuild path (graph: Some) recomputes clone_token_df
+        // authoritatively from the postings via one GROUP BY in refresh_clone_token_df at finalize
+        // (rebuild.rs), so the per-token df upserts here would be recomputed-and-discarded — pure
+        // waste + hot-row contention on common tokens. The incremental path (graph: None) runs no
+        // such finalize, so it must keep the df current with the drift-tolerated per-token bump.
+        self.write_symbol_fingerprints(
+            &symbol_db_ids,
+            &prepared.symbol_fingerprints,
+            BumpDf(graph.is_none()),
+        )?;
         // Edge candidates were computed in the parallel prepare phase with LOCAL symbol indices;
         // remap them to the real DB ids just assigned.
         match graph {
@@ -207,6 +226,97 @@ impl IndexDatabase {
                 },
         }
         self.mark_fts_dirty()?;
+        Ok(())
+    }
+
+    /// Compute + persist baseline clone fingerprints for the file's function symbols (#215). A
+    /// fingerprint is a pure function of the symbol body, so it is scope-independent and keyed by
+    /// symbol_id; the FK cascade discards it when the symbol is removed on reindex. Re-parses the
+    /// file to walk the AST — the incremental/heal path that calls this already re-reads the file,
+    /// so the extra parse is local to that path. The full-rebuild path computes fingerprints in the
+    /// parallel prepare phase (#230) and calls `write_symbol_fingerprints` directly instead.
+    fn store_symbol_fingerprints(
+        &self,
+        language: Language,
+        path: &Path,
+        text: &str,
+        symbols: &[Symbol],
+        symbol_ids: &[i64],
+    ) -> anyhow::Result<()> {
+        // Only `kind == "function"` symbols are fingerprinted (#215). Bail before re-parsing the
+        // file when none qualify — the parse is the expensive part of this incremental/heal
+        // wrapper.
+        if symbols.iter().all(|s| s.kind != "function") {
+            return Ok(());
+        }
+        let Some(parsed) = parser::parse_file(path, language, text) else {
+            return Ok(());
+        };
+        let fingerprints = clones::fingerprint_symbols(parsed.root(), text, symbols);
+        // Heal/inline path runs no full-rebuild finalize, so the df must be kept current here via
+        // the per-token bump (drift-tolerated; see write_symbol_fingerprints).
+        self.write_symbol_fingerprints(symbol_ids, &fingerprints, BumpDf(true))
+    }
+
+    /// Write precomputed baseline clone fingerprints (#215). `fingerprints` carries
+    /// `(local_symbol_index, fingerprint)` pairs from `clones::fingerprint_symbols`; each index
+    /// selects the matching DB id in `symbol_db_ids`. This is the DB-write half shared by the
+    /// full-rebuild prepare phase (#230) and the incremental `store_symbol_fingerprints` wrapper,
+    /// so the per-row insert discipline lives in exactly one place.
+    ///
+    /// `bump_df` gates the per-token `clone_token_df` upsert. On the full-rebuild path it is
+    /// `BumpDf(false)`: `refresh_clone_token_df` (rebuild.rs) recomputes df exactly from the
+    /// postings at finalize, so bumping it per token here is recomputed-and-discarded work plus
+    /// hot-row B-tree contention on common tokens. On the incremental/heal paths it is
+    /// `BumpDf(true)` — no finalize runs there, so the drift-tolerated bump is how df stays current
+    /// (df is a selectivity hint only; the candidate read LEFT-JOINs + COALESCEs it, so drift never
+    /// changes a result — see query_api/clones.rs).
+    fn write_symbol_fingerprints(
+        &self,
+        symbol_db_ids: &[i64],
+        fingerprints: &[(usize, clones::SymbolFingerprint)],
+        bump_df: BumpDf,
+    ) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        let normalizer_kind = clones::NormalizerKind::Baseline.as_db_str();
+        for (local_index, fp) in fingerprints {
+            let symbol_id = symbol_db_ids[*local_index];
+            conn.prepare_cached(
+                "INSERT INTO symbol_fingerprints(symbol_id, normalizer_kind, normalizer_version, \
+                 oracle_run_id, struct_hash, token_len, created_at_ms)
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                symbol_id,
+                normalizer_kind,
+                clones::NORM_VERSION,
+                fp.struct_hash,
+                fp.token_len,
+                now_ms(),
+            ])?;
+            // Write the inverted index: one posting row per distinct token (#215). The global
+            // document frequency for the token is bumped here ONLY when `bump_df`
+            // (incremental/heal): df is a selectivity hint only (the candidate read
+            // LEFT-JOINs + COALESCEs it), so the bump is drift-tolerated. A full
+            // rebuild skips the bump and instead recomputes df authoritatively from the
+            // postings at finalize (refresh_clone_token_df, rebuild.rs).
+            for &(token_hash, freq) in &fp.token_bag {
+                conn.prepare_cached(
+                    "INSERT INTO symbol_token_postings(symbol_id, normalizer_kind, token_hash, \
+                     freq)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![symbol_id, normalizer_kind, token_hash, freq])?;
+                if bump_df.0 {
+                    conn.prepare_cached(
+                        "INSERT INTO clone_token_df(normalizer_kind, token_hash, df)
+                         VALUES (?1, ?2, 1)
+                         ON CONFLICT(normalizer_kind, token_hash) DO UPDATE SET df = df + 1",
+                    )?
+                    .execute(params![normalizer_kind, token_hash])?;
+                }
+            }
+        }
         Ok(())
     }
 
