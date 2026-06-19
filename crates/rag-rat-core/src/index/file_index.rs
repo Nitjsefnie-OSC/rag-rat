@@ -72,10 +72,21 @@ impl IndexDatabase {
             }
         }
         let sha256 = hex_sha256(text.as_bytes());
+        let chunks = if kind == TargetKind::Generated {
+            chunker::generated_chunks_for_file(path, text)
+        } else {
+            chunker::chunks_for_file(path, language, text)
+        };
+        let chunks = prepare_chunks(path, language.as_str(), kind.as_str(), chunks, text);
+        // has_test_code from the SAME chunk-text marker set as insert_prepared_file + the V024
+        // backfill, so a file healed through this path matches a fully-indexed one (#77). The heal
+        // path is a second files-insert site; chunks are prepared up here (they don't need file_id)
+        // so the flag can be set in the INSERT instead of left at the default 0.
+        let has_test_code = chunks.iter().any(|pc| text_has_test_marker(&pc.chunk.text));
         let file_id = self.storage.connection().query_row(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              RETURNING id",
             params![
                 path_string(path),
@@ -88,15 +99,10 @@ impl IndexDatabase {
                 sha256,
                 &scope.commit_sha,
                 &scope.worktree_id,
+                has_test_code,
             ],
             |row| row.get::<_, i64>(0),
         )?;
-        let chunks = if kind == TargetKind::Generated {
-            chunker::generated_chunks_for_file(path, text)
-        } else {
-            chunker::chunks_for_file(path, language, text)
-        };
-        let chunks = prepare_chunks(path, language.as_str(), kind.as_str(), chunks, text);
         let symbols =
             if kind == TargetKind::Generated || text.len() > chunker::MAX_STRUCTURAL_PARSE_BYTES {
                 Vec::new()
@@ -139,6 +145,10 @@ impl IndexDatabase {
             self.insert_parser_failure(&file.relative_path, file.language, message)?;
         }
         let path = path_string(&file.relative_path);
+        // Precompute the file-level test-code flag (#77): impact_surface's "tests touching this
+        // symbol" query reads this indexed flag instead of scanning `chunks.text` for the markers.
+        // Computed from the chunk text we already hold; same marker set as the V024 backfill.
+        let has_test_code = prepared.chunks.iter().any(|pc| text_has_test_marker(&pc.chunk.text));
         // prepare_cached so the per-file/-chunk/-symbol INSERTs compile once per connection and
         // are reused across the whole rebuild instead of re-parsing the SQL on every row (#57).
         let file_id = self
@@ -146,8 +156,8 @@ impl IndexDatabase {
             .connection()
             .prepare_cached(
                 "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-                 indexed_at_ms, indexed_revision, commit_sha, worktree_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, has_test_code)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  RETURNING id",
             )?
             .query_row(
@@ -162,6 +172,7 @@ impl IndexDatabase {
                     prepared.sha256,
                     file.commit_sha,
                     file.worktree_id,
+                    has_test_code,
                 ],
                 |row| row.get::<_, i64>(0),
             )?;

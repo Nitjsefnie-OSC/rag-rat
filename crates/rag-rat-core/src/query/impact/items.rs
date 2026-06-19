@@ -48,15 +48,15 @@ pub(crate) fn test_items(
             &name,
             "Tests touching this symbol/path",
             "test_mentions_symbol_or_path",
+            // Test detection reads the precomputed `files.has_test_code` flag (#77) instead of
+            // scanning `chunks.text` for the markers — same marker set (see
+            // `index::text_has_test_marker`), now an indexed column, no raw-text scan.
             "
             files.kind = 'source'
             AND (
                 files.path LIKE '%test%'
                 OR files.path LIKE '%spec%'
-                OR chunks.text LIKE '%#[cfg(test)]%'
-                OR chunks.text LIKE '%describe(%'
-                OR chunks.text LIKE '%it(%'
-                OR chunks.text LIKE '%test(%'
+                OR files.has_test_code = 1
             )
             ",
             limit,
@@ -131,6 +131,18 @@ pub(crate) fn section_like_items(
     limit: u32,
 ) -> anyhow::Result<Vec<ImpactItem>> {
     let like = format!("%{needle}%");
+    // Chunk-text "mentions" match goes through the `chunk_fts` index (MATCH), NOT a raw
+    // `chunks.text LIKE` full scan — tokenized + indexed, reads no raw text (#77). The FTS subquery
+    // yields chunk file_ids across all scopes; the outer `files` is the active-scope view, so
+    // `files.id IN (...)` keeps only in-scope files. `None` (needle has no token) → omit the
+    // clause.
+    let fts = fts_phrase_query(needle);
+    let chunk_clause = if fts.is_some() {
+        "OR files.id IN (SELECT chunks.file_id FROM chunks JOIN chunk_fts ON chunk_fts.rowid = \
+         chunks.id WHERE chunk_fts MATCH ?3)"
+    } else {
+        ""
+    };
     // Collapse to ONE row per file. The previous `LEFT JOIN symbols` without aggregation fanned a
     // file out into one row per symbol whenever the match was file-level (path or chunk text),
     // flooding the output and letting one big file starve the `LIMIT` (see issue #48). Grouping by
@@ -144,21 +156,25 @@ pub(crate) fn section_like_items(
                MAX(CASE WHEN files.path LIKE ?1 THEN 1 ELSE 0 END) AS path_match
         FROM files
         LEFT JOIN symbols ON symbols.file_id = files.id
-        LEFT JOIN chunks ON chunks.file_id = files.id
         WHERE ({filter})
           AND (
               files.path LIKE ?1
               OR symbols.name LIKE ?1
               OR symbols.qualified_name LIKE ?1
-              OR chunks.text LIKE ?1
+              {chunk_clause}
           )
         GROUP BY files.path, files.language, files.kind
         ORDER BY files.kind, files.path
         LIMIT ?2
         "
     );
+    let limit_param = i64::from(limit);
+    let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&like, &limit_param];
+    if let Some(fts) = &fts {
+        binds.push(fts);
+    }
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![like, i64::from(limit)], |row| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
         let matched_symbol: Option<String> = row.get(3)?;
         let path_match: i64 = row.get(4)?;
         // Precedence is path > symbol > chunk text. A path match is checked first because a

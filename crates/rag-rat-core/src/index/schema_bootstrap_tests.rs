@@ -8795,7 +8795,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 23);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 24);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -8858,9 +8858,13 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         ALTER TABLE edges_data DROP COLUMN import_scope_end_byte;
         ALTER TABLE edges_data DROP COLUMN import_mod_id;
         DELETE FROM schema_version WHERE id = '022_per_package_import_scope';
-        -- Also drop V023 (recreates the view) so `known_version` reads the contiguous V21 below;
-        -- leaving it would make the applied-set max 23 and skip the migrate.
+        -- Also drop the later migration rows so `known_version` reads the contiguous V21 below;
+        -- leaving any would make the applied-set max > 21 and skip the migrate. (The artifacts
+        -- those later migrations added — the edges view (V023), files.has_test_code (V024) — can
+        -- stay: their apply fns are idempotent, so the forward-migrate below is a clean no-op for
+        -- the parts already present.)
         DELETE FROM schema_version WHERE id = '023_dispatch_edge_facts_view_exclusion';
+        DELETE FROM schema_version WHERE id = '024_files_has_test_code';
         ",
     )
     .unwrap();
@@ -8881,6 +8885,106 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
     }
     // The view was rebuilt and surfaces the columns (a SELECT must not fail).
     conn.query_row("SELECT import_mod_id FROM edges LIMIT 1", [], |_| Ok(())).optional().unwrap();
+}
+
+#[test]
+fn files_has_test_code_flag_is_computed_at_index_time() {
+    // #77 V024: the precomputed files.has_test_code flag replaces impact_surface's chunks.text
+    // marker scan. Assert it's set at index time from the file's text (the same marker set the
+    // V024 backfill + test_items use), independent of the path.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A test-marker file whose PATH has no 'test'/'spec' — only the flag can classify it.
+    fs::write(root.join("src/markers.rs"), "#[cfg(test)]\nmod inner {\n    pub fn check() {}\n}\n")
+        .unwrap();
+    fs::write(root.join("src/plain.rs"), "pub fn plain_helper() {}\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let flag = |path: &str| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT has_test_code FROM main.files WHERE path = ?1", [path], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(flag("src/markers.rs"), 1, "a #[cfg(test)] file gets has_test_code = 1");
+    assert_eq!(flag("src/plain.rs"), 0, "a plain file gets has_test_code = 0");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn files_has_test_code_flag_survives_the_heal_path() {
+    // #77 / PR #223 review: the lazy heal path (heal_file -> index_file) is a SECOND files-insert
+    // site. Without computing the flag there, a marker-only test file healed (e.g. on a lexical
+    // search miss) would drop to has_test_code = 0 and be misclassified as a non-test. Heal must
+    // recompute it from the same chunk markers as the full/incremental path.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // PATH has no 'test'/'spec' — only the flag can classify it.
+    fs::write(root.join("src/markers.rs"), "#[cfg(test)]\nmod inner {\n    pub fn check() {}\n}\n")
+        .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let flag = || -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT has_test_code FROM main.files WHERE path = 'src/markers.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(flag(), 1, "full index sets has_test_code");
+    db.heal_file(std::path::Path::new("src/markers.rs")).unwrap();
+    assert_eq!(flag(), 1, "heal_file re-indexes through index_file and keeps has_test_code = 1");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn has_test_code_backfill_is_case_sensitive() {
+    // PR #223 review: the V024 backfill must use the SAME case rules as the index-time
+    // `str::contains` (case-sensitive). SQLite `LIKE` is case-insensitive for ASCII, so it would
+    // set the flag for an uppercase `TEST(` that a freshly-indexed file (whose
+    // `contains("test(")` is false) leaves at 0 — a migrated-vs-reindexed divergence. `instr`
+    // is case-sensitive, so they agree.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    for (id, path) in [(1, "a.rs"), (2, "b.rs")] {
+        conn.execute(
+            "INSERT INTO files(id, path, language, kind, sha256, modified_at_ms, indexed_at_ms) \
+             VALUES (?1, ?2, 'rust', 'source', 'x', 0, 0)",
+            rusqlite::params![id, path],
+        )
+        .unwrap();
+    }
+    // File 1: a lowercase marker. File 2: only an UPPERCASE non-marker (no lowercase marker).
+    conn.execute(
+        "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+         text, text_hash) VALUES (1, 'block', 0, 1, 1, 1, 'fn f() { test() }', 'h1')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
+         text, text_hash) VALUES (2, 'block', 0, 1, 1, 1, 'fn g() { TEST() }', 'h2')",
+        [],
+    )
+    .unwrap();
+    conn.execute("UPDATE files SET has_test_code = 0", []).unwrap();
+    schema::apply_files_has_test_code(&conn).unwrap();
+    let flag = |id: i64| -> i64 {
+        conn.query_row("SELECT has_test_code FROM files WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(flag(1), 1, "lowercase test( marks the file");
+    assert_eq!(flag(2), 0, "uppercase TEST( does NOT (case-sensitive, like str::contains)");
 }
 
 /// End-to-end through the FULL-REBUILD driver (`resolve_and_insert_edges`): a real `rebuild` of a

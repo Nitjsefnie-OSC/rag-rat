@@ -663,6 +663,27 @@ pub(crate) fn apply_dispatch_edge_facts_view_exclusion(conn: &Connection) -> rus
     ensure_edges_view(conn)
 }
 
+/// V024 (#77): add `files.has_test_code` and backfill it from existing chunk text. Additive +
+/// idempotent — `add_column_if_missing` guards the ADD (a fresh DB already has the column from the
+/// baseline), and the backfill recomputes from the SAME markers `impact_surface` previously scanned
+/// for, so a forward-migrated index matches a freshly-indexed one immediately (no wait for
+/// reindex). Invariant: the marker set here MUST stay in sync with `index::text_has_test_marker`
+/// (the index-time compute) and `test_items`'s filter, or migrated vs reindexed rows would diverge.
+/// Uses `instr` (case-sensitive, literal substring), NOT `LIKE` — SQLite `LIKE` is case-insensitive
+/// for ASCII, so it would match an uppercase `TEST(` that the case-sensitive `str::contains` at
+/// index time does not, diverging a forward-migrated row from a freshly-indexed one. (`instr` also
+/// needs no `%`-escaping of the `[`/`(` in the markers.)
+pub(crate) fn apply_files_has_test_code(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "files", "has_test_code", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch(
+        "UPDATE files SET has_test_code = 1 WHERE id IN (
+             SELECT DISTINCT file_id FROM chunks
+             WHERE instr(text, '#[cfg(test)]') > 0 OR instr(text, 'describe(') > 0
+                OR instr(text, 'it(') > 0 OR instr(text, 'test(') > 0
+         );",
+    )
+}
+
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     let legacy_table: Option<String> = conn
         .query_row(
@@ -990,6 +1011,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_021_ID => Some(21),
             MIGRATION_022_ID => Some(22),
             MIGRATION_023_ID => Some(23),
+            MIGRATION_024_ID => Some(24),
             _ => None,
         })
         .max()
@@ -1022,6 +1044,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_021_ID
             | MIGRATION_022_ID
             | MIGRATION_023_ID
+            | MIGRATION_024_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1051,6 +1074,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_021_ID => migration.checksum != MIGRATION_021_CHECKSUM,
         MIGRATION_022_ID => migration.checksum != MIGRATION_022_CHECKSUM,
         MIGRATION_023_ID => migration.checksum != MIGRATION_023_CHECKSUM,
+        MIGRATION_024_ID => migration.checksum != MIGRATION_024_CHECKSUM,
         _ => false,
     }
 }
