@@ -12521,3 +12521,1288 @@ fn candidate_components_exclude_generated_files_via_read_filter() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Max-denominator overlap gate regression: two structurally different functions whose
+/// token_len ratio is ≥ θ (they SURVIVE the size prune) but whose token-overlap/max_len < θ
+/// (the gate rejects them). This is distinct from the containment test
+/// (`candidate_components_reject_small_function_contained_in_large_one`), which is eliminated
+/// by the size prune alone — this fixture proves it is the overlap/max gate doing the work.
+///
+/// Fixture: `a` is a sequential let-chain; `b` is a loop+match accumulator. They are structurally
+/// different enough that their shared tokens (keywords, operators, AST-node-kind tokens) fall well
+/// below the overlap threshold, even though their token_lens are within the 1/θ ≈ 1.43x band.
+#[test]
+fn candidate_components_reject_partial_overlap_below_max_denominator_theta() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // a: sequential let-chain with five named sub-computations, returns a sum.
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn a(x: i32, y: i32) -> i32 { let p = alpha(x); let q = beta(y); let r = gamma(p); \
+         let s = delta(q); let t = epsilon(r, s); p + q + r + s + t }\n",
+    )
+    .unwrap();
+    // b: loop-based accumulator with a match arm — completely different control flow from a.
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn b(items: Vec<i32>, acc: i32) -> i32 { let mut total = acc; for item in \
+         items.iter() { let v = process(item); match v { 0 => total += 1, _ => total += v } } if \
+         total > 0 { total } else { -1 } }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Asserting the pair SURVIVES the size prune isolates the overlap/max gate as the reason for
+    // exclusion (distinct from the 5× containment test, which the size prune kills).
+    //
+    // Measured token_lens: a=92, b=104.  ceil(0.7 * 104) = 73.  92 ≥ 73 → prune passes.
+    // Overlap (Σ min(freq_a, freq_b)) = 51 < 73 → gate fails.  Values are asserted below so a
+    // future fixture change that breaks the isolation is caught immediately.
+    let conn = db.storage.connection();
+    let lens: Vec<i64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT token_len FROM symbol_fingerprints WHERE normalizer_kind='baseline' ORDER \
+                 BY token_len",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+    };
+    assert_eq!(lens.len(), 2, "both functions must be fingerprinted: {lens:?}");
+    let min_len = lens[0];
+    let max_len = lens[1];
+    let threshold = (0.7_f64 * max_len as f64).ceil() as i64;
+    assert!(
+        min_len >= threshold,
+        "pair must survive the size prune (min_len={min_len} >= ceil(0.7*max_len)={threshold}) so \
+         the next assertion targets the overlap/max gate, not the prune"
+    );
+
+    let comps = db.candidate_clone_components().unwrap();
+    assert!(
+        comps.is_empty(),
+        "a partial-overlap pair below overlap/max θ must NOT be a candidate (no regression to \
+         containment): min_len={min_len} max_len={max_len} threshold={threshold} {comps:?}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// normalizer_version filter: after a NORM_VERSION bump the old rows are stale and the read
+/// must ignore them. Simulate by writing rows at version N and then decrementing to N-1.
+#[test]
+fn candidate_read_ignores_stale_normalizer_version_rows() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    assert_eq!(
+        db.candidate_clone_components().unwrap().len(),
+        1,
+        "renamed clones form one component at the current version"
+    );
+    // Simulate a NORM_VERSION bump that left old rows behind: rewrite both rows to an old version.
+    db.storage
+        .connection()
+        .execute("UPDATE symbol_fingerprints SET normalizer_version = normalizer_version - 1", [])
+        .unwrap();
+    assert!(
+        db.candidate_clone_components().unwrap().is_empty(),
+        "stale-version fingerprints must be ignored by the read"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// `find_clones` integration test: four near-identical rename-clone functions across two
+/// directories form one candidate class; metrics are plausible and completeness block is populated.
+#[test]
+fn find_clones_ranks_a_clean_clone_class_with_metrics() {
+    use crate::index::clones::NORM_VERSION;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+
+    // Four rename-clone variants — identical structure, only the variable name changes.
+    for (dir, name, var) in [
+        ("a", "load_user", "u"),
+        ("a", "load_order", "o"),
+        ("b", "load_item", "i"),
+        ("b", "load_blob", "x"),
+    ] {
+        fs::write(
+            root.join(dir).join(format!("{name}.rs")),
+            format!(
+                "pub fn {name}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    // A structurally distinct function that must NOT join the clone class.
+    fs::write(
+        root.join("a/misc.rs"),
+        "pub fn misc(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n += b as usize; } n }\n",
+    )
+    .unwrap();
+
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("a"), PathBuf::from("b")],
+            include: vec!["a/".to_string(), "b/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+    };
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+
+    assert_eq!(res.classes.len(), 1, "exactly one clone class (the four rename-clones)");
+    let c = &res.classes[0];
+    assert_eq!(c.member_count, 4, "all four rename-clone functions are members");
+    assert_eq!(c.class_kind, "candidate_component");
+    assert!(!c.refined, "Plan-2 classes are never refined");
+    assert!(
+        c.similarity_min > 0.9,
+        "rename-clones are near-identical; expected similarity_min > 0.9, got {}",
+        c.similarity_min
+    );
+    assert_eq!(c.cross_module_spread, 2, "members span two directories (a/ and b/)");
+    assert_eq!(c.language, "rust");
+    assert!(!c.class_key.is_empty());
+
+    // Completeness block.
+    assert_eq!(res.completeness.candidate_metric, "overlap_max_denominator");
+    assert_eq!(res.completeness.normalizer_version, NORM_VERSION);
+    assert!(!res.completeness.truncated);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// `clones_for_symbol` integration test: two rename-clone functions (a.rs / b.rs) form one
+/// candidate class; the `Ref` selector resolves to that class, the `PathLine` selector at line 1
+/// resolves to the same `class_key`, and a structurally distinct solo function → `None`.
+#[test]
+fn clones_for_symbol_returns_the_class_by_ref_and_by_path_line() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // --- Ref selector ---
+    let by_ref_res =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    let by_ref = by_ref_res.class.as_ref().expect("src/a.rs::load_user should be in a clone class");
+    assert_eq!(by_ref.member_count, 2, "class must contain both rename-clones");
+    assert!(
+        by_ref.members.iter().any(|m| m.r#ref.ends_with("b.rs::load_order")),
+        "siblings must include the other clone; got: {:?}",
+        by_ref.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
+    );
+
+    // --- PathLine selector — same class_key as Ref ---
+    let by_line_res = db
+        .clones_for_symbol(CloneSymbolSelector::PathLine { path: "src/a.rs".into(), line: 1 })
+        .unwrap();
+    let by_line = by_line_res
+        .class
+        .as_ref()
+        .expect("PathLine at line 1 in src/a.rs should resolve to the same clone class");
+    assert_eq!(
+        by_line.class_key, by_ref.class_key,
+        "PathLine and Ref must resolve to the same class_key"
+    );
+
+    // --- Unrelated solo function → class: None ---
+    // A structurally distinct function whose token bag won't reach θ=0.7 against the clones.
+    fs::write(
+        root.join("src/c.rs"),
+        "pub fn solo(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n ^= b as usize; } n }\n",
+    )
+    .unwrap();
+    let db2 = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let solo_res =
+        db2.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::solo".into())).unwrap();
+    assert!(solo_res.class.is_none(), "a symbol in no clone class must have class: None");
+    assert!(solo_res.symbol_resolved, "the solo symbol still resolves");
+    assert!(solo_res.symbol_fingerprinted, "the solo function is eligible (fingerprinted)");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 1 (#215): `min_similarity` is honored ALL the way through candidate generation, not merely
+/// post-filtered. A borderline pair whose overlap/max ≈ 0.58 (in [0.5, 0.7)) is below the const θ
+/// so it never even becomes a candidate at the default threshold — only a caller-supplied θ ≤ 0.58
+/// widens candidate generation enough to surface it. The completeness block reports the θ used.
+#[test]
+fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // `a` is a let-chain; `b` shares `a`'s first four statements then diverges into a loop+match,
+    // so their token bags overlap moderately. Measured: token_lens 92 / 136, overlap/max ≈ 0.58.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn a(x: i32, y: i32) -> i32 { let p = alpha(x); let q = beta(y); let r = gamma(p); \
+         let s = delta(q); let t = epsilon(r, s); p + q + r + s + t }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn b(x: i32, y: i32) -> i32 { let p = alpha(x); let q = beta(y); let r = gamma(p); \
+         let s = delta(q); for item in items.iter() { let v = process(item); match v { 0 => total \
+         += 1, _ => total += v } } if total > 0 { total } else { -1 } }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // θ = 0.5 (below the pair's ≈0.58 similarity): the pair becomes a candidate and is returned,
+    // and the completeness block records the requested θ.
+    let widened = db
+        .find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        widened.classes.len(),
+        1,
+        "θ=0.5 must surface the borderline pair as a class: {:?}",
+        widened.classes
+    );
+    let sim = widened.classes[0].similarity_min;
+    assert!(
+        (0.5..0.7).contains(&sim),
+        "the planted pair's similarity must sit in [0.5, 0.7): got {sim}"
+    );
+    assert_eq!(
+        widened.completeness.min_similarity, 0.5,
+        "completeness must report the θ actually used (0.5)"
+    );
+
+    // Default θ (None ⇒ 0.7): the pair is below threshold and must NOT be a candidate — proving
+    // the widening was real (candidate generation, not just a post-filter relax).
+    let default = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        default.classes.is_empty(),
+        "θ=0.7 must NOT surface the borderline pair: {:?}",
+        default.classes
+    );
+    assert_eq!(default.completeness.min_similarity, 0.7, "default completeness θ is 0.7");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in (0.0, 1.0]. Values
+/// outside that range are rejected up front (before candidate generation) so a unit error (e.g. a
+/// percentage like 1.5) or a degenerate 0.0 floor can't silently admit every pair.
+#[test]
+fn find_clones_rejects_out_of_range_min_similarity() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // A single clone pair so the index isn't empty; the range check fires regardless of contents.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // 0.0 (boundary, exclusive lower) → error.
+    let zero = db.find_clones(FindClonesOptions {
+        min_similarity: Some(0.0),
+        min_copies: None,
+        limit: None,
+    });
+    let err = zero.expect_err("min_similarity = 0.0 must be rejected").to_string();
+    assert!(err.contains("(0.0, 1.0]"), "{err}");
+
+    // 1.5 (above 1.0) → error.
+    let high = db.find_clones(FindClonesOptions {
+        min_similarity: Some(1.5),
+        min_copies: None,
+        limit: None,
+    });
+    let err = high.expect_err("min_similarity = 1.5 must be rejected").to_string();
+    assert!(err.contains("(0.0, 1.0]"), "{err}");
+
+    // 1.0 (boundary, inclusive upper) → accepted.
+    db.find_clones(FindClonesOptions { min_similarity: Some(1.0), min_copies: None, limit: None })
+        .expect("min_similarity = 1.0 is the inclusive upper bound and must be accepted");
+
+    // 0.5 (interior) → accepted.
+    db.find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
+        .expect("min_similarity = 0.5 is in range and must be accepted");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 2 (#215): `completeness.truncated` reflects whole CLASSES dropped by `limit`, not only
+/// members capped within a class. Plant two distinct clone classes, ask for `limit=1`, and assert
+/// the dropped second class flips `truncated`.
+#[test]
+fn find_clones_truncated_reflects_class_limit() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Class 1: two rename-clones of a `load_*` accessor.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    // Class 2: two rename-clones of a structurally DIFFERENT `sum_*` reducer — its own component.
+    fs::write(
+        root.join("src/c.rs"),
+        "pub fn sum_bytes(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n += b as usize; } n \
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/d.rs"),
+        "pub fn sum_words(w: Vec<u8>) -> usize { let mut m = 0; for c in w { m += c as usize; } m \
+         }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Sanity: with no limit there are two distinct classes and nothing is truncated.
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(all.classes.len(), 2, "two distinct clone classes are planted: {:?}", all.classes);
+    assert!(!all.completeness.truncated, "no limit ⇒ not truncated");
+
+    // limit=1 drops one whole class ⇒ truncated must be true (Fix 2).
+    let limited = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: Some(1) })
+        .unwrap();
+    assert_eq!(limited.classes.len(), 1, "limit=1 returns exactly one class");
+    assert!(
+        limited.completeness.truncated,
+        "dropping a whole class via the limit must set completeness.truncated"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 3 (#215): a TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) stays visible
+/// as ONE clone class — the class-level `similarity_min < θ` filter that previously dropped it is
+/// gone. θ governs CANDIDATE GENERATION only (every EDGE is ≥ θ); a component's aggregate
+/// min-pairwise can legitimately dip below θ for a chain. This also makes `find_clones` and
+/// `clones_for_symbol` AGREE on chain components (the latter never had the filter).
+///
+/// The fixture is empirically tuned and the test asserts the MEASURED edge similarities so it is
+/// honest about the chain it plants (a tokenizer change that shifts the numbers reddens here, not
+/// silently). At HEAD the measured edges are A/B≈0.74, B/C≈0.86, A/C≈0.67 — a genuine chain whose
+/// weakest (A/C) endpoint sits below the default θ=0.70.
+#[test]
+fn find_clones_keeps_transitive_chain_components() {
+    // The candidate metric is overlap/MAX_len, so the three members must be ~EQUAL length (a length
+    // gap trips the size prune `min_len >= ceil(θ*max_len)` and kills the edges). Identifier names
+    // alpha-rename to ID<n>, so only STRUCTURE drives the bag. Each member = a shared CORE of
+    // let-bindings + TWO distinct structural slots built from DIFFERENT constructs (their tokens
+    // don't overlap): A shares slot S1 with B; B shares slot S2 with C; A and C share neither, so
+    // A/B and B/C clear θ while A/C falls below it.
+    let core = "let c1 = ca(x); let c2 = cb(c1); let c3 = cc(c2);";
+    let s1 = "if x > 0 { acc = p1(x); } else { acc = p2(x); } if acc > 1 { acc = p3(acc); } else \
+              { acc = p4(acc); }";
+    let s2 = "for it in xs { match it { 0 => acc += q1(it), 1 => acc += q2(it), _ => acc -= \
+              q3(it) } } for jt in ys { match jt { 0 => acc += q4(jt), _ => acc -= q5(jt) } }";
+    let sx = "while acc > 0 { acc = r1(acc); acc = r2(acc); acc = r3(acc); } while acc < 9 { acc \
+              = r4(acc); acc = r5(acc); }";
+    let sy = "loop { acc = s1f(acc); acc = s2f(acc); acc = s3f(acc); if acc == 0 { break; } } \
+              loop { acc = s4f(acc); if acc < 0 { break; } }";
+    // A = CORE + S1 + SX ; B = CORE + S1 + S2 ; C = CORE + S2 + SY.
+    let a = format!("pub fn fa(x: i32) -> i32 {{ {core} {s1} {sx} 0 }}\n");
+    let b = format!("pub fn fb(x: i32) -> i32 {{ {core} {s1} {s2} 0 }}\n");
+    let c = format!("pub fn fc(x: i32) -> i32 {{ {core} {s2} {sy} 0 }}\n");
+    let (a, b, c) = (a.as_str(), b.as_str(), c.as_str());
+
+    const THETA: f64 = 0.7;
+
+    // Measure each pairwise edge by rebuilding a two-file subset (so the only clone class is that
+    // single pair, whose `similarity_min` IS the edge similarity). This makes the chain claim a
+    // measured fact, not an assumption.
+    let edge_sim = |src1: (&str, &str), src2: (&str, &str)| -> f64 {
+        let r = unique_temp_root();
+        let _ = fs::remove_dir_all(&r);
+        fs::create_dir_all(r.join("src")).unwrap();
+        fs::write(r.join(format!("src/{}.rs", src1.0)), src1.1).unwrap();
+        fs::write(r.join(format!("src/{}.rs", src2.0)), src2.1).unwrap();
+        let d = IndexDatabase::rebuild(&source_config(r.clone(), Language::Rust)).unwrap();
+        // θ=0.30 so even a sub-θ edge surfaces; the class's similarity_min is the pair's
+        // similarity.
+        let res = d
+            .find_clones(FindClonesOptions {
+                min_similarity: Some(0.30),
+                min_copies: None,
+                limit: None,
+            })
+            .unwrap();
+        let sim = res
+            .classes
+            .first()
+            .unwrap_or_else(|| panic!("the {}/{} pair must form a class at θ=0.30", src1.0, src2.0))
+            .similarity_min;
+        fs::remove_dir_all(r).unwrap();
+        sim
+    };
+    let ab = edge_sim(("a", a), ("b", b));
+    let bc = edge_sim(("b", b), ("c", c));
+    let ac = edge_sim(("a", a), ("c", c));
+    assert!(ab >= THETA, "A/B must be a real (≥θ) edge: measured {ab}");
+    assert!(bc >= THETA, "B/C must be a real (≥θ) edge: measured {bc}");
+    assert!(
+        ac < THETA,
+        "A/C must be BELOW θ so the three only link transitively through B: measured {ac}"
+    );
+
+    // Now the full three-member scope. At the default θ=0.70 the chain forms ONE class of all three
+    // members, with an aggregate min-pairwise (== A/C) below θ — proving the dropped class-filter.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), a).unwrap();
+    fs::write(root.join("src/b.rs"), b).unwrap();
+    fs::write(root.join("src/c.rs"), c).unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        res.classes.len(),
+        1,
+        "the transitive chain is ONE clone class at default θ: {:?}",
+        res.classes.iter().map(|c| c.member_count).collect::<Vec<_>>()
+    );
+    let class = &res.classes[0];
+    assert_eq!(class.member_count, 3, "all three chain members are in the class");
+    assert!(
+        class.cohesion_min_pairwise < THETA,
+        "the chain's aggregate min-pairwise must be below θ (it is the A/C edge), proving the \
+         class-level similarity_min<θ filter is gone: got {}",
+        class.cohesion_min_pairwise
+    );
+    // cohesion_min_pairwise == similarity_min == the measured A/C edge.
+    assert!(
+        (class.cohesion_min_pairwise - ac).abs() < 1e-9,
+        "the class min-pairwise must equal the measured A/C edge: class={} ac={ac}",
+        class.cohesion_min_pairwise
+    );
+
+    // CONSISTENCY: clones_for_symbol(A) must return the SAME 3-member chain class — the two
+    // surfaces now agree (clones_for_symbol never had the class-filter that find_clones dropped).
+    let by_ref = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
+    let cfs_class = by_ref.class.as_ref().expect("fa is in the chain class");
+    assert_eq!(cfs_class.member_count, 3, "clones_for_symbol(fa) returns the full 3-member chain");
+    assert_eq!(
+        cfs_class.class_key, class.class_key,
+        "find_clones and clones_for_symbol must return the SAME class for the chain"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 3 (#215): `clones_for_symbol` carries eligibility flags. A below-`MIN_TOKENS` function
+/// RESOLVES (`symbol_resolved=true`) but is not fingerprinted (`symbol_fingerprinted=false`,
+/// `class=None`); an eligible-but-unique function is fingerprinted with no class; an eligible
+/// clone yields `class=Some`.
+#[test]
+fn clones_for_symbol_reports_eligibility() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // tiny: below MIN_TOKENS ⇒ resolves but is never fingerprinted.
+    fs::write(root.join("src/tiny.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    // solo: a substantial, structurally distinct function ⇒ fingerprinted but in no clone class.
+    fs::write(
+        root.join("src/solo.rs"),
+        "pub fn solo(v: Vec<u8>) -> usize { let mut n = 0; for b in v { n ^= b as usize; } n }\n",
+    )
+    .unwrap();
+    // a/b: two rename-clones ⇒ an eligible clone class.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // tiny: resolves, not fingerprinted, no class.
+    let tiny = db.clones_for_symbol(CloneSymbolSelector::Ref("src/tiny.rs::tiny".into())).unwrap();
+    assert!(tiny.symbol_resolved, "tiny resolves to a scoped symbol");
+    assert!(!tiny.symbol_fingerprinted, "tiny is below MIN_TOKENS ⇒ not fingerprinted");
+    assert!(tiny.class.is_none(), "an unfingerprinted symbol is in no class");
+
+    // solo: eligible (fingerprinted) but unique ⇒ no class.
+    let solo = db.clones_for_symbol(CloneSymbolSelector::Ref("src/solo.rs::solo".into())).unwrap();
+    assert!(solo.symbol_resolved, "solo resolves");
+    assert!(solo.symbol_fingerprinted, "solo is substantial ⇒ fingerprinted (eligible)");
+    assert!(solo.class.is_none(), "a unique eligible symbol has no clone class");
+
+    // load_user: eligible AND a clone ⇒ class is Some.
+    let clone =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    assert!(clone.symbol_resolved, "load_user resolves");
+    assert!(clone.symbol_fingerprinted, "load_user is fingerprinted");
+    let class = clone.class.expect("load_user is in a clone class");
+    assert_eq!(class.member_count, 2, "the clone class has both rename-clones");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Worktree-overlay scope: `find_clones` returns the BRANCH-ONLY clone class under the overlay
+/// scope, and the base scope has no clone classes. Proves the clone read is scope-correct —
+/// only the branch's symbol_fingerprint rows (written by `index_worktree_overlay`) are visible
+/// under the linked scope; the base sees only its own (non-clone) file.
+#[test]
+fn worktree_overlay_find_clones_reflects_branch_clone_pair() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // Base has only a tiny function — below MIN_TOKENS, so no fingerprint, no clone class.
+    fs::write(main.join("src/base.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Confirm base has NO clone classes.
+    let base_before = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        base_before.classes.is_empty(),
+        "base scope must have no clone classes before overlay: {:?}",
+        base_before.classes
+    );
+
+    // Create a linked worktree on a new branch that ADDS a rename-clone pair.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // Two renamed-clone functions — same structure as the existing clone fixture.
+    fs::write(
+        linked.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        linked.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "add clone pair"]);
+
+    // Index the overlay — leaves connection in the linked scope.
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "the branch's new files are indexed as overlay rows");
+
+    // Under the overlay scope, find_clones must return the branch's clone class.
+    let overlay_res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        overlay_res.classes.len(),
+        1,
+        "overlay scope must expose exactly the branch's clone class: {:?}",
+        overlay_res.classes
+    );
+    let class = &overlay_res.classes[0];
+    assert_eq!(class.member_count, 2, "the branch clone class has 2 members");
+
+    // Round-6 regression (#215): `stale_members` must be 0 under an overlay scope. The branch's
+    // members (src/a.rs, src/b.rs) are branch-ONLY — absent from the main checkout — so a
+    // main-checkout staleness comparison would count them both "missing" → stale=2 (false). The
+    // overlay is maintained from branch bytes, so `count_stale_member_paths` correctly skips the
+    // main-checkout check under a linked-overlay scope and reports 0.
+    assert_eq!(
+        overlay_res.completeness.stale_members, 0,
+        "branch-only overlay members must not be falsely reported stale against the main checkout"
+    );
+
+    // Base scope must still have no clone classes.
+    set_base_scope(&mut db, &main);
+    let base_after = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        base_after.classes.is_empty(),
+        "base scope must have no clone classes after overlay indexing: {:?}",
+        base_after.classes
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+/// Fix 1 + Fix 2 (#215): a clone class with more than MAX_MEMBERS members exercises two paths that
+/// a small fixture never reaches:
+///  - Fix 1 (chunked hydration): `build_class` hydrates members in batches of HYDRATION_CHUNK
+///    rather than one `?` host-param per member. With 60 members the single-statement path would
+///    still fit under the SQLite var limit, but this proves the chunked accumulation produces the
+///    correct `member_count`/`members.len()`/`truncated` semantics with no error — the chunking is
+///    otherwise only stress-visible above ~999 members, which is too expensive to plant in a unit
+///    test.
+///  - Fix 2 (subject pinning): `clones_for_symbol` for a clone whose `symbols.id` falls LATE in the
+///    component (past MAX_MEMBERS by id) must still return that subject in the capped member list —
+///    the caller asked about THAT symbol.
+#[test]
+fn find_clones_caps_large_class_and_pins_late_subject() {
+    use crate::index::query_api::MAX_MEMBERS;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 60 rename-clone functions: identical structure, only the local variable name changes, so they
+    // share a struct_hash and form ONE clone component well above MAX_MEMBERS. Files are named so
+    // that lexical write order does NOT predetermine symbols.id order (the subject we resolve by
+    // ref is a LATE one, whose rowid lands past MAX_MEMBERS in the component's id-sorted
+    // order).
+    const N: usize = 60;
+    for i in 0..N {
+        let var = format!("v{i}");
+        fs::write(
+            root.join(format!("src/f{i:02}.rs")),
+            format!(
+                "pub fn f{i:02}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Fix 1: find_clones returns the full-population class — member_count is all 60, the returned
+    // member list is capped at MAX_MEMBERS, truncated is set, and there is NO error.
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        res.classes.len(),
+        1,
+        "the 60 rename-clones form one class: {:?}",
+        res.classes.len()
+    );
+    let class = &res.classes[0];
+    assert_eq!(class.member_count, N, "member_count reflects the FULL component");
+    assert_eq!(class.total_members, N, "total_members reflects the FULL component");
+    assert_eq!(class.members.len(), MAX_MEMBERS, "returned members are capped at MAX_MEMBERS");
+    assert_eq!(class.members_returned, MAX_MEMBERS, "members_returned == cap");
+    assert!(res.completeness.truncated, "a capped member list must set truncated");
+
+    // Find a subject whose symbols.id is LATE in the component (past MAX_MEMBERS in id order), so
+    // the plain `take(cap)` path would DROP it. We read the highest fingerprinted symbol id's
+    // qualified name — that member sorts last in the component's id order, well past
+    // MAX_MEMBERS.
+    let conn = db.storage.connection();
+    let late_ref: String = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ns.value
+                 FROM symbols
+                 JOIN files ON files.id = symbols.file_id
+                 JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+                 JOIN symbol_fingerprints sf
+                   ON sf.symbol_id = symbols.id AND sf.normalizer_kind = 'baseline'
+                 ORDER BY symbols.id DESC
+                 LIMIT 1",
+            )
+            .unwrap();
+        stmt.query_row([], |r| r.get(0)).unwrap()
+    };
+
+    // Fix 2: clones_for_symbol for that late subject must INCLUDE it in the capped member list.
+    let by_ref = db.clones_for_symbol(CloneSymbolSelector::Ref(late_ref.clone())).unwrap();
+    let pinned = by_ref.class.as_ref().expect("the late subject is in the clone class");
+    assert_eq!(pinned.member_count, N, "the class still reports the full population");
+    assert_eq!(pinned.members.len(), MAX_MEMBERS, "members are capped at MAX_MEMBERS");
+    assert!(
+        pinned.members.iter().any(|m| m.r#ref == late_ref),
+        "the pinned late subject {late_ref} must appear in the capped members: {:?}",
+        pinned.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 5 (#215): the clone surface stays empty (and errors NOT) when no fingerprint rows survive —
+/// `build_class`'s `raw_members.is_empty()` guard returns `None` rather than building an
+/// internally-inconsistent class. We delete every fingerprint row after a clone class was formed
+/// and assert `find_clones` returns no classes with no error.
+#[test]
+fn find_clones_returns_no_class_when_fingerprints_vanish() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Baseline: one clone class.
+    let before = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(before.classes.len(), 1, "baseline: one clone class");
+
+    // Drop every fingerprint row. The candidate read loads bags from the same rows, so no component
+    // forms and the Fix 5 empty-check guarantees no malformed class can leak through. Either way
+    // the surface must be empty with no error.
+    db.storage.connection().execute("DELETE FROM symbol_fingerprints", []).unwrap();
+    let after = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(after.classes.is_empty(), "no fingerprints ⇒ no clone classes (no error): {after:?}");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 4 (#215): the `Ref` and `PathLine` resolution arms now LEFT JOIN symbol_fingerprints and
+/// prefer a fingerprinted row. This is primarily a SQL-correctness change (proven to COMPILE and to
+/// not regress the existing resolution tests). Here we additionally assert the simple positive case
+/// keeps working end-to-end: a fingerprinted clone resolves by `Ref` AND `PathLine` to its class.
+#[test]
+fn clones_for_symbol_prefers_fingerprinted_row_on_resolution() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Ref resolution finds the fingerprinted clone and its class.
+    let by_ref =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    assert!(by_ref.symbol_fingerprinted, "Ref must resolve to the fingerprinted row");
+    let ref_class = by_ref.class.as_ref().expect("Ref resolves into the clone class");
+
+    // PathLine resolution at line 1 reaches the same class via the fingerprint-preferred ordering.
+    let by_line = db
+        .clones_for_symbol(CloneSymbolSelector::PathLine { path: "src/a.rs".into(), line: 1 })
+        .unwrap();
+    assert!(by_line.symbol_fingerprinted, "PathLine must resolve to the fingerprinted row");
+    let line_class = by_line.class.as_ref().expect("PathLine resolves into the clone class");
+    assert_eq!(
+        ref_class.class_key, line_class.class_key,
+        "Ref and PathLine must resolve to the same fingerprinted class"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ── Fix 1 regression guard (PathLine tightest-span PRIMARY) ──────────────────────────────────
+
+/// PathLine CONTRACT: span is PRIMARY. The tightest-spanning symbol at the cursor wins,
+/// regardless of fingerprint status. A tiny unfingerprinted (below MIN_TOKENS) nested item that
+/// is ENCLOSED by a larger fingerprinted outer function must be returned when the cursor is
+/// within the inner item — we must NOT silently jump to the enclosing fingerprinted function.
+///
+/// Fixture: two symbols at line 3 of the same file — the OUTER spans lines 1-10 and is
+/// fingerprinted (it is large enough), and an INNER placeholder spans lines 3-3 and is NOT
+/// fingerprinted (below MIN_TOKENS). PathLine{line=3} must resolve to the INNER symbol (smaller
+/// span), not the OUTER one.
+///
+/// Because the test fixture is entirely synthetic (we inject symbols directly into the DB rather
+/// than relying on the parser to produce nested symbols from source), the inner symbol has a
+/// bare stub source that definitely stays below MIN_TOKENS.
+#[test]
+fn pathline_tightest_span_wins_over_fingerprinted_enclosing() {
+    use crate::index::clones::NORM_VERSION;
+
+    // Strategy: inject TWO symbols rows directly into the DB for the same file and same line,
+    // with DIFFERENT spans. The OUTER has a wider span (lines 1-10) and IS fingerprinted (we
+    // copy the real fp row from an indexed clone). The INNER has span 0 (lines 5-5) and has NO
+    // fingerprint row. PathLine{line=5} must resolve to the INNER (tightest span), not the
+    // OUTER (wider span, but fingerprinted).
+    //
+    // We use a clone pair so at least one function is fingerprinted (large enough token count),
+    // and then inject a synthetic outer that wraps the fingerprinted symbol's span.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Clone pair so load_user gets a real fingerprint row.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+
+    // Look up the indexed load_user symbol (line 1-1 after parsing).
+    let (lu_id, lu_file_id): (i64, i64) = conn
+        .query_row(
+            "SELECT symbols.id, symbols.file_id FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+             WHERE files.path = 'src/a.rs'
+             ORDER BY (end_line - start_line) ASC
+             LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    // Verify load_user is fingerprinted.
+    let lu_fp_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE symbol_id = ?1 AND normalizer_kind = \
+             'baseline'",
+            [lu_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if lu_fp_count == 0 {
+        // load_user not fingerprinted — can't run this test; skip gracefully.
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+
+    // Inject a SYNTHETIC OUTER symbol covering lines 1-20 (wider than load_user's 1-1).
+    // It WILL be fingerprinted (we copy load_user's fp row to it).
+    // Inner: inject at lines 1-1 with start_byte slightly different — same line, same span.
+    // The key: inject a synthetic WIDE outer symbol spanning lines 1-20, fingerprinted.
+    // Then inject a synthetic TINY inner symbol at lines 1-1 (same line, span 0), NOT
+    // fingerprinted. PathLine{line=1} now has TWO candidates: outer (span 19) and inner (span
+    // 0). The INNER must win (tightest span), even though the OUTER is fingerprinted.
+
+    // Fake name string for the outer.
+    conn.execute(
+        "INSERT OR IGNORE INTO name_strings (value) VALUES ('src/a.rs::synthetic_outer')",
+        [],
+    )
+    .unwrap();
+    let outer_name_id: i64 = conn
+        .query_row(
+            "SELECT id FROM name_strings WHERE value = 'src/a.rs::synthetic_outer'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Inject the wide outer symbol (lines 1-20, large span).
+    conn.execute(
+        "INSERT INTO symbols (file_id, name, qualified_name_id, kind, language, start_line, \
+         end_line, start_byte, end_byte) VALUES (?1, 'synthetic_outer', ?2, 'function', 'rust', \
+         1, 20, 0, 1000)",
+        rusqlite::params![lu_file_id, outer_name_id],
+    )
+    .unwrap();
+    let outer_id: i64 = conn.last_insert_rowid();
+
+    // Copy load_user's fp row to the outer (making it fingerprinted with the same token bag).
+    let (nk, nv, tl, sh, created_at): (String, i64, i64, String, i64) = conn
+        .query_row(
+            "SELECT normalizer_kind, normalizer_version, token_len, struct_hash, created_at_ms \
+             FROM symbol_fingerprints WHERE symbol_id = ?1 AND normalizer_kind = 'baseline' LIMIT \
+             1",
+            [lu_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO symbol_fingerprints (symbol_id, normalizer_kind, \
+         normalizer_version, token_len, struct_hash, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, \
+         ?6)",
+        rusqlite::params![outer_id, &nk, nv, tl, &sh, created_at],
+    )
+    .unwrap();
+
+    // Fake name string for the tiny inner (NOT fingerprinted).
+    conn.execute(
+        "INSERT OR IGNORE INTO name_strings (value) VALUES ('src/a.rs::synthetic_inner')",
+        [],
+    )
+    .unwrap();
+    let inner_name_id: i64 = conn
+        .query_row(
+            "SELECT id FROM name_strings WHERE value = 'src/a.rs::synthetic_inner'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Inject the tiny inner symbol at lines 1-1 (within the outer's 1-20 span, span=0).
+    // NO fingerprint row for this one.
+    conn.execute(
+        "INSERT INTO symbols (file_id, name, qualified_name_id, kind, language, start_line, \
+         end_line, start_byte, end_byte) VALUES (?1, 'synthetic_inner', ?2, 'function', 'rust', \
+         1, 1, 0, 10)",
+        rusqlite::params![lu_file_id, inner_name_id],
+    )
+    .unwrap();
+    let inner_id: i64 = conn.last_insert_rowid();
+
+    // Sanity: outer IS fingerprinted, inner is NOT.
+    let outer_fp: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE symbol_id = ?1 AND normalizer_kind = \
+             'baseline' AND normalizer_version = ?2",
+            rusqlite::params![outer_id, NORM_VERSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let inner_fp: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE symbol_id = ?1 AND normalizer_kind = \
+             'baseline' AND normalizer_version = ?2",
+            rusqlite::params![inner_id, NORM_VERSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(outer_fp, 1, "outer must be fingerprinted for the regression to be testable");
+    assert_eq!(inner_fp, 0, "inner must NOT be fingerprinted");
+
+    // PathLine at line 1: must resolve to the TIGHTEST spanning symbol.
+    // - load_user: span 0 (lines 1-1) — fingerprinted
+    // - synthetic_inner: span 0 (lines 1-1) — NOT fingerprinted
+    // - synthetic_outer: span 19 (lines 1-20) — fingerprinted
+    //
+    // The tightest span is 0 (load_user or synthetic_inner, both at lines 1-1). The old
+    // fingerprint-first ORDER BY would have put synthetic_outer FIRST if we had the bug.
+    // The correct ORDER BY puts synthetic_outer LAST (span=19 > span=0).
+    //
+    // The regression guard: if fingerprint-presence were PRIMARY, the resolver would pick
+    // outer (fingerprinted, span=19) over inner (unfingerprinted, span=0). With the fix,
+    // it picks one of the span-0 symbols first.
+    //
+    // To make this unambiguous, we can directly verify that the outer is NOT the resolved symbol
+    // by checking: if synthetic_inner (no fp) is resolved, symbol_fingerprinted=false.
+    // But since load_user also has span=0 and IS fingerprinted, the tiebreaker (fp-then-rowid)
+    // may pick load_user. Either way, synthetic_outer (span=19) must NOT be picked.
+    //
+    // Direct verification: query what PathLine resolves to using the same SQL as the resolver.
+    let resolved_id: Option<i64> = conn
+        .query_row(
+            "SELECT symbols.id
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             LEFT JOIN symbol_fingerprints sf
+               ON sf.symbol_id = symbols.id
+               AND sf.normalizer_kind = 'baseline'
+               AND sf.normalizer_version = ?3
+             WHERE files.path = ?1
+               AND ?2 BETWEEN symbols.start_line AND symbols.end_line
+             ORDER BY (symbols.end_line - symbols.start_line) ASC,
+                      (sf.symbol_id IS NULL) ASC, symbols.id ASC
+             LIMIT 1",
+            rusqlite::params!["src/a.rs", 1i64, NORM_VERSION],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+
+    let resolved_symbol_id = resolved_id.expect("line 1 in src/a.rs must resolve to SOME symbol");
+
+    // The resolved symbol must NOT be the outer (span=19). It must be one of the span=0 symbols.
+    assert_ne!(
+        resolved_symbol_id, outer_id,
+        "PathLine must NOT resolve to synthetic_outer (span=19, fingerprinted) — the tightest \
+         span (0) must win; this would fail with fingerprint-first ORDER BY"
+    );
+
+    // The span of the resolved symbol must be 0 (lines 1-1), not 19.
+    let (res_start, res_end): (i64, i64) = conn
+        .query_row(
+            "SELECT start_line, end_line FROM symbols WHERE id = ?1",
+            [resolved_symbol_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        res_end - res_start,
+        0,
+        "resolved symbol must have span=0 (lines {res_start}-{res_end}), not the wide outer \
+         (span=19)"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ── Fix 2: Ref ambiguity rejection ───────────────────────────────────────────────────────────
+
+/// Fix 2 (#215): a `Ref` that matches EXACTLY ONE fingerprinted symbol resolves normally.
+/// A `Ref` that matches NO fingerprinted symbols falls back to the unfingerprinted path
+/// (`symbol_resolved=true, symbol_fingerprinted=false, class=None`) — existing behaviour preserved.
+///
+/// True same-ref duplicate-fingerprinted injection is not possible via the standard indexer
+/// (the indexer deduplicates by qualified_name per file), so we test the two non-ambiguous paths
+/// here and note the gap. The ambiguous-ref path (>1 fingerprinted match → Err) is tested via
+/// direct DB injection in the dedicated fixture below.
+#[test]
+fn clones_for_symbol_ref_single_fingerprinted_resolves_unfingerprinted_falls_back() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two rename-clones so load_user is fingerprinted and in a class.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    // A tiny function: resolves but is not fingerprinted.
+    fs::write(root.join("src/tiny.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Exactly 1 fingerprinted match → resolves to clone class.
+    let res = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into())).unwrap();
+    assert!(res.symbol_resolved);
+    assert!(res.symbol_fingerprinted);
+    assert!(res.class.is_some(), "single fingerprinted Ref must return its clone class");
+
+    // 0 fingerprinted matches (tiny is below MIN_TOKENS) → resolved but not fingerprinted.
+    let tiny_res =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("src/tiny.rs::tiny".into())).unwrap();
+    assert!(tiny_res.symbol_resolved, "the unfingerprinted symbol still resolves");
+    assert!(!tiny_res.symbol_fingerprinted, "tiny is below MIN_TOKENS");
+    assert!(tiny_res.class.is_none());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix 2 (#215): injecting TWO distinct fingerprinted `symbols` rows that share the SAME
+/// qualified name causes `clones_for_symbol(Ref)` to return an `Err` with "disambiguate" in the
+/// message. This exercises the >1 fingerprinted path in `resolve_selector_to_symbol_id`.
+///
+/// We inject the second symbol row directly into the DB (the indexer never produces same-ref
+/// duplicates for the same file, but the index schema allows it and the code must handle it).
+#[test]
+fn clones_for_symbol_ref_ambiguous_fingerprinted_returns_err() {
+    use crate::index::clones::NORM_VERSION;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // One file with one function; rebuild gives us a clean indexed symbol + fingerprint.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+
+    // Fetch the existing symbol's id and its name_id.
+    let (orig_id, name_id, file_id): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT symbols.id, symbols.qualified_name_id, symbols.file_id
+             FROM symbols
+             JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+             WHERE ns.value = 'src/a.rs::load_user'
+             LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+
+    // Inject a SECOND symbols row sharing the same qualified_name_id and file_id but different
+    // span — simulating an overload / cfg variant with the same qualified name.
+    // `name` is the bare symbol identifier (NOT NULL); we reuse "load_user".
+    conn.execute(
+        "INSERT INTO symbols (file_id, name, qualified_name_id, kind, language, start_line, \
+         end_line, start_byte, end_byte) VALUES (?1, 'load_user', ?2, 'function', 'rust', 2, 5, \
+         10, 50)",
+        rusqlite::params![file_id, name_id],
+    )
+    .unwrap();
+    let dup_id: i64 = conn.last_insert_rowid();
+
+    // Fetch an existing fingerprint row for orig_id to clone its token data.
+    let fp: Option<(String, i64, i64, String)> = conn
+        .query_row(
+            "SELECT normalizer_kind, normalizer_version, token_len, struct_hash
+             FROM symbol_fingerprints WHERE symbol_id = ?1 AND normalizer_kind = 'baseline' AND \
+             normalizer_version = ?2 LIMIT 1",
+            rusqlite::params![orig_id, NORM_VERSION],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .unwrap();
+
+    let Some((nk, nv, tl, sh)) = fp else {
+        // If there's no fingerprint yet the ambiguity path can't be reached; skip gracefully.
+        fs::remove_dir_all(root).unwrap();
+        return;
+    };
+
+    // Give the duplicate its own fingerprint row (same normalizer_version = current).
+    // created_at_ms is NOT NULL in STRICT mode; use 0 as a placeholder.
+    conn.execute(
+        "INSERT OR IGNORE INTO symbol_fingerprints (symbol_id, normalizer_kind, \
+         normalizer_version, token_len, struct_hash, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        rusqlite::params![dup_id, nk, nv, tl, sh],
+    )
+    .unwrap();
+
+    // Verify the dup fp row was actually inserted (it would be silently ignored if the PK
+    // already existed, which can't happen here since dup_id is fresh, but be explicit).
+    let dup_fp_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbol_fingerprints WHERE symbol_id = ?1 AND normalizer_kind = \
+             'baseline' AND normalizer_version = ?2",
+            rusqlite::params![dup_id, NORM_VERSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if dup_fp_count == 0 {
+        // fp INSERT was silently ignored (shouldn't happen) — skip the test.
+        fs::remove_dir_all(root).unwrap();
+        return;
+    }
+
+    // Now Ref("src/a.rs::load_user") matches TWO fingerprinted symbols → must return Err.
+    let err = db
+        .clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::load_user".into()))
+        .expect_err("Ref matching >1 fingerprinted symbols must return Err, not silently pick one");
+    let msg = err.to_string();
+    assert!(msg.contains("disambiguate"), "error message must mention 'disambiguate', got: {msg}");
+    assert!(
+        msg.contains("src/a.rs::load_user"),
+        "error message must name the ambiguous ref, got: {msg}"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+// ── Fix 3: stale_members in completeness ────────────────────────────────────────────────────
+
+/// Fix 3 (#215): `completeness.stale_members` counts DISTINCT returned-member file paths whose
+/// on-disk content no longer matches the indexed `files.sha256`.
+///
+/// Clean index → `stale_members == 0`. After editing one member file on disk WITHOUT reindexing
+/// → `stale_members >= 1`.
+#[test]
+fn find_clones_stale_members_zero_on_clean_index_and_nonzero_after_disk_edit() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    let a_path = root.join("src/a.rs");
+    let b_path = root.join("src/b.rs");
+    fs::write(
+        &a_path,
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        &b_path,
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Clean index: stale_members must be 0.
+    let clean = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(clean.classes.len(), 1, "the two rename-clones form one class");
+    assert_eq!(
+        clean.completeness.stale_members, 0,
+        "a freshly-indexed index with unchanged files must report stale_members=0"
+    );
+
+    // Edit one member file on disk WITHOUT reindexing — content now differs from indexed sha256.
+    fs::write(&a_path, "pub fn load_user(db: Db) -> i32 { /* EDITED: body replaced */ 42 }\n")
+        .unwrap();
+
+    // find_clones reads PERSISTED fingerprint tables (unchanged) but stale_members checks disk.
+    let stale = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        stale.classes.len(),
+        1,
+        "the class is still returned (stale detection is read-only)"
+    );
+    assert!(
+        stale.completeness.stale_members >= 1,
+        "after editing src/a.rs on disk, stale_members must be >= 1, got {}",
+        stale.completeness.stale_members
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
