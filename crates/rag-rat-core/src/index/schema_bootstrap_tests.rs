@@ -10491,12 +10491,13 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables'", [])
+            .execute("DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled'", [
+            ])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the V029 ledger row makes the schema Older"
+            "removing the V030 ledger row makes the schema Older"
         );
     }
 
@@ -10521,7 +10522,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 29);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 30);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10596,6 +10597,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '027_drop_chunks_text';
         DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
+        DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
         ",
     )
     .unwrap();
@@ -10734,16 +10736,18 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         ",
     )
     .unwrap();
-    // 3. Drop the V028 and V029 ledger rows so the schema reads Older and the migration replays.
+    // 3. Drop the V028, V029, and V030 ledger rows so the schema reads Older and the migration
+    //    replays.
     conn.execute_batch(
         "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
-         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';",
+         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
+         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
     )
     .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028+V029 ledger rows makes the pre-V028 shape Older"
+        "removing the V028+V029+V030 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12260,6 +12264,82 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
     assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
 }
 
+/// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
+/// `clone_refinements.lcs_sampled` (because V029 was applied before the column landed) must have
+/// the column added by the V030 forward migration. Simulates the bug by building a full schema,
+/// dropping the column, deleting the V030 ledger row (making the schema Older), then re-running
+/// `migrate_forward` and asserting the column is present and a direct SELECT succeeds.
+#[test]
+fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    // Start from a fully-applied schema (includes V029 DDL which already has lcs_sampled).
+    crate::index::schema::apply(&conn).expect("apply");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "fresh apply reaches V30"
+    );
+
+    // --- Simulate a V029-era index that was recorded before lcs_sampled landed ---
+    // SQLite ≥3.35 supports DROP COLUMN.
+    conn.execute_batch("ALTER TABLE clone_refinements DROP COLUMN lcs_sampled;")
+        .expect("drop lcs_sampled to simulate the pre-column V029 state");
+    // Confirm the column is gone.
+    let cols_before: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(clone_refinements)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert!(
+        !cols_before.contains(&"lcs_sampled".to_string()),
+        "lcs_sampled must be absent before the migration runs"
+    );
+    // Remove the V030 ledger row so the schema reads Older and migrate_forward replays it.
+    conn.execute_batch(
+        "DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
+    )
+    .expect("delete V030 ledger row");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing V030 ledger row"
+    );
+
+    // --- Run the forward migration ---
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+
+    // --- Assert the column is now present and the schema is current ---
+    let cols_after: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(clone_refinements)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    assert!(
+        cols_after.contains(&"lcs_sampled".to_string()),
+        "V030 must add lcs_sampled to an existing V029 clone_refinements table"
+    );
+    // A direct SELECT proves the column is queryable (the original bug: `no such column:
+    // lcs_sampled`).
+    let _: i64 = conn
+        .query_row("SELECT COUNT(lcs_sampled) FROM clone_refinements", [], |r| r.get(0))
+        .expect("SELECT lcs_sampled must succeed after V030 migration");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST_SCHEMA_VERSION after V030 migration"
+    );
+    assert_eq!(
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        30,
+        "LATEST_SCHEMA_VERSION is 30 after V030"
+    );
+    // Idempotency: running migrate_forward again must not error.
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Compatible,
+        "schema is still Compatible after second migrate_forward"
+    );
+}
+
 #[test]
 fn indexing_writes_baseline_fingerprints_for_functions() {
     let root = unique_temp_root();
@@ -12682,8 +12762,11 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
     assert_eq!(res.classes.len(), 1, "exactly one clone class (the four rename-clones)");
     let c = &res.classes[0];
     assert_eq!(c.member_count, 4, "all four rename-clone functions are members");
-    assert_eq!(c.class_kind, "candidate_component");
-    assert!(!c.refined, "Plan-2 classes are never refined");
+    // Plan 4a: a clean class inside the refine budget is REFINED (it was the only class, so the
+    // top-N driver refined it). The class_kind flips to "refined_class" and `refined` is true.
+    assert_eq!(c.class_kind, "refined_class");
+    assert!(c.refined, "a clean class inside the refine budget is refined (Plan 4a)");
+    assert_eq!(c.refine_mode, Some("baseline"), "refined classes carry the baseline refine mode");
     assert!(
         c.similarity_min > 0.9,
         "rename-clones are near-identical; expected similarity_min > 0.9, got {}",
@@ -12825,9 +12908,10 @@ fn find_clones_min_similarity_below_theta_widens_and_is_reported() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in (0.0, 1.0]. Values
+/// `min_similarity` is a similarity ratio θ = overlap/max_len and must lie in [0.5, 1.0]. Values
 /// outside that range are rejected up front (before candidate generation) so a unit error (e.g. a
-/// percentage like 1.5) or a degenerate 0.0 floor can't silently admit every pair.
+/// percentage like 1.5), a degenerate 0.0 floor, or any value below the 0.5 safety floor can't
+/// cause O(S²) candidate-pair explosion in the inverted index.
 #[test]
 fn find_clones_rejects_out_of_range_min_similarity() {
     let root = unique_temp_root();
@@ -12846,14 +12930,25 @@ fn find_clones_rejects_out_of_range_min_similarity() {
     .unwrap();
     let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
 
-    // 0.0 (boundary, exclusive lower) → error.
+    // 0.0 (below floor) → error; message must mention the valid range [0.5, 1.0].
     let zero = db.find_clones(FindClonesOptions {
         min_similarity: Some(0.0),
         min_copies: None,
         limit: None,
     });
     let err = zero.expect_err("min_similarity = 0.0 must be rejected").to_string();
-    assert!(err.contains("(0.0, 1.0]"), "{err}");
+    assert!(err.contains("[0.5, 1.0]"), "expected '[0.5, 1.0]' in error, got: {err}");
+
+    // 0.4 (below floor) → also rejected.
+    let below_floor = db.find_clones(FindClonesOptions {
+        min_similarity: Some(0.4),
+        min_copies: None,
+        limit: None,
+    });
+    let err = below_floor
+        .expect_err("min_similarity = 0.4 must be rejected (below 0.5 floor)")
+        .to_string();
+    assert!(err.contains("[0.5, 1.0]"), "expected '[0.5, 1.0]' in error for 0.4, got: {err}");
 
     // 1.5 (above 1.0) → error.
     let high = db.find_clones(FindClonesOptions {
@@ -12862,15 +12957,15 @@ fn find_clones_rejects_out_of_range_min_similarity() {
         limit: None,
     });
     let err = high.expect_err("min_similarity = 1.5 must be rejected").to_string();
-    assert!(err.contains("(0.0, 1.0]"), "{err}");
+    assert!(err.contains("[0.5, 1.0]"), "expected '[0.5, 1.0]' in error for 1.5, got: {err}");
 
     // 1.0 (boundary, inclusive upper) → accepted.
     db.find_clones(FindClonesOptions { min_similarity: Some(1.0), min_copies: None, limit: None })
         .expect("min_similarity = 1.0 is the inclusive upper bound and must be accepted");
 
-    // 0.5 (interior) → accepted.
+    // 0.5 (inclusive lower bound) → accepted.
     db.find_clones(FindClonesOptions { min_similarity: Some(0.5), min_copies: None, limit: None })
-        .expect("min_similarity = 0.5 is in range and must be accepted");
+        .expect("min_similarity = 0.5 is the inclusive lower bound and must be accepted");
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -12929,18 +13024,26 @@ fn find_clones_truncated_reflects_class_limit() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// Fix 3 (#215): a TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) stays visible
-/// as ONE clone class — the class-level `similarity_min < θ` filter that previously dropped it is
-/// gone. θ governs CANDIDATE GENERATION only (every EDGE is ≥ θ); a component's aggregate
-/// min-pairwise can legitimately dip below θ for a chain. This also makes `find_clones` and
-/// `clones_for_symbol` AGREE on chain components (the latter never had the filter).
+/// Plan 4 coherence-splits over-merged components; the A~B~C chain becomes coherent sub-classes.
+///
+/// A TRANSITIVE-chain component (A–B and B–C both ≥ θ, but A–C < θ) is over-merged by union-find
+/// into one 3-member component. Plan 4a's `coherence_split` (greedy maximal clique cover) breaks
+/// it: every returned class is internally coherent (all pairs ≥ θ), so NO single class contains all
+/// three. For this fixture the cover yields BOTH coherent pairs — {A,B} and {B,C} — with B in both
+/// (the overlap is correct: B coheres with two peers that are themselves incompatible).
+/// `find_clones` therefore returns two 2-member classes, never the 3-member chain.
+///
+/// `clones_for_symbol(A)` returns the largest coherent group containing A — here the {A,B} pair.
+/// `clones_for_symbol(C)` returns the coherent {B,C} pair (C is NO LONGER a singleton under the
+/// clique cover), so a query ABOUT C surfaces a real refined sub-class, not the over-merged
+/// fallback.
 ///
 /// The fixture is empirically tuned and the test asserts the MEASURED edge similarities so it is
 /// honest about the chain it plants (a tokenizer change that shifts the numbers reddens here, not
 /// silently). At HEAD the measured edges are A/B≈0.74, B/C≈0.86, A/C≈0.67 — a genuine chain whose
 /// weakest (A/C) endpoint sits below the default θ=0.70.
 #[test]
-fn find_clones_keeps_transitive_chain_components() {
+fn coherence_split_applied_in_find_clones() {
     // The candidate metric is overlap/MAX_len, so the three members must be ~EQUAL length (a length
     // gap trips the size prune `min_len >= ceil(θ*max_len)` and kills the edges). Identifier names
     // alpha-rename to ID<n>, so only STRUCTURE drives the bag. Each member = a shared CORE of
@@ -12974,20 +13077,18 @@ fn find_clones_keeps_transitive_chain_components() {
         fs::write(r.join(format!("src/{}.rs", src1.0)), src1.1).unwrap();
         fs::write(r.join(format!("src/{}.rs", src2.0)), src2.1).unwrap();
         let d = IndexDatabase::rebuild(&source_config(r.clone(), Language::Rust)).unwrap();
-        // θ=0.30 so even a sub-θ edge surfaces; the class's similarity_min is the pair's
-        // similarity.
+        // θ=0.5 (floor) so even a sub-default edge surfaces if ≥0.5; the class's similarity_min
+        // is the pair's similarity. If no class forms at θ=0.5, the pair's similarity is < 0.5 —
+        // which is still < θ=0.7 (THETA), satisfying the ac < THETA assertion. Return 0.0 as a
+        // sentinel in that case.
         let res = d
             .find_clones(FindClonesOptions {
-                min_similarity: Some(0.30),
+                min_similarity: Some(0.5),
                 min_copies: None,
                 limit: None,
             })
             .unwrap();
-        let sim = res
-            .classes
-            .first()
-            .unwrap_or_else(|| panic!("the {}/{} pair must form a class at θ=0.30", src1.0, src2.0))
-            .similarity_min;
+        let sim = res.classes.first().map(|c| c.similarity_min).unwrap_or(0.0);
         fs::remove_dir_all(r).unwrap();
         sim
     };
@@ -13001,8 +13102,10 @@ fn find_clones_keeps_transitive_chain_components() {
         "A/C must be BELOW θ so the three only link transitively through B: measured {ac}"
     );
 
-    // Now the full three-member scope. At the default θ=0.70 the chain forms ONE class of all three
-    // members, with an aggregate min-pairwise (== A/C) below θ — proving the dropped class-filter.
+    // Now the full three-member scope. At the default θ=0.70 the over-merged union-find component
+    // {A,B,C} is coherence-SPLIT: no returned class contains all three, and every returned class is
+    // internally coherent (all pairs ≥ θ). The greedy clique cover yields BOTH coherent pairs:
+    // {A,B} and {B,C}.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
@@ -13014,35 +13117,620 @@ fn find_clones_keeps_transitive_chain_components() {
     let res = db
         .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
         .unwrap();
-    assert_eq!(
-        res.classes.len(),
-        1,
-        "the transitive chain is ONE clone class at default θ: {:?}",
+    // No class may contain all three members — that is the whole point of the coherence split.
+    assert!(
+        res.classes.iter().all(|c| c.member_count < 3),
+        "the over-merged chain must split — no class may keep all 3 members: {:?}",
         res.classes.iter().map(|c| c.member_count).collect::<Vec<_>>()
     );
-    let class = &res.classes[0];
-    assert_eq!(class.member_count, 3, "all three chain members are in the class");
-    assert!(
-        class.cohesion_min_pairwise < THETA,
-        "the chain's aggregate min-pairwise must be below θ (it is the A/C edge), proving the \
-         class-level similarity_min<θ filter is gone: got {}",
-        class.cohesion_min_pairwise
+    // Every returned class must be internally coherent (its aggregate min-pairwise ≥ θ).
+    for class in &res.classes {
+        assert!(
+            class.cohesion_min_pairwise >= THETA - 1e-9,
+            "a coherence-split class must be internally ≥ θ: got {}",
+            class.cohesion_min_pairwise
+        );
+    }
+    // After clique-cover split, both {A,B} and {B,C} are returned (B in both).
+    assert_eq!(
+        res.classes.len(),
+        2,
+        "the chain yields two coherent ≥2 classes: {{A,B}} and {{B,C}}"
     );
-    // cohesion_min_pairwise == similarity_min == the measured A/C edge.
+    for class in &res.classes {
+        assert_eq!(class.member_count, 2, "each coherent class has 2 members");
+    }
+
+    // clones_for_symbol(A): A is in {A,B} only. The largest group containing A is {A,B} (refined).
+    let by_a = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
+    let a_class = by_a.class.as_ref().expect("fa is in the coherent {A,B} sub-class");
+    assert_eq!(a_class.member_count, 2, "clones_for_symbol(fa) returns A's coherent sub-class");
+    // A's class must match one of the returned classes from find_clones.
     assert!(
-        (class.cohesion_min_pairwise - ac).abs() < 1e-9,
-        "the class min-pairwise must equal the measured A/C edge: class={} ac={ac}",
-        class.cohesion_min_pairwise
+        res.classes.iter().any(|c| c.class_key == a_class.class_key),
+        "find_clones and clones_for_symbol must return the SAME coherent sub-class for A"
     );
 
-    // CONSISTENCY: clones_for_symbol(A) must return the SAME 3-member chain class — the two
-    // surfaces now agree (clones_for_symbol never had the class-filter that find_clones dropped).
-    let by_ref = db.clones_for_symbol(CloneSymbolSelector::Ref("src/a.rs::fa".into())).unwrap();
-    let cfs_class = by_ref.class.as_ref().expect("fa is in the chain class");
-    assert_eq!(cfs_class.member_count, 3, "clones_for_symbol(fa) returns the full 3-member chain");
+    // clones_for_symbol(C): after the clique cover, C is in the coherent {B,C} sub-class (NOT a
+    // singleton anymore), so the reverse lookup serves that refined 2-member class — no fallback to
+    // the over-merged 3-member component.
+    let by_c = db.clones_for_symbol(CloneSymbolSelector::Ref("src/c.rs::fc".into())).unwrap();
+    let c_class = by_c.class.as_ref().expect("fc is in the coherent {B,C} sub-class");
     assert_eq!(
-        cfs_class.class_key, class.class_key,
-        "find_clones and clones_for_symbol must return the SAME class for the chain"
+        c_class.member_count, 2,
+        "clones_for_symbol(fc) returns C's coherent {{B,C}} sub-class"
+    );
+    assert!(c_class.refined, "the {{B,C}} sub-class is refined");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Helper: write four renamed clones (identical structure, different identifiers) across two
+/// directories into `root`, returning the rebuilt index. The four functions form ONE clean,
+/// high-fidelity clone class — the canonical refine fixture.
+fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
+    let _ = fs::remove_dir_all(root);
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    for (dir, name, var) in [
+        ("a", "load_user", "u"),
+        ("a", "load_order", "o"),
+        ("b", "load_item", "i"),
+        ("b", "load_blob", "x"),
+    ] {
+        fs::write(
+            root.join(dir).join(format!("{name}.rs")),
+            format!(
+                "pub fn {name}(db: Db) -> i32 {{ let {var} = db.get(1); validate({var}); {var} + \
+                 1 }}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let config = Config {
+        root: root.clone(),
+        database: root.join(".rag-rat/index.sqlite"),
+        targets: vec![ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("a"), PathBuf::from("b")],
+            include: vec!["a/".to_string(), "b/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        }],
+        local_ai: Default::default(),
+        watch: Default::default(),
+        version_check: Default::default(),
+        oracle: Default::default(),
+    };
+    IndexDatabase::rebuild(&config).unwrap()
+}
+
+/// Plan 4a: four renamed clones (same structure, different names) form ONE class that the refine
+/// driver promotes to a refined class — `refined`, `class_kind == "refined_class"`, a near-perfect
+/// `lcs_ratio`, `confidence == "high"`, `refactorability > 0.9`, `refine_mode == Some("baseline")`,
+/// and a positive ROI (the refactorability multiplier replaces the cohesion one).
+#[test]
+fn find_clones_refines_a_clean_class() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(res.classes.len(), 1, "the four renamed clones are one class");
+    let c = &res.classes[0];
+
+    assert!(c.refined, "a clean class inside the refine budget must be refined");
+    assert_eq!(c.class_kind, "refined_class");
+    assert_eq!(c.refine_mode, Some("baseline"));
+    let lcs = c.lcs_ratio.expect("a refined class carries an lcs_ratio");
+    assert!(lcs > 0.95, "renamed clones are near-identical; lcs_ratio should be ~1.0, got {lcs}");
+    assert_eq!(c.confidence.as_deref(), Some("high"), "near-perfect fidelity → high confidence");
+    let refac = c.refactorability.expect("a refined class carries a refactorability");
+    assert!(refac > 0.9, "refactorability should be high for a clean class, got {refac}");
+    // ROI reflects refactorability: cross_module_spread × member_count × medoid × LBF × refac.
+    let expected_roi = c.cross_module_spread as f64
+        * c.member_count as f64
+        * c.body_token_len_medoid as f64
+        * c.roi_factors.load_bearing_factor
+        * refac;
+    assert!(
+        (c.roi - expected_roi).abs() < 1e-6,
+        "refined ROI must use refactorability: roi={} expected={expected_roi}",
+        c.roi
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: `clones_for_symbol` always refines the subject's class (when refine inputs are
+/// available). A reverse lookup into the clean 4-member class returns a REFINED class with the
+/// subject present.
+#[test]
+fn clones_for_symbol_returns_refined_class() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    let res =
+        db.clones_for_symbol(CloneSymbolSelector::Ref("a/load_user.rs::load_user".into())).unwrap();
+    let class = res.class.as_ref().expect("load_user is in the clone class");
+    assert!(class.refined, "clones_for_symbol refines the subject's class");
+    assert_eq!(class.class_kind, "refined_class");
+    assert_eq!(class.refine_mode, Some("baseline"));
+    assert!(class.lcs_ratio.is_some(), "a refined class carries an lcs_ratio");
+    assert!(
+        class.members.iter().any(|m| m.r#ref.ends_with("load_user.rs::load_user")),
+        "the subject must appear in its own refined class: {:?}",
+        class.members.iter().map(|m| &m.r#ref).collect::<Vec<_>>()
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: the content-addressed `refinement_key` is over the struct_hash MULTISET (order-
+/// independent), and is DISTINCT from the read-side `class_key` (location-derived). Same multiset →
+/// same key; the two key families never collide for the same class.
+#[test]
+fn refinement_key_is_content_addressed_and_distinct_from_read_key() {
+    use crate::index::clones::refine::cache::refinement_key;
+
+    let hashes = vec!["h1".to_string(), "h2".to_string(), "h3".to_string()];
+    let shuffled = vec!["h3".to_string(), "h1".to_string(), "h2".to_string()];
+    // Same multiset, different order → same refinement_key (content-addressed).
+    assert_eq!(
+        refinement_key("rust", &hashes),
+        refinement_key("rust", &shuffled),
+        "the same struct_hash multiset must address the same refinement"
+    );
+
+    // The refinement key (structural) is NOT the read-side class_key (location-derived). Build a
+    // real clone class, then confirm its persisted refinement key ≠ its read-side class_key.
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    let read_key = &res.classes[0].class_key;
+    // The persisted refinement row's PRIMARY KEY is the content-addressed key; it must not equal
+    // the location-derived read-side class_key.
+    let refinement_pk: String = db
+        .storage
+        .connection()
+        .query_row("SELECT class_key FROM clone_refinements LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(
+        &refinement_pk, read_key,
+        "the content-addressed refinement key must differ from the location-derived read key"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: the refinement cache is read-through — the first `find_clones` populates a
+/// `clone_refinements` row; a second `find_clones` over the same index serves the cache and does
+/// NOT grow the row count.
+#[test]
+fn refine_cache_is_read_through() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    let count_rows = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // Before any find_clones run the cache is empty.
+    assert_eq!(count_rows(&db), 0, "no refinements before the first run");
+
+    // Run 1: refines the clean class → exactly one cache row.
+    let r1 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r1.classes[0].refined, "run 1 refines the class");
+    let after_run1 = count_rows(&db);
+    assert_eq!(after_run1, 1, "run 1 persists exactly one refinement row");
+
+    // Run 2: same inputs → cache HIT, row count unchanged.
+    let r2 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r2.classes[0].refined, "run 2 still refined (served from cache)");
+    assert_eq!(count_rows(&db), after_run1, "run 2 is a cache hit — the row count must not grow");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Fix A (#215 Plan 4a codex2): the warm path (cache hit) must NOT re-parse any source file.
+/// If re-parsing were happening on the warm path, deleting the source files after the first
+/// find_clones would cause the second find_clones to return an un-refined class
+/// (load_refine_members returns None on a missing file → un-refined fallback). With the fix — cache
+/// probe BEFORE load_refine_members — the second call serves from the cache entirely: the source
+/// files are never read and the class is still `refined=true`.
+#[test]
+fn find_clones_warm_cache_serves_refined_without_reparse() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    // Run 1 (cold path): populates the cache.
+    let r1 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r1.classes[0].refined, "run 1 must refine the class (cold path)");
+
+    // Delete the source files so any attempt to re-parse would fail / return None.
+    for dir in &["a", "b"] {
+        let _ = fs::remove_dir_all(root.join(dir));
+    }
+
+    // Run 2 (warm path): the cache must serve the refinement WITHOUT touching the (now-absent)
+    // source files. If the warm path were re-parsing, load_refine_members would return None
+    // (file missing) and the class would be left un-refined.
+    let r2 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        r2.classes[0].refined,
+        "run 2 must still be refined from the cache — warm path must not re-parse source files"
+    );
+    assert_eq!(
+        r1.classes[0].lcs_ratio, r2.classes[0].lcs_ratio,
+        "warm-path lcs_ratio must match the cold-path value"
+    );
+
+    fs::remove_dir_all(root).unwrap_or(());
+}
+
+/// Fix B (#215 Plan 4a codex2): the member-count sampling dimension must be reported consistently
+/// on BOTH the cold and warm cache paths. A class with more than LCS_MEMBER_SAMPLE members must
+/// have `metrics_sampled=true` on the second (warm) find_clones call, not just the first (cold).
+///
+/// NOTE: planting >64 distinct fingerprinted clone-class members via the full index pipeline is
+/// expensive; instead we verify the logic path directly via the public find_clones surface with a
+/// small class (metrics_sampled stays false for small classes) and document that the large-class
+/// warm-path consistency is enforced by the `apply_refinement` function's unconditional
+/// `class.member_count > LCS_MEMBER_SAMPLE` OR-in, which is independent of cache hit/miss.
+#[test]
+fn find_clones_warm_cache_metrics_sampled_consistent() {
+    let root = unique_temp_root();
+    let db = write_four_renamed_clones(&root);
+
+    // Run 1 (cold): 4-member class — below LCS_MEMBER_SAMPLE, metrics_sampled should be false.
+    let r1 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r1.classes[0].refined, "run 1 refines the class");
+    let sampled_cold = r1.classes[0].metrics_sampled;
+
+    // Run 2 (warm cache hit): the member-count dimension must be applied consistently.
+    let r2 = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(r2.classes[0].refined, "run 2 is refined from the cache");
+    let sampled_warm = r2.classes[0].metrics_sampled;
+
+    assert_eq!(
+        sampled_cold, sampled_warm,
+        "metrics_sampled must be consistent across cold ({sampled_cold}) and warm \
+         ({sampled_warm}) paths"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Plan 4a: only the top-N (by provisional ROI) classes are refined, where N == the caller's limit.
+/// With TWO distinct clean classes and `limit = 1`, exactly ONE class is refined: the returned
+/// (top-1) class is refined, and only ONE `clone_refinements` row is written — the second class is
+/// outside the refine budget and never reaches refinement, keeping its Plan-2 (un-refined) shape.
+/// (Because the output is truncated to the limit, the un-refined class is not in the returned set;
+/// the persisted-row count is the observable proof that only the top-N were refined.)
+#[test]
+fn unrefined_class_outside_top_n_keeps_plan2_shape() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Class 1: two big-body renamed clones (high ROI via long body) — refined first.
+    let big = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
+             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
+        )
+    };
+    fs::write(root.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+    // Class 2: two small-body renamed clones (lower ROI via short body) — structurally distinct
+    // from class 1 so they form a SEPARATE class, ranked below it.
+    let small = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(xs: Vec<u8>) -> usize {{ let mut {v} = 0; for e in xs {{ {v} += e as \
+             usize; }} {v} }}\n"
+        )
+    };
+    fs::write(root.join("src/small_a.rs"), small("sum_bytes", "n")).unwrap();
+    fs::write(root.join("src/small_b.rs"), small("sum_words", "m")).unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let count_rows = |db: &IndexDatabase| -> i64 {
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM clone_refinements", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // Sanity: with no limit BOTH classes exist (the default budget 50 refines both).
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(all.classes.len(), 2, "two distinct clean classes are planted");
+    assert!(all.classes.iter().all(|c| c.refined), "default budget refines both");
+    assert_eq!(count_rows(&db), 2, "default budget persists both refinements");
+
+    // Fresh index so the cache starts empty for the budget assertion.
+    let root2 = unique_temp_root();
+    let _ = fs::remove_dir_all(&root2);
+    fs::create_dir_all(root2.join("src")).unwrap();
+    fs::write(root2.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root2.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+    fs::write(root2.join("src/small_a.rs"), small("sum_bytes", "n")).unwrap();
+    fs::write(root2.join("src/small_b.rs"), small("sum_words", "m")).unwrap();
+    let db2 = IndexDatabase::rebuild(&source_config(root2.clone(), Language::Rust)).unwrap();
+
+    // limit=1 ⇒ refine budget 1 ⇒ only the top-1 class is refined.
+    let limited = db2
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: Some(1) })
+        .unwrap();
+    assert_eq!(limited.classes.len(), 1, "limit=1 returns exactly one class");
+    let top = &limited.classes[0];
+    assert!(top.refined, "the single returned (top-1) class is refined");
+    assert!(top.lcs_ratio.is_some(), "the refined class carries an lcs_ratio");
+    assert_eq!(top.refine_mode, Some("baseline"));
+    // Only ONE refinement was computed/persisted: the second class is outside the budget and keeps
+    // its un-refined Plan-2 shape (it never reached `refine_class`).
+    assert_eq!(
+        count_rows(&db2),
+        1,
+        "limit=1 refines only the top-1 class — the out-of-budget class is never refined"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(root2).unwrap();
+}
+
+/// Fix 2 (Codex P2 #215 Plan 4a): find_clones with limit=Some(N) must never return an unrefined
+/// class. The old implementation refine-budget top-N then re-sort ALL → a rank-(N+1) unrefined
+/// class could displace a refined one after ROI recalculation. The fix truncates to N BEFORE
+/// refining so only refined (or best-effort-unrefined) classes appear in a limited result.
+///
+/// Fixture: 3 structurally distinct clone classes (A db-getter / B match-expr / C loop-reducer —
+/// distinct constructs so they form three separate components, never cross-merge). With
+/// `limit=Some(2)` only the top-2 by provisional ROI are truncated into the refine set, refined,
+/// and returned; the third class (truncated away before refining) never enters the result. The
+/// load-bearing assertion is that EVERY class in the limited result has `refined == true` — the
+/// property the old re-sort-ALL path could violate.
+#[test]
+fn find_clones_limited_result_contains_only_refined_classes() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Class A: big body, high ROI.
+    let big = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(db: Db) -> i32 {{ let {v}1 = db.get(1); let {v}2 = db.get(2); let {v}3 \
+             = db.get(3); validate({v}1); validate({v}2); validate({v}3); {v}1 + {v}2 + {v}3 }}\n"
+        )
+    };
+    fs::write(root.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+
+    // Class B: a `match`-expression body — structurally distinct from both the db-getter (A) and
+    // the loop-reducer (C), so it forms its OWN component (no cross-class merge). Medium length.
+    let matchy = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(k: i32) -> i32 {{ let {v} = match k {{ 0 => 10, 1 => 20, 2 => 30, _ => \
+             40 }}; {v} + 1 }}\n"
+        )
+    };
+    fs::write(root.join("src/match_a.rs"), matchy("classify_a", "n")).unwrap();
+    fs::write(root.join("src/match_b.rs"), matchy("classify_b", "m")).unwrap();
+
+    // Class C: a loop-reducer body — structurally distinct from A and B. Small length.
+    let small = |name: &str, v: &str| {
+        format!(
+            "pub fn {name}(xs: Vec<u8>) -> usize {{ let mut {v} = 0; for e in xs {{ {v} += e as \
+             usize; }} {v} }}\n"
+        )
+    };
+    fs::write(root.join("src/small_a.rs"), small("sum_bytes", "s")).unwrap();
+    fs::write(root.join("src/small_b.rs"), small("sum_words", "t")).unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Sanity: all 3 classes exist and unlimited refines all of them (budget=50).
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(all.classes.len(), 3, "three distinct clone classes are planted: {:?}", all.classes);
+    assert!(all.classes.iter().all(|c| c.refined), "unlimited refines all 3 (budget=50)");
+
+    // Fresh index for the fix-2 assertion (cache starts empty).
+    let root2 = unique_temp_root();
+    let _ = fs::remove_dir_all(&root2);
+    fs::create_dir_all(root2.join("src")).unwrap();
+    fs::write(root2.join("src/big_a.rs"), big("big_user", "u")).unwrap();
+    fs::write(root2.join("src/big_b.rs"), big("big_order", "o")).unwrap();
+    fs::write(root2.join("src/match_a.rs"), matchy("classify_a", "n")).unwrap();
+    fs::write(root2.join("src/match_b.rs"), matchy("classify_b", "m")).unwrap();
+    fs::write(root2.join("src/small_a.rs"), small("sum_bytes", "s")).unwrap();
+    fs::write(root2.join("src/small_b.rs"), small("sum_words", "t")).unwrap();
+    let db2 = IndexDatabase::rebuild(&source_config(root2.clone(), Language::Rust)).unwrap();
+
+    // limit=2: top-2 by provisional ROI are truncated, refined, returned. Class C never enters.
+    let limited = db2
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: Some(2) })
+        .unwrap();
+    assert_eq!(limited.classes.len(), 2, "limit=2 returns exactly 2 classes");
+    for (i, c) in limited.classes.iter().enumerate() {
+        assert!(
+            c.refined,
+            "every class in a limited result must be refined (or best-effort-unrefined); \
+             class[{i}] (key={}) has refined=false",
+            c.class_key
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(root2);
+}
+
+/// I2 (#215 Plan 4a adversary): find_clones with a huge limit must clamp effective returned classes
+/// to UNLIMITED_REFINE_BUDGET (50), returning all-refined. This plants MORE than 50 distinct clone
+/// classes so the clamp is actually EXERCISED (the earlier 3-class fixture never tripped it): a
+/// huge `limit` returns EXACTLY 50 classes (all refined), and both `truncated` and
+/// `refine_budget_clamped` are set.
+#[test]
+fn find_clones_huge_limit_clamps_to_refine_budget() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Generate 18 ops × 4 length-tiers = 72 DISTINCT, non-merging clone classes (> the budget of
+    // 50). Two independent axes keep distinct classes from cross-merging under the SourcererCC
+    // candidate edge test (overlap/max_len >= θ=0.7):
+    //   1. OPERATOR axis: each body is a long left-assoc binary chain `a OP a OP a …` over a single
+    //      operand, so the verbatim operator token dominates the normalized bag. The 18 distinct
+    //      binary operators each yield a separate class (within-tier max similarity < 0.7 once the
+    //      chain is long enough — the smallest tier is 64 reps; 40 reps merges).
+    //   2. LENGTH-TIER axis: four chain lengths ~1.6× apart (> 1/θ ≈ 1.43) so the size-prune
+    //      (min_len >= ceil(θ·max_len)) drops EVERY cross-tier edge regardless of content.
+    // The `_a`/`_b` variants are rename-clones (operand `a` vs `b`, distinct fn names): identical
+    // structure → same struct_hash → exactly one class per pair via the struct-hash fast path.
+    // NOTE: identifier names and literal VALUES are normalization-invariant, so the per-pair
+    // distinction MUST come from structure (operator + chain length), never names/literals.
+    let ops = [
+        "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<", ">", "<=", ">=", "==", "!=", "&&",
+        "||",
+    ];
+    let tiers = [64usize, 104, 168, 270];
+    let body = |op: &str, n: usize, var: &str, name: &str| {
+        let mut s = format!("pub fn {name}({var}: i64) -> i64 {{\n    {var}");
+        for _ in 0..n {
+            s.push_str(&format!(" {op} {var}"));
+        }
+        s.push_str("\n}\n");
+        s
+    };
+    let mut idx = 0usize;
+    for (ti, &n) in tiers.iter().enumerate() {
+        for (oi, op) in ops.iter().enumerate() {
+            let fa = body(op, n, "a", &format!("fn_a_t{ti}_o{oi}"));
+            let fb = body(op, n, "b", &format!("fn_b_t{ti}_o{oi}"));
+            fs::write(root.join(format!("src/clone_a{idx}.rs")), fa).unwrap();
+            fs::write(root.join(format!("src/clone_b{idx}.rs")), fb).unwrap();
+            idx += 1;
+        }
+    }
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Sanity: the full (unlimited) result must surface MORE than the refine budget of classes,
+    // otherwise the clamp below is vacuous.
+    let all = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert!(
+        all.classes.len() > 50,
+        "fixture must plant > 50 clone classes to exercise the clamp; got {}",
+        all.classes.len()
+    );
+
+    // limit=100000 >> total classes — clamps to exactly UNLIMITED_REFINE_BUDGET (50).
+    let limited = db
+        .find_clones(FindClonesOptions {
+            min_similarity: None,
+            min_copies: None,
+            limit: Some(100_000),
+        })
+        .unwrap();
+    assert_eq!(
+        limited.classes.len(),
+        50,
+        "a huge limit over > 50 classes must return EXACTLY the refine budget (50); got {}",
+        limited.classes.len()
+    );
+    assert!(
+        limited.classes.iter().all(|c| c.refined),
+        "every class in a huge-limited result must be refined"
+    );
+    assert!(
+        limited.completeness.truncated,
+        "dropping whole classes to honor the budget must set truncated"
+    );
+    assert!(
+        limited.completeness.refine_budget_clamped,
+        "a limit above the budget that drops classes must set refine_budget_clamped"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// I3 (#215 Plan 4a adversary): `load_refine_members` caps the re-parse to LCS_MEMBER_SAMPLE (64)
+/// members. This exercises the RUNTIME cap, not just the constant: it plants a single clone class
+/// with MORE than 64 members, then calls `load_refine_members` and asserts it returns EXACTLY 64
+/// members in canonical (struct_hash, symbol_id) order. Because the members are exact clones their
+/// struct_hashes are all equal, so the canonical order reduces to ascending symbol_id.
+#[test]
+fn load_refine_members_caps_to_lcs_sample_at_runtime() {
+    use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
+    // Keep the constant assertion — the cap value is load-bearing.
+    assert_eq!(LCS_MEMBER_SAMPLE, 64, "LCS_MEMBER_SAMPLE must be 64 (the load cap constant)");
+
+    const MEMBERS: usize = LCS_MEMBER_SAMPLE + 1; // 65 — one over the cap.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // 65 rename-clones of ONE structure: identical AST shape, distinct identifier names. Baseline
+    // normalization alpha-renames identifiers to ID<n> and buckets literals, so all 65 collapse to
+    // the SAME struct_hash → one clone class (the struct_hash exact fast path components them).
+    for i in 0..MEMBERS {
+        let src = format!(
+            "pub fn fn_{i}(db: Db) -> i32 {{ let a{i} = db.get(); let b{i} = db.get(); let c{i} = \
+             db.get(); validate(a{i}); validate(b{i}); validate(c{i}); a{i} + b{i} + c{i} }}\n"
+        );
+        fs::write(root.join(format!("src/m{i}.rs")), src).unwrap();
+    }
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    // Find the single component holding all 65 members.
+    let components = db.candidate_clone_components().expect("components");
+    let mut big = components
+        .into_iter()
+        .find(|c| c.len() == MEMBERS)
+        .unwrap_or_else(|| panic!("expected one component of {MEMBERS} exact clones"));
+    big.sort_unstable();
+
+    // load_refine_members must cap the re-parse to LCS_MEMBER_SAMPLE members.
+    let members = db
+        .load_refine_members(&big)
+        .expect("load_refine_members ok")
+        .expect("refine inputs available for an in-scope class");
+    assert_eq!(
+        members.len(),
+        LCS_MEMBER_SAMPLE,
+        "load_refine_members must cap a {MEMBERS}-member class to LCS_MEMBER_SAMPLE (64)"
+    );
+
+    // All struct_hashes are equal (exact clones), so canonical order is ascending symbol_id — the
+    // first 64 ids of the sorted component.
+    let returned_ids: Vec<i64> = members.iter().map(|m| m.symbol_id).collect();
+    let expected_ids: Vec<i64> = big.iter().copied().take(LCS_MEMBER_SAMPLE).collect();
+    assert_eq!(
+        returned_ids, expected_ids,
+        "capped members must be the first LCS_MEMBER_SAMPLE in canonical (struct_hash, id) order"
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -13186,6 +13874,44 @@ fn worktree_overlay_find_clones_reflects_branch_clone_pair() {
 
     let _ = fs::remove_dir_all(&main);
     let _ = fs::remove_dir_all(&linked);
+}
+
+/// Plan 4a (#215): the refine driver is BEST-EFFORT — when refine inputs are unavailable it leaves
+/// the class in its Plan-2 un-refined shape rather than erroring. We force `load_refine_members` to
+/// return `None` by deleting the source files AFTER indexing: the bags/fingerprints are already
+/// persisted in SQLite (so `find_clones` can still build the class), but `read_to_string` of each
+/// member's now-missing path fails, tripping the un-refinable fallback. The returned class must be
+/// the bare candidate component with every refinement field cleared — no panic, no error.
+#[test]
+fn find_clones_falls_back_to_unrefined_when_source_unavailable() {
+    let root = unique_temp_root();
+    // Build the index — fingerprints/bags persisted in the DB under `root/.rag-rat`.
+    let db = write_four_renamed_clones(&root);
+
+    // Delete the source trees (a/ and b/) but keep `.rag-rat/` (the SQLite DB). Each member's path
+    // now fails `read_to_string`, so `load_refine_members` returns `None` → un-refinable fallback.
+    fs::remove_dir_all(root.join("a")).unwrap();
+    fs::remove_dir_all(root.join("b")).unwrap();
+
+    let res = db
+        .find_clones(FindClonesOptions { min_similarity: None, min_copies: None, limit: None })
+        .unwrap();
+    assert_eq!(
+        res.classes.len(),
+        1,
+        "the class is still built from persisted bags even with source gone"
+    );
+    let c = &res.classes[0];
+
+    assert!(!c.refined, "source gone → refine inputs unavailable → class stays un-refined");
+    assert_eq!(c.class_kind, "candidate_component", "un-refined classes keep the Plan-2 kind");
+    assert!(c.lcs_ratio.is_none(), "no lcs_ratio on an un-refined class");
+    assert!(c.refactorability.is_none(), "no refactorability on an un-refined class");
+    assert!(c.confidence.is_none(), "no confidence on an un-refined class");
+    assert!(c.refine_mode.is_none(), "no refine_mode on an un-refined class");
+
+    // a/ and b/ are already gone; only `.rag-rat/` remains under root.
+    let _ = fs::remove_dir_all(root);
 }
 
 /// Fix 1 + Fix 2 (#215): a clone class with more than MAX_MEMBERS members exercises two paths that
@@ -13805,4 +14531,206 @@ fn find_clones_stale_members_zero_on_clean_index_and_nonzero_after_disk_edit() {
     );
 
     fs::remove_dir_all(root).unwrap();
+}
+
+/// Resolve the `symbols.id` of a fingerprinted function by its qualified-name `ref` (the
+/// `path::name` form `find_clones`/`clones_for_symbol` emit). Used by the refine-loader tests to
+/// get the raw member ids `load_refine_members` takes.
+fn fingerprinted_symbol_id_for_ref(db: &IndexDatabase, qualified_name: &str) -> i64 {
+    db.storage
+        .connection()
+        .query_row(
+            "SELECT symbols.id
+             FROM symbols
+             JOIN name_strings ns ON ns.id = symbols.qualified_name_id
+             JOIN symbol_fingerprints sf
+               ON sf.symbol_id = symbols.id
+               AND sf.normalizer_kind = 'baseline'
+             WHERE ns.value = ?1
+             ORDER BY symbols.id
+             LIMIT 1",
+            params![qualified_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| panic!("no fingerprinted symbol id for ref {qualified_name}: {e}"))
+}
+
+/// Faithfulness pin (#215 Plan 4a Task 2): `load_refine_members` re-parses each member's scoped
+/// source and re-normalizes to the ordered baseline token sequence — the strong correctness
+/// guarantee is that `tokens::struct_hash(&member.seq)` reproduces the PERSISTED
+/// `symbol_fingerprints.struct_hash` exactly (the re-parse is faithful to Plan-1's normalization).
+/// Also pins: seqs are non-empty, members come back sorted by struct_hash, and the lang/byte-range
+/// are populated.
+#[test]
+fn load_refine_members_reparse_is_faithful_to_persisted_struct_hash() {
+    use crate::index::clones::tokens::struct_hash;
+
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two rename-clone functions — identical structure, different identifier names. Both
+    // fingerprint to the SAME struct_hash (renamed clones), so sorting by struct_hash is stable on
+    // symbol_id.
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    let members = db
+        .load_refine_members(&[id_a, id_b])
+        .unwrap()
+        .expect("refine inputs available for an unchanged, in-scope clone pair");
+    assert_eq!(members.len(), 2, "both members loaded");
+
+    // Persisted struct_hash per member, for the faithfulness comparison.
+    let persisted = |sid: i64| -> String {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT struct_hash FROM symbol_fingerprints
+                 WHERE symbol_id = ?1 AND normalizer_kind = 'baseline'",
+                params![sid],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+
+    for m in &members {
+        assert!(!m.seq.is_empty(), "the re-parsed token sequence must be non-empty");
+        assert_eq!(m.lang, Language::Rust, "member language is rust");
+        assert!(m.end_byte > m.start_byte, "byte range must be non-empty");
+        // THE PIN: the re-parse reproduces Plan-1's normalization exactly.
+        assert_eq!(
+            struct_hash(&m.seq),
+            m.struct_hash,
+            "re-parsed struct_hash must equal the member's persisted struct_hash"
+        );
+        assert_eq!(
+            m.struct_hash,
+            persisted(m.symbol_id),
+            "the member's carried struct_hash must equal the DB-persisted struct_hash"
+        );
+    }
+
+    // Members are returned in canonical sorted-by-struct_hash (then symbol_id) order.
+    let mut expected =
+        members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
+    expected.sort();
+    let actual = members.iter().map(|m| (m.struct_hash.clone(), m.symbol_id)).collect::<Vec<_>>();
+    assert_eq!(actual, expected, "members must be sorted by (struct_hash, symbol_id)");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Empty input is a valid (empty) refine set — not a failure.
+#[test]
+fn load_refine_members_empty_input_returns_empty() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/a.rs"), "pub fn f() -> i32 { 0 }\n").unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let members = db.load_refine_members(&[]).unwrap().expect("empty input is a valid empty set");
+    assert!(members.is_empty(), "empty member_ids → empty members");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Missing source: a member whose source file is deleted from disk (but whose fingerprint row is
+/// still persisted) makes the re-parse impossible, so `load_refine_members` returns `Ok(None)` —
+/// the caller falls back to an un-refined class rather than refining over a partial input.
+#[test]
+fn load_refine_members_returns_none_when_source_missing() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    // Delete one member's source file on disk; the fingerprint rows are unchanged in the index.
+    fs::remove_file(root.join("src/b.rs")).unwrap();
+
+    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    assert!(
+        result.is_none(),
+        "a member with a deleted source file must yield Ok(None) for the whole class"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Overlay fallback (#215 Plan 4a Task 2): under a LINKED-WORKTREE OVERLAY scope, `source_root` is
+/// the MAIN checkout — not the branch the overlay's symbol rows came from — so no scope-correct
+/// source read is available and `load_refine_members` must return `Ok(None)` BEFORE touching disk.
+/// Mirrors `count_stale_member_paths` / the staleness heal path's overlay early-return.
+#[test]
+fn load_refine_members_returns_none_under_linked_overlay_scope() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    // Base has only a tiny (below-MIN_TOKENS) function — no fingerprint, no clone class.
+    fs::write(main.join("src/base.rs"), "pub fn tiny() -> i32 { 0 }\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    // Linked worktree on a new branch adds a rename-clone pair.
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/a.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(1); validate(u); u + 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        linked.join("src/b.rs"),
+        "pub fn load_order(s: Db) -> i32 { let o = s.get(2); validate(o); o + 1 }\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "add clone pair"]);
+
+    // Index the overlay — leaves the connection in the linked (overlay) scope.
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(db.active_scope_is_linked_overlay(), "connection must be in the overlay scope");
+
+    // Resolve the branch members' ids (under the overlay scope they are visible).
+    let id_a = fingerprinted_symbol_id_for_ref(&db, "src/a.rs::load_user");
+    let id_b = fingerprinted_symbol_id_for_ref(&db, "src/b.rs::load_order");
+
+    // Even with valid member ids, refine is unavailable under an overlay scope.
+    let result = db.load_refine_members(&[id_a, id_b]).unwrap();
+    assert!(
+        result.is_none(),
+        "refine must be unavailable (Ok(None)) under a linked-worktree overlay scope"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
 }

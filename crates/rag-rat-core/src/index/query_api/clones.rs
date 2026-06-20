@@ -7,6 +7,7 @@
 //! shared total order plus the exact verify, so a missing/stale df never drops a true clone.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -23,6 +24,11 @@ const METRIC_SAMPLE_CAP: usize = 200;
 
 use crate::index::IndexDatabase;
 use crate::index::clones::NORM_VERSION;
+use crate::index::clones::refine::align::LCS_MEMBER_SAMPLE;
+use crate::index::clones::refine::cache::{
+    refine_compute_and_store, refine_lookup, refinement_key,
+};
+use crate::index::clones::refine::split::coherence_split;
 
 /// Similarity threshold θ: a candidate pair is kept iff `overlap / max_len >= THETA`. The MAX
 /// denominator is deliberate (design rev-4 §3b) — it bounds the member length ratio to ≈1/θ, the
@@ -80,12 +86,29 @@ pub struct CandidateCloneClass {
     pub body_token_len_medoid: i64,
     pub roi: f64,
     pub roi_factors: RoiFactors,
-    /// `true` when the component has more than [`METRIC_SAMPLE_CAP`] members and the pairwise
-    /// metric computation (`similarity_min`, medoid, `similarity_medoid_min`, `containment_max`)
-    /// ran over only the first `METRIC_SAMPLE_CAP` members instead of the full upper triangle.
+    /// `true` when a cost cap engaged for this class's metric computation, so a sampled metric is
+    /// distinguishable from an exact one. Two independent caps set it:
+    /// - The Plan-2 pairwise-metric cap ([`METRIC_SAMPLE_CAP`]): the component has more than
+    ///   `METRIC_SAMPLE_CAP` members and the pairwise loop (`similarity_min`, medoid,
+    ///   `similarity_medoid_min`, `containment_max`) ran over only the first `METRIC_SAMPLE_CAP`.
+    /// - The Plan-4a refine LCS caps (`LCS_MEMBER_SAMPLE` / `LCS_MAX_SEQ_TOKENS`, Fix 1): the
+    ///   refine pass bounded the all-pairs LCS by sampling members and/or replacing very long
+    ///   pairs with the multiset-Dice proxy. `refine_class_in_place` ORs the refinement's
+    ///   `lcs_sampled` into this flag, so a refined class with a cost-bounded fidelity reports
+    ///   `true`.
+    ///
     /// `member_count` / `total_members` / `class_key` are always over the FULL component.
-    /// `false` for all normal-size components (the typical case).
+    /// `false` for all normal-size components computed exactly (the typical case).
     pub metrics_sampled: bool,
+    /// Refinement outputs (#215 Plan 4a). All `None` on an UN-refined candidate class; populated
+    /// only on classes the two-phase driver refined (`refined == true`). `lcs_ratio` is the NiCad
+    /// class fidelity (min pairwise `2·LCS/(|a|+|b|)`); `confidence` is the persisted band
+    /// (`"high"`/`"medium"`/`"low"`); `refactorability` is the `(0,1]`-clamped ROI multiplier;
+    /// `refine_mode` is `Some("baseline")` when refined.
+    pub lcs_ratio: Option<f64>,
+    pub confidence: Option<String>,
+    pub refactorability: Option<f64>,
+    pub refine_mode: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -103,6 +126,12 @@ pub struct CloneCompleteness {
     pub index_freshness: String,          // reuse index_status freshness summary
     pub oracle_coverage: &'static str,    // "n/a_baseline_only" in Plan 2 (SCIP is Plan 3)
     pub truncated: bool,
+    /// `true` when `limit` was supplied and was clamped by the refine budget (the budget,
+    /// currently 50, is less than the requested limit AND the total built classes exceed the
+    /// budget). A `true` value means classes beyond the refine budget were dropped — use
+    /// `limit: None` to retrieve all classes. Always `false` on the unlimited path and on
+    /// `clones_for_symbol`.
+    pub refine_budget_clamped: bool,
     /// Count of DISTINCT member file paths whose on-disk content no longer matches the indexed
     /// `files.sha256`. A non-zero value means the returned clone classes describe STALE file
     /// contents — consumers should reindex / `rag-rat heal` before acting on these results.
@@ -136,6 +165,27 @@ pub(crate) fn class_key_for(member_refs: &[String]) -> String {
     sorted.sort_unstable();
     let joined = sorted.join("\n");
     crate::index::hex_sha256(joined.as_bytes())[..16].to_string()
+}
+
+/// Minimum pairwise overlap/max_len similarity across all member pairs of `class`. This is the same
+/// cohesion floor `build_class` computes for `similarity_min`, recomputed cheaply here as the
+/// tie-breaker for `clones_for_symbol`'s largest-group selection (when the clique-cover split
+/// returns several equal-size groups containing the subject, the most internally-cohesive wins).
+/// A 1-member (or empty) class has no pairs → cohesion 1.0 (vacuously fully coherent).
+fn min_pairwise_cohesion(class: &[i64], by_id: &BTreeMap<i64, &SymbolBag>) -> f64 {
+    let mut min = f64::MAX;
+    for i in 0..class.len() {
+        for j in (i + 1)..class.len() {
+            if let (Some(ba), Some(bb)) = (by_id.get(&class[i]), by_id.get(&class[j])) {
+                let max_len = ba.token_len.max(bb.token_len);
+                let sim = if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 };
+                if sim < min {
+                    min = sim;
+                }
+            }
+        }
+    }
+    if min == f64::MAX { 1.0 } else { min }
 }
 
 /// Sentinel df for tokens with no `clone_token_df` row (LEFT JOIN miss). i64::MAX sorts them LAST
@@ -185,7 +235,10 @@ pub struct FindClonesOptions {
     pub min_similarity: Option<f64>,
     /// Minimum number of copies for a class to be returned. Defaults to 2 if `None`.
     pub min_copies: Option<usize>,
-    /// Maximum number of classes to return (sorted by ROI desc). No limit if `None`.
+    /// Maximum number of classes to return (sorted by ROI desc). No limit if `None`. Note: a
+    /// limited query is clamped to the refine budget (currently 50) — `limit: Some(N)` returns at
+    /// most 50 classes, all refined. To retrieve more classes (only the top 50 refined), use
+    /// `limit: None`.
     pub limit: Option<usize>,
 }
 
@@ -204,20 +257,31 @@ impl IndexDatabase {
     /// score, filters by `min_similarity` / `min_copies`, sorts by ROI descending, and attaches a
     /// [`CloneCompleteness`] provenance block. Classes are UNREFINED (Plan 4 adds coherence
     /// splitting and anti-unification).
+    ///
+    /// **Refine-budget cap:** a limited query (`limit: Some(N)`) clamps to the refine budget
+    /// (currently 50): at most 50 classes are returned, all refined. An unlimited query
+    /// (`limit: None`) returns all classes (only the top 50 refined, the rest unrefined). Use
+    /// `limit: None` to retrieve more than 50 classes. `completeness.refine_budget_clamped`
+    /// reports when a supplied limit was clamped by the budget AND classes were dropped.
     pub fn find_clones(&self, opts: FindClonesOptions) -> anyhow::Result<FindClonesResult> {
         let conn = self.storage.connection();
 
         // Validate the caller-supplied θ BEFORE it touches candidate generation. θ is a similarity
-        // ratio (overlap/max_len) so it must lie in (0.0, 1.0]: ≤ 0.0 would admit every pair (and a
-        // 0.0 sub-block prefix walks the whole bag), > 1.0 is unreachable and signals a unit error.
-        // NaN must be explicitly rejected: both `v <= 0.0` and `v > 1.0` are false for NaN, so
-        // without the `is_finite` guard NaN slips through and makes `ceil(NaN) as i64 = 0`, which
-        // widens the sub-block to the whole bag → O(n²) blowup with every same-language
-        // token-sharing pair reported as a clone.
+        // ratio (overlap/max_len) and must lie in [0.5, 1.0]:
+        // - > 1.0 is unreachable and signals a unit error.
+        // - < 0.5 is rejected not just for the ≤0 degenerate case but because any small positive θ
+        //   makes the sub-block prefix p = L − ceil(θ·L) + 1 approach the whole bag, flooding the
+        //   inverted index with hot/common tokens and causing O(S²) candidate-pair explosion
+        //   (measured: 5k symbols at θ=0.01 → ~20s/~700MB in candidate gen alone). The 0.5 floor
+        //   keeps the sub-block at most L/2 occurrences — a practical safety bound. A deeper fix
+        //   (capping candidate-pair/posting-list work and restoring the full (0,1] range) is
+        //   tracked in #235.
+        // - NaN and non-finite values must be explicitly rejected: both `v < 0.5` and `v > 1.0` are
+        //   false for NaN, so without the `is_finite` guard NaN slips through.
         if let Some(v) = opts.min_similarity
-            && (!v.is_finite() || v <= 0.0 || v > 1.0)
+            && (!v.is_finite() || !(0.5..=1.0).contains(&v))
         {
-            anyhow::bail!("min_similarity must be a finite value in (0.0, 1.0]");
+            anyhow::bail!("min_similarity must be in [0.5, 1.0]");
         }
 
         let bags = load_scoped_baseline_bags(conn)?;
@@ -233,41 +297,103 @@ impl IndexDatabase {
 
         let min_copies = opts.min_copies.unwrap_or(2);
 
-        let mut classes: Vec<CandidateCloneClass> = Vec::new();
-
+        // Plan 4a: coherence-SPLIT every component before building classes. Union-find over-merges
+        // transitive chains (A~B, B~C, A!~C ⇒ {A,B,C}); `coherence_split` returns internally-
+        // coherent sub-classes (every pair ≥ θ) instead. A component that splits entirely into
+        // singletons (each < min_copies) yields NO class — that is correct: an over-merged chain
+        // with no coherent ≥2 sub-class is not a real clone class. (No fallback here; the
+        // un-refined-component fallback is `clones_for_symbol`'s, where the caller pinned a
+        // subject.) Each built class travels with its component ids so the two-phase driver
+        // can refine it.
+        let mut built: Vec<(Vec<i64>, CandidateCloneClass)> = Vec::new();
         for component in &components {
             if component.len() < min_copies {
                 continue;
             }
-            // No class-level `similarity_min < theta` filter: θ governs CANDIDATE GENERATION only
-            // (every EDGE in the component is ≥ θ via `candidate_pairs_from_bags`). A component's
-            // aggregate min-pairwise can dip below θ for a TRANSITIVE chain (A–B and B–C both ≥ θ,
-            // but A–C < θ), and that component is legitimately one clone class — it stays visible,
-            // gets ROI-penalized through the cohesion multiplier, and surfaces its low cohesion in
-            // `cohesion_min_pairwise`. Dropping it here also diverged from `clones_for_symbol`,
-            // which never applied this filter, so the two surfaces now agree on chain components.
-            match build_class(component, &by_id, conn, None)? {
-                None => continue,
-                Some(class) => classes.push(class),
+            let coherent_classes = coherence_split(
+                component,
+                |a, b| {
+                    let ba = by_id[&a];
+                    let bb = by_id[&b];
+                    let max_len = ba.token_len.max(bb.token_len);
+                    if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
+                },
+                theta,
+            );
+            for class_ids in &coherent_classes {
+                if class_ids.len() < min_copies {
+                    continue;
+                }
+                if let Some(class) = build_class(class_ids, &by_id, conn, None)? {
+                    built.push((class_ids.clone(), class));
+                }
             }
         }
 
-        // Sort by ROI descending (stable for determinism within ties).
-        classes.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+        // ── Two-phase ROI ranking (Plan 4a) ────────────────────────────────────────────────────
+        // Phase 1: sort ALL coherent classes by the Plan-2 (un-refined) ROI — the cohesion
+        // multiplier. Refining is comparatively expensive (re-read + re-parse + LCS), so the
+        // provisional rank picks which classes are worth refining.
+        built.sort_by(|a, b| b.1.roi.partial_cmp(&a.1.roi).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Capture the post-filter class count BEFORE the limit truncation so `truncated` can
-        // report classes dropped by the limit (Fix 2), not just members capped within a class.
-        let classes_after_filter = classes.len();
+        // Total coherent classes BEFORE any limit drop — feeds the `truncated` flag below so a
+        // limited result that dropped whole classes still reports `truncated == true`.
+        let total_classes_built = built.len();
 
-        if let Some(limit) = opts.limit {
-            classes.truncate(limit);
-        }
+        // Refine budget: the maximum number of classes to refine (re-read + re-parse + LCS).
+        // Shared between the limited and unlimited paths — the limited path clamps its effective
+        // returned count to this budget so `find_clones { limit: 100000 }` can't queue unbounded
+        // re-parse work while still returning all-refined classes. The unlimited path refines only
+        // the top-budget classes and returns all (with unrefined tail).
+        const UNLIMITED_REFINE_BUDGET: usize = 50;
+
+        let classes: Vec<CandidateCloneClass> = if let Some(limit) = opts.limit {
+            // Limited result: truncate to min(limit, UNLIMITED_REFINE_BUDGET) so a huge `limit`
+            // doesn't queue unbounded re-parse work. The all-refined-limited invariant (Fix 2
+            // round-1: every class in a limited result is refined, no unrefined rank-(N+1) class)
+            // is preserved because we clamp BEFORE refining — we refine at most
+            // UNLIMITED_REFINE_BUDGET classes and return exactly those. Callers wanting
+            // more than UNLIMITED_REFINE_BUDGET classes (with only the top refined)
+            // should use limit: None. DOCUMENTED BEHAVIOR: a limited query returns at
+            // most UNLIMITED_REFINE_BUDGET (50) classes, all refined; to retrieve more
+            // classes use limit: None.
+            let effective_limit = limit.min(UNLIMITED_REFINE_BUDGET);
+            built.truncate(effective_limit);
+            for (class_ids, class) in built.iter_mut() {
+                self.refine_class_in_place(conn, class_ids, &by_id, class)?;
+            }
+            let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
+            cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+            cs
+        } else {
+            // Unlimited result: refine the top-`UNLIMITED_REFINE_BUDGET` by provisional ROI, return
+            // ALL classes. Classes beyond the budget keep their Plan-2 (un-refined) shape — the
+            // inherent best-effort case for unlimited results. After refinement the FULL list is
+            // re-sorted by ROI so a refined class that gained/lost rank lands in the right place.
+            for (idx, (class_ids, class)) in built.iter_mut().enumerate() {
+                if idx >= UNLIMITED_REFINE_BUDGET {
+                    break;
+                }
+                self.refine_class_in_place(conn, class_ids, &by_id, class)?;
+            }
+            let mut cs: Vec<CandidateCloneClass> = built.into_iter().map(|(_, c)| c).collect();
+            cs.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+            cs
+        };
 
         // `truncated` is true if ANY returned class capped its member list (members_returned <
-        // total_members) OR the class-limit dropped whole classes (classes_after_filter >
-        // returned).
+        // total_members) OR whole classes were dropped to honor the limit (limited path only —
+        // `total_classes_built` exceeds the returned count).
         let truncated = classes.iter().any(|c| c.members_returned < c.total_members)
-            || classes_after_filter > classes.len();
+            || total_classes_built > classes.len();
+
+        // refine_budget_clamped: true when a limit was supplied, the limit exceeded the budget, AND
+        // the budget actually dropped classes (total_classes_built > effective_limit). A limit at
+        // or below the budget never clamps; a limit above the budget only clamps when there
+        // were more built classes than the budget could return.
+        let refine_budget_clamped = opts.limit.is_some_and(|lim| {
+            lim > UNLIMITED_REFINE_BUDGET && total_classes_built > UNLIMITED_REFINE_BUDGET
+        });
 
         let freshness = self.meta("git_commit")?.unwrap_or_else(|| "unknown".to_string());
 
@@ -275,20 +401,174 @@ impl IndexDatabase {
         // sha256 (read-only signal; Plan 2 does not heal-before-return).
         let stale_members = count_stale_member_paths(self, conn, &classes)?;
 
-        let completeness =
-            build_completeness(theta, min_copies, truncated, stale_members, freshness);
+        let completeness = build_completeness(
+            theta,
+            min_copies,
+            truncated,
+            refine_budget_clamped,
+            stale_members,
+            freshness,
+        );
 
         Ok(FindClonesResult { classes, completeness })
     }
+
+    /// Refine one candidate class IN PLACE (#215 Plan 4a): load the class's refine inputs (re-read,
+    /// re-parse, and re-normalize each member to its ordered baseline token sequence), compute the
+    /// content-addressed refinement (read-through `clone_refinements` cache), set the
+    /// refinement fields, flip `refined`/`class_kind`, and swap the ROI cohesion multiplier for
+    /// `refactorability`. This is a NO-OP (the class keeps its Plan-2 un-refined shape) when refine
+    /// inputs are unavailable (overlay scope, drifted source, parse failure, or a vanished
+    /// hydration row), exactly mirroring the un-refinable fallback `load_refine_members`
+    /// already encodes.
+    ///
+    /// `class_ids` is the class's component (the coherent sub-class) symbol ids; `by_id` supplies
+    /// each member's persisted `struct_hash` for the content-addressed key (no extra DB
+    /// round-trip).
+    fn refine_class_in_place(
+        &self,
+        conn: &Connection,
+        class_ids: &[i64],
+        by_id: &BTreeMap<i64, &SymbolBag>,
+        class: &mut CandidateCloneClass,
+    ) -> anyhow::Result<()> {
+        // ── Phase 0 (CHEAP, NO RE-PARSE): build the content-addressed key from each member's
+        // persisted struct_hash already in `by_id` — no file I/O, no tree-sitter parse.
+        // If a class member's struct_hash is somehow absent from `by_id` (shouldn't happen for a
+        // coherent class, but defend anyway) the key would be over an incomplete multiset, which
+        // could alias a different class. Fall back to leaving this class un-refined rather than
+        // computing a wrong refinement.
+        let struct_hashes: Vec<String> = class_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).map(|b| b.struct_hash.clone()))
+            .collect();
+        if struct_hashes.len() != class_ids.len() {
+            // Defensive: a member's bag is missing — skip rather than key over a partial multiset.
+            return Ok(());
+        }
+
+        // Content-addressed key over the member struct_hash multiset — NOT the read-side
+        // `class.class_key` (location-derived). Two classes with the same structural content share
+        // a refinement; the key survives a reindex that reassigns rowids.
+        //
+        // For coherent classes exceeding METRIC_SAMPLE_CAP members, `class.similarity_min` was
+        // derived from the first `METRIC_SAMPLE_CAP` members only (the metric-sample path in
+        // `build_class`), while `key` spans the FULL struct_hash multiset. The gap is not a
+        // determinism break — the sample is id-ASC stable — but Plan-4b should compute confidence
+        // over the full set or fold the sample into the key.
+        let key = refinement_key(&class.language, &struct_hashes);
+
+        // ── Phase 1 (PURE READ — warm path): probe the content-addressed cache. A SELECT is safe
+        // on the MCP's read-only connection; a WARM cache hit never takes the write lock and never
+        // re-parses any source file. This is the main perf win: the re-parse (load_refine_members,
+        // below) was previously called BEFORE the cache probe, so a warm hit still paid the full
+        // tree-sitter re-parse cost for every member — now it is bypassed entirely.
+        //
+        // CORRECTNESS NOTE: on a cache HIT we intentionally skip the load_refine_members
+        // struct_hash-faithfulness re-validation. This is safe: the cache is keyed by the persisted
+        // struct_hash multiset, so a drifted source that changes struct_hash produces a different
+        // key → cache miss → cold path (re-parse + faithfulness check). Staleness is separately
+        // surfaced to callers via `completeness.stale_members`. Skipping the re-validation on warm
+        // hits is therefore not a regression; it is the designed behavior.
+        if let Some(refinement) = refine_lookup(conn, &key)? {
+            // WARM path: cache hit — apply the refinement without re-parsing any source files.
+            apply_refinement(class, refinement);
+            return Ok(());
+        }
+
+        // ── Phase 2 (COLD path only): cache miss. Before any expensive work, probe writability. If
+        // the connection is read-only, surface a genuine SQLITE_READONLY error so
+        // `is_readonly_violation` flags it and the MCP dispatcher retries read-write; the retry
+        // takes the same path but writable (Phase 1 may hit the cache on the retry if a concurrent
+        // writer raced us, or falls through to the compute below).
+        if conn.is_readonly(rusqlite::MAIN_DB)? {
+            // Mint a real SQLITE_READONLY `rusqlite::Error` that `is_readonly_violation`
+            // recognizes, WITHOUT any expensive LCS work. A zero-row write to a real table
+            // (`DELETE … WHERE 1=0`) acquires the write lock → fails with SQLITE_READONLY on a
+            // RO connection. (A `BEGIN IMMEDIATE` does NOT error here — this rusqlite/SQLite
+            // build defers the write-lock acquisition past transaction-start, so the probe must
+            // be an actual write statement.) The `WHERE 1=0` makes it a true no-op even on a
+            // writable connection; in practice this branch only runs on the RO pass, since the
+            // RW retry sees `is_readonly == false` and skips straight to the compute.
+            conn.execute("DELETE FROM clone_refinements WHERE 1=0", [])?;
+            // The probe MUST error on a RO connection; if it somehow didn't, bail rather than
+            // fall through to a compute whose INSERT would itself fail.
+            anyhow::bail!("clone refine requires a writable connection");
+        }
+
+        // ── Phase 3 (writable cold path): re-parse each member's source file with tree-sitter,
+        // compute the LCS ratio + refactorability, persist in the cache, and apply.
+        // `load_refine_members` is the expensive step (file reads + tree-sitter parses).
+        // `None` ⇒ refine unavailable (overlay scope, drifted source, parse failure, or a
+        // vanished fingerprint row) — leave the class un-refined.
+        let Some(members) = self.load_refine_members(class_ids)? else {
+            return Ok(());
+        };
+        // An empty or singleton member set (shouldn't happen for a ≥2 class) is not refinable.
+        if members.len() < 2 {
+            return Ok(());
+        }
+
+        let refinement =
+            refine_compute_and_store(conn, &key, &class.language, &members, class.similarity_min)?;
+        apply_refinement(class, refinement);
+
+        Ok(())
+    }
+}
+
+/// Apply a [`CachedRefinement`] to a [`CandidateCloneClass`] in place (Plan 4a). Shared between
+/// the warm (cache-hit) and cold (compute+store) paths of [`IndexDatabase::refine_class_in_place`].
+///
+/// `metrics_sampled` accumulates the sampling dimensions via OR-in:
+/// - `refinement.lcs_sampled` — either LCS cost cap engaged: the member-count sample
+///   (`LCS_MEMBER_SAMPLE`) OR the per-pair length proxy (`LCS_MAX_SEQ_TOKENS`). This bit is now
+///   PERSISTED in `clone_refinements` (Fix 3, #215 Plan 4a round-2), so it survives a warm cache
+///   hit — the long-sequence dimension is no longer lost on a hit the way it was when the bit was
+///   compute-only.
+/// - `class.member_count > LCS_MEMBER_SAMPLE` — kept as an independent, cache-agnostic guard for
+///   the member-count dimension: it is deterministic from the class's member count regardless of
+///   cache hit/miss, so it flags the member-count sample even for a row that predates the persisted
+///   bit (default 0 on an additively-migrated DB until recomputed).
+fn apply_refinement(
+    class: &mut CandidateCloneClass,
+    refinement: crate::index::clones::refine::cache::CachedRefinement,
+) {
+    // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
+    // other factors are unchanged (cross-module spread × member count × medoid body tokens ×
+    // load-bearing factor); `cohesion_min_pairwise` stays surfaced for transparency.
+    class.roi = class.cross_module_spread as f64
+        * class.member_count as f64
+        * class.body_token_len_medoid as f64
+        * class.roi_factors.load_bearing_factor
+        * refinement.refactorability;
+
+    class.refined = true;
+    class.class_kind = "refined_class";
+    class.lcs_ratio = Some(refinement.lcs_ratio);
+    class.confidence = Some(refinement.confidence.as_db_str().to_string());
+    class.refactorability = Some(refinement.refactorability);
+    class.refine_mode = Some(refinement.refine_mode);
+
+    // Fold the LCS sampling dimensions into the class's metrics_sampled flag (OR-in so any
+    // already-sampled Plan-2 metric stays flagged):
+    //   1. refinement.lcs_sampled — either cost cap (member-count sample or long-seq proxy), now
+    //      PERSISTED (Fix 3) so it is honored on BOTH the cold compute AND the warm cache hit.
+    //   2. member_count > LCS_MEMBER_SAMPLE — independent, cache-agnostic guard for the
+    //      member-count dimension; covers a pre-persisted-bit row whose stored flag defaults to 0.
+    class.metrics_sampled |= refinement.lcs_sampled || class.member_count > LCS_MEMBER_SAMPLE;
 }
 
 /// Build the [`CloneCompleteness`] provenance block shared by `find_clones` and
-/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`, `stale_members`,
-/// and the index freshness summary vary per call; the rest are fixed Plan-2 policy constants.
+/// `clones_for_symbol`. Only `min_similarity` (θ), `min_copies`, `truncated`,
+/// `refine_budget_clamped`, `stale_members`, and the index freshness summary vary per call; the
+/// rest are fixed Plan-2 policy constants. `clones_for_symbol` always passes
+/// `refine_budget_clamped = false` (it has no class limit).
 fn build_completeness(
     min_similarity: f64,
     min_copies: usize,
     truncated: bool,
+    refine_budget_clamped: bool,
     stale_members: usize,
     freshness: String,
 ) -> CloneCompleteness {
@@ -306,6 +586,7 @@ fn build_completeness(
         index_freshness: freshness,
         oracle_coverage: "n/a_baseline_only",
         truncated,
+        refine_budget_clamped,
         stale_members,
         known_index_gaps: vec![
             "#232: TS function-valued declarators not yet fingerprinted".into(),
@@ -360,7 +641,15 @@ impl IndexDatabase {
                 class,
                 symbol_resolved,
                 symbol_fingerprinted,
-                completeness: build_completeness(THETA, 2, truncated, stale_members, freshness),
+                // No class limit on this path → never refine-budget-clamped.
+                completeness: build_completeness(
+                    THETA,
+                    2,
+                    truncated,
+                    false,
+                    stale_members,
+                    freshness,
+                ),
             }
         };
 
@@ -387,10 +676,66 @@ impl IndexDatabase {
             return Ok(make_result(None, true, true, 0, freshness));
         };
 
+        // Plan 4a: coherence-split the component, then serve the coherent sub-class that contains
+        // the subject. If the subject is a SINGLETON after the split (it cohered with no peer at
+        // θ), fall back to the full UN-refined component so the caller still sees the
+        // symbol's over-merged neighborhood — `clones_for_symbol` is a reverse lookup ABOUT
+        // a specific symbol, so an empty answer for a symbol that IS in an (over-merged)
+        // component would be less useful than the un-refined fallback. `find_clones` has no
+        // such fallback (no subject).
+        let coherent_classes = coherence_split(
+            &component,
+            |a, b| {
+                let ba = by_id[&a];
+                let bb = by_id[&b];
+                let max_len = ba.token_len.max(bb.token_len);
+                if max_len == 0 { 1.0 } else { overlap(ba, bb) as f64 / max_len as f64 }
+            },
+            THETA,
+        );
+        // Pick the largest coherent group containing the subject (tie → highest min-pairwise
+        // cohesion → lowest member id). The greedy clique-cover split can return MULTIPLE
+        // overlapping groups containing the subject (e.g. B is in both {A,B} and {B,C} for chain
+        // A~B / B~C / A!~C) — the subject's "best" class is the largest such group, so a reverse
+        // lookup surfaces the richest coherent neighborhood it belongs to rather than an arbitrary
+        // first-fit pair.
+        let subject_subclass = {
+            let candidates: Vec<Vec<i64>> =
+                coherent_classes.into_iter().filter(|cls| cls.contains(&symbol_id)).collect();
+            candidates.into_iter().max_by(|a, b| {
+                a.len()
+                    .cmp(&b.len())
+                    .then_with(|| {
+                        // Higher min-pairwise cohesion wins.
+                        let cohesion_a = min_pairwise_cohesion(a, &by_id);
+                        let cohesion_b = min_pairwise_cohesion(b, &by_id);
+                        cohesion_a.partial_cmp(&cohesion_b).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    // Fully-deterministic final tiebreak: compare the full sorted member-id vector
+                    // (lexicographically, reversed so max_by keeps the lexicographically-smallest).
+                    // `max_by` returns the LAST equal element, so we reverse: "greater" vector loses.
+                    .then_with(|| b.cmp(a))
+            })
+        };
+
         // Pin the resolved subject so it is guaranteed to appear in the (capped) member list even
-        // when its id falls past MAX_MEMBERS in the component's id order — the caller asked about
+        // when its id falls past MAX_MEMBERS in the (sub)class id order — the caller asked about
         // THIS symbol (Fix 2, #215).
-        let class = build_class(&component, &by_id, conn, Some(symbol_id))?;
+        let class = match subject_subclass {
+            Some(subclass) => {
+                let mut built = build_class(&subclass, &by_id, conn, Some(symbol_id))?;
+                // Always refine the subject's one class when refine inputs are available.
+                if let Some(c) = built.as_mut() {
+                    self.refine_class_in_place(conn, &subclass, &by_id, c)?;
+                }
+                built
+            },
+            None => {
+                // Subject split to a singleton: serve the full un-refined component
+                // (refined=false).
+                build_class(&component, &by_id, conn, Some(symbol_id))?
+            },
+        };
 
         // Count stale member paths over just this class's members (None class → 0 stale).
         let stale_members = match &class {
@@ -403,6 +748,211 @@ impl IndexDatabase {
 
         Ok(make_result(class, true, true, stale_members, freshness))
     }
+}
+
+/// One member's persisted hydration row before the re-parse: scoped path + byte range + language +
+/// the baseline `struct_hash` (the canonical sort/cache key). Mirrors `build_class`'s member
+/// hydration but additionally pulls `start_byte`/`end_byte` (for the AST descent) and `struct_hash`
+/// (the faithfulness pin).
+struct RefineRow {
+    symbol_id: i64,
+    path: String,
+    start_byte: usize,
+    end_byte: usize,
+    language: crate::language::Language,
+    struct_hash: String,
+}
+
+impl IndexDatabase {
+    /// Load refine inputs for a class's members (#215 Plan 4a Task 2): resolve each member's scoped
+    /// path + byte range, read the active-scope-correct source, parse, descend to the symbol node,
+    /// and `normalize_baseline` into the ordered baseline token sequence. Returns members in
+    /// CANONICAL sorted-by-`struct_hash` order (then `symbol_id` as a tiebreak) — the ordinal basis
+    /// the anti-unify step's `per_member_values[]` aligns to.
+    ///
+    /// Returns `Ok(None)` if refine inputs are unavailable for ANY member — source
+    /// missing/unreadable, a hydration row that vanished mid-read (TOCTOU), a parse failure, no AST
+    /// node at the byte range, or a re-parse whose `struct_hash` no longer matches the persisted
+    /// one (the file drifted off-index). The caller falls back to an un-refined class.
+    /// Returning `None` on ANY missing member (rather than dropping it) keeps the class a
+    /// faithful whole: a partial refine over a subset of members would mis-rank and
+    /// mis-template.
+    ///
+    /// SCOPE LIMITATION (deliberate, mirrors `count_stale_member_paths` / the staleness heal path):
+    /// under a LINKED-WORKTREE OVERLAY scope, `source_root` is the MAIN checkout — NOT the branch
+    /// the overlay's symbol rows came from. Re-reading main's bytes at the overlay member's byte
+    /// range would parse the WRONG source (or fail entirely on a branch-only file). There is no
+    /// scope-correct source read available here for the overlay, so refine is unavailable under an
+    /// overlay scope: return `Ok(None)` and let the caller serve the un-refined class. (When a
+    /// scope-correct overlay source read lands, this guard can be lifted.)
+    pub(crate) fn load_refine_members(
+        &self,
+        member_ids: &[i64],
+    ) -> anyhow::Result<Option<Vec<crate::index::clones::refine::RefineMember>>> {
+        if member_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        // Overlay scope: no scope-correct source read is available (see doc above). Bail to the
+        // un-refined fallback rather than re-parse the wrong (main-checkout) bytes.
+        if self.active_scope_is_linked_overlay() {
+            return Ok(None);
+        }
+
+        let Some(root) = self.storage.source_root() else {
+            return Ok(None);
+        };
+
+        let conn = self.storage.connection();
+        let rows = match load_refine_rows(conn, member_ids)? {
+            None => return Ok(None),
+            Some(rows) => rows,
+        };
+
+        // I3 (#215 Plan 4a adversary): cap the re-parse to the first LCS_MEMBER_SAMPLE members in
+        // canonical (struct_hash, symbol_id) order. `class_lcs_ratio` and `lcs_skeleton` only use
+        // the first LCS_MEMBER_SAMPLE members anyway (the member-count cap in align.rs), so
+        // parsing the tail is pure waste. Sorting here is O(n log n) over metadata rows — cheap
+        // compared to the file-I/O + tree-sitter parse that follows.
+        //
+        // NOTE for Plan 4b: anti-unification's per_member_values will need ALL members, not just
+        // the LCS sample — when 4b lands, load the full set (or lazily extend) for
+        // variation_points.
+        let mut rows = rows;
+        rows.sort_by(|a, b| {
+            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
+        });
+        rows.truncate(LCS_MEMBER_SAMPLE);
+
+        // I3 (#215 Plan 4a adversary): dedup file reads by path. A class whose members cluster in a
+        // few large files would otherwise re-read each file once per member; instead cache each
+        // distinct file's bytes and reuse the cached text for every member in that file.
+        let mut file_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        let mut members: Vec<crate::index::clones::refine::RefineMember> =
+            Vec::with_capacity(rows.len());
+        for row in rows {
+            if !file_cache.contains_key(&row.path) {
+                let Ok(content) = std::fs::read_to_string(root.join(&row.path)) else {
+                    // Source missing/unreadable on disk — can't reproduce the token sequence.
+                    return Ok(None);
+                };
+                file_cache.insert(row.path.clone(), content);
+            }
+            let text = file_cache.get(&row.path).expect("just inserted above");
+            let Some(parsed) =
+                crate::index::parser::parse_file(Path::new(&row.path), row.language, text)
+            else {
+                // Parse failure (or a no-grammar language like markdown) — no AST to descend.
+                return Ok(None);
+            };
+            let Some(node) = parsed.root().descendant_for_byte_range(row.start_byte, row.end_byte)
+            else {
+                // No node spans the persisted byte range — the file drifted off-index.
+                return Ok(None);
+            };
+            let seq = crate::index::clones::normalize::normalize_baseline(node, text);
+
+            // Faithfulness pin: the re-parse must reproduce Plan-1's normalization exactly. A
+            // mismatch means the on-disk file no longer matches the indexed fingerprint (the
+            // `files.sha256` staleness signal would also flag it) — refining a drifted member would
+            // align stale tokens, so bail to the un-refined fallback rather than panic in
+            // production.
+            let reparsed_hash = crate::index::clones::tokens::struct_hash(&seq);
+            if reparsed_hash != row.struct_hash {
+                // Silent degrade: a library read must not write to stderr. The drift is already
+                // surfaced to callers via `completeness.stale_members`; here we just fall back to
+                // the un-refined class rather than align stale tokens.
+                return Ok(None);
+            }
+
+            members.push(crate::index::clones::refine::RefineMember {
+                symbol_id: row.symbol_id,
+                lang: row.language,
+                path: row.path,
+                start_byte: row.start_byte,
+                end_byte: row.end_byte,
+                struct_hash: row.struct_hash,
+                seq,
+            });
+        }
+
+        // Canonical order: by struct_hash ascending, then symbol_id (the refine ordinal basis).
+        members.sort_by(|a, b| {
+            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
+        });
+
+        Ok(Some(members))
+    }
+}
+
+/// Hydrate the scoped path + byte range + language + persisted baseline `struct_hash` for each
+/// `member_ids` symbol, in chunks of [`HYDRATION_CHUNK`] (the same SQLite host-param discipline as
+/// `build_class`). Filters the baseline normalizer version so a stale fingerprint row never feeds
+/// the refine input. Returns `Ok(None)` if ANY requested member is absent (a fingerprint row
+/// vanished mid-read, or the symbol fell out of scope): a partial refine would be unfaithful.
+fn load_refine_rows(
+    conn: &Connection,
+    member_ids: &[i64],
+) -> anyhow::Result<Option<Vec<RefineRow>>> {
+    let mut rows: Vec<RefineRow> = Vec::with_capacity(member_ids.len());
+    for chunk in member_ids.chunks(HYDRATION_CHUNK) {
+        let id_placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+        let version_placeholder = format!("?{}", chunk.len() + 1);
+        let sql = format!(
+            "SELECT symbols.id, files.path, symbols.start_byte, symbols.end_byte, \
+             symbols.language, sf.struct_hash
+             FROM symbols
+             JOIN files ON files.id = symbols.file_id
+             JOIN symbol_fingerprints sf
+               ON sf.symbol_id = symbols.id
+               AND sf.normalizer_kind = 'baseline'
+               AND sf.normalizer_version = {version_placeholder}
+             WHERE symbols.id IN ({})
+             ORDER BY symbols.id",
+            id_placeholders.join(", ")
+        );
+        let params: Vec<i64> = chunk.iter().copied().chain(std::iter::once(NORM_VERSION)).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let chunk_rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let start_byte: i64 = row.get(2)?;
+            let end_byte: i64 = row.get(3)?;
+            let lang_str: String = row.get(4)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                start_byte,
+                end_byte,
+                lang_str,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        for row in chunk_rows {
+            let (symbol_id, path, start_byte, end_byte, lang_str, struct_hash) = row?;
+            // A negative byte offset can't occur (schema NOT NULL, written from usize), but guard
+            // the cast so a corrupt row degrades to the un-refined fallback rather than panicking.
+            let (Ok(start_byte), Ok(end_byte)) =
+                (usize::try_from(start_byte), usize::try_from(end_byte))
+            else {
+                return Ok(None);
+            };
+            // An unparseable language string means the row's language is no longer one this build
+            // understands — bail to the un-refined fallback.
+            let Ok(language) = lang_str.parse::<crate::language::Language>() else {
+                return Ok(None);
+            };
+            rows.push(RefineRow { symbol_id, path, start_byte, end_byte, language, struct_hash });
+        }
+    }
+
+    // EVERY requested member must hydrate. A missing one (vanished fingerprint row, out-of-scope
+    // symbol) makes the class incomplete — refine the whole class or none of it.
+    if rows.len() != member_ids.len() {
+        return Ok(None);
+    }
+    rows.sort_unstable_by_key(|r| r.symbol_id);
+    Ok(Some(rows))
 }
 
 /// Count DISTINCT member file paths in `classes` whose on-disk content no longer matches the
@@ -856,6 +1406,12 @@ pub(crate) fn build_class(
         roi,
         roi_factors,
         metrics_sampled,
+        // Refinement fields are None on an un-refined candidate class; the two-phase driver in
+        // `find_clones` / `clones_for_symbol` populates them (and flips `refined`/`class_kind`).
+        lcs_ratio: None,
+        confidence: None,
+        refactorability: None,
+        refine_mode: None,
     }))
 }
 
@@ -1200,7 +1756,7 @@ mod tests {
         crate::IndexDatabase::rebuild(&config).unwrap();
         let db = crate::IndexDatabase::open_config(&config).unwrap();
 
-        // NaN must be rejected.
+        // NaN must be rejected (non-finite, caught by !v.is_finite()).
         let err = db
             .find_clones(FindClonesOptions {
                 min_similarity: Some(f64::NAN),
@@ -1209,11 +1765,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("finite"),
-            "NaN should produce a 'finite' error message, got: {err}"
+            err.to_string().contains("[0.5, 1.0]"),
+            "NaN should produce a '[0.5, 1.0]' error message, got: {err}"
         );
 
-        // +infinity must be rejected.
+        // +infinity must be rejected (non-finite, caught by !v.is_finite()).
         let err = db
             .find_clones(FindClonesOptions {
                 min_similarity: Some(f64::INFINITY),
@@ -1222,11 +1778,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("finite"),
-            "INFINITY should produce a 'finite' error message, got: {err}"
+            err.to_string().contains("[0.5, 1.0]"),
+            "INFINITY should produce a '[0.5, 1.0]' error message, got: {err}"
         );
 
-        // -infinity must be rejected (also non-finite).
+        // -infinity must be rejected (non-finite, caught by !v.is_finite()).
         let err = db
             .find_clones(FindClonesOptions {
                 min_similarity: Some(f64::NEG_INFINITY),
@@ -1235,11 +1791,11 @@ mod tests {
             })
             .unwrap_err();
         assert!(
-            err.to_string().contains("finite"),
-            "NEG_INFINITY should produce an error, got: {err}"
+            err.to_string().contains("[0.5, 1.0]"),
+            "NEG_INFINITY should produce a '[0.5, 1.0]' error message, got: {err}"
         );
 
-        // 0.0 still rejected (in-range check, kept from before).
+        // 0.0 still rejected (below the 0.5 floor).
         assert!(
             db.find_clones(FindClonesOptions {
                 min_similarity: Some(0.0),
