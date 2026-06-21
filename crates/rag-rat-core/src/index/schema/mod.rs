@@ -5,7 +5,74 @@ pub(crate) use migrations::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 30;
+pub const LATEST_SCHEMA_VERSION: u32 = 31;
+
+/// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
+/// reindex.
+///
+/// INVARIANT (load-bearing, #248): oracle-derived outputs MUST survive reindex. They achieve this
+/// by being **content-keyed with NO reindex-cascading FK** to a reindex-volatile parent
+/// ([`REINDEX_VOLATILE_PARENTS`]); their reads JOIN the live parents by that content key, so a
+/// dangling row (whose parent was rewritten) simply never resolves rather than being CASCADE-wiped.
+/// This is the model `logical_symbol_monikers` shipped (#70) and `edge_oracle` was retrofitted to
+/// (#248) after its `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` silently
+/// wiped every verdict on the first reindex.
+///
+/// The ENFORCING structural trip-wire `no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`
+/// scans EVERY table in `sqlite_master` (not this list) and asserts none carries an `ON DELETE
+/// CASCADE`/`RESTRICT` FK to a volatile parent except the explicit [`CASCADE_FK_ALLOWLIST`] — the
+/// exact check that would have caught the original `edge_oracle` FK, and which catches a future
+/// oracle/durable table automatically even if it forgets to opt into any list. This const remains
+/// the canonical DECLARATION of which outputs must survive reindex — the same trip-wire asserts
+/// each listed table exists, and the lifecycle guard
+/// `oracle_outputs_survive_full_and_incremental_reindex` exercises their survival behaviorally
+/// across both reindex shapes.
+// Consumed only by the reindex trip-wires (#[cfg(test)]), so the non-test lib build sees no reader;
+// it is intentionally a durable schema-invariant declaration.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const ORACLE_PERSISTED_TABLES: &[&str] =
+    &["edge_oracle", "logical_symbol_monikers", "oracle_runs"];
+
+/// The parent tables a reindex REWRITES (full rebuild and/or per-file `remove_file_in_scope`), so
+/// an `ON DELETE CASCADE`/`RESTRICT` FK from an oracle-derived table to one of these wipes the
+/// oracle output on every reindex — the #248 bug class. The trip-wire forbids exactly such an FK.
+/// `files` is rowid-keyed and rewritten per file; `edges_data` / `symbols` / `logical_symbols` are
+/// all rebuilt (DELETE-all + reinsert) on a full reindex.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const REINDEX_VOLATILE_PARENTS: &[&str] =
+    &["edges_data", "symbols", "logical_symbols", "files"];
+
+/// The `(child_table, volatile_parent)` pairs that LEGITIMATELY carry an `ON DELETE
+/// CASCADE`/`RESTRICT` FK to a reindex-volatile parent ([`REINDEX_VOLATILE_PARENTS`]) — every one a
+/// table that is *rebuilt with its parent* on every reindex and holds NO oracle/durable state, so
+/// the cascade is the desired freshness behavior (the child must die with the parent row that
+/// produced it), not the #248 data-loss bug.
+///
+/// INVARIANT (#248): this is the EXPLICIT opt-out the enforcing trip-wire
+/// [`no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`] consults. The trip-wire scans EVERY
+/// table in `sqlite_master` (not a hand-maintained list), so a NEW table that adds a cascading FK
+/// to a volatile parent FAILS the test automatically unless it is added here WITH a reason. Never
+/// allowlist a table that holds oracle/durable state — that re-creates the #248 bug; re-anchor such
+/// a table on a content key + drop the FK instead.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const CASCADE_FK_ALLOWLIST: &[(&str, &str)] = &[
+    // `chunks` are per-file text/embedding inputs, re-chunked from scratch when a file is
+    // reindexed.
+    ("chunks", "files"),
+    // `edges_data` is the heuristic graph itself, rebuilt per-file (it IS a volatile parent).
+    ("edges_data", "files"),
+    // `symbols` are rebuilt per-file (AUTOINCREMENT rowids re-mint on reindex).
+    ("symbols", "files"),
+    // Logical-symbol grouping is rebuilt wholesale from the live symbols on every pass.
+    ("logical_symbol_members", "symbols"),
+    ("logical_symbol_members", "logical_symbols"),
+    // Per-symbol derived facts, rebuilt with the symbols they describe.
+    ("symbol_facts", "symbols"),
+    // Clone-detection fingerprints + their inverted-index postings, rebuilt with the symbols.
+    ("symbol_fingerprints", "symbols"),
+    ("symbol_token_postings", "symbols"),
+];
+
 const DIRTY_MIGRATION_ID: &str = "__dirty__";
 const MIGRATION_001_ID: &str = "001_sqlite_storage_baseline";
 const MIGRATION_001_CHECKSUM: &str = "sha256:rag-rat-sqlite-baseline-v1";
@@ -131,6 +198,10 @@ const MIGRATION_030_ID: &str = "030_clone_refinements_lcs_sampled";
 const MIGRATION_030_CHECKSUM: &str = "sha256:rag-rat-clone-refinements-lcs-sampled-v30";
 const MIGRATION_030_DESCRIPTION: &str =
     "Add clone_refinements.lcs_sampled (additive; heals indexes already at V029)";
+const MIGRATION_031_ID: &str = "031_edge_oracle_content_anchor";
+const MIGRATION_031_CHECKSUM: &str = "sha256:rag-rat-edge-oracle-content-anchor-v31";
+const MIGRATION_031_DESCRIPTION: &str = "Rebuild edge_oracle content-anchored (drop edges_data FK \
+                                         + edge_id PK) so verdicts survive reindex (#248)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -410,6 +481,12 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         checksum: MIGRATION_030_CHECKSUM,
         description: MIGRATION_030_DESCRIPTION,
         apply: apply_clone_refinements_lcs_sampled,
+    },
+    Migration {
+        id: MIGRATION_031_ID,
+        checksum: MIGRATION_031_CHECKSUM,
+        description: MIGRATION_031_DESCRIPTION,
+        apply: apply_edge_oracle_content_anchor,
     },
 ];
 

@@ -10497,13 +10497,12 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled'", [
-            ])
+            .execute("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor'", [])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the V030 ledger row makes the schema Older"
+            "removing the newest (V031) ledger row makes the schema Older"
         );
     }
 
@@ -10528,7 +10527,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 30);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 31);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10604,6 +10603,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
+        DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
         ",
     )
     .unwrap();
@@ -10742,18 +10742,20 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         ",
     )
     .unwrap();
-    // 3. Drop the V028, V029, and V030 ledger rows so the schema reads Older and the migration
-    //    replays.
+    // 3. Drop the V028..V031 ledger rows so the schema reads Older and the migration replays. Every
+    //    later row must go — `known_version` reads the MAX applied version, so leaving any (e.g.
+    //    V031) would keep the schema Compatible and skip the forward migrate.
     conn.execute_batch(
         "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
          DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
-         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
+         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
+         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';",
     )
     .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028+V029+V030 ledger rows makes the pre-V028 shape Older"
+        "removing the V028..V031 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12299,11 +12301,14 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         !cols_before.contains(&"lcs_sampled".to_string()),
         "lcs_sampled must be absent before the migration runs"
     );
-    // Remove the V030 ledger row so the schema reads Older and migrate_forward replays it.
+    // Remove the V030 ledger row (and every later one) so the schema reads Older and
+    // migrate_forward replays V030. Later migrations (V031+) must also be unrecorded or
+    // `known_version` would still report LATEST and the schema would read Compatible.
     conn.execute_batch(
-        "DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';",
+        "DELETE FROM schema_version
+         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor');",
     )
-    .expect("delete V030 ledger row");
+    .expect("delete V030+ ledger rows");
     assert_eq!(
         crate::index::schema::status(&conn).unwrap().state,
         crate::index::schema::SchemaState::Older,
@@ -12334,8 +12339,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        30,
-        "LATEST_SCHEMA_VERSION is 30 after V030"
+        31,
+        "LATEST_SCHEMA_VERSION is 31 after V031"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
@@ -12343,6 +12348,234 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
         crate::index::schema::status(&conn).unwrap().state,
         crate::index::schema::SchemaState::Compatible,
         "schema is still Compatible after second migrate_forward"
+    );
+}
+
+/// V031 (#248): a DB migrated to LATEST has `edge_oracle` content-anchored — NO `edges_data` FK,
+/// the content-key columns present, and a `DELETE FROM edges_data` does NOT cascade-wipe a manually
+/// inserted `edge_oracle` row (the bug: V018's `ON DELETE CASCADE` wiped every verdict on reindex).
+/// Drives the migration path explicitly: build the OLD (V018) FK shape, record the ledger one short
+/// of V031, then `migrate_forward` and assert the rebuilt shape.
+#[test]
+fn migration_031_edge_oracle_no_fk_content_key() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    crate::index::schema::apply(&conn).expect("apply reaches V31");
+
+    // Simulate a V030-era index whose `edge_oracle` still has the OLD edge_id-keyed FK shape: drop
+    // the content-anchored table and recreate the V018 shape, then remove the V031 ledger row so
+    // migrate_forward replays the rebuild.
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE edge_oracle;
+        CREATE TABLE edge_oracle(
+            edge_id INTEGER NOT NULL,
+            file_sha TEXT NOT NULL,
+            tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL,
+            resolved_symbol_id INTEGER,
+            scip_symbol TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            computed_at INTEGER NOT NULL,
+            PRIMARY KEY(edge_id, tool, tool_version),
+            FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE
+        ) STRICT;
+        PRAGMA foreign_keys = ON;
+        ",
+    )
+    .expect("recreate legacy V018 edge_oracle");
+    conn.execute_batch("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';")
+        .expect("drop V031 ledger row");
+    assert_eq!(
+        schema::status(&conn).unwrap().state,
+        schema::SchemaState::Older,
+        "schema is Older after dropping the V031 ledger row + reverting the table shape"
+    );
+    // Confirm the legacy FK is really there before migrating.
+    let fk_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('edge_oracle')", [], |r| r.get(0))
+        .unwrap();
+    assert!(fk_before > 0, "legacy edge_oracle has an edges_data FK before V031");
+
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward replays V031");
+    assert_eq!(
+        schema::status(&conn).unwrap().current_version,
+        schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST after V031"
+    );
+
+    // (1) No FK on edge_oracle.
+    let fk_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_list('edge_oracle')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fk_after, 0, "V031 edge_oracle has NO foreign key");
+
+    // (2) The content-key columns exist.
+    let cols = conn_table_columns(&conn, "edge_oracle");
+    for expected in [
+        "source_path",
+        "source_start_byte",
+        "source_end_byte",
+        "callee_start_byte",
+        "callee_end_byte",
+        "edge_kind",
+    ] {
+        assert!(cols.contains(&expected.to_string()), "edge_oracle missing {expected}");
+    }
+    assert!(!cols.contains(&"edge_id".to_string()), "edge_id column is gone");
+
+    // (3) A DELETE FROM edges_data does NOT delete a manually-inserted edge_oracle row (no
+    // cascade). Seed a file + an edge so edges_data is non-empty, then insert a verdict whose
+    // content key is independent of any edge id.
+    conn.execute(
+        "INSERT INTO files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+         commit_sha, worktree_id) VALUES ('a.rs', 'rust', 'source', 'sha-a', 0, 0, 'c', '')",
+        [],
+    )
+    .unwrap();
+    let file_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO name_strings(value) VALUES ('target'), ('calls_name'), ('unresolved'), \
+         ('NameOnly') ON CONFLICT DO NOTHING",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edges_data(source_file_id, to_name_id, callee_start_byte, callee_end_byte, \
+         resolution_id, edge_kind_id, confidence_id) VALUES (?1, (SELECT id FROM name_strings \
+         WHERE value='target'), 14, 20, (SELECT id FROM name_strings WHERE value='unresolved'), \
+         (SELECT id FROM name_strings WHERE value='calls_name'), (SELECT id FROM name_strings \
+         WHERE value='NameOnly'))",
+        params![file_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO edge_oracle(source_path, source_start_byte, source_end_byte, \
+         callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version, \
+         resolved_symbol_id, scip_symbol, kind, computed_at) VALUES ('a.rs', 0, 0, 14, 20, \
+         'calls_name', 'sha-a', 'rust-analyzer', 'v', NULL, 's', 'upgrade', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM edges_data", []).unwrap();
+    let remaining: i64 =
+        conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(remaining, 1, "edge_oracle survives a full edges_data delete (no cascade)");
+}
+
+/// Every `ON DELETE CASCADE`/`RESTRICT` FK to a reindex-volatile parent, as
+/// `(child_table, parent_table, on_delete)`, scanned from a FULLY-MIGRATED DB. Enumerates EVERY
+/// table in `sqlite_master` (not a hand-maintained list) so a new offender is caught automatically.
+fn cascading_fks_to_volatile_parents(conn: &rusqlite::Connection) -> Vec<(String, String, String)> {
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    };
+    let mut found = Vec::new();
+    for table in tables {
+        // `pragma_foreign_key_list` columns: `id`, `seq`, `table` (parent), `from`, `to`,
+        // `on_update`, `on_delete`, `match`.
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT \"table\", on_delete FROM pragma_foreign_key_list('{table}')"
+            ))
+            .unwrap();
+        let fks: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (parent, on_delete) in fks {
+            let is_volatile_parent =
+                crate::index::schema::REINDEX_VOLATILE_PARENTS.contains(&parent.as_str());
+            let is_cascading = matches!(on_delete.to_uppercase().as_str(), "CASCADE" | "RESTRICT");
+            if is_volatile_parent && is_cascading {
+                found.push((table.clone(), parent, on_delete));
+            }
+        }
+    }
+    found
+}
+
+/// ENFORCING STRUCTURAL TRIP-WIRE (#248): the "can't happen again" guard for the whole bug CLASS,
+/// rewritten to ENUMERATE EVERY table in a fully-migrated DB (via
+/// [`cascading_fks_to_volatile_parents`]) rather than iterate a hand-maintained list. It asserts NO
+/// table carries an `ON DELETE CASCADE`/`RESTRICT` FK to a reindex-VOLATILE parent
+/// (`schema::REINDEX_VOLATILE_PARENTS`: `edges_data`, `symbols`, `logical_symbols`, the rowid-keyed
+/// `files`) EXCEPT the explicit `schema::CASCADE_FK_ALLOWLIST` of `(child, parent)` pairs that are
+/// rebuilt-with-their-parent and hold no oracle/durable state.
+///
+/// This is the exact check that would have FAILED on the original `edge_oracle`
+/// `FOREIGN KEY(edge_id) REFERENCES edges_data(id) ON DELETE CASCADE` — the FK that silently wiped
+/// every verdict on the first reindex. Crucially, because it scans `sqlite_master` (not
+/// `ORACLE_PERSISTED_TABLES`), a FUTURE oracle/durable table that forgets to opt into any list
+/// still FAILS automatically: the author must EITHER content-anchor it (no cascading FK) OR
+/// consciously add it to the allowlist with a reason — and the allowlist is explicitly NOT for
+/// durable state.
+///
+/// If this fails on a NEW table that genuinely holds oracle/durable output, that is ANOTHER
+/// instance of the #248 bug to FIX (re-anchor on a content key + drop the FK), not to allowlist.
+#[test]
+fn no_table_has_a_reindex_cascading_fk_to_a_volatile_parent() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply reaches LATEST");
+
+    // Every declared oracle-derived table exists and is implicitly covered by the scan below (a
+    // typo in the const would otherwise drift from reality unnoticed). The const stays the
+    // canonical declaration of which outputs MUST survive reindex; the scan is what ENFORCES
+    // the FK shape.
+    for &table in crate::index::schema::ORACLE_PERSISTED_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "ORACLE_PERSISTED_TABLES lists `{table}` but it does not exist");
+    }
+
+    let disallowed: Vec<(String, String, String)> = cascading_fks_to_volatile_parents(&conn)
+        .into_iter()
+        .filter(|(table, parent, _)| {
+            !crate::index::schema::CASCADE_FK_ALLOWLIST.contains(&(table.as_str(), parent.as_str()))
+        })
+        .collect();
+
+    assert!(
+        disallowed.is_empty(),
+        "table(s) carry a reindex-cascading FK to a volatile parent (the #248 bug class): \
+         {disallowed:?}\noracle/durable outputs MUST survive reindex — content-key + no \
+         reindex-cascading FK; reads join the live parent so dangling rows never resolve. If a \
+         flagged table is genuinely ephemeral-with-its-parent (rebuilt with it, no durable \
+         state), add (table, parent) to schema::CASCADE_FK_ALLOWLIST with a reason. Never \
+         allowlist a table that holds oracle/durable state.",
+    );
+
+    // NEGATIVE SUB-ASSERTION (the trip-wire has teeth): a synthetic table WITH a cascading FK to a
+    // volatile parent (`edges_data`) IS flagged by the scan — proving a future offender would not
+    // slip through. Built on its own connection so the production scan above stays clean.
+    let probe = rusqlite::Connection::open_in_memory().expect("open probe");
+    crate::index::schema::apply(&probe).expect("apply reaches LATEST");
+    probe
+        .execute_batch(
+            "CREATE TABLE __trip_wire_probe__(
+                 id INTEGER PRIMARY KEY,
+                 x INTEGER,
+                 FOREIGN KEY(x) REFERENCES edges_data(id) ON DELETE CASCADE
+             );",
+        )
+        .unwrap();
+    let probe_hits = cascading_fks_to_volatile_parents(&probe);
+    assert!(
+        probe_hits.iter().any(|(t, p, od)| t == "__trip_wire_probe__"
+            && p == "edges_data"
+            && od.eq_ignore_ascii_case("CASCADE")),
+        "the scan must flag a synthetic CASCADE FK to edges_data — otherwise the trip-wire is \
+         toothless; got {probe_hits:?}",
     );
 }
 

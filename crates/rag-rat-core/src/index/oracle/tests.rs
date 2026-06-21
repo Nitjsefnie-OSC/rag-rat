@@ -51,6 +51,17 @@ const VERSION: &str = "test";
 const COMMIT: &str = "deadbeefcafef00d";
 const WORKTREE: &str = "";
 
+/// The content-key fields of a live edge, owned so an [`EdgeOracleRow`] borrowing them outlives the
+/// borrow (#248: verdicts are content-keyed, not rowid-keyed).
+struct EdgeContentKey {
+    source_path: String,
+    source_start_byte: i64,
+    source_end_byte: i64,
+    callee_start_byte: i64,
+    callee_end_byte: i64,
+    edge_kind: String,
+}
+
 /// A test corpus written to a temp checkout + an index DB seeded to match.
 struct Harness {
     conn: Connection,
@@ -283,11 +294,23 @@ impl Harness {
         self.conn.last_insert_rowid()
     }
 
-    /// The persisted oracle verdict for an edge, if any.
+    /// The persisted oracle verdict for an edge, if any. Looks the row up by the edge's CONTENT key
+    /// (#248: `edge_oracle` no longer carries `edge_id`) — joining the live edge by path + source +
+    /// callee spans + edge_kind, the same key the production read join uses. NOTE: unlike the
+    /// surfacing reads, this does NOT gate on `files.sha256 = file_sha`, so a test that wrote a
+    /// non-matching `file_sha` still sees its row (the persisted-population view).
     fn verdict(&self, edge_id: i64) -> Option<(String, Option<i64>, String)> {
         self.conn
             .query_row(
-                "SELECT kind, resolved_symbol_id, scip_symbol FROM edge_oracle WHERE edge_id = ?1",
+                "SELECT eo.kind, eo.resolved_symbol_id, eo.scip_symbol
+                 FROM edge_oracle eo
+                 JOIN edges ON edges.source_start_byte = eo.source_start_byte
+                           AND edges.source_end_byte = eo.source_end_byte
+                           AND edges.callee_start_byte = eo.callee_start_byte
+                           AND edges.callee_end_byte = eo.callee_end_byte
+                           AND edges.edge_kind = eo.edge_kind
+                 JOIN files ON files.id = edges.source_file_id AND files.path = eo.source_path
+                 WHERE edges.id = ?1",
                 params![edge_id],
                 |row| {
                     Ok((
@@ -298,6 +321,78 @@ impl Harness {
                 },
             )
             .ok()
+    }
+
+    /// The recorded `files.sha256` for a path in the active checkout — the "current content" sha a
+    /// verdict must carry to be counted/surfaced (the scope join + current predicate gate on it).
+    fn file_sha(&self, path: &str) -> String {
+        self.conn
+            .query_row("SELECT sha256 FROM files WHERE path = ?1", params![path], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The recorded `files.sha256` for a path in a specific commit scope — for verdicts written
+    /// against a sibling checkout's file (disambiguates the same path across two commits).
+    fn file_sha_for_commit(&self, path: &str, commit: &str) -> String {
+        self.conn
+            .query_row(
+                "SELECT sha256 FROM files WHERE path = ?1 AND commit_sha = ?2",
+                params![path, commit],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The content-key fields of a live edge (`source_path`, source/callee byte spans,
+    /// `edge_kind`), for building an [`EdgeOracleRow`] in tests that reference an edge by id.
+    /// Mirrors what the production write path reads from each [`store::EdgeJoinCandidate`].
+    fn edge_content_key(&self, edge_id: i64) -> EdgeContentKey {
+        self.conn
+            .query_row(
+                "SELECT files.path, edges.source_start_byte, edges.source_end_byte,
+                        edges.callee_start_byte, edges.callee_end_byte, edges.edge_kind
+                 FROM edges JOIN files ON files.id = edges.source_file_id
+                 WHERE edges.id = ?1",
+                params![edge_id],
+                |row| {
+                    Ok(EdgeContentKey {
+                        source_path: row.get(0)?,
+                        source_start_byte: row.get(1)?,
+                        source_end_byte: row.get(2)?,
+                        callee_start_byte: row.get(3)?,
+                        callee_end_byte: row.get(4)?,
+                        edge_kind: row.get(5)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    /// Write an `edge_oracle` verdict for a live edge, deriving the content key from the edge so
+    /// the row matches the production read join by construction. The `EdgeContentKey` outlives
+    /// the row.
+    fn write_verdict(
+        &self,
+        edge_id: i64,
+        file_sha: &str,
+        resolved_symbol_id: Option<i64>,
+        scip_symbol: &str,
+        kind: OracleResolutionKind,
+    ) {
+        let key = self.edge_content_key(edge_id);
+        store::write_edge_oracle(&self.conn, TOOL, VERSION, &EdgeOracleRow {
+            source_path: &key.source_path,
+            source_start_byte: key.source_start_byte,
+            source_end_byte: key.source_end_byte,
+            callee_start_byte: key.callee_start_byte,
+            callee_end_byte: key.callee_end_byte,
+            edge_kind: &key.edge_kind,
+            file_sha,
+            resolved_symbol_id,
+            scip_symbol,
+            kind,
+        })
+        .unwrap();
     }
 
     /// The heuristic resolution on the `edges` row (must never change).
@@ -747,15 +842,26 @@ fn migration_creates_oracle_side_tables() {
         assert_eq!(count, 1, "{table} table must exist");
     }
 
-    // STRICT mode (repo convention for new tables).
+    // STRICT mode (repo convention for new tables); NO FK to edges_data (#248 — the V018 cascade
+    // wiped verdicts on reindex).
     let edge_oracle_sql: String = conn
         .query_row("SELECT sql FROM sqlite_master WHERE name = 'edge_oracle'", [], |row| row.get(0))
         .unwrap();
     assert!(edge_oracle_sql.contains("STRICT"), "edge_oracle must be STRICT");
+    assert!(
+        !edge_oracle_sql.to_uppercase().contains("FOREIGN KEY"),
+        "edge_oracle must NOT carry an FK to edges_data — a reindex CASCADE would wipe verdicts"
+    );
 
+    // Content-key columns (#248) replace the volatile `edge_id`.
     let columns = table_columns(&conn, "edge_oracle");
     for expected in [
-        "edge_id",
+        "source_path",
+        "source_start_byte",
+        "source_end_byte",
+        "callee_start_byte",
+        "callee_end_byte",
+        "edge_kind",
         "file_sha",
         "tool",
         "tool_version",
@@ -766,8 +872,9 @@ fn migration_creates_oracle_side_tables() {
     ] {
         assert!(columns.contains(&expected.to_string()), "edge_oracle missing {expected}");
     }
+    assert!(!columns.contains(&"edge_id".to_string()), "edge_id column was dropped");
 
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 30);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 31);
 }
 
 /// The V019 moniker migration: the `logical_symbol_monikers` table (STRICT, NO foreign key — see
@@ -819,31 +926,41 @@ fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
         .unwrap()
 }
 
-/// Deleting an `edges` row cascades to its `edge_oracle` verdict (FK `ON DELETE CASCADE`, V018), so
-/// no orphan verdict survives for `status`/eval to keep counting. The rebuild +
-/// `remove_file_in_scope` edge deletes reinsert edges with new ids and recompute the oracle, so
-/// cascading old verdicts away is correct.
+/// #248: deleting an `edges` row no longer cascades to its `edge_oracle` verdict (the FK is gone —
+/// it CASCADE-wiped every verdict on reindex). Instead the verdict stops RESOLVING: the content
+/// join finds no live edge, so the surfacing/metric reads return nothing — the moniker model
+/// (dangling never resolves). The physical row persists until the next run's clear or gc sweeps it.
 #[test]
-fn deleting_an_edge_cascades_away_its_oracle_verdict() {
+fn deleting_an_edge_leaves_a_dangling_verdict_that_does_not_resolve() {
     let h = Harness::new();
     let f = h.add_file("a.rs", "fn caller() { target(); }\n");
     let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind: OracleResolutionKind::Upgrade,
-    })
-    .unwrap();
-    assert!(h.verdict(edge).is_some(), "verdict present before delete");
+    let file_sha: String = h
+        .conn
+        .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
+        .unwrap();
+    h.write_verdict(edge, &file_sha, None, "s", OracleResolutionKind::Upgrade);
+    assert!(h.verdict(edge).is_some(), "verdict resolves before delete");
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "the live verdict is counted before delete"
+    );
 
     h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge]).unwrap();
 
-    assert!(h.verdict(edge).is_none(), "verdict cascaded away with its edge");
+    assert!(h.verdict(edge).is_none(), "no live edge → the verdict no longer resolves");
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        0,
+        "the dangling verdict is excluded from the scoped count (live-edge join)"
+    );
     let remaining: i64 =
         h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
-    assert_eq!(remaining, 0, "no orphan edge_oracle rows survive the edge delete");
+    assert_eq!(
+        remaining, 1,
+        "no FK cascade: the physical row survives the edge delete (swept later)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -908,9 +1025,11 @@ fn symbol_spans_for_path_returns_scoped_ordered_spans() {
     );
 }
 
-/// Writing an `edge_oracle` row and reading it back round-trips every field; re-writing the same
-/// `(edge_id, tool, tool_version)` upserts (new file_sha/kind) rather than inserting a duplicate.
-/// The matching `edges` row is never touched (side-table invariant).
+/// #248: writing an `edge_oracle` row keyed by the edge's CONTENT key round-trips every field;
+/// re-writing the SAME content key upserts (new file_sha/kind) rather than inserting a duplicate.
+/// The row resolves through the live-edge content join, and the matching `edges` row is never
+/// touched (side-table invariant). The write uses the real `files.sha256` so the count path (which
+/// now gates on current content via the scope join) tallies it.
 #[test]
 fn write_edge_oracle_round_trips_and_upserts_without_touching_edges() {
     let h = Harness::new();
@@ -918,48 +1037,58 @@ fn write_edge_oracle_round_trips_and_upserts_without_touching_edges() {
     let defs = h.add_file("defs.rs", "fn target() {}\n");
     let target_sym = h.add_symbol(defs, "target", 3, 9);
     let edge = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+    let caller_sha: String = h
+        .conn
+        .query_row("SELECT sha256 FROM files WHERE path = 'caller.rs'", [], |r| r.get(0))
+        .unwrap();
 
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "sha-v1",
-        resolved_symbol_id: Some(7),
-        scip_symbol: "scip `target`().",
-        kind: OracleResolutionKind::Upgrade,
-    })
-    .unwrap();
+    h.write_verdict(
+        edge,
+        &caller_sha,
+        Some(target_sym),
+        "scip `target`().",
+        OracleResolutionKind::Upgrade,
+    );
 
     let (kind, resolved, scip) = h.verdict(edge).expect("row written");
     assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
-    assert_eq!(resolved, Some(7));
+    assert_eq!(resolved, Some(target_sym));
     assert_eq!(scip, "scip `target`().");
     assert_eq!(
         store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
         1
     );
 
-    // Re-write the same key with a new sha + verdict → upsert, still one row.
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "sha-v2",
-        resolved_symbol_id: None,
-        scip_symbol: "scip cargo tokio `target`().",
-        kind: OracleResolutionKind::ResolvedExternal,
-    })
-    .unwrap();
+    // Re-write the SAME content key (same edge) with a new sha + verdict → upsert, still one row.
+    // Use the same `caller_sha` so the count path keeps it (a different sha would read as stale).
+    h.write_verdict(
+        edge,
+        &caller_sha,
+        None,
+        "scip cargo tokio `target`().",
+        OracleResolutionKind::ResolvedExternal,
+    );
     assert_eq!(
         store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
-        1
+        1,
+        "upsert overwrote the row by content key — no duplicate"
     );
     let (kind2, resolved2, _) = h.verdict(edge).expect("row still present");
     assert_eq!(kind2, OracleResolutionKind::ResolvedExternal.as_db_str());
     assert_eq!(resolved2, None);
+    let physical_rows: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(physical_rows, 1, "the upsert kept a single physical row");
     let file_sha: String = h
         .conn
-        .query_row("SELECT file_sha FROM edge_oracle WHERE edge_id = ?1", params![edge], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT file_sha FROM edge_oracle WHERE source_path = 'caller.rs' AND \
+             callee_start_byte = 14 AND callee_end_byte = 20 AND edge_kind = 'calls_name'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert_eq!(file_sha, "sha-v2", "upsert refreshed the staleness sha");
+    assert_eq!(file_sha, caller_sha, "upsert refreshed the staleness sha");
 
     // The heuristic edges row is untouched by either write.
     assert_eq!(h.heuristic_resolution(edge), ("exact".to_string(), Some(target_sym)));
@@ -975,15 +1104,8 @@ fn staleness_key_distinguishes_rows_by_file_sha_tool_and_version() {
     let e1 = h.add_edge(f, "x", 1, 2, "NameOnly", None);
     let e2 = h.add_edge(f, "y", 3, 4, "NameOnly", None);
 
-    let row = |edge: i64, sha: &'static str| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: sha,
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind: OracleResolutionKind::Upgrade,
-    };
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &row(e1, "sha-fresh")).unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &row(e2, "sha-old")).unwrap();
+    h.write_verdict(e1, "sha-fresh", None, "s", OracleResolutionKind::Upgrade);
+    h.write_verdict(e2, "sha-old", None, "s", OracleResolutionKind::Upgrade);
 
     let count_for_sha = |sha: &str| -> i64 {
         h.conn
@@ -1048,19 +1170,11 @@ fn record_oracle_run_and_count_by_kind() {
     assert!(id2 > id1, "row id increments");
 
     let f = h.add_file("a.rs", "x\n");
+    let sha = h.file_sha("a.rs");
     let e_up = h.add_edge(f, "u", 0, 1, "NameOnly", None);
     let e_conf = h.add_edge(f, "c", 1, 2, "Exact", None);
-    let mk = |edge, kind| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind,
-    };
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e_up, OracleResolutionKind::Upgrade))
-        .unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e_conf, OracleResolutionKind::Confirm))
-        .unwrap();
+    h.write_verdict(e_up, &sha, None, "s", OracleResolutionKind::Upgrade);
+    h.write_verdict(e_conf, &sha, None, "s", OracleResolutionKind::Confirm);
 
     assert_eq!(
         store::count_edge_oracle_scoped(
@@ -1109,19 +1223,11 @@ fn oracle_status_reports_counts_and_last_run() {
     store::record_oracle_run(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, "Blocked", "{}").unwrap();
 
     let f = h.add_file("a.rs", "x\n");
+    let sha = h.file_sha("a.rs");
     let e1 = h.add_edge(f, "a", 0, 1, "NameOnly", None);
     let e2 = h.add_edge(f, "b", 1, 2, "Exact", None);
-    let mk = |edge, kind| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind,
-    };
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e1, OracleResolutionKind::Upgrade))
-        .unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e2, OracleResolutionKind::Contradict))
-        .unwrap();
+    h.write_verdict(e1, &sha, None, "s", OracleResolutionKind::Upgrade);
+    h.write_verdict(e2, &sha, None, "s", OracleResolutionKind::Contradict);
 
     let status = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
     assert_eq!(status.tool, "rust-analyzer");
@@ -1350,6 +1456,7 @@ fn recall_gap_counts_only_call_like_occurrences() {
 fn eval_metrics_derive_rates_from_persisted_verdicts() {
     let h = Harness::new();
     let f = h.add_file("a.rs", "fn caller() {}\n");
+    let sha = h.file_sha("a.rs");
     // Exact edges judged: one confirmed, one contradicted. (to_symbol_id NULL keeps the FK happy;
     // precision is derived from the persisted edge_oracle rows, not the edges row.)
     let e_conf = h.add_edge(f, "c", 0, 1, "Exact", None);
@@ -1357,34 +1464,9 @@ fn eval_metrics_derive_rates_from_persisted_verdicts() {
     // A NameOnly edge the oracle upgraded.
     let e_up = h.add_edge(f, "u", 2, 3, "NameOnly", None);
 
-    let mk = |edge, kind, resolved| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: resolved,
-        scip_symbol: "s",
-        kind,
-    };
-    store::write_edge_oracle(
-        &h.conn,
-        TOOL,
-        VERSION,
-        &mk(e_conf, OracleResolutionKind::Confirm, Some(1)),
-    )
-    .unwrap();
-    store::write_edge_oracle(
-        &h.conn,
-        TOOL,
-        VERSION,
-        &mk(e_contra, OracleResolutionKind::Contradict, Some(3)),
-    )
-    .unwrap();
-    store::write_edge_oracle(
-        &h.conn,
-        TOOL,
-        VERSION,
-        &mk(e_up, OracleResolutionKind::Upgrade, Some(4)),
-    )
-    .unwrap();
+    h.write_verdict(e_conf, &sha, Some(1), "s", OracleResolutionKind::Confirm);
+    h.write_verdict(e_contra, &sha, Some(3), "s", OracleResolutionKind::Contradict);
+    h.write_verdict(e_up, &sha, Some(4), "s", OracleResolutionKind::Upgrade);
 
     // Recall sides come from the run, occurrence-counted over the call population: 3 covered call
     // occurrences + 1 oracle-only gap. (Recall no longer derives from the per-kind verdict sum.)
@@ -1418,27 +1500,14 @@ fn eval_metrics_derive_rates_from_persisted_verdicts() {
 fn oracle_upgradeable_fraction_is_bounded_by_one() {
     let h = Harness::new();
     let f = h.add_file("a.rs", "fn caller() {}\n");
+    let sha = h.file_sha("a.rs");
     // The only low-confidence candidate (denominator = 1): a NameOnly edge the oracle upgraded.
     let e_low = h.add_edge(f, "u", 0, 1, "NameOnly", None);
     // An already-Exact edge the oracle placed to an EXTERNAL dep — NOT in the low-conf denominator.
     let e_exact = h.add_edge(f, "x", 1, 2, "Exact", None);
 
-    let mk = |edge, kind| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind,
-    };
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e_low, OracleResolutionKind::Upgrade))
-        .unwrap();
-    store::write_edge_oracle(
-        &h.conn,
-        TOOL,
-        VERSION,
-        &mk(e_exact, OracleResolutionKind::ResolvedExternal),
-    )
-    .unwrap();
+    h.write_verdict(e_low, &sha, None, "s", OracleResolutionKind::Upgrade);
+    h.write_verdict(e_exact, &sha, None, "s", OracleResolutionKind::ResolvedExternal);
 
     let m = super::oracle_eval_metrics(
         &h.conn,
@@ -1817,28 +1886,28 @@ fn parse_utf16_astral_character_shifts_offset_by_surrogate_width() {
 const OTHER_COMMIT: &str = "5ad1f1ce5ad1f1ce";
 const OTHER_WORKTREE: &str = "";
 
-/// Finding 1: `clear_edge_oracle_for_tool` must delete ONLY the active checkout's verdicts. With
-/// two worktrees' verdicts for the same `(tool, tool_version)` in one DB, clearing one leaves the
-/// other's intact (the clear is scoped via `edge_oracle -> edges -> files`).
+/// Finding 1 + #248: `clear_edge_oracle_for_tool` must delete ONLY the active checkout's verdicts.
+/// With two worktrees' verdicts for the same `(tool, tool_version)` in one DB, clearing one leaves
+/// the other's intact — the clear is scoped via a CONTENT join to the live edges in the active
+/// checkout (path + source/callee spans + edge_kind), not the old `edge_id` rowid subquery. The two
+/// checkouts use DISTINCT callee ranges so their content keys differ (a content-key COLLISION
+/// across checkouts is the intentional "same resolution → shared verdict" case, which would defeat
+/// the per-checkout isolation this test asserts).
 #[test]
-fn clear_edge_oracle_is_scoped_to_active_checkout() {
+fn clear_edge_oracle_for_tool_scopes_by_checkout_content() {
     let h = Harness::new();
-    // Active-checkout edge (commit_sha="" / worktree_id="") + a verdict.
-    let active_file = h.add_file("a.rs", "fn caller() { target(); }\n");
+    // Active-checkout edge + a verdict (real file sha so the scoped count tallies it).
+    let active_file = h.add_file("a.rs", "fn caller() { target(); other(); }\n");
+    let active_sha = h.file_sha("a.rs");
     let active_edge = h.add_edge(active_file, "target", 14, 20, "NameOnly", None);
-    // Another worktree's edge (same DB) + a verdict for the SAME tool/version.
+    // Another worktree's edge (same DB, same path, DIFFERENT callee range → distinct content key) +
+    // a verdict for the SAME tool/version.
     let other_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
-    let other_edge = h.add_edge(other_file, "target", 14, 20, "NameOnly", None);
+    let other_sha = h.file_sha_for_commit("a.rs", OTHER_COMMIT);
+    let other_edge = h.add_edge(other_file, "other", 22, 27, "NameOnly", None);
 
-    let mk = |edge| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind: OracleResolutionKind::Upgrade,
-    };
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(active_edge)).unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(other_edge)).unwrap();
+    h.write_verdict(active_edge, &active_sha, None, "s", OracleResolutionKind::Upgrade);
+    h.write_verdict(other_edge, &other_sha, None, "s", OracleResolutionKind::Upgrade);
     // Whole-table count (both worktrees) — the production count helper is intentionally scoped to
     // ONE checkout, so this test reads the raw total directly to prove the cross-checkout state.
     let total_rows = || -> i64 {
@@ -1864,6 +1933,323 @@ fn clear_edge_oracle_is_scoped_to_active_checkout() {
     );
 }
 
+/// #248 THE killer test: an `edge_oracle` verdict SURVIVES reindex for an UNCHANGED file. A reindex
+/// rewrites `edges_data` (DELETE + reinsert with NEW rowids); before the content-key fix the
+/// `ON DELETE CASCADE` FK wiped every verdict and the opt-in oracle never repopulated. Now the
+/// verdict is content-keyed with no FK, so the reindexed edge (same path + spans + edge_kind, same
+/// `files.sha256`) RE-ANCHORS the verdict by content — `count_edge_oracle_scoped` /
+/// `current_oracle_comparisons` still return it, re-projected onto the NEW edge id.
+#[test]
+fn edge_oracle_survives_reindex_for_unchanged_file() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let sha = h.file_sha("a.rs");
+    let target = h.add_symbol(f, "target", 3, 9);
+    // An Exact edge the heuristic resolved to `target`; the oracle CONTRADICTS it (so it shows up
+    // in `current_oracle_comparisons`, which keeps Contradict rows).
+    let edge_v1 = h.add_edge(f, "target", 14, 20, "Exact", Some(target));
+    h.write_verdict(
+        edge_v1,
+        &sha,
+        None,
+        "scip-rust cargo other 1.0 `target`().",
+        OracleResolutionKind::Contradict,
+    );
+
+    // Sanity before reindex: counted + surfaced in compare.
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "verdict counted before reindex"
+    );
+    assert_eq!(
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap().len(),
+        1
+    );
+    let physical_before: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+
+    // --- Simulate a reindex of the UNCHANGED file: DELETE the edge (rewriting edges_data) and
+    // re-insert the SAME edge content, which mints a NEW edges_data rowid. files.sha256 unchanged.
+    // ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v1]).unwrap();
+    let edge_v2 = h.add_edge(f, "target", 14, 20, "Exact", Some(target));
+    assert_ne!(edge_v2, edge_v1, "reindex minted a new edge rowid");
+
+    // The verdict was NOT touched (no cascade) — same physical row count.
+    let physical_after: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(physical_after, physical_before, "no FK cascade wiped the verdict on reindex");
+
+    // And it RE-ANCHORS to the new edge by content key: still counted, still in compare, now keyed
+    // on the NEW edge id.
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "verdict still counted after reindex (re-anchored by content)"
+    );
+    let comparisons =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(comparisons.len(), 1, "verdict re-surfaces in compare after reindex");
+    assert_eq!(
+        comparisons[0].edge_id, edge_v2,
+        "the comparison is re-projected onto the LIVE edge id"
+    );
+    assert_eq!(
+        h.verdict(edge_v2).map(|(kind, _, _)| kind),
+        Some(OracleResolutionKind::Contradict.as_db_str().to_string()),
+        "the reindexed edge resolves the re-anchored verdict by content"
+    );
+}
+
+/// #248: a verdict for a CHANGED file (its `files.sha256` no longer matches the verdict's
+/// `file_sha`) is NOT counted — the scope join gates `files.sha256 = edge_oracle.file_sha`, so a
+/// stale verdict drops out of the metrics until the next run rewrites it.
+#[test]
+fn edge_oracle_stale_after_file_change_not_counted() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { target(); }\n");
+    let sha = h.file_sha("a.rs");
+    let edge = h.add_edge(f, "target", 14, 20, "Exact", None);
+    h.write_verdict(edge, &sha, None, "scip x `target`().", OracleResolutionKind::Confirm);
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "current verdict counted"
+    );
+
+    // The file content changed: its recorded sha no longer matches the verdict's file_sha.
+    h.conn.execute("UPDATE files SET sha256 = 'changed-sha' WHERE id = ?1", params![f]).unwrap();
+
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        0,
+        "a changed file's verdict is stale → not counted (file_sha mismatch)"
+    );
+    assert!(
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE)
+            .unwrap()
+            .is_empty(),
+        "a stale verdict does not surface in compare either"
+    );
+}
+
+/// #248 END-TO-END (the regression that started the issue): a full `run_oracle` writes verdicts,
+/// then a reindex of the UNCHANGED file rewrites `edges_data` with new ids — and the compare
+/// surface (`current_oracle_comparisons`, the data behind `compare_graph_to_scip`) is STILL
+/// non-empty, re-anchored to the reindexed edge by content key. Before #248 the `ON DELETE CASCADE`
+/// FK wiped the verdict on reindex and the compare surface went empty (the opt-in oracle never
+/// repopulated). Exercises the REAL join+write path (`run_oracle` over a built `.scip` with a call
+/// + def occurrence), not a hand-written verdict.
+#[test]
+fn oracle_run_then_reindex_then_compare_graph_to_scip_nonempty() {
+    let h = Harness::new();
+    let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+    let defs = h.add_file("defs.rs", "fn target() {}\nfn other() {}\n");
+    // Heuristic resolved `target` to the WRONG symbol; the oracle CONTRADICTS it (Contradict rows
+    // are exactly what `current_oracle_comparisons` keeps).
+    let wrong_sym = h.add_symbol(defs, "other", 18, 23);
+    let right_sym = h.add_symbol(defs, "target", 3, 9);
+    let edge_v1 = h.add_edge(caller, "target", 14, 20, "Exact", Some(wrong_sym));
+
+    let symbol = "scip-rust crate v1 `target`().";
+    let mut index = Index {
+        documents: vec![Document {
+            relative_path: "caller.rs".to_string(),
+            occurrences: vec![occurrence(
+                0,
+                14,
+                20,
+                symbol,
+                SymbolRole::UnspecifiedSymbolRole as i32,
+            )],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    index.documents.push(Document {
+        relative_path: "defs.rs".to_string(),
+        occurrences: vec![occurrence(0, 3, 9, symbol, SymbolRole::Definition as i32)],
+        position_encoding: EnumOrUnknown::new(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        ..Default::default()
+    });
+    let bytes = index.write_to_bytes().unwrap();
+
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    assert_eq!(report.rows_written, 1, "the run wrote one verdict");
+
+    // Compare surface is non-empty before reindex (sanity).
+    let before =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(before.len(), 1, "the contradiction surfaces in compare before reindex");
+    assert_eq!(before[0].edge_id, edge_v1);
+    assert_eq!(before[0].kind, OracleResolutionKind::Contradict);
+
+    // --- Simulate a reindex of the UNCHANGED caller.rs: rewrite the edge (new edges_data rowid),
+    // SAME file content/sha. (The defs.rs symbols are untouched so the def-drift gate stays
+    // satisfied.) ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v1]).unwrap();
+    let edge_v2 = h.add_edge(caller, "target", 14, 20, "Exact", Some(wrong_sym));
+    assert_ne!(edge_v2, edge_v1, "reindex minted a new edge rowid");
+
+    // THE REGRESSION ASSERTION: compare surface is STILL non-empty, re-anchored to the new edge id.
+    let after =
+        store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(after.len(), 1, "compare surface survives reindex (re-anchored by content key)");
+    assert_eq!(
+        after[0].edge_id, edge_v2,
+        "the comparison re-projects onto the LIVE reindexed edge"
+    );
+    assert_eq!(after[0].kind, OracleResolutionKind::Contradict);
+    assert_eq!(
+        after[0].resolved_symbol_id,
+        Some(right_sym),
+        "the re-anchored verdict still names the oracle's correct target",
+    );
+}
+
+/// #248 collision: a `calls_name` edge and a `references_type` edge that share the SAME callee token
+/// (same callee byte range, same call site) get DISTINCT verdicts — the content key includes
+/// `edge_kind`, so the two never collide onto one `edge_oracle` row, and a verdict for one never
+/// leaks onto the other. (This is the design's disambiguation claim — R1: the call-site span + the
+/// callee span + the edge kind make the key unique per edge.)
+#[test]
+fn edge_oracle_collision_same_callee_range_different_kind_disambiguated() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { Thing(); }\n");
+    let sha = h.file_sha("a.rs");
+    // Two edges on the SAME identifier token `Thing` (callee bytes 14..19, same call site span):
+    // one a `calls_name` (constructor call), one a `references_type`. Same callee range, different
+    // kind — the pre-#248 callee-range-only key would have collided them.
+    let call_edge = h.add_edge_with_kind(f, "Thing", 14, 19, "calls_name", "Exact", None);
+    let ref_edge = h.add_edge_with_kind(f, "Thing", 14, 19, "references_type", "Exact", None);
+    assert_ne!(call_edge, ref_edge, "two distinct edges share the callee token");
+
+    // Distinct verdicts: the call resolves to a function symbol, the type-ref to a type symbol.
+    h.write_verdict(call_edge, &sha, None, "scip x `Thing`#new().", OracleResolutionKind::Upgrade);
+    h.write_verdict(ref_edge, &sha, None, "scip x `Thing`#", OracleResolutionKind::Confirm);
+
+    // Two physical rows (the content key disambiguated by edge_kind), not one overwritten row.
+    let rows: i64 = h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 2, "edge_kind in the content key keeps the two verdicts distinct");
+
+    // Each edge resolves to ITS OWN verdict — no cross-contamination.
+    let (call_kind, _, call_scip) = h.verdict(call_edge).expect("call verdict");
+    assert_eq!(call_kind, OracleResolutionKind::Upgrade.as_db_str());
+    assert_eq!(call_scip, "scip x `Thing`#new().");
+    let (ref_kind, _, ref_scip) = h.verdict(ref_edge).expect("ref verdict");
+    assert_eq!(ref_kind, OracleResolutionKind::Confirm.as_db_str());
+    assert_eq!(ref_scip, "scip x `Thing`#");
+}
+
+/// #248 content-key collision SEMANTICS (the schema-permitted, organically-unreachable edge case):
+/// two verdicts with the SAME FULL content key
+/// `(tool, tool_version, source_path, source_start_byte, source_end_byte, callee_start_byte,
+/// callee_end_byte, edge_kind)` — differing only in the resolved target (`resolved_symbol_id` /
+/// `scip_symbol`) and verdict `kind` — collapse to EXACTLY ONE physical `edge_oracle` row via the
+/// PRIMARY-KEY upsert (last write wins). The unique-key disambiguation test above keeps two rows by
+/// changing `edge_kind`; THIS test pins what happens when even `edge_kind` matches.
+///
+/// This is DOCUMENTED as schema-PERMITTED but organically UNREACHABLE for real extracted edges: the
+/// call-site source span (`source_start_byte`/`source_end_byte`) is part of the key, and two
+/// distinct call sites always carry distinct source spans (measured 0 collisions / 1.03M rows). The
+/// key is NOT schema-enforced to be 1:1 with a live edge — it is unique only because real call-site
+/// spans are. Pinning the upsert here means a FUTURE extract/resolve span change that made the same
+/// full key reachable for two genuinely-different edges would surface as a behavior change this
+/// test catches (the count helpers assume this measured 1:1, per `count_edge_oracle_scoped`).
+#[test]
+fn edge_oracle_same_full_content_key_upserts_one_row() {
+    let h = Harness::new();
+    let f = h.add_file("a.rs", "fn caller() { thing(); }\n");
+    let sha = h.file_sha("a.rs");
+    // ONE edge → ONE content key. Writing two verdicts for it reuses the identical full key.
+    let edge = h.add_edge(f, "thing", 14, 19, "Exact", None);
+
+    // First verdict: an Upgrade naming target A.
+    h.write_verdict(edge, &sha, Some(101), "scip x `thing`#A().", OracleResolutionKind::Upgrade);
+    // Second verdict, SAME full content key (same edge → same path + spans + edge_kind, same
+    // TOOL/VERSION), differing only in the resolved target and the verdict kind.
+    h.write_verdict(edge, &sha, Some(202), "scip x `thing`#B().", OracleResolutionKind::Confirm);
+
+    // EXACTLY ONE physical row — the second write UPSERTED the first (it did not insert a sibling).
+    let rows: i64 = h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 1, "same full content key collapses to one edge_oracle row (PK upsert)");
+
+    // Last write wins: the surviving row carries the SECOND verdict's target + kind.
+    let (kind, resolved, scip) = h.verdict(edge).expect("the single upserted verdict");
+    assert_eq!(
+        kind,
+        OracleResolutionKind::Confirm.as_db_str(),
+        "the later verdict's kind survives"
+    );
+    assert_eq!(resolved, Some(202), "the later verdict's resolved target survives");
+    assert_eq!(scip, "scip x `thing`#B().", "the later verdict's scip symbol survives");
+}
+
+/// #248 counts: after a reindex that CHANGES one file (its `files.sha256` drifts), status/eval
+/// counts reflect only LIVE + CURRENT verdicts — the changed file's verdict drops out (file_sha
+/// mismatch in the scope join) and never inflates the totals, while the unchanged file's verdict
+/// stays counted. Without the live-edge content join + the sha gate, dangling/stale verdicts would
+/// inflate the count.
+#[test]
+fn status_eval_counts_unaffected_by_dangling() {
+    let h = Harness::new();
+    // Two files each with a confirmed verdict — both counted initially.
+    let stable = h.add_file("stable.rs", "fn caller() { keep(); }\n");
+    let stable_sha = h.file_sha("stable.rs");
+    let stable_edge = h.add_edge(stable, "keep", 14, 18, "Exact", None);
+    h.write_verdict(
+        stable_edge,
+        &stable_sha,
+        None,
+        "scip x `keep`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    let churn = h.add_file("churn.rs", "fn caller() { drift(); }\n");
+    let churn_sha = h.file_sha("churn.rs");
+    let churn_edge = h.add_edge(churn, "drift", 14, 19, "Exact", None);
+    h.write_verdict(
+        churn_edge,
+        &churn_sha,
+        None,
+        "scip x `drift`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    let status0 = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(status0.total_verdicts, 2, "both verdicts counted before any change");
+    assert_eq!(status0.confirmed, 2);
+
+    // Reindex churn.rs with CHANGED content: rewrite its edge (new rowid) AND drift its
+    // files.sha256 — the verdict's file_sha no longer matches, so it is stale. The stable file
+    // is untouched.
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![churn_edge]).unwrap();
+    let _churn_edge_v2 = h.add_edge(churn, "drift", 14, 19, "Exact", None);
+    h.conn
+        .execute("UPDATE files SET sha256 = 'churn-changed' WHERE id = ?1", params![churn])
+        .unwrap();
+
+    let status1 = super::oracle_status(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
+    assert_eq!(
+        status1.total_verdicts, 1,
+        "only the live + current (unchanged-file) verdict counts; the changed file's is stale",
+    );
+    assert_eq!(status1.confirmed, 1);
+
+    // Eval metrics use the SAME scoped counts — the stale verdict does not inflate them either.
+    let m = super::oracle_eval_metrics(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, RecallCalls {
+        covered: 1,
+        oracle_only: 0,
+    })
+    .unwrap();
+    assert_eq!(m.confirmed, 1, "eval confirmed count is live + current only");
+}
+
 /// Finding 2: a low-confidence edge in ANOTHER worktree must not inflate the current run's
 /// `oracle_upgradeable_fraction` denominator. With one upgraded low-conf edge in-scope and an
 /// extra unresolved low-conf edge out-of-scope, the scoped fraction is 1/1 = 1.0 (not 1/2).
@@ -1872,15 +2258,9 @@ fn upgradeable_fraction_denominator_is_scoped_to_active_checkout() {
     let h = Harness::new();
     // Active checkout: one NameOnly edge the oracle upgraded → numerator 1, denominator 1.
     let active = h.add_file("a.rs", "fn caller() {}\n");
+    let active_sha = h.file_sha("a.rs");
     let e_low = h.add_edge(active, "u", 0, 1, "NameOnly", None);
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: e_low,
-        file_sha: "s",
-        resolved_symbol_id: Some(1),
-        scip_symbol: "s",
-        kind: OracleResolutionKind::Upgrade,
-    })
-    .unwrap();
+    h.write_verdict(e_low, &active_sha, Some(1), "s", OracleResolutionKind::Upgrade);
 
     // Another worktree: an unresolved NameOnly candidate carrying a callee range, NO verdict. If
     // the denominator weren't scoped, it would count → fraction 1/2.
@@ -2026,40 +2406,28 @@ fn recall_gap_excludes_occurrences_in_unindexed_source_files() {
 #[test]
 fn verdict_counts_and_metrics_ignore_sibling_checkout_rows() {
     let h = Harness::new();
-    let mk = |edge, kind| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind,
-    };
 
     // Active checkout A: one confirmed + one contradicted Exact edge → precision 1/2.
     let a_file = h.add_file("a.rs", "fn caller() {}\n");
+    let a_sha = h.file_sha("a.rs");
     let a_conf = h.add_edge(a_file, "c", 0, 1, "Exact", None);
     let a_contra = h.add_edge(a_file, "d", 1, 2, "Exact", None);
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(a_conf, OracleResolutionKind::Confirm))
-        .unwrap();
-    store::write_edge_oracle(
-        &h.conn,
-        TOOL,
-        VERSION,
-        &mk(a_contra, OracleResolutionKind::Contradict),
-    )
-    .unwrap();
+    h.write_verdict(a_conf, &a_sha, None, "s", OracleResolutionKind::Confirm);
+    h.write_verdict(a_contra, &a_sha, None, "s", OracleResolutionKind::Contradict);
 
-    // Sibling checkout B (same DB, same tool/version): TWO confirms + an upgrade. If A's counts
-    // leaked B's rows, A's precision would jump to 3/4 and its recall would change.
-    let b_file = h.add_file_in_scope("a.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    // Sibling checkout B (same DB, same tool/version): TWO confirms + an upgrade. Uses a DISTINCT
+    // path ("b.rs") so the content keys never collide with A's (#248: the content key omits
+    // commit/worktree, so a same-path same-span edge in B would SHARE A's verdict row — that is the
+    // intentional "same resolution" case; this test asserts SCOPE isolation, so it keeps the
+    // populations physically distinct). If A's counts leaked B's rows, A's precision would jump.
+    let b_file = h.add_file_in_scope("b.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let b_sha = h.file_sha_for_commit("b.rs", OTHER_COMMIT);
     let b_conf1 = h.add_edge(b_file, "e", 0, 1, "Exact", None);
     let b_conf2 = h.add_edge(b_file, "f", 1, 2, "Exact", None);
     let b_up = h.add_edge(b_file, "g", 2, 3, "NameOnly", None);
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(b_conf1, OracleResolutionKind::Confirm))
-        .unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(b_conf2, OracleResolutionKind::Confirm))
-        .unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(b_up, OracleResolutionKind::Upgrade))
-        .unwrap();
+    h.write_verdict(b_conf1, &b_sha, None, "s", OracleResolutionKind::Confirm);
+    h.write_verdict(b_conf2, &b_sha, None, "s", OracleResolutionKind::Confirm);
+    h.write_verdict(b_up, &b_sha, None, "s", OracleResolutionKind::Upgrade);
 
     // A's metrics: precision = 1 confirm / (1 confirm + 1 contradict) = 0.5; recall over A's
     // covered call set (2 covered call occurrences) and 0 oracle-only = 2/2 = 1.0. The recall
@@ -2734,18 +3102,10 @@ fn name_only_recovery_rate_excludes_exact_upgrades() {
     // low-confidence denominator, so admitting it in the numerator (the old raw `counts.upgraded`)
     // would push the rate to 2/1 = 2.0.
     let e_exact = h.add_edge(f, "x", 1, 2, "Exact", None);
+    let sha = h.file_sha("a.rs");
 
-    let mk = |edge, kind| EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "s",
-        resolved_symbol_id: None,
-        scip_symbol: "s",
-        kind,
-    };
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e_low, OracleResolutionKind::Upgrade))
-        .unwrap();
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &mk(e_exact, OracleResolutionKind::Upgrade))
-        .unwrap();
+    h.write_verdict(e_low, &sha, None, "s", OracleResolutionKind::Upgrade);
+    h.write_verdict(e_exact, &sha, None, "s", OracleResolutionKind::Upgrade);
 
     let m = super::oracle_eval_metrics(
         &h.conn,
@@ -2808,14 +3168,7 @@ fn seed_verdict_full(
     // `edge_oracle_current_predicate` filters a dangling `resolved_symbol_id`.
     let resolved_symbol_id = in_corpus.then(|| h.add_symbol(f, "target", 3, 9));
     let edge = h.add_edge(f, "target", 14, 20, "NameOnly", None);
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: edge,
-        file_sha: &file_sha,
-        resolved_symbol_id,
-        scip_symbol,
-        kind,
-    })
-    .unwrap();
+    h.write_verdict(edge, &file_sha, resolved_symbol_id, scip_symbol, kind);
     (h, edge, file_sha, resolved_symbol_id)
 }
 
@@ -2914,14 +3267,13 @@ fn overlay_shadowed_def_verdict_is_not_surfaced() {
     let defs = h.add_file_in_scope("defs.rs", COMMIT, "");
     let resolved = h.add_symbol(defs, "target", 3, 9);
     let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: edge,
-        file_sha: "caller-sha",
-        resolved_symbol_id: Some(resolved),
-        scip_symbol: "scip x `target`().",
-        kind: OracleResolutionKind::Upgrade,
-    })
-    .unwrap();
+    h.write_verdict(
+        edge,
+        "caller-sha",
+        Some(resolved),
+        "scip x `target`().",
+        OracleResolutionKind::Upgrade,
+    );
 
     // Sanity: with no overlay, the committed def is in scope → the verdict surfaces.
     let before =
@@ -3013,14 +3365,13 @@ fn comparisons_return_current_contradictions_only() {
     // An Exact edge the heuristic resolved to `target`; the oracle CONTRADICTS it (points
     // elsewhere).
     let edge = h.add_edge(f, "target", 14, 20, "Exact", Some(target));
-    store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-        edge_id: edge,
-        file_sha: &sha,
-        resolved_symbol_id: None,
-        scip_symbol: "scip-rust cargo other 1.0 `target`().",
-        kind: OracleResolutionKind::Contradict,
-    })
-    .unwrap();
+    h.write_verdict(
+        edge,
+        &sha,
+        None,
+        "scip-rust cargo other 1.0 `target`().",
+        OracleResolutionKind::Contradict,
+    );
 
     let comparisons =
         store::current_oracle_comparisons(&h.conn, TOOL, VERSION, COMMIT, WORKTREE).unwrap();
@@ -3084,6 +3435,75 @@ fn prune_oracle_runs_drops_dead_contexts_only() {
     let remaining: i64 =
         h.conn.query_row("SELECT COUNT(*) FROM oracle_runs", [], |r| r.get(0)).unwrap();
     assert_eq!(remaining, 2);
+}
+
+/// gc (#248): `prune_edge_oracle_without_live_edge` is a GLOBAL sweep — it deletes a verdict whose
+/// content key matches NO live edge in ANY scope, but KEEPS one that matches a live edge anywhere
+/// (so a sibling worktree's still-live verdict is never swept by a sweep run in another checkout).
+/// This is the gc hygiene that replaces the dropped FK cascade; correctness never depended on it
+/// (dangling verdicts already never resolve via the live join — see
+/// `edge_oracle_survives_reindex_for_unchanged_file`), so this only guards unbounded growth.
+#[test]
+fn gc_prunes_edge_oracle_rows_with_no_live_edge() {
+    let h = Harness::new();
+
+    // (A) A verdict whose edge is LIVE in the active checkout — must be kept.
+    let live_file = h.add_file("live.rs", "fn caller() { target(); }\n");
+    let live_sha = h.file_sha("live.rs");
+    let live_edge = h.add_edge(live_file, "target", 14, 20, "Exact", None);
+    h.write_verdict(
+        live_edge,
+        &live_sha,
+        None,
+        "scip x `target`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    // (B) A verdict whose edge lives in a SIBLING checkout (another commit). The global sweep does
+    // NOT apply the active-checkout predicate, so it must still see this edge as live and keep its
+    // verdict — a sweep in THIS checkout must never delete a sibling's live verdict.
+    let sibling_file = h.add_file_in_scope("sibling.rs", OTHER_COMMIT, OTHER_WORKTREE);
+    let sibling_sha = h.file_sha_for_commit("sibling.rs", OTHER_COMMIT);
+    let sibling_edge = h.add_edge(sibling_file, "thing", 14, 19, "Exact", None);
+    h.write_verdict(
+        sibling_edge,
+        &sibling_sha,
+        None,
+        "scip x `thing`().",
+        OracleResolutionKind::Confirm,
+    );
+
+    // (C) A DANGLING verdict — content key matches no live edge anywhere (the edge was deleted in a
+    // reindex, leaving the FK-less verdict behind). Build it by writing a verdict, then deleting
+    // its edge (simulating `remove_file_in_scope` dropping a changed file's edges).
+    let dangling_file = h.add_file("dangling.rs", "fn caller() { gone(); }\n");
+    let dangling_sha = h.file_sha("dangling.rs");
+    let dangling_edge = h.add_edge(dangling_file, "gone", 14, 18, "Exact", None);
+    h.write_verdict(
+        dangling_edge,
+        &dangling_sha,
+        None,
+        "scip x `gone`().",
+        OracleResolutionKind::Confirm,
+    );
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![dangling_edge]).unwrap();
+
+    let before: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(before, 3, "three verdicts before the sweep (live, sibling, dangling)");
+
+    let deleted = store::prune_edge_oracle_without_live_edge(&h.conn).unwrap();
+    assert_eq!(deleted, 1, "only the dangling verdict (no live edge anywhere) is swept");
+
+    let after: i64 =
+        h.conn.query_row("SELECT COUNT(*) FROM edge_oracle", [], |r| r.get(0)).unwrap();
+    assert_eq!(after, 2, "the live + sibling verdicts survive the global sweep");
+    // The two survivors still resolve to their live edges by content key.
+    assert!(h.verdict(live_edge).is_some(), "the active-checkout verdict is kept");
+    assert!(
+        h.verdict(sibling_edge).is_some(),
+        "the sibling-checkout verdict is kept (global sweep)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3174,6 +3594,128 @@ fn oracle_rerun_clears_prior_monikers_for_tool() {
     let empty = scip_bytes_docs(vec![("defs.rs", vec![])]);
     run_oracle(&h.conn, TOOL, "v2", COMMIT, WORKTREE, &empty, h.root(), None, None).unwrap();
     assert!(h.moniker(1001).is_none(), "authoritative clear removed the stale moniker");
+}
+
+/// BEHAVIORAL LIFECYCLE GUARD (#248): the integration test the suite never had. Every prior oracle
+/// test wrote+read its outputs with NO reindex in between — which is exactly why the CASCADE-on-
+/// reindex bug was invisible for so long. This runs the oracle to populate BOTH oracle-derived
+/// outputs (`edge_oracle` via a call/def join, `logical_symbol_monikers` via the def→logical map),
+/// then exercises the two reindex shapes that rewrite the volatile parents, and asserts BOTH
+/// outputs still resolve through their LIVE-JOIN reads afterward. The two shapes are a FULL reindex
+/// (`DELETE FROM edges_data` + a wholesale `logical_symbols` rebuild — DELETE-all + reinsert with
+/// the SAME content-derived id, modelling an UNCHANGED symbol) and a per-file INCREMENTAL reindex
+/// on an UNCHANGED file (`remove_file_in_scope` deletes + the indexer re-inserts the same edge, the
+/// `file_rows.rs` path). It is paired with a CHANGED-file/CHANGED-symbol staleness assertion, so it
+/// pins BOTH directions: unchanged content survives, changed content goes stale.
+#[test]
+fn oracle_outputs_survive_full_and_incremental_reindex() {
+    use crate::query::memory::{MonikerResolution, resolve_moniker};
+
+    let h = Harness::new();
+    // A caller + a def file. The def's symbol is grouped into a logical symbol (content-derived id
+    // 1001 here; stable across rebuilds in production), so the moniker pass writes a moniker for
+    // it.
+    let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+    let defs = h.add_file("defs.rs", "fn target() {}\n");
+    let target_sym = h.add_symbol_qualified(defs, "target", "defs.rs::target", "function", 0, 14);
+    h.add_chunk(defs, "defs.rs::target", "fn target() {}\n");
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", target_sym);
+    // The heuristic resolved the call; the oracle CONFIRMS it (an in-corpus verdict + a moniker).
+    let edge_v1 = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+
+    let bytes = scip_bytes_docs(vec![
+        ("caller.rs", vec![occurrence(
+            0,
+            14,
+            20,
+            TARGET_MONIKER,
+            SymbolRole::UnspecifiedSymbolRole as i32,
+        )]),
+        ("defs.rs", vec![occurrence(0, 3, 9, TARGET_MONIKER, SymbolRole::Definition as i32)]),
+    ]);
+    let report =
+        run_oracle(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, &bytes, h.root(), None, None).unwrap();
+    assert_eq!(report.rows_written, 1, "the run wrote a verdict");
+    assert_eq!(report.monikers_written, 1, "the run wrote a moniker");
+
+    // Both outputs resolve through their LIVE-JOIN reads before any reindex (sanity).
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "verdict counted before reindex"
+    );
+    assert!(
+        matches!(
+            resolve_moniker(&h.conn, TARGET_MONIKER, TOOL.as_db_str()).unwrap(),
+            MonikerResolution::Unique { logical_symbol_id: 1001, .. }
+        ),
+        "moniker resolves to the live logical symbol before reindex"
+    );
+
+    // --- FULL reindex: rewrite edges_data (DELETE + re-insert the SAME edge → new rowid) AND
+    // rebuild logical_symbols wholesale (DELETE-all + reinsert the SAME content-derived id 1001,
+    // the unchanged-symbol case). The caller/def file shas are untouched. ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v1]).unwrap();
+    let edge_v2 = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+    assert_ne!(edge_v2, edge_v1, "full reindex minted a new edge rowid");
+    // Wholesale logical_symbols rebuild: drop the members + the logical row, reinsert with the SAME
+    // id (unchanged symbol → stable content-derived id).
+    h.conn
+        .execute("DELETE FROM logical_symbol_members WHERE logical_symbol_id = 1001", [])
+        .unwrap();
+    h.conn.execute("DELETE FROM logical_symbols WHERE id = 1001", []).unwrap();
+    h.add_logical_symbol(1001, "defs.rs", "target", "defs.rs::target", target_sym);
+
+    // BOTH outputs still resolve after the full reindex (re-anchored by content key / stable id).
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "edge_oracle survives the FULL reindex (re-anchored by content key)"
+    );
+    assert!(
+        matches!(
+            resolve_moniker(&h.conn, TARGET_MONIKER, TOOL.as_db_str()).unwrap(),
+            MonikerResolution::Unique { logical_symbol_id: 1001, .. }
+        ),
+        "moniker survives the FULL logical_symbols rebuild (stable content-derived id)"
+    );
+
+    // --- INCREMENTAL reindex on the UNCHANGED caller.rs: the per-file path deletes the file's
+    // edges then the indexer re-inserts the same one. Model `remove_file_in_scope`'s edge
+    // delete + the re-insert; the file row + sha stay put. ---
+    h.conn.execute("DELETE FROM edges WHERE id = ?1", params![edge_v2]).unwrap();
+    let edge_v3 = h.add_edge(caller, "target", 14, 20, "Exact", Some(target_sym));
+    assert_ne!(edge_v3, edge_v2, "incremental reindex minted a new edge rowid");
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        1,
+        "edge_oracle survives the per-file INCREMENTAL reindex of an unchanged file"
+    );
+
+    // --- CHANGED-content staleness (the other direction): drift the caller's sha → its verdict
+    // goes stale (file_sha mismatch); mint a new logical id for the symbol → its moniker
+    // dangles. ---
+    h.conn
+        .execute("UPDATE files SET sha256 = 'caller-changed' WHERE id = ?1", params![caller])
+        .unwrap();
+    assert_eq!(
+        store::count_edge_oracle_scoped(&h.conn, TOOL, VERSION, COMMIT, WORKTREE, None).unwrap(),
+        0,
+        "a CHANGED file's verdict is stale (file_sha mismatch) — not counted"
+    );
+    // A changed symbol mints a NEW content-derived logical id; the old moniker row dangles.
+    h.conn
+        .execute("DELETE FROM logical_symbol_members WHERE logical_symbol_id = 1001", [])
+        .unwrap();
+    h.conn.execute("DELETE FROM logical_symbols WHERE id = 1001", []).unwrap();
+    h.add_logical_symbol(2002, "defs.rs", "target", "defs.rs::target", target_sym);
+    assert!(
+        matches!(
+            resolve_moniker(&h.conn, TARGET_MONIKER, TOOL.as_db_str()).unwrap(),
+            MonikerResolution::Dangling
+        ),
+        "a CHANGED symbol's moniker dangles (its content-derived logical id died) — not resolved"
+    );
 }
 
 /// Create a memory bound to the harness symbol, asserting the automatic `scip_moniker` binding.
@@ -4334,14 +4876,7 @@ fn resolution_report_assembles_before_after_from_index() {
         .query_row("SELECT sha256 FROM files WHERE id = ?1", params![f], |r| r.get(0))
         .unwrap();
     let write = |edge: i64, kind: OracleResolutionKind, resolved: Option<i64>| {
-        store::write_edge_oracle(&h.conn, TOOL, VERSION, &EdgeOracleRow {
-            edge_id: edge,
-            file_sha: &file_sha,
-            resolved_symbol_id: resolved,
-            scip_symbol: "scip x `t`().",
-            kind,
-        })
-        .unwrap();
+        h.write_verdict(edge, &file_sha, resolved, "scip x `t`().", kind);
     };
     write(up, OracleResolutionKind::Upgrade, Some(target));
     write(ext, OracleResolutionKind::ResolvedExternal, None);
