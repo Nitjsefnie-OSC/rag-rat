@@ -10497,12 +10497,12 @@ fn open_under_a_held_write_lock_migrates_older_schema_without_deadlock() {
         let db = IndexDatabase::rebuild(&config).unwrap();
         db.storage
             .connection()
-            .execute("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor'", [])
+            .execute("DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob'", [])
             .unwrap();
         assert_eq!(
             schema::status(db.storage.connection()).unwrap().state,
             schema::SchemaState::Older,
-            "removing the newest (V031) ledger row makes the schema Older"
+            "removing the newest (V032) ledger row makes the schema Older"
         );
     }
 
@@ -10527,7 +10527,7 @@ fn v022_fresh_apply_creates_packages_and_dedicated_import_scope_columns() {
     schema::apply(&conn).unwrap();
 
     assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 31);
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 32);
     assert!(conn_table_exists(&conn, "packages"), "packages table is created on a fresh apply");
 
     let package_cols = conn_table_columns(&conn, "packages");
@@ -10604,6 +10604,7 @@ fn v022_forward_migrate_adds_artifacts_to_an_older_index() {
         DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
         DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
+        DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';
         ",
     )
     .unwrap();
@@ -10749,13 +10750,14 @@ fn v028_forward_migrate_interns_and_drops_the_inline_column() {
         "DELETE FROM schema_version WHERE id = '028_intern_symbol_qualified_names';
          DELETE FROM schema_version WHERE id = '029_clone_fingerprint_tables';
          DELETE FROM schema_version WHERE id = '030_clone_refinements_lcs_sampled';
-         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';",
+         DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
     )
     .unwrap();
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "removing the V028..V031 ledger rows makes the pre-V028 shape Older"
+        "removing the V028..V032 ledger rows makes the pre-V028 shape Older"
     );
 
     // --- Forward-migrate ---
@@ -12218,14 +12220,14 @@ fn impact_completeness_flags_a_dirty_callee_definition_file() {
 }
 
 #[test]
-fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
-    // Fresh DB: apply() must create the SourcererCC postings tables + refinements, and report
-    // Compatible at the latest version. fingerprint_bands must NOT exist (dropped in R1 rework).
+fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs() {
+    // V032 (#231) BLOB-packs the token bag: `symbol_token_postings` is dropped and a `token_bag`
+    // BLOB column rides `symbol_fingerprints`. V029 still CREATEs the postings table; V032 drops it
+    // (R5 — V029 is never edited), so after apply()/migrate_forward the postings table must be GONE
+    // and the column present. The other clone tables (refinements, df) survive.
     let conn = rusqlite::Connection::open_in_memory().expect("open");
     crate::index::schema::apply(&conn).expect("apply");
-    for table in
-        ["symbol_fingerprints", "symbol_token_postings", "clone_token_df", "clone_refinements"]
-    {
+    for table in ["symbol_fingerprints", "clone_token_df", "clone_refinements"] {
         let n: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -12235,21 +12237,27 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
             .expect("query");
         assert_eq!(n, 1, "{table} should exist after apply()");
     }
-    // fingerprint_bands was replaced by symbol_token_postings + clone_token_df in R1.
-    let bands: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fingerprint_bands'",
-            [],
-            |r| r.get(0),
-        )
-        .expect("query bands");
-    assert_eq!(bands, 0, "fingerprint_bands must not exist after R1 rework");
+    // symbol_token_postings is dropped by V032; fingerprint_bands was already gone (R1 rework).
+    for absent in ["symbol_token_postings", "fingerprint_bands"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [absent],
+                |r| r.get(0),
+            )
+            .expect("query absent");
+        assert_eq!(n, 0, "{absent} must not exist after V032");
+    }
+    assert!(
+        conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "symbol_fingerprints gains the token_bag BLOB column on a fresh apply()"
+    );
 
     let status = crate::index::schema::status(&conn).expect("status");
     assert_eq!(status.current_version, crate::index::schema::LATEST_SCHEMA_VERSION);
     assert!(matches!(status.state, crate::index::schema::SchemaState::Compatible));
 
-    // Migrated DB: a DB at the prior baseline that runs migrate_forward gains the new tables too.
+    // Migrated DB: a DB driven through migrate_forward reaches the same post-V032 shape.
     let conn2 = rusqlite::Connection::open_in_memory().expect("open2");
     crate::index::schema::apply(&conn2).expect("apply2"); // already-latest is a no-op forward
     crate::index::schema::migrate_forward(&conn2).expect("migrate_forward");
@@ -12261,7 +12269,11 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
             |r| r.get(0),
         )
         .expect("query2");
-    assert_eq!(postings, 1, "symbol_token_postings must exist after migrate_forward");
+    assert_eq!(postings, 0, "symbol_token_postings must be gone after migrate_forward");
+    assert!(
+        conn_table_columns(&conn2, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "symbol_fingerprints carries token_bag after migrate_forward"
+    );
     let df: i64 = conn2
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='clone_token_df'",
@@ -12270,6 +12282,64 @@ fn v029_creates_clone_fingerprint_tables_on_fresh_and_migrated_dbs() {
         )
         .expect("query3");
     assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
+}
+
+/// V032 forward migrate (#231): an index recorded at V031 (postings table present, NO `token_bag`
+/// column) must, after migrate_forward, gain the `token_bag` BLOB column and lose
+/// `symbol_token_postings`. Simulates the pre-V032 shape by re-creating the postings table +
+/// dropping the column + deleting the V032 ledger row (making the schema Older), then replays.
+#[test]
+fn migration_032_adds_token_bag_drops_postings() {
+    let conn = rusqlite::Connection::open_in_memory().expect("open");
+    crate::index::schema::apply(&conn).expect("apply");
+
+    // --- Simulate a V031-era index: postings table present, no token_bag column ---
+    conn.execute_batch(
+        "ALTER TABLE symbol_fingerprints DROP COLUMN token_bag;
+         CREATE TABLE IF NOT EXISTS symbol_token_postings(
+             symbol_id       INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+             normalizer_kind TEXT    NOT NULL,
+             token_hash      INTEGER NOT NULL,
+             freq            INTEGER NOT NULL,
+             PRIMARY KEY (symbol_id, normalizer_kind, token_hash)
+         ) STRICT;
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+    )
+    .expect("revert to V031 shape");
+    assert!(
+        !conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "token_bag is absent before the migration runs"
+    );
+    assert!(conn_table_exists(&conn, "symbol_token_postings"), "postings present at V031");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Older,
+        "schema is Older after removing the V032 ledger row"
+    );
+
+    // --- Run the forward migration ---
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward");
+
+    assert!(
+        conn_table_columns(&conn, "symbol_fingerprints").contains(&"token_bag".to_string()),
+        "V032 adds the token_bag BLOB column"
+    );
+    assert!(!conn_table_exists(&conn, "symbol_token_postings"), "V032 drops symbol_token_postings");
+    // The column is a queryable BLOB.
+    let _: i64 = conn
+        .query_row("SELECT COUNT(token_bag) FROM symbol_fingerprints", [], |r| r.get(0))
+        .expect("SELECT token_bag must succeed after V032");
+    assert_eq!(
+        crate::index::schema::status(&conn).unwrap().current_version,
+        crate::index::schema::LATEST_SCHEMA_VERSION,
+        "schema is at LATEST_SCHEMA_VERSION after V032"
+    );
+    // Idempotency: a second migrate_forward is a clean no-op (guarded on the token_bag column).
+    crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
+    assert!(matches!(
+        crate::index::schema::status(&conn).unwrap().state,
+        crate::index::schema::SchemaState::Compatible
+    ));
 }
 
 /// Regression test for the P1 schema bug (#215 Plan 4a): an index recorded at V029 WITHOUT
@@ -12306,7 +12376,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     // `known_version` would still report LATEST and the schema would read Compatible.
     conn.execute_batch(
         "DELETE FROM schema_version
-         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor');",
+         WHERE id IN ('030_clone_refinements_lcs_sampled', '031_edge_oracle_content_anchor',
+                      '032_clone_token_bag_blob');",
     )
     .expect("delete V030+ ledger rows");
     assert_eq!(
@@ -12339,8 +12410,8 @@ fn v030_forward_migrate_adds_lcs_sampled_to_existing_v029_index() {
     );
     assert_eq!(
         crate::index::schema::LATEST_SCHEMA_VERSION,
-        31,
-        "LATEST_SCHEMA_VERSION is 31 after V031"
+        32,
+        "LATEST_SCHEMA_VERSION is 32 after V032"
     );
     // Idempotency: running migrate_forward again must not error.
     crate::index::schema::migrate_forward(&conn).expect("migrate_forward is idempotent");
@@ -12385,12 +12456,17 @@ fn migration_031_edge_oracle_no_fk_content_key() {
         ",
     )
     .expect("recreate legacy V018 edge_oracle");
-    conn.execute_batch("DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';")
-        .expect("drop V031 ledger row");
+    // Drop the V031 AND V032 ledger rows: `known_version` reads the MAX applied version, so
+    // leaving V032 recorded would keep the schema Compatible and skip the forward migrate.
+    conn.execute_batch(
+        "DELETE FROM schema_version WHERE id = '031_edge_oracle_content_anchor';
+         DELETE FROM schema_version WHERE id = '032_clone_token_bag_blob';",
+    )
+    .expect("drop V031+ ledger rows");
     assert_eq!(
         schema::status(&conn).unwrap().state,
         schema::SchemaState::Older,
-        "schema is Older after dropping the V031 ledger row + reverting the table shape"
+        "schema is Older after dropping the V031/V032 ledger rows + reverting the table shape"
     );
     // Confirm the legacy FK is really there before migrating.
     let fk_before: i64 = conn
@@ -12605,21 +12681,44 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
         .unwrap();
     assert_eq!(fps, 2, "the two functions are fingerprinted; tiny() is below MIN_TOKENS");
 
-    // The inverted index carries postings for exactly the two fingerprinted symbols (R3).
-    let posting_symbols: i64 = conn
+    // The token bag rides each fingerprint row as a non-NULL `token_bag` BLOB (#231) — there is no
+    // symbol_token_postings table any more. Both fingerprinted symbols carry a bag that decodes to
+    // a non-empty `(token_hash, freq)` multiset matching their `token_len`.
+    let bagged_symbols: i64 = conn
         .query_row(
-            "SELECT count(DISTINCT symbol_id) FROM symbol_token_postings WHERE \
-             normalizer_kind='baseline'",
+            "SELECT count(*) FROM symbol_fingerprints
+             WHERE normalizer_kind='baseline' AND token_bag IS NOT NULL",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        posting_symbols, 2,
-        "both fingerprinted functions get postings rows; tiny() does not"
-    );
+    assert_eq!(bagged_symbols, 2, "both fingerprinted functions carry a non-NULL token_bag BLOB");
 
-    // df is populated from the postings.
+    // Decode each BLOB and confirm it is a real bag (lossless: token_len == sum of freqs, no
+    // duplicate token_hash — the codec invariants exercised against indexed data).
+    let mut stmt = conn
+        .prepare(
+            "SELECT token_len, token_bag FROM symbol_fingerprints
+             WHERE normalizer_kind='baseline'",
+        )
+        .unwrap();
+    let rows: Vec<(i64, Vec<u8>)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for (token_len, blob) in &rows {
+        let bag = crate::index::clones::bag_blob::decode_token_bag(blob).expect("BLOB decodes");
+        assert!(!bag.is_empty(), "a fingerprinted symbol has a non-empty bag");
+        let total_freq: i64 = bag.iter().map(|&(_, f)| f).sum();
+        assert_eq!(total_freq, *token_len, "token_len == sum of freqs (lossless bag)");
+        let mut hashes: Vec<i64> = bag.iter().map(|&(h, _)| h).collect();
+        let distinct = hashes.len();
+        hashes.dedup();
+        assert_eq!(hashes.len(), distinct, "no duplicate token_hash in the indexed bag");
+    }
+
+    // df is populated (recomputed from the BLOBs at finalize).
     let df_rows: i64 =
         conn.query_row("SELECT count(*) FROM clone_token_df", [], |r| r.get(0)).unwrap();
     assert!(df_rows > 0, "clone_token_df is populated during indexing");
@@ -12634,14 +12733,71 @@ fn indexing_writes_baseline_fingerprints_for_functions() {
         .unwrap();
     assert!(max_df >= 2, "a token shared by both clones has df >= 2, got {max_df}");
 
-    // Cascade: deleting a symbol drops its fingerprint AND postings rows (FK + reindex freshness).
+    // Cascade: deleting a symbol drops its fingerprint row (the bag rides it as the BLOB column).
     conn.execute("DELETE FROM symbols", []).unwrap();
     let after_fps: i64 =
         conn.query_row("SELECT count(*) FROM symbol_fingerprints", [], |r| r.get(0)).unwrap();
-    assert_eq!(after_fps, 0, "fingerprints cascade on symbol delete");
-    let after_postings: i64 =
-        conn.query_row("SELECT count(*) FROM symbol_token_postings", [], |r| r.get(0)).unwrap();
-    assert_eq!(after_postings, 0, "postings cascade on symbol delete");
+    assert_eq!(after_fps, 0, "fingerprints (and their token_bag BLOBs) cascade on symbol delete");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// T4 (#231): `refresh_clone_token_df` recomputed from the token-bag BLOBs equals the postings-era
+/// `GROUP BY symbol_token_postings` semantics — df = the count of DISTINCT symbols whose decoded
+/// bag contains each `(normalizer_kind, token_hash)`, with NO generated-file filter (R6). Build a
+/// real index, then independently re-derive the expected df from the BLOBs and assert it equals the
+/// persisted `clone_token_df` row-for-row.
+#[test]
+fn clone_token_df_recomputed_from_blobs_matches_postings_era() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    // Two renamed clones (shared tokens → some df == 2) + one distinct function (its tokens → df
+    // 1).
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn load_user(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }\npub fn \
+         load_order(store: Db) -> i32 { let o = store.get(20); validate(o); o + 1 }\npub fn \
+         compute_totals(items: Vec<i64>) -> i64 { let mut s = 0; for it in items { s += it * 2; } \
+         s + 1 }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    // Independently re-derive df from EVERY fingerprint BLOB (no generated filter — R6).
+    let mut stmt =
+        conn.prepare("SELECT normalizer_kind, token_bag FROM symbol_fingerprints").unwrap();
+    let mut expected: std::collections::BTreeMap<(String, i64), i64> =
+        std::collections::BTreeMap::new();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let kind: String = row.get(0).unwrap();
+        let Some(blob) = row.get::<_, Option<Vec<u8>>>(1).unwrap() else {
+            continue;
+        };
+        let bag = crate::index::clones::bag_blob::decode_token_bag(&blob).expect("decodes");
+        for (token_hash, _freq) in bag {
+            *expected.entry((kind.clone(), token_hash)).or_insert(0) += 1;
+        }
+    }
+    assert!(!expected.is_empty(), "fixture produced fingerprints");
+
+    // The persisted clone_token_df must match the independent recompute exactly.
+    let mut df_stmt =
+        conn.prepare("SELECT normalizer_kind, token_hash, df FROM clone_token_df").unwrap();
+    let mut persisted: std::collections::BTreeMap<(String, i64), i64> =
+        std::collections::BTreeMap::new();
+    let mut df_rows = df_stmt.query([]).unwrap();
+    while let Some(row) = df_rows.next().unwrap() {
+        persisted.insert((row.get(0).unwrap(), row.get(1).unwrap()), row.get(2).unwrap());
+    }
+    assert_eq!(persisted, expected, "clone_token_df == distinct-symbol count per token from BLOBs");
+    assert!(
+        expected.values().any(|&d| d == 2),
+        "the two renamed clones share at least one token (df == 2)"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
