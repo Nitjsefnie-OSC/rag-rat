@@ -406,6 +406,10 @@ impl IndexDatabase {
         let theta = opts.min_similarity.unwrap_or(THETA);
         let pairs = candidate_pairs_from_bags(&bags, theta);
         let components = components_from_pairs(&pairs);
+        // Bucket the θ-verified candidate pairs per component (#256): the coherence split seeds its
+        // clique cover from these edges instead of an O(n²) all-pairs scan, so a giant component
+        // splits scalably. ONE O(|pairs|) pass over a node→component map.
+        let edges_by_component = bucket_edges_by_component(&pairs, &components);
 
         let min_copies = opts.min_copies.unwrap_or(2);
 
@@ -418,12 +422,13 @@ impl IndexDatabase {
         // subject.) Each built class travels with its component ids so the two-phase driver
         // can refine it.
         let mut built: Vec<(Vec<i64>, CandidateCloneClass)> = Vec::new();
-        for component in &components {
+        for (comp_idx, component) in components.iter().enumerate() {
             if component.len() < min_copies {
                 continue;
             }
             let coherent_classes = coherence_split(
                 component,
+                &edges_by_component[comp_idx],
                 |a, b| {
                     let ba = by_id[&a];
                     let bb = by_id[&b];
@@ -653,6 +658,43 @@ impl IndexDatabase {
     }
 }
 
+/// Anti-unify coverage below which a refined class is strongly penalized in the ROI sort (#256). A
+/// class under this is degenerate (almost none of the shared spine is fixed, a `⟨m0⟩`-style
+/// template), so it is not a refactorable clone and must not float to the top on member count.
+const COVERAGE_STRONG_GATE: f64 = 0.3;
+/// Anti-unify coverage below which a refined class is mildly penalized (the band between
+/// [`COVERAGE_STRONG_GATE`] and this). Mirrors `refactorability_v2`'s `< 0.5` band.
+const COVERAGE_MILD_GATE: f64 = 0.5;
+/// Strong refined-ROI multiplier for a near-zero-coverage (degenerate) class: an order of
+/// magnitude, enough to sink a coverage-0.00 13-member helper "class" below genuine higher-coverage
+/// clones without zeroing the ROI (a strictly positive factor keeps the class visible, just
+/// deprioritized).
+const COVERAGE_STRONG_PENALTY: f64 = 0.10;
+/// Mild refined-ROI multiplier for the `[0.3, 0.5)` coverage band (matches `refactorability_v2`).
+const COVERAGE_MILD_PENALTY: f64 = 0.70;
+
+/// Mutually-exclusive coverage band giving the refined-ROI multiplier (#256): the strong penalty
+/// below [`COVERAGE_STRONG_GATE`], the mild penalty in the `[0.3, 0.5)` band, and `1.0` (no
+/// penalty) at/above [`COVERAGE_MILD_GATE`]. Applied ONLY to the refined ROI in
+/// [`apply_refinement`]; the un-refined sort has no coverage to gate on.
+///
+/// This gate STACKS ON `refactorability_v2`'s own `< 0.5 → ×0.70` coverage factor — it does NOT
+/// replace it. In [`apply_refinement`] the refined ROI is `… × refactorability_v2 × coverage_gate`,
+/// and `refactorability_v2` is ALREADY coverage-penalized, so the two multipliers compound. The NET
+/// coverage multiplier is `0.70 × 0.70 = 0.49` in the `[0.3, 0.5)` band and `0.70 × 0.10 = 0.07`
+/// below `0.3`. The compounding is INTENTIONAL: `refactorability_v2`'s `×0.70` alone was too weak
+/// to sink a degenerate coverage-0.00 class beneath genuine higher-coverage clones, because raw
+/// `member_count` dominates — the extra gate is what makes the penalty bite (#256).
+fn coverage_roi_gate(anti_unify_coverage: f64) -> f64 {
+    if anti_unify_coverage < COVERAGE_STRONG_GATE {
+        COVERAGE_STRONG_PENALTY
+    } else if anti_unify_coverage < COVERAGE_MILD_GATE {
+        COVERAGE_MILD_PENALTY
+    } else {
+        1.0
+    }
+}
+
 /// Apply a [`CachedRefinement`] to a [`CandidateCloneClass`] in place (Plan 4a). Shared between
 /// the warm (cache-hit) and cold (compute+store) paths of [`IndexDatabase::refine_class_in_place`].
 ///
@@ -676,11 +718,23 @@ fn apply_refinement(
     // Swap the ROI cohesion multiplier for `refactorability` on refined classes (Plan 4a). The
     // other factors are unchanged (cross-module spread × member count × medoid body tokens ×
     // load-bearing factor); `cohesion_min_pairwise` stays surfaced for transparency.
+    //
+    // Coverage gate (#256): a class whose anti-unification found almost NO shared structure has a
+    // near-zero `anti_unify_coverage` and a degenerate template (`⟨m0⟩` — the whole body is one
+    // metavar). Such a class is not a refactorable clone, yet `member_count × body_token_len`
+    // alone floated several coverage-0.00 13-member test-helper "classes" to the very top after the
+    // giant split. `refactorability_v2`'s ×0.70 below 0.5 was too weak to overcome the raw
+    // member-count signal. So gate the REFINED ROI on coverage as a mutually-exclusive band
+    // (mirrors the `refactorability_v2` style, score.rs): a strong penalty below 0.3, the milder
+    // 0.70 between 0.3 and 0.5, none at/above 0.5. This touches ONLY the refined sort — the
+    // un-refined (Plan-2) sort has no coverage and is left alone.
+    let coverage_gate = coverage_roi_gate(refinement.anti_unify_coverage);
     class.roi = class.cross_module_spread as f64
         * class.member_count as f64
         * class.body_token_len_medoid as f64
         * class.roi_factors.load_bearing_factor
-        * refinement.refactorability;
+        * refinement.refactorability
+        * coverage_gate;
 
     class.refined = true;
     class.class_kind = "refined_class";
@@ -826,20 +880,26 @@ impl IndexDatabase {
         let pairs = candidate_pairs_from_bags(&bags, THETA);
         let components = components_from_pairs(&pairs);
 
-        // Find the component that contains this symbol_id.
-        let Some(component) = components.into_iter().find(|comp| comp.contains(&symbol_id)) else {
+        // Find the component that contains this symbol_id (with its index so we can pull its edge
+        // bucket).
+        let Some(comp_idx) = components.iter().position(|comp| comp.contains(&symbol_id)) else {
             return Ok(make_result(None, true, true, 0, freshness));
         };
+        let component = components[comp_idx].clone();
+        // The θ-verified edge subset for THIS component (#256) — feeds the scalable clique cover so
+        // a giant over-merged component the subject lands in splits instead of being returned
+        // whole.
+        let mut edges_by_component = bucket_edges_by_component(&pairs, &components);
+        let component_edges = std::mem::take(&mut edges_by_component[comp_idx]);
 
         // Plan 4a: coherence-split the component, then serve the coherent sub-class that contains
         // the subject. If the subject is a SINGLETON after the split (it cohered with no peer at
-        // θ), fall back to the full UN-refined component so the caller still sees the
-        // symbol's over-merged neighborhood — `clones_for_symbol` is a reverse lookup ABOUT
-        // a specific symbol, so an empty answer for a symbol that IS in an (over-merged)
-        // component would be less useful than the un-refined fallback. `find_clones` has no
-        // such fallback (no subject).
+        // θ), there is NO whole-component fallback (#256): serving the full over-merged component
+        // would re-expose the very giant the split exists to break. `clones_for_symbol` returns the
+        // subject's COHERENT neighborhood (the clique(s) containing it) or nothing.
         let coherent_classes = coherence_split(
             &component,
+            &component_edges,
             |a, b| {
                 let ba = by_id[&a];
                 let bb = by_id[&b];
@@ -886,9 +946,12 @@ impl IndexDatabase {
                 built
             },
             None => {
-                // Subject split to a singleton: serve the full un-refined component
-                // (refined=false).
-                build_class(&component, &by_id, conn, Some(symbol_id))?
+                // Subject split to a singleton — it cohered with no peer at θ, so there is no
+                // coherent class to serve. Return nothing (#256): the OLD behavior served the full
+                // un-refined component, which re-exposed the over-merged giant the split exists to
+                // break (the exact `clones-for`-on-a-chained-symbol regression #256 names). A
+                // reverse lookup ABOUT a symbol that has no coherent clone peer is honestly empty.
+                None
             },
         };
 
@@ -2002,14 +2065,84 @@ fn components_from_pairs(pairs: &[(i64, i64)]) -> Vec<Vec<i64>> {
         .collect()
 }
 
+/// Partition the θ-verified candidate `pairs` into per-component edge lists, parallel to
+/// `components` (entry `i` holds the edges whose endpoints belong to `components[i]`) (#256).
+///
+/// The coherence split seeds its clique cover from a component's edge list; supplying the
+/// precomputed edges makes seeding O(edges) instead of the old O(n²) all-pairs scan (the reason the
+/// removed `SPLIT_MAX` member cap existed). Both endpoints of a pair share a component by
+/// construction (`components_from_pairs` union-finds the same pairs), so a node→component-index map
+/// resolves every edge in ONE O(|pairs|) pass. An edge whose endpoints fall in a dropped singleton
+/// component (not in the map) is skipped — it can never appear, but the guard keeps the partition
+/// total.
+fn bucket_edges_by_component(
+    pairs: &[(i64, i64)],
+    components: &[Vec<i64>],
+) -> Vec<Vec<(i64, i64)>> {
+    let mut node_to_component: BTreeMap<i64, usize> = BTreeMap::new();
+    for (idx, component) in components.iter().enumerate() {
+        for &node in component {
+            node_to_component.insert(node, idx);
+        }
+    }
+    let mut edges_by_component: Vec<Vec<(i64, i64)>> = vec![Vec::new(); components.len()];
+    for &(a, b) in pairs {
+        if let Some(&idx) = node_to_component.get(&a) {
+            // `a` and `b` are unioned into the same component, so indexing by `a` is correct.
+            edges_by_component[idx].push((a, b));
+        }
+    }
+    edges_by_component
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        SymbolBag, THETA, TokenPosting, add_struct_hash_pairs, class_key_for,
-        components_from_pairs, overlap, sub_block_candidate_pairs,
+        SymbolBag, THETA, TokenPosting, add_struct_hash_pairs, bucket_edges_by_component,
+        class_key_for, components_from_pairs, coverage_roi_gate, overlap,
+        sub_block_candidate_pairs,
     };
+
+    /// #256: the refined-ROI coverage gate is a mutually-exclusive band. A near-zero-coverage
+    /// (degenerate `⟨m0⟩`) class gets the strong penalty so it can't float to the top on member
+    /// count; a `[0.3, 0.5)` class gets the mild 0.70; at/above 0.5 there is no penalty.
+    #[test]
+    fn roi_low_coverage_refined_class_downranked() {
+        // Strong band: below 0.3 → the order-of-magnitude penalty (degenerate, e.g. coverage 0.00).
+        assert_eq!(coverage_roi_gate(0.0), super::COVERAGE_STRONG_PENALTY);
+        assert_eq!(coverage_roi_gate(0.29), super::COVERAGE_STRONG_PENALTY);
+        // Mild band: [0.3, 0.5) → 0.70 (matches refactorability_v2).
+        assert_eq!(coverage_roi_gate(0.3), super::COVERAGE_MILD_PENALTY);
+        assert_eq!(coverage_roi_gate(0.49), super::COVERAGE_MILD_PENALTY);
+        // No penalty at/above 0.5 — a healthy class is untouched.
+        assert_eq!(coverage_roi_gate(0.5), 1.0);
+        assert_eq!(coverage_roi_gate(1.0), 1.0);
+        // The gate strictly down-ranks a degenerate class relative to a healthy one with the SAME
+        // structural factors: a coverage-0.00 class's ROI multiplier (0.10) is far below a
+        // coverage-1.0 class's (1.0), so member count alone can no longer invert the order.
+        assert!(coverage_roi_gate(0.0) < coverage_roi_gate(0.6));
+        // Each factor is strictly positive (never zeroes the ROI — a gated class stays visible).
+        for cov in [0.0, 0.2, 0.4, 0.6, 1.0] {
+            assert!(coverage_roi_gate(cov) > 0.0);
+        }
+    }
+
+    /// #256: `bucket_edges_by_component` partitions the candidate pairs into per-component edge
+    /// lists parallel to `components`, with both endpoints landing in the same bucket.
+    #[test]
+    fn bucket_edges_partitions_pairs_per_component() {
+        // Two disjoint components: {1,2,3} and {10,11}.
+        let pairs = vec![(1, 2), (2, 3), (1, 3), (10, 11)];
+        let components = components_from_pairs(&pairs);
+        // components_from_pairs sorts components by lowest id, so [0]={1,2,3}, [1]={10,11}.
+        assert_eq!(components, vec![vec![1, 2, 3], vec![10, 11]]);
+        let buckets = bucket_edges_by_component(&pairs, &components);
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0], vec![(1, 2), (2, 3), (1, 3)]);
+        assert_eq!(buckets[1], vec![(10, 11)]);
+    }
 
     // ── Fix A: NaN / non-finite min_similarity ────────────────────────────────────────────────
 
