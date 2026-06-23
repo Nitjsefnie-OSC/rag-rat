@@ -125,7 +125,13 @@ impl IndexDatabase {
         // desync the external-content index until the next forced rebuild).
         self.insert_chunks(ChunkInsertFile { file_id, source_revision: &sha256 }, &chunks)?;
         let symbol_ids = self.insert_symbols(file_id, language, &symbols)?;
-        self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
+        // (#232 #6) Skip generated files on the incremental/heal path too — same write-side hygiene
+        // and the same `file_is_generated` arg as the full-rebuild prepare gate (prep.rs). Catches
+        // PATH-heuristic codegen under a Source target (`src/generated/*.rs`, `*.d.ts`); the
+        // `kind=Generated` case is already symbol-empty above.
+        if !file_is_generated(kind, &path_string(path)) {
+            self.store_symbol_fingerprints(language, path, text, &symbols, &symbol_ids)?;
+        }
         if kind != TargetKind::Generated && text.len() <= edges::MAX_GRAPH_PARSE_BYTES {
             edges::index_file_edges(self.storage.connection(), file_id, path, language, text)?;
         }
@@ -243,10 +249,13 @@ impl IndexDatabase {
         symbols: &[Symbol],
         symbol_ids: &[i64],
     ) -> anyhow::Result<()> {
-        // Only `kind == "function"` symbols are fingerprinted (#215). Bail before re-parsing the
-        // file when none qualify — the parse is the expensive part of this incremental/heal
-        // wrapper.
-        if symbols.iter().all(|s| s.kind != "function") {
+        // `kind == "function"` symbols AND function-valued `const` declarators are fingerprinted
+        // (#215; #232 #5). This is a node-free PRE-PARSE early-bail, so it can only widen on the
+        // `kind` SUPERSET — a function-valued declarator is `kind == "const"` (parser.rs) — and let
+        // `fingerprint_symbols` + `symbol_is_function_valued` reject plain-value consts AFTER the
+        // parse. Bail before re-parsing only when NO `function` and NO `const` symbol exists — the
+        // parse is the expensive part of this incremental/heal wrapper.
+        if symbols.iter().all(|s| s.kind != "function" && s.kind != "const") {
             return Ok(());
         }
         let Some(parsed) = parser::parse_file(path, language, text) else {

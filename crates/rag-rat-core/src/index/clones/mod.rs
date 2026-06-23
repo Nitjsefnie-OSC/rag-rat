@@ -15,7 +15,15 @@ use tree_sitter::Node;
 
 /// Bumped when normalization changes; invalidates fingerprints (and the later refine cache) without
 /// a schema migration.
-pub(crate) const NORM_VERSION: i64 = 1;
+///
+/// `2` (#232): the normalization stream changed in two ways that affect every fingerprint — (1)
+/// comments and other tree-sitter EXTRAs are skipped (`walk_spanned`), and (2) multi-language
+/// literal leaves bucket (TS `string_fragment` → `LIT_STRING_FRAGMENT`; `true`/`false` value-erase
+/// to `LIT_BOOL`). The already-shipped read filter (`sf.normalizer_version = NORM_VERSION` on every
+/// fingerprint read) auto-EXCLUDES the v1 rows, which are recomputed at v2 on the next reindex; the
+/// 4b refinement cache invalidates via `NORM_VERSION` in the content-addressed `refinement_key` +
+/// the freshness predicate (`refine::cache`). No schema migration is needed.
+pub(crate) const NORM_VERSION: i64 = 2;
 /// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
@@ -78,12 +86,31 @@ pub(crate) fn fingerprint_symbol(node: Node<'_>, text: &str) -> Option<SymbolFin
     })
 }
 
-/// Baseline fingerprints for a file's function symbols, walking the SHARED parse tree (no re-parse,
-/// no DB). Returns `(local_symbol_index, fingerprint)` pairs keyed by index into `symbols`, so the
-/// caller maps each to the right DB id when it writes. Non-function symbols, symbols that can't be
-/// located in the tree, and bodies that normalize below `MIN_TOKENS` are skipped. The full-rebuild
-/// prepare phase calls this from the parse it already did for symbols/edges; the incremental path
-/// re-parses and calls it from `store_symbol_fingerprints`.
+/// `true` when a symbol's AST node is a FUNCTION-VALUED declarator: a `variable_declarator`
+/// (`const f = () => {…}`, `let f = function(){…}`) or `public_field_definition` (a class-field
+/// arrow handler) whose `value` child is an `arrow_function` / `function_expression` (#232 #5).
+///
+/// These carry symbol `kind = "const"` in `parser.rs` (NOT changed — `kind` drives chunking, graph
+/// edges, and search facets; see the plan's invariant) but ARE real function bodies worth
+/// fingerprinting: two `const x = () => {…}` clones match each other (same declarator shape). The
+/// node-level check is what keeps a plain-value `const x = 5;` excluded — its `value` child is a
+/// `number`, not a function. Probe-confirmed against the wired TS grammar: matches const-arrow,
+/// const-func-expr, let-async-arrow, and class-field-arrow; rejects destructure / number / object.
+fn symbol_is_function_valued(node: Node<'_>) -> bool {
+    matches!(node.kind(), "variable_declarator" | "public_field_definition")
+        && node
+            .child_by_field_name("value")
+            .is_some_and(|v| matches!(v.kind(), "arrow_function" | "function_expression"))
+}
+
+/// Baseline fingerprints for a file's fingerprintable symbols, walking the SHARED parse tree (no
+/// re-parse, no DB). Returns `(local_symbol_index, fingerprint)` pairs keyed by index into
+/// `symbols`, so the caller maps each to the right DB id when it writes. A symbol is fingerprinted
+/// when it is a `kind == "function"` symbol OR a function-valued declarator
+/// ([`symbol_is_function_valued`], #232 #5); symbols that can't be located in the tree and bodies
+/// that normalize below `MIN_TOKENS` are skipped. The full-rebuild prepare phase calls this from
+/// the parse it already did for symbols/edges; the incremental path re-parses and calls it from
+/// `store_symbol_fingerprints`.
 pub(crate) fn fingerprint_symbols(
     root: Node<'_>,
     text: &str,
@@ -91,12 +118,14 @@ pub(crate) fn fingerprint_symbols(
 ) -> Vec<(usize, SymbolFingerprint)> {
     let mut out = Vec::new();
     for (i, symbol) in symbols.iter().enumerate() {
-        if symbol.kind != "function" {
-            continue;
-        }
         let Some(node) = root.descendant_for_byte_range(symbol.start_byte, symbol.end_byte) else {
             continue;
         };
+        // Fingerprint a `function` symbol OR a function-valued declarator (the node check rejects
+        // plain-value consts — `const x = 5;` — so symbol `kind` stays unchanged, #232 #5 / R2).
+        if symbol.kind != "function" && !symbol_is_function_valued(node) {
+            continue;
+        }
         if let Some(fp) = fingerprint_symbol(node, text) {
             out.push((i, fp));
         }
@@ -109,15 +138,53 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::index::parser;
+    use crate::index::{parser, symbols};
     use crate::language::Language;
 
-    fn fp(src: &str) -> Option<SymbolFingerprint> {
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, src).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("function");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
+    /// Generalized fingerprint harness (#232): parse `src` with `language` (under `path`), select
+    /// the target symbol — the one whose subtree normalizes to the MOST tokens, language-agnostic
+    /// so it works for Rust `function`, TS `const`/function-valued declarators, and Python
+    /// `function` alike — and return its fingerprint (`None` below `MIN_TOKENS`). Test fixtures
+    /// MUST clear `MIN_TOKENS` (20) or `fp_lang` returns `None` for the size gate, not the
+    /// property under test.
+    fn fp_lang(src: &str, path: &str, language: Language) -> Option<SymbolFingerprint> {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        let node = parsed
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let node = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
+                let len = normalize::normalize_baseline(node, src).len();
+                Some((len, node))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, node)| node)
+            .expect("at least one symbol with a normalizable subtree");
         fingerprint_symbol(node, src)
+    }
+
+    /// Rust-only wrapper — the existing Rust fingerprint tests call this unchanged.
+    fn fp(src: &str) -> Option<SymbolFingerprint> {
+        fp_lang(src, "t.rs", Language::Rust)
+    }
+
+    #[test]
+    fn norm_version_is_2() {
+        // #232: the comment-skip (T2) + multi-language literal bucketing (T3) changed the
+        // normalization stream, so NORM_VERSION must be 2. The read filter + content-addressed
+        // refinement key both key off this constant, so a stream change without the bump silently
+        // serves stale fingerprints/refinements.
+        assert_eq!(NORM_VERSION, 2);
+    }
+
+    #[test]
+    fn fp_lang_fingerprints_ts_and_python() {
+        // Smoke test for the generalized fingerprint harness — both fixtures clear MIN_TOKENS (20).
+        let ts = "function f() { const a = get(1); const b = get(2); const c = get(3); return a + \
+                  b + c; }";
+        assert!(fp_lang(ts, "t.ts", Language::TypeScript).is_some(), "TS fn must fingerprint");
+        let py = "def f():\n    a = get(1)\n    b = get(2)\n    c = get(3)\n    return a + b + c\n";
+        assert!(fp_lang(py, "t.py", Language::Python).is_some(), "Python fn must fingerprint");
     }
 
     #[test]
@@ -133,5 +200,82 @@ mod tests {
     #[test]
     fn trivial_bodies_below_min_tokens_are_not_fingerprinted() {
         assert!(fp("fn x() -> i32 { 0 }").is_none());
+    }
+
+    // ── Task 5 (#232): function-valued declarators are fingerprinted (kind unchanged)
+    // ─────────
+
+    #[test]
+    fn ts_function_valued_declarator_is_fingerprinted() {
+        // A `const`-bound arrow function (>20 tokens, clears MIN_TOKENS) IS fingerprinted even
+        // though its symbol `kind` is "const" (#232 #5).
+        let arrow = "const load = (id) => { const row = get(id); const ok = check(row); return ok \
+                     ? row : null; }";
+        assert!(
+            fp_lang(arrow, "t.ts", Language::TypeScript).is_some(),
+            "const-bound arrow function must be fingerprinted"
+        );
+
+        // A `let`-bound async arrow (>20 tokens) IS fingerprinted too.
+        let async_arrow = "let run = async (q) => { const a = await fetch(q); const b = await \
+                           parse(a); return b.value; }";
+        assert!(
+            fp_lang(async_arrow, "t.ts", Language::TypeScript).is_some(),
+            "let-bound async arrow must be fingerprinted"
+        );
+    }
+
+    #[test]
+    fn ts_class_field_arrow_handler_is_fingerprinted() {
+        // A class-field arrow handler (`public_field_definition` with arrow value, >20 tokens) IS
+        // fingerprinted (#232 #5).
+        let field = "class C { handler = (ev) => { const x = read(ev); const y = norm(x); \
+                     send(y); return y; } }";
+        assert!(
+            fp_lang(field, "t.ts", Language::TypeScript).is_some(),
+            "class-field arrow handler must be fingerprinted"
+        );
+    }
+
+    #[test]
+    fn ts_large_non_function_value_const_is_not_fingerprinted() {
+        // R3: the negative MUST be a >20-token NON-function value to isolate
+        // `symbol_is_function_valued` (a <20-token `const x = 5` would pass for the WRONG
+        // reason — the MIN_TOKENS size gate). A large object-literal const clears
+        // MIN_TOKENS but its `value` child is an `object`, not a function, so it is NOT
+        // fingerprinted.
+        let big_object =
+            "const cfg = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11 };";
+        let parsed =
+            parser::parse_file(Path::new("t.ts"), Language::TypeScript, big_object).expect("parse");
+        let decl = parsed.symbols.iter().find(|s| s.kind == "const").expect("a const symbol");
+        let node =
+            parsed.root().descendant_for_byte_range(decl.start_byte, decl.end_byte).expect("node");
+        // Clears MIN_TOKENS (so this isn't the size gate) but is NOT function-valued.
+        assert!(
+            normalize::normalize_baseline(node, big_object).len() >= MIN_TOKENS,
+            "fixture must clear MIN_TOKENS so the negative isolates the value guard"
+        );
+        assert!(
+            !symbol_is_function_valued(node),
+            "object-literal const must not be function-valued"
+        );
+        let fps =
+            fingerprint_symbols(parsed.root(), big_object, &symbols::from_parsed(&parsed.symbols));
+        assert!(
+            fps.is_empty(),
+            "a large non-function-value const must NOT be fingerprinted: {fps:?}"
+        );
+    }
+
+    #[test]
+    fn ts_const_kind_is_unchanged_by_fingerprint_guard() {
+        // #232 #5 must NOT change symbol `kind`: a function-valued declarator is still classified
+        // `const` (the guard is fingerprint-local; parser.rs is untouched).
+        let arrow = "const load = (id) => { const row = get(id); return row; }";
+        let parsed =
+            parser::parse_file(Path::new("t.ts"), Language::TypeScript, arrow).expect("parse");
+        let sym = parsed.symbols.iter().find(|s| s.name == "load").expect("load symbol");
+        assert_eq!(sym.kind, "const", "function-valued declarator keeps kind=const");
     }
 }

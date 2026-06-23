@@ -9,9 +9,34 @@ fn is_identifier_kind(kind: &str) -> bool {
 }
 
 /// A leaf kind that is a literal whose *value* must not drive matching.
+///
+/// `string_fragment` is the TypeScript/JavaScript string-body leaf (the text inside the quotes, the
+/// counterpart to Python's `string_content` — both are the value-bearing inner leaf, #232 #2a). It
+/// buckets to `LIT_STRING_FRAGMENT`, which the anti-unify/signature contract maps to `&str` (see
+/// `signature::literal_bucket_to_type`).
 fn is_literal_kind(kind: &str) -> bool {
     kind.ends_with("literal")
-        || matches!(kind, "string_content" | "integer" | "float" | "number" | "char")
+        || matches!(
+            kind,
+            "string_content" | "string_fragment" | "integer" | "float" | "number" | "char"
+        )
+}
+
+/// A leaf kind that is a boolean literal in the grammars that expose booleans as their own leaf
+/// kind: Rust emits `true`/`false` as leaves under an internal `boolean_literal`; TypeScript,
+/// Python, C and C++ emit bare `true`/`false` leaves (Python lexemes `True`/`False` map to kinds
+/// `true`/`false`). Bucketing both to ONE `LIT_BOOL` token (not `LIT_TRUE`/`LIT_FALSE`)
+/// value-ERASES the boolean: two bodies differing only in `true` vs `false` then normalize equal,
+/// and `LIT_BOOL` recovers `bool` typing in the signature contract (#232 #2b). The single bucket
+/// is why this is NOT routed through the generic `LIT_{kind.uppercased}` path — that would encode
+/// the value.
+///
+/// NOT covered: `tree-sitter-kotlin-ng` emits `true`/`false`/`null` as plain `identifier` leaves,
+/// so Kotlin booleans are alpha-renamed (`ID<n>`) rather than value-erased. This is a deferred
+/// recall gap, not a correctness bug — the language partition guarantees Kotlin only ever
+/// clone-matches Kotlin, where identifiers and booleans are treated consistently (#232 follow-up).
+fn is_boolean_leaf_kind(kind: &str) -> bool {
+    matches!(kind, "true" | "false")
 }
 
 /// `true` for a tree-sitter node kind that names a Rust type position — a bare type name
@@ -97,6 +122,19 @@ fn walk_spanned(
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
 
+    // (#232 #1) Comments and other tree-sitter EXTRAs (e.g. Python `line_continuation`) carry no
+    // semantic token: skip the WHOLE subtree, pushing NEITHER a token NOR a span so the seq↔span
+    // bijection is preserved. The OR is load-bearing (R4): `is_extra()` catches every grammar's
+    // comments via the runtime EXTRA flag PLUS non-comment extras like `line_continuation`, while
+    // the explicit `kind.contains("comment")` is a belt-and-braces guard for any grammar that
+    // flags a comment as a normal (non-extra) node — neither predicate alone covers all six
+    // grammars, so we keep both. (Comments themselves never anchor a clone variation point;
+    // skipping them at the source means no caller — antiunify, signature recovery — ever sees a
+    // comment span.)
+    if node.is_extra() || kind.contains("comment") {
+        return;
+    }
+
     if node.child_count() == 0 {
         // Leaf: push the token and its span.
         let leaf = node.utf8_text(src).unwrap_or("");
@@ -104,10 +142,17 @@ fn walk_spanned(
             let next = idents.len();
             let id = *idents.entry(leaf.to_string()).or_insert(next);
             format!("ID{id}")
+        } else if is_boolean_leaf_kind(kind) {
+            // Value-erase booleans to ONE bucket (NOT `LIT_{kind.uppercased}`): `true`/`false`
+            // collapse to `LIT_BOOL` so a true↔false-only diff is a clone (#232 #2b).
+            "LIT_BOOL".to_string()
         } else if is_literal_kind(kind) {
             format!("LIT_{}", kind.to_ascii_uppercase())
         } else {
-            // keyword / operator / punctuation — structural, kept verbatim
+            // (#232 #2c) NULL-FAMILY out of scope (low value + wrapped-node hazard): `null` /
+            // `undefined` (TS), `none` (Python), and the C/C++ `NULL`/`nullptr` leaves stay
+            // verbatim. keyword / operator / punctuation / null-family — structural,
+            // kept verbatim
             leaf.to_string()
         };
         tokens.push(token);
@@ -133,20 +178,201 @@ mod tests {
     use crate::index::parser;
     use crate::language::Language;
 
+    /// Pick the target symbol's AST node for a normalization test: the symbol whose subtree
+    /// normalizes to the MOST tokens (the actual body under test, language-agnostic). Choosing by
+    /// token count instead of `kind == "function"` is what lets the same harness drive Rust
+    /// `function`, TS `const`/function-valued declarators, and Python `function` symbols — the
+    /// languages disagree on the symbol `kind` string but agree that the biggest normalized subtree
+    /// is the body we want to compare.
+    fn target_node_for<'a>(parsed: &'a parser::ParsedFile, src: &str) -> tree_sitter::Node<'a> {
+        parsed
+            .symbols
+            .iter()
+            .filter_map(|s| {
+                let node = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
+                let len = normalize_baseline(node, src).len();
+                Some((len, node))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, node)| node)
+            .expect("at least one symbol with a normalizable subtree")
+    }
+
+    /// Generalized normalize harness: parse `src` with `language` (under `path`, which selects the
+    /// grammar / generated heuristics), select the target symbol, return its normalized stream.
+    fn norm_lang(src: &str, path: &str, language: Language) -> Vec<String> {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        normalize_baseline(target_node_for(&parsed, src), src)
+    }
+
+    /// Generalized spanned-normalize harness (token stream + parallel `NodeSpan`s).
+    fn spanned_lang(src: &str, path: &str, language: Language) -> (Vec<String>, Vec<NodeSpan>) {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        normalize_baseline_spanned(target_node_for(&parsed, src), src)
+    }
+
+    /// Rust-only wrappers — the existing Rust tests call these unchanged.
     fn norm(src: &str) -> Vec<String> {
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, src).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        normalize_baseline(node, src)
+        norm_lang(src, "t.rs", Language::Rust)
     }
 
     fn spanned(src: &str) -> (Vec<String>, Vec<NodeSpan>) {
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, src).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        normalize_baseline_spanned(node, src)
+        spanned_lang(src, "t.rs", Language::Rust)
+    }
+
+    // ── Task 1 (#232): multi-language harness smoke test
+    // ───────────────────────────────────────
+
+    /// The generalized harness parses TypeScript and Python (not just Rust) and returns a non-empty
+    /// normalized stream carrying the function-body tokens. Pure harness smoke test — proves the
+    /// grammar selection + target-symbol picker work cross-language before T2/T3/T5 lean on them.
+    #[test]
+    fn harness_parses_ts_and_python() {
+        let ts = norm_lang(
+            "function f() { const a = get(1); const b = get(2); return a + b; }",
+            "t.ts",
+            Language::TypeScript,
+        );
+        assert!(!ts.is_empty(), "TS normalize stream must be non-empty");
+        assert!(ts.iter().any(|t| t == "return_statement"), "TS stream missing body: {ts:?}");
+
+        let py = norm_lang(
+            "def f():\n    a = get(1)\n    b = get(2)\n    return a + b\n",
+            "t.py",
+            Language::Python,
+        );
+        assert!(!py.is_empty(), "Python normalize stream must be non-empty");
+        assert!(py.iter().any(|t| t == "return_statement"), "Python stream missing body: {py:?}");
+    }
+
+    // ── Task 2 (#232): comments are ignored
+    // ──────────────────────────────────────────
+
+    /// For Rust (`//`, `/* */`), TS (`//`, `/* */`), and Python (`#`): two function bodies that
+    /// differ ONLY by comments normalize to the SAME token stream (comments carry no semantic
+    /// token), and the seq↔span bijection holds throughout.
+    #[test]
+    fn comments_are_ignored_across_languages() {
+        // Rust — line + block comments.
+        let rust_plain = "fn f(db: Db) -> i32 { let u = db.get(10); validate(u); u + 1 }";
+        let rust_commented = "fn f(db: Db) -> i32 {\n    // load it\n    let u = db.get(10); /* \
+                              hmm */ validate(u); u + 1 }";
+        let (tp, sp) = spanned(rust_plain);
+        let (tc, sc) = spanned(rust_commented);
+        assert_eq!(tp, tc, "Rust comment-only diff must normalize equal");
+        assert_eq!(tp.len(), sp.len(), "bijection broken (rust plain)");
+        assert_eq!(tc.len(), sc.len(), "bijection broken (rust commented)");
+
+        // TypeScript — line + block comments.
+        let ts_plain = "function f() { const a = get(1); const b = get(2); return a + b; }";
+        let ts_commented =
+            "function f() {\n  // a\n  const a = get(1); /* b */ const b = get(2); return a + b; }";
+        let (ttp, _) = spanned_lang(ts_plain, "t.ts", Language::TypeScript);
+        let (ttc, ttcs) = spanned_lang(ts_commented, "t.ts", Language::TypeScript);
+        assert_eq!(ttp, ttc, "TS comment-only diff must normalize equal");
+        assert_eq!(ttc.len(), ttcs.len(), "bijection broken (ts commented)");
+
+        // Python — `#` comments.
+        let py_plain = "def f():\n    a = get(1)\n    b = get(2)\n    return a + b\n";
+        let py_commented =
+            "def f():\n    # load a\n    a = get(1)\n    b = get(2)  # and b\n    return a + b\n";
+        let (typ, _) = spanned_lang(py_plain, "t.py", Language::Python);
+        let (tyc, tycs) = spanned_lang(py_commented, "t.py", Language::Python);
+        assert_eq!(typ, tyc, "Python comment-only diff must normalize equal");
+        assert_eq!(tyc.len(), tycs.len(), "bijection broken (py commented)");
+    }
+
+    /// Python `line_continuation` (`\` at EOL) is a tree-sitter EXTRA leaf, not a comment — the
+    /// `is_extra()` arm of the skip catches it (R4). It carries no semantic token, so a body with a
+    /// line continuation normalizes equal to the same body written on one line, and the bijection
+    /// still holds.
+    #[test]
+    fn python_line_continuation_is_skipped() {
+        let one_line = "def f():\n    x = aaa + bbb + ccc\n    return x\n";
+        let continued = "def f():\n    x = aaa + \\\n        bbb + ccc\n    return x\n";
+        let (t1, _) = spanned_lang(one_line, "t.py", Language::Python);
+        let (t2, s2) = spanned_lang(continued, "t.py", Language::Python);
+        assert_eq!(t1, t2, "line_continuation must not change the normalized stream");
+        assert_eq!(t2.len(), s2.len(), "bijection broken (py line_continuation)");
+    }
+
+    // ── Task 3 (#232): multi-language literal bucketing
+    // ───────────────────────────────────
+
+    /// TS strings (`string_fragment`) and booleans (`true`/`false` → `LIT_BOOL`) bucket: two bodies
+    /// differing ONLY in string contents normalize equal, and two differing ONLY in `true` vs
+    /// `false` normalize equal (the `LIT_BOOL` value-erase, #232 #2b).
+    #[test]
+    fn ts_strings_and_booleans_bucket() {
+        // Strings — differ only in the quoted contents.
+        let s1 = "function f() { const a = log(\"hello\"); const b = log(\"world\"); return a; }";
+        let s2 = "function f() { const a = log(\"foo\"); const b = log(\"bar\"); return a; }";
+        assert_eq!(
+            norm_lang(s1, "t.ts", Language::TypeScript),
+            norm_lang(s2, "t.ts", Language::TypeScript),
+            "TS string-content-only diff must normalize equal (string_fragment bucketed)"
+        );
+
+        // Booleans — differ only in true vs false.
+        let b_true = "function f() { const x = check(); const y = x; return true; }";
+        let b_false = "function f() { const x = check(); const y = x; return false; }";
+        let nt = norm_lang(b_true, "t.ts", Language::TypeScript);
+        let nf = norm_lang(b_false, "t.ts", Language::TypeScript);
+        assert_eq!(nt, nf, "TS true/false-only diff must normalize equal (LIT_BOOL)");
+        assert!(nt.iter().any(|t| t == "LIT_BOOL"), "TS boolean must emit LIT_BOOL: {nt:?}");
+    }
+
+    /// Python booleans (`True`/`False`, leaf kinds `true`/`false`) bucket to `LIT_BOOL`; `None`
+    /// (the null-family) stays verbatim — out of scope (#232 #2c).
+    #[test]
+    fn python_booleans_bucket_null_stays_verbatim() {
+        let t = "def f():\n    x = check()\n    y = x\n    return True\n";
+        let f = "def f():\n    x = check()\n    y = x\n    return False\n";
+        let nt = norm_lang(t, "t.py", Language::Python);
+        let nf = norm_lang(f, "t.py", Language::Python);
+        assert_eq!(nt, nf, "Python True/False-only diff must normalize equal (LIT_BOOL)");
+        assert!(
+            nt.iter().any(|tok| tok == "LIT_BOOL"),
+            "Python boolean must emit LIT_BOOL: {nt:?}"
+        );
+
+        // null-family deferred: `None` stays VERBATIM (the leaf kind is `none`, but the verbatim
+        // branch pushes the leaf TEXT `None` — no LIT_ bucket, #232 #2c).
+        let n = "def f():\n    x = check()\n    y = x\n    return None\n";
+        let nn = norm_lang(n, "t.py", Language::Python);
+        assert!(
+            nn.iter().any(|tok| tok == "None"),
+            "Python None stays verbatim (null-family deferred): {nn:?}"
+        );
+        assert!(
+            !nn.iter().any(|tok| tok.starts_with("LIT_")),
+            "Python None must NOT bucket to any LIT_ token: {nn:?}"
+        );
+    }
+
+    /// Rust regression / post-#2 stream pin: `let x = true` now emits `LIT_BOOL` for the boolean
+    /// leaf (where pre-#232 the `true`/`false` leaf fell through VERBATIM). This pins the NEW
+    /// stream — exactly one `LIT_BOOL` token, no `true` token left, the wrapping
+    /// `boolean_literal` node kind still pushed before it. A true↔false-only Rust diff now
+    /// normalizes equal.
+    #[test]
+    fn rust_booleans_bucket_to_lit_bool() {
+        let t = "fn f() -> bool { let a = compute(); let b = a; let x = true; x }";
+        let f = "fn f() -> bool { let a = compute(); let b = a; let x = false; x }";
+        let nt = norm(t);
+        let nf = norm(f);
+        assert_eq!(nt, nf, "Rust true/false-only diff must normalize equal (LIT_BOOL)");
+        // Exactly one LIT_BOOL, no bare `true`/`false` survivor, wrapping node kind still present.
+        assert_eq!(
+            nt.iter().filter(|tok| *tok == "LIT_BOOL").count(),
+            1,
+            "exactly one LIT_BOOL leaf: {nt:?}"
+        );
+        assert!(!nt.iter().any(|tok| tok == "true" || tok == "false"), "no verbatim bool: {nt:?}");
+        assert!(
+            nt.iter().any(|tok| tok == "boolean_literal"),
+            "wrapping boolean_literal node kind still pushed: {nt:?}"
+        );
     }
 
     // ── Original tests (must stay green)
