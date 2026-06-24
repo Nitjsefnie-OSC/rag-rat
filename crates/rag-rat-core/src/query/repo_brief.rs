@@ -290,7 +290,7 @@ fn capped(value: f64) -> f64 {
 }
 
 fn support_path_multiplier(mode: RepoBriefMode, path: &str) -> f64 {
-    if !is_test_or_mock_path(path) {
+    if !crate::index::parser::is_test_path(path) {
         return 1.0;
     }
     match mode {
@@ -298,19 +298,6 @@ fn support_path_multiplier(mode: RepoBriefMode, path: &str) -> f64 {
         RepoBriefMode::Spine => 0.70,
         RepoBriefMode::Churn => 1.0,
     }
-}
-
-fn is_test_or_mock_path(path: &str) -> bool {
-    path.contains("/__tests__/")
-        || path.contains("/__mocks__/")
-        || path.contains("/tests/")
-        || path.ends_with("/tests.rs")
-        || path.ends_with("_test.rs")
-        || path.ends_with("_tests.rs")
-        || path.ends_with(".test.ts")
-        || path.ends_with(".test.tsx")
-        || path.ends_with(".spec.ts")
-        || path.ends_with(".spec.tsx")
 }
 
 fn category_for(
@@ -638,29 +625,32 @@ pub(crate) fn enrich_symbol_kinds(
     conn: &Connection,
     rows: &mut [FileBriefRow],
 ) -> anyhow::Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let paths = rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>();
-    let symbol_kinds = symbol_kind_counts_by_path(conn, &paths)?;
-
-    for row in rows {
-        row.symbol_kinds = symbol_kinds.get(&row.path).cloned().unwrap_or_default();
-    }
-    Ok(())
+    enrich_rows(conn, rows, symbol_kind_counts_by_path, |row, value| row.symbol_kinds = value)
 }
 
 pub(crate) fn enrich_memory_counts(
     conn: &Connection,
     rows: &mut [FileBriefRow],
 ) -> anyhow::Result<()> {
+    enrich_rows(conn, rows, memory_counts_by_path, |row, value| row.memories = value)
+}
+
+/// Shared per-path enrichment: build the `path -> T` map (via `counts_by_path`) once, then `assign`
+/// each row its value (defaulting when the path is absent). `enrich_symbol_kinds` /
+/// `enrich_memory_counts` were ~identical but for the lookup fn and the target field (#294 dedup).
+fn enrich_rows<T: Clone + Default>(
+    conn: &Connection,
+    rows: &mut [FileBriefRow],
+    counts_by_path: impl Fn(&Connection, &[String]) -> anyhow::Result<BTreeMap<String, T>>,
+    assign: impl Fn(&mut FileBriefRow, T),
+) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     let paths = rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>();
-    let memory_counts = memory_counts_by_path(conn, &paths)?;
+    let counts = counts_by_path(conn, &paths)?;
     for row in rows {
-        row.memories = memory_counts.get(&row.path).cloned().unwrap_or_default();
+        assign(row, counts.get(&row.path).cloned().unwrap_or_default());
     }
     Ok(())
 }
