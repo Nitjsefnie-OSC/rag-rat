@@ -15,7 +15,11 @@ name: oracle
 on:
   pull_request:
     paths:
-      - 'crates/**'
+      # oracle runs the `rag-rat` binary (`index --full` + `oracle report`, see tools/oracle-run.sh)
+      # over external corpora, so it gates core's parser/resolution AND the cli entry points that
+      # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
+      - 'crates/rag-rat-core/**'
+      - 'crates/rag-rat-cli/**'
       # Root Cargo.toml/Cargo.lock change the built rag-rat binary (workspace deps / pinned
       # versions) without touching crates/** — gate on them too so a dependency bump can't merge
       # parser/oracle behaviour changes past the resolution health gate.
@@ -31,7 +35,11 @@ on:
   push:
     branches: [main]
     paths:
-      - 'crates/**'
+      # oracle runs the `rag-rat` binary (`index --full` + `oracle report`, see tools/oracle-run.sh)
+      # over external corpora, so it gates core's parser/resolution AND the cli entry points that
+      # drive it. Only the mcp crate can't move it — narrow from crates/** to core + cli (drops mcp).
+      - 'crates/rag-rat-core/**'
+      - 'crates/rag-rat-cli/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tools/oracle-corpora.toml'
