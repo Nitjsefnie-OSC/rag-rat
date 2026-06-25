@@ -1,10 +1,11 @@
-# Glama MCP server image for cq27-dev/rag-rat.
+# Local reproduction of Glama's hosted MCP build for cq27-dev/rag-rat.
 #
-# Tailored to Glama's hosted inspection harness: it builds debian + node + mcp-proxy, clones the
-# repo, and runs `mcp-proxy -- <command>`, which spawns the command as a stdio MCP server and
-# exposes it at :8080/mcp (+/sse) with a /ping health check. Glama's stock template leaves
-# <command> empty and ships no Rust toolchain, so this file adds both: a pinned toolchain +
-# `cargo install`, and a real start command after `--`.
+# Glama builds from its own Build Spec (base image + node + mcp-proxy, clone repo, then `buildSteps`,
+# then `cmdArguments`), NOT from this file. This Dockerfile bundles the same steps into one runnable
+# image so the Glama build can be reproduced and tested locally. The Build Spec's `buildSteps` must
+# install a Rust toolchain and `cargo install` rag-rat (Glama's base has none), and `cmdArguments`
+# must be `mcp-proxy -- rag-rat --config /workspace/rag-rat.toml mcp` — mcp-proxy spawns rag-rat as a
+# stdio MCP server and exposes it at :8080/mcp (+/sse) with the /ping health check Glama polls.
 #
 # The server roots itself in a tiny sample repo with embeddings off, so introspection
 # (initialize + tools/list, served from a static catalog) boots instantly — no model download,
