@@ -346,6 +346,19 @@ pub(crate) struct EvalArgs {
     /// `--replay`.
     #[arg(long)]
     pub replay_parent_state: bool,
+    /// Run searches with the graded-git rerank ON (#109): scores the SAME at-head index with
+    /// `[search] graded_git_rerank` forced true, for an A/B against the default fuse. Applies to
+    /// both the active and the hash-vector-baseline pass. Pair with `--replay` for the inner-loop
+    /// dial (`rag-rat eval --replay --rerank`).
+    #[arg(long)]
+    pub rerank: bool,
+    /// How many hits each search returns — the width of the candidate pool scored (#109). Default
+    /// 10 (unchanged behavior). `recall@3`/`recall@10` stay FIXED top-3/top-10 cutoffs regardless;
+    /// widening this only grows `recall_at_returned`, the candidate-recall ceiling. At 100 it
+    /// measures recall@100 ≈ the candidate-generation ceiling — pure measurement, no search
+    /// change.
+    #[arg(long, default_value_t = 10)]
+    pub search_limit: usize,
 }
 
 #[derive(Debug, Args)]
