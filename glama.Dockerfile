@@ -32,8 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 WORKDIR /app
-RUN git clone https://github.com/cq27-dev/rag-rat . \
-    && git checkout b903b9bebe8e9c194523ce48dca13bac659bcdd2
+# Track main HEAD, matching the Glama Build Spec's `pinnedCommit: null`.
+RUN git clone --depth 1 https://github.com/cq27-dev/rag-rat .
 
 # Hash-only build (no FastEmbed) -> small and offline; identical MCP tool surface for introspection.
 RUN cargo install --locked --path crates/rag-rat-cli --bin rag-rat \
