@@ -17,21 +17,17 @@ use sha2::{Digest, Sha256};
 pub(crate) use status::*;
 pub(crate) use store::*;
 
+#[cfg(feature = "fastembed")]
+use crate::embedding_models::{BGE_SMALL_MODEL_ID, JINA_CODE_MODEL_ID};
+use crate::embedding_models::{HASH_EMBEDDING_DIM, HASH_MODEL_ID};
+#[cfg(feature = "model2vec")]
+use crate::embedding_models::{MODEL2VEC_EMBEDDING_DIM, MODEL2VEC_MODEL_ID};
 use crate::index::now_ms;
 use crate::language::Language;
 
-pub const HASH_MODEL_ID: &str = "embedding-hash";
-pub const FASTEMBED_MODEL_ID: &str = "fastembed-all-minilm-l6-v2";
-pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
-pub const HASH_EMBEDDING_DIM: usize = 384;
-pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
-/// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
-/// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
-/// for very large repos where the FastEmbed backfill is infeasible. See `EmbeddingBackend`.
-pub const MODEL2VEC_MODEL_ID: &str = "model2vec-potion-retrieval-32m";
-pub const MODEL2VEC_DISPLAY_MODEL: &str = "minishlab/potion-retrieval-32M";
+/// The Model2Vec HF repo to pull weights from. Not a registry field — it is a construction detail
+/// of `Model2VecEmbedder`, not part of the model's index identity.
 pub const MODEL2VEC_HF_REPO: &str = "minishlab/potion-retrieval-32M";
-pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
 pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
     "Model2Vec backend requested, but this binary was built without Model2Vec support.\nRebuild \
      with default features enabled:\n  cargo install rag-rat";
@@ -103,13 +99,42 @@ impl Embedder for MockEmbedder {
 #[cfg(feature = "fastembed")]
 pub struct FastEmbedEmbedder {
     model: std::sync::Mutex<fastembed::TextEmbedding>,
+    model_id: &'static str,
+    dim: usize,
 }
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedEmbedder {
-    pub fn new(intra_threads: Option<usize>) -> anyhow::Result<Self> {
-        use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-        let mut options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+    /// Construct the FastEmbed embedder for a registered model id. This is the ONLY place that maps
+    /// a `model_id` to a `fastembed::EmbeddingModel` enum — every fastembed model the registry
+    /// knows about is selected here, defaulting to all-MiniLM for the (registry-guaranteed)
+    /// MiniLM id. The `dim` comes from the registry spec so the embedder reports the right
+    /// dimension without a second source of truth.
+    ///
+    /// All current fastembed models are SYMMETRIC (queries and code embed raw); fastembed applies
+    /// each model's Mean pooling + L2-normalize internally, so nothing is overridden here. See the
+    /// BGE instruction-collapse note in `embedding_models`.
+    pub fn for_model_id(
+        model_id: &'static str,
+        dim: usize,
+        intra_threads: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        let model = match model_id {
+            BGE_SMALL_MODEL_ID => fastembed::EmbeddingModel::BGESmallENV15,
+            JINA_CODE_MODEL_ID => fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            _ => fastembed::EmbeddingModel::AllMiniLML6V2,
+        };
+        Self::with_model(model, model_id, dim, intra_threads)
+    }
+
+    fn with_model(
+        model: fastembed::EmbeddingModel,
+        model_id: &'static str,
+        dim: usize,
+        intra_threads: Option<usize>,
+    ) -> anyhow::Result<Self> {
+        use fastembed::{InitOptions, TextEmbedding};
+        let mut options = InitOptions::new(model)
             .with_cache_dir(fastembed_cache_dir())
             .with_show_download_progress(true);
         // `ort_threads` caps the ONNX Runtime intra-op thread pool. Microsoft's prebuilt ORT
@@ -119,18 +144,18 @@ impl FastEmbedEmbedder {
         if let Some(threads) = intra_threads.filter(|threads| *threads > 0) {
             options = options.with_intra_threads(threads);
         }
-        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?) })
+        Ok(Self { model: std::sync::Mutex::new(TextEmbedding::try_new(options)?), model_id, dim })
     }
 }
 
 #[cfg(feature = "fastembed")]
 impl Embedder for FastEmbedEmbedder {
     fn model_id(&self) -> &str {
-        FASTEMBED_MODEL_ID
+        self.model_id
     }
 
     fn dim(&self) -> usize {
-        FASTEMBED_EMBEDDING_DIM
+        self.dim
     }
 
     fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {

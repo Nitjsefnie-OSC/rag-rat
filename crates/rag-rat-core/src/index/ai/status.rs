@@ -1,9 +1,17 @@
 use super::*;
+use crate::embedding_models::{
+    Backend, FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, spec,
+};
 
 pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyhow::Result<()> {
     #[cfg(feature = "fastembed")]
     {
-        let embedder = FastEmbedEmbedder::new(None)
+        // Init the model that matches `model_id` (triggers its download + yields the right dim) —
+        // each fastembed model pulls its own weights and reports its own dim (#112). The dim comes
+        // from the registry spec; jina-v2-code is 768-dim, not 384.
+        let spec = spec(model_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown fastembed model `{model_id}`"))?;
+        let embedder = FastEmbedEmbedder::for_model_id(spec.model_id, spec.dim, None)
             .map_err(|err| anyhow::anyhow!("failed to initialize fastembed model: {err}"))?;
         conn.execute(
             "UPDATE ai_models
@@ -31,7 +39,14 @@ pub(crate) fn fastembed_operational_status(
     active_model_id: &str,
     total_chunks: u64,
 ) -> anyhow::Result<FastEmbedOperationalStatus> {
-    let model = model(conn, FASTEMBED_MODEL_ID)?;
+    // Report the ACTIVE fastembed model (all-MiniLM / BGE-small / jina-code), not always all-MiniLM
+    // — else installing another fastembed model makes status/doctor flag MiniLM as missing or
+    // needing reconcile (#112 review). A model is "a fastembed model" iff its registry backend is
+    // FastEmbed; everything non-fastembed falls back to the MiniLM report identity.
+    let active_is_fastembed = spec(active_model_id).map(|s| s.backend) == Some(Backend::FastEmbed);
+    let report_model_id = if active_is_fastembed { active_model_id } else { FASTEMBED_MODEL_ID };
+    let report_display = spec(report_model_id).map_or(FASTEMBED_DISPLAY_MODEL, |s| s.display);
+    let model = model(conn, report_model_id)?;
     // PERF: report coverage from CHEAP persisted counts (the `embedding_artifacts` rows + the chunk
     // total) rather than `embedding_reconcile_plan` — which loads EVERY chunk and rebuilds +
     // re-hashes its embedding input (~200s on a 174k-chunk index, paid with OR without an active
@@ -40,12 +55,11 @@ pub(crate) fn fastembed_operational_status(
     // same basis it uses for the generic `capability_status` counts); the exact policy-skip +
     // live-drift breakdown is the `reconcile --plan` command's job, where the per-chunk scan
     // belongs.
-    let current = current_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID)?;
-    let stale = stale_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID)?;
-    let failed =
-        status_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID, ArtifactStatus::Failed)?;
+    let current = current_artifact_count(conn, "embedding", report_model_id)?;
+    let stale = stale_artifact_count(conn, "embedding", report_model_id)?;
+    let failed = status_artifact_count(conn, "embedding", report_model_id, ArtifactStatus::Failed)?;
     let blocked =
-        status_artifact_count(conn, "embedding", FASTEMBED_MODEL_ID, ArtifactStatus::Blocked)?;
+        status_artifact_count(conn, "embedding", report_model_id, ArtifactStatus::Blocked)?;
     // Exact `skipped` (embedding input too large) needs the decompressed text per chunk — deferred
     // to `reconcile --plan`. The status treats every chunk as eligible, so the invariant
     // `eligible + skipped == total` holds with `skipped == 0`.
@@ -56,7 +70,7 @@ pub(crate) fn fastembed_operational_status(
     let next = if !fastembed_build_feature_enabled() {
         Some("cargo install rag-rat".to_string())
     } else if validate_ready_model(&model).is_err() {
-        Some(format!("rag-rat models install {FASTEMBED_MODEL_ID}"))
+        Some(format!("rag-rat models install {report_model_id}"))
     } else if missing > 0 || stale > 0 || failed > 0 {
         Some("rag-rat reconcile --limit 500".to_string())
     } else {
@@ -65,12 +79,14 @@ pub(crate) fn fastembed_operational_status(
     Ok(FastEmbedOperationalStatus {
         backend: "fastembed".to_string(),
         build_feature_enabled: fastembed_build_feature_enabled(),
-        model_id: FASTEMBED_MODEL_ID.to_string(),
-        model: FASTEMBED_DISPLAY_MODEL.to_string(),
-        dim: FASTEMBED_EMBEDDING_DIM,
+        model_id: report_model_id.to_string(),
+        model: report_display.to_string(),
+        // The reported dim must reflect the ACTIVE model (jina-code is 768, not 384) — driven off
+        // the registry spec so it never regresses to the MiniLM default for a 768-dim active model.
+        dim: spec(report_model_id).map_or(FASTEMBED_EMBEDDING_DIM, |s| s.dim),
         cache: fastembed_cache_dir().display().to_string(),
         installed: model.installed,
-        active: active_model_id == FASTEMBED_MODEL_ID,
+        active: active_is_fastembed,
         status: model.status,
         current_embeddings: current,
         eligible_embeddings: eligible,
