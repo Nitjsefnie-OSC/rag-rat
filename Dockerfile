@@ -1,11 +1,10 @@
-# Glama MCP verification image for cq27-dev/rag-rat.
+# Glama MCP server image for cq27-dev/rag-rat.
 #
-# This is for Glama's hosted inspection harness, NOT general use — see the repo-root `Dockerfile`
-# for a plain standalone image. Glama builds debian + node + mcp-proxy, clones the repo, and runs
-# `mcp-proxy -- <command>`, which spawns the command as a stdio MCP server and exposes it at
-# :8080/mcp (+/sse) with a /ping health check. Glama's stock template leaves <command> empty and
-# ships no Rust toolchain, so this file adds both: a pinned toolchain + `cargo install`, and a real
-# start command after `--`.
+# Tailored to Glama's hosted inspection harness: it builds debian + node + mcp-proxy, clones the
+# repo, and runs `mcp-proxy -- <command>`, which spawns the command as a stdio MCP server and
+# exposes it at :8080/mcp (+/sse) with a /ping health check. Glama's stock template leaves
+# <command> empty and ships no Rust toolchain, so this file adds both: a pinned toolchain +
+# `cargo install`, and a real start command after `--`.
 #
 # The server roots itself in a tiny sample repo with embeddings off, so introspection
 # (initialize + tools/list, served from a static catalog) boots instantly — no model download,
