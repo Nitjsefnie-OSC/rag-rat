@@ -313,6 +313,13 @@ pub(crate) struct ReconcileArgs {
     /// Truncate chunk text to this many chars before embedding.
     #[arg(long)]
     pub max_embedding_chars: Option<usize>,
+    /// Force the legacy-f32 → int8 vector re-encode now (#312), ignoring the run-once meta gate.
+    /// A format-only conversion (no model inference); idempotent — converts only rows still in
+    /// f32. SHORT-CIRCUITS: re-encodes and exits, ignoring the other reconcile flags (no
+    /// embeddings are computed). Honors `--max-seconds` (the conversion is bounded and resumes
+    /// on a later run).
+    #[arg(long)]
+    pub reencode_vectors: bool,
 }
 
 #[cfg(feature = "eval")]
