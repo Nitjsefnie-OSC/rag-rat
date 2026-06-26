@@ -2,11 +2,23 @@
 root = "."
 database = ".rag-rat/index.sqlite"
 
-[local_ai.embedding]
-# model2vec — static embeddings; ~100-500x faster on CPU, some quality cost
-model = "model2vec"
+[llm.embedding]
+# The MODEL by its full id (the HF path). all-MiniLM-L6-v2 (384-dim) — served over this box's local
+# Ollama below (CONNECT mode) instead of in-process. "none" disables embeddings; the static
+# model2vec tier (minishlab/potion-retrieval-32M) is the no-Ollama-dependency alternative.
+model = "sentence-transformers/all-MiniLM-L6-v2"
 
-[local_ai.embedding.runtime]
+# Serve that model over the local Ollama (`ollama pull all-minilm`) — see docs/config.md "Remote
+# embedding over Ollama". CONNECT = a fixed endpoint; reconcile + queries both embed against it. If
+# the Ollama is unreachable, reconcile leaves embeddings pending and semantic_search degrades to
+# BM25 (so a contributor without Ollama still gets a working lexical index). The mode is INFERRED:
+# set EXACTLY ONE of `endpoint` (connect) or `cookbook` (provision an ephemeral box).
+[llm.embedding.remote]
+endpoint = "http://localhost:11434"   # this box's Ollama server
+model = "all-minilm"                  # the Ollama-side model name
+batch_size = 256                      # texts per /api/embed request
+
+[llm.embedding.runtime]
 batch_size = 64
 ort_threads = 4
 omp_threads = 1

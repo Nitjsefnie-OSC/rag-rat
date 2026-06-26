@@ -9,36 +9,113 @@
 root = "."
 database = ".rag-rat/index.sqlite"
 
-[local_ai.embedding]
-model = "minilm"   # embedding backend: "minilm" | "model2vec" | "none"
+[llm.embedding]
+# the MODEL by its full id (the HF path) — no aliases. "none" disables embeddings.
+model = "sentence-transformers/all-MiniLM-L6-v2"
 
-[local_ai.embedding.runtime]
+[llm.embedding.runtime]
 batch_size = 64
 ort_threads = 4
 omp_threads = 1
 max_embedding_chars = 4000
 ```
 
-## Embedding backend (`[local_ai.embedding] model`)
+## Embedding model (`[llm.embedding] model`)
 
-Selects how `semantic_search` computes the **vector** half of its hybrid ranking. `rag-rat init`
-recommends a default from repo size; you can override it here.
+Selects how `semantic_search` computes the **vector** half of its hybrid ranking. The selector is the
+model's **full id — its HF path** (no aliases). `rag-rat init` recommends a default from repo size;
+you can override it here. The registered models:
 
-- `minilm` (default) — MiniLM transformer via FastEmbed. Best retrieval quality, but the cold
-  embedding backfill is CPU-bound (~10-100 chunks/sec), so it's only comfortable for repos that
-  finish in a few minutes.
-- `model2vec` — static token-vector lookup + mean-pool (`minishlab/potion-retrieval-32M`, 512-dim).
-  ~100-500× faster on CPU at some retrieval-quality cost: it has distributional/synonym semantics
-  but no context, word order, or polysemy disambiguation. The right choice for large repos that
-  still want vectors. BM25 (the other half of the hybrid) cushions the quality drop.
+- `sentence-transformers/all-MiniLM-L6-v2` (default) — MiniLM transformer via FastEmbed (384-dim).
+  Best retrieval quality, but the cold backfill is CPU-bound (~10-100 chunks/sec), so it's only
+  comfortable for repos that finish in a few minutes.
+- `BAAI/bge-small-en-v1.5` — a stronger general-retrieval transformer at the same 384-dim.
+- `jinaai/jina-embeddings-v2-base-code` — a code-specific transformer (768-dim).
+- `minishlab/potion-retrieval-32M` — static token-vector lookup + mean-pool (512-dim). ~100-500×
+  faster on CPU at some retrieval-quality cost: distributional/synonym semantics but no context, word
+  order, or polysemy disambiguation. The right choice for large repos that still want vectors. BM25
+  (the other half of the hybrid) cushions the quality drop.
 - `none` — structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25, and every
   other tool (symbols, graph, impact, git/papertrail, memories) is unaffected. The cheapest option
   for enormous codebases (e.g. the Linux kernel) where any embedding backfill is impractical.
 
 The selector chooses which model `init` installs and activates. The active model is recorded in the
-index, so switching the backend in the config takes effect after re-running `rag-rat init` or
+index, so switching the model in the config takes effect after re-running `rag-rat init` or
 `rag-rat models install <model-id>` (and a reconcile to re-embed under the new model). Different
-backends have different vector dimensions, so switching re-embeds from scratch.
+models have different vector dimensions, so switching re-embeds from scratch.
+
+## Remote embedding over Ollama (`[llm.embedding.remote]`)
+
+The `model = "..."` selector names the **model**; an optional `[llm.embedding.remote]` block
+serves **that same model** over an Ollama server (`POST /api/embed`) instead of running it
+in-process — the lever for large repos whose CPU backfill is too slow on the indexing box. Ollama is
+a **transport, not a model**: there is no `model = "ollama"` selector. The block's mere **presence**
+flips the runtime; absent it, embedding stays local. Same model, same `model_id`, same dimension —
+only the runtime changes, so chunk embeddings are keyed by the model regardless of where they were
+computed.
+
+There is **no `mode` field** — the mode is INFERRED from which URL field is set. **Exactly one** of
+`endpoint` (CONNECT) or `cookbook` (EPHEMERAL) must be present; both or neither is rejected.
+
+**CONNECT** — talk to an already-running Ollama at a fixed URL:
+
+```toml
+[llm.embedding]
+model = "sentence-transformers/all-MiniLM-L6-v2"   # the MODEL (HF path, 384-dim)
+
+[llm.embedding.remote]       # PRESENCE = "serve that model via Ollama"
+endpoint = "http://box:11434"     # CONNECT: the Ollama server URL (required)
+model = "all-minilm"              # the Ollama-side model name (the server's own identifier)
+# auth_env = "OLLAMA_TOKEN"       # NAME of an env var holding a bearer token (never the token itself)
+# batch_size = 256                # texts per /api/embed request
+# request_timeout_s = 60          # per-request HTTP timeout
+```
+
+**EPHEMERAL** — provision an on-demand GPU box (e.g. Modal) for the bulk reconcile, then tear it
+down. rag-rat spawns the **cookbook** recipe as a subprocess; it provisions a box, prints a handshake
+when it's serving, and is torn down (SIGTERM) when the reconcile finishes. Queries embed against a
+**local** Ollama (`query_endpoint`) running the same model — so the query vectors share the same
+space as the remote-embedded chunks.
+
+```toml
+[llm.embedding]
+model = "sentence-transformers/all-MiniLM-L6-v2"
+
+[llm.embedding.remote]
+cookbook = "@rag-rat/cookbook modal"        # EPHEMERAL: an npm package + a provider subcommand
+                                            #   (e.g. `modal`, `runpod`), or a recipe path + args.
+                                            #   First token picks the runner: .mjs/.js → node,
+                                            #   .ts/.mts → npx tsx, else → npx -y. The value is split
+                                            #   on whitespace — paths with spaces are unsupported.
+model = "all-minilm"                        # the Ollama-side model name
+# query_endpoint = "http://localhost:11434" # the LOCAL ollama for QUERY embedding
+                                            #   (defaults to http://localhost:11434)
+# auth_env = "OLLAMA_TOKEN"                 # optional bearer-token env var NAME
+```
+
+Provisioning happens **only on an explicit `rag-rat reconcile`** (the deliberate bulk pass) — the
+background watcher/maintenance pass does **not** cold-start a GPU box for a few changed chunks (it
+leaves them pending; an explicit reconcile embeds them). So run, after editing:
+
+```bash
+rag-rat models install sentence-transformers/all-MiniLM-L6-v2   # install/activate (probes the box)
+rag-rat reconcile                                               # provisions, embeds, tears down
+```
+
+The **two `model` keys are different things**: `[llm.embedding] model` is the rag-rat **model
+selector** (the HF-path model_id — resolves the dimension + identity); `[remote] model` is the
+**Ollama-side model name** sent in the request body. They need not be spelled the same. Only
+**transformer** models (`sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`,
+`jinaai/jina-embeddings-v2-base-code`) can be served remotely — a `[remote]` block on
+`minishlab/potion-retrieval-32M` (static), the hash model, or `none` is rejected.
+
+The freshness key is **endpoint-independent** — pointing the `endpoint` (or each ephemeral box's
+per-run URL) at a different host does **not** re-embed the repo. A re-embed happens only when the
+`[remote] model` changes or you flip between local and remote (those change the vector space; the
+endpoint does not). If the (query) endpoint is unreachable at query time, `semantic_search` degrades
+to BM25 rather than failing. Embedding is fully offline only when the endpoint is local.
+**Credentials go in `auth_env` only** — an `endpoint`/`query_endpoint` URL with embedded
+`user:pass@host` is rejected, because that URL is persisted into the index.
 
 The database stores explicit schema migrations in `schema_version` with migration id,
 `applied_at_ms`, checksum, and description. Opening the index **migrates an older schema forward
@@ -88,7 +165,7 @@ still obey `include_generated` filtering.
 Parser grammar dependencies are exact-pinned in `Cargo.toml`: `tree-sitter` 0.22.6,
 `tree-sitter-rust` 0.21.2, `tree-sitter-typescript` 0.21.2, and `tree-sitter-kotlin` 0.3.8.
 
-`[local_ai.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
+`[llm.embedding.runtime]` controls reconcile defaults for local embedding generation. CLI flags
 still take precedence: `--batch-size` overrides `batch_size`, and `--max-embedding-chars` overrides
 `max_embedding_chars`.
 

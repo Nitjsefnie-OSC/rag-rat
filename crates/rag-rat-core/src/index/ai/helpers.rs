@@ -417,20 +417,31 @@ pub(crate) fn set_active_remote_config(
 /// Read the persisted active remote-embedding config (the inverse of [`set_active_remote_config`]).
 /// `None` when no remote config has been written (the common local-embedder case). A present-but-
 /// malformed value is a hard error — a corrupted meta must surface loudly, not silently fall back
-/// to "no remote config" and then bail with the wrong message in the dispatch.
+/// to "no remote config" and then bail with the wrong message in the dispatch. The endpoint comes
+/// from the persisted config (toml `[remote] endpoint`); there is no runtime endpoint override.
 pub(crate) fn active_remote_config(
     conn: &Connection,
 ) -> anyhow::Result<Option<RemoteEmbeddingConfig>> {
     let Some(json) = meta(conn, ACTIVE_EMBEDDING_REMOTE_CONFIG_META)? else {
         return Ok(None);
     };
-    let remote = serde_json::from_str(&json).map_err(|e| {
+    let remote: RemoteEmbeddingConfig = serde_json::from_str(&json).map_err(|e| {
         anyhow::anyhow!(
             "stored remote embedding config (`{ACTIVE_EMBEDDING_REMOTE_CONFIG_META}`) is \
              malformed: {e}"
         )
     })?;
     Ok(Some(remote))
+}
+
+/// Drop the persisted remote-embedding config meta — called when a model is installed LOCALLY, so
+/// `active_embedder` stops reconstructing an `OllamaEmbedder` from a stale prior remote install of
+/// the same model (a no-op when the meta is already absent).
+pub(crate) fn clear_active_remote_config(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM index_meta WHERE key = ?1", params![
+        ACTIVE_EMBEDDING_REMOTE_CONFIG_META
+    ])?;
+    Ok(())
 }
 
 pub(crate) fn set_reconcile_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
@@ -446,6 +457,13 @@ pub(crate) fn reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<Opt
     Ok(conn
         .query_row("SELECT value FROM reconcile_meta WHERE key = ?1", [key], |row| row.get(0))
         .optional()?)
+}
+
+/// Delete a `reconcile_meta` key (a no-op when absent). Used to clear the stale freshness-version
+/// meta when the active model goes away, so the hash fallback doesn't inherit a legacy model's key.
+pub(crate) fn clear_reconcile_meta(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM reconcile_meta WHERE key = ?1", params![key])?;
+    Ok(())
 }
 
 pub(crate) fn collect_rows<T>(
@@ -479,7 +497,6 @@ pub(crate) fn find_existing_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RemoteMode;
 
     fn unit(v: &[f32]) -> Vec<f32> {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -497,9 +514,10 @@ mod tests {
 
     fn sample_remote() -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some("http://localhost:11434".to_string()),
+            cookbook: None,
+            query_endpoint: None,
             // The NAME of an env var — never a token. The round-trip test asserts this name is
             // present and no token is.
             auth_env: Some("OLLAMA_TOKEN".to_string()),
@@ -557,45 +575,44 @@ mod tests {
 
     #[test]
     fn active_embedding_model_version_is_scoped_to_the_active_model() {
-        use crate::embedding_models::{FASTEMBED_MODEL_ID, OLLAMA_ALL_MINILM_MODEL_ID};
+        use crate::embedding_models::{BGE_SMALL_MODEL_ID, FASTEMBED_MODEL_ID};
 
-        // Ollama is active with a dynamic endpoint-hash freshness key in the global meta.
+        // The fastembed all-minilm model is active with a dynamic (remote) freshness key in the
+        // meta.
         let conn = schema_conn();
-        activate_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID);
-        let endpoint_hash = "ollama-all-minilm-v1-deadbeefcafef00d";
-        set_reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, endpoint_hash).unwrap();
+        activate_model(&conn, FASTEMBED_MODEL_ID);
+        let dynamic_key = "fastembed-all-minilm-l6-v2-v1-deadbeefcafef00d";
+        set_reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, dynamic_key).unwrap();
 
         // The ACTIVE model gets the dynamic meta...
-        assert_eq!(
-            active_embedding_model_version(&conn, OLLAMA_ALL_MINILM_MODEL_ID).unwrap(),
-            endpoint_hash,
-        );
-        // ...but a NON-active model gets its OWN static spec.version, NOT the ollama hash — so
-        // fastembed_operational_status doesn't report existing FastEmbed rows stale against the
-        // active model's key.
-        let fastembed_version = active_embedding_model_version(&conn, FASTEMBED_MODEL_ID).unwrap();
-        assert_eq!(fastembed_version, spec(FASTEMBED_MODEL_ID).unwrap().version);
-        assert_ne!(fastembed_version, endpoint_hash, "must not leak the ollama hash to fastembed");
+        assert_eq!(active_embedding_model_version(&conn, FASTEMBED_MODEL_ID).unwrap(), dynamic_key,);
+        // ...but a NON-active model gets its OWN static spec.version, NOT the active model's key —
+        // so fastembed_operational_status doesn't report a non-active model's rows stale
+        // against the active model's key.
+        let bge_version = active_embedding_model_version(&conn, BGE_SMALL_MODEL_ID).unwrap();
+        assert_eq!(bge_version, spec(BGE_SMALL_MODEL_ID).unwrap().version);
+        assert_ne!(bge_version, dynamic_key, "must not leak the active key to a non-active model");
     }
 
     #[test]
     fn embed_query_falls_back_to_lexical_when_the_remote_query_embed_fails() {
-        use crate::embedding_models::OLLAMA_ALL_MINILM_MODEL_ID;
+        use crate::embedding_models::FASTEMBED_MODEL_ID;
 
-        // An ollama-active conn whose persisted endpoint points at a CLOSED port: construction
-        // succeeds (from_remote_config doesn't connect), but embed_batch fails (connection
-        // refused). The QUERY path must degrade to lexical — Ok(None), not Err — so search
-        // still returns BM25.
+        // The active model is served over Ollama (a persisted remote config) whose endpoint points
+        // at a CLOSED port: construction succeeds (from_remote_config doesn't connect), but
+        // embed_batch fails (connection refused). The QUERY path must degrade to lexical —
+        // Ok(None), not Err — so search still returns BM25.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
         let conn = schema_conn();
-        activate_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID);
+        activate_model(&conn, FASTEMBED_MODEL_ID);
         let remote = RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(format!("http://127.0.0.1:{port}")),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 2,
@@ -675,6 +692,9 @@ mod tests {
         // jina-v2-base-code is the 768-dim code tier; pin its identity explicitly.
         use crate::embedding_models::JINA_CODE_MODEL_ID;
         assert_eq!(expected_dim(JINA_CODE_MODEL_ID), Some(768));
-        assert_eq!(default_model_version(JINA_CODE_MODEL_ID), "fastembed-jina-v2-base-code-v1");
+        assert_eq!(
+            default_model_version(JINA_CODE_MODEL_ID),
+            "jinaai/jina-embeddings-v2-base-code-v1"
+        );
     }
 }

@@ -277,7 +277,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: Default::default(),
+            llm: Default::default(),
             watch: Default::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -353,7 +353,7 @@ mod tests {
             ("ffi_surface", json!({})),
             ("compare_graph_to_scip", json!({})),
             ("index_status", json!({})),
-            ("local_ai_status", json!({})),
+            ("llm_status", json!({})),
             ("github_sync_status", json!({})),
             ("memory_validate", json!({})),
         ];

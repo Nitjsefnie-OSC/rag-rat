@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use super::Embedder;
 use crate::config::RemoteEmbeddingConfig;
-use crate::embedding_models::OLLAMA_ALL_MINILM_MODEL_ID;
 
 /// Request body for Ollama's `/api/embed`. `input` is an array — the batch endpoint embeds every
 /// text in one request.
@@ -31,16 +30,23 @@ struct EmbedResponse {
 }
 
 /// A native HTTP embedder that offloads embedding work to an Ollama server's `/api/embed`. The dim
-/// is the registry spec's dim (the parity contract); every response vector is checked against it on
-/// each batch.
+/// is the SELECTED model's registry dim (the parity contract); every response vector is checked
+/// against it on each batch.
 #[derive(Debug)]
 pub struct OllamaEmbedder {
     agent: ureq::Agent,
     /// `<endpoint>/api/embed`, precomputed once at construction.
     embed_url: String,
-    model: String,
+    /// The SELECTED model's persisted registry id (e.g. `fastembed-all-minilm-l6-v2`).
+    /// `model_id()` returns THIS — chunk_embeddings key by the selected model regardless of
+    /// runtime, so the same rows are reused whether the model is embedded locally or via
+    /// Ollama (#317 rework). NOT the server-side Ollama model name (that is `server_model`).
+    selected_model_id: String,
+    /// The Ollama API model name sent in the `/api/embed` request body (`[remote] model`, e.g.
+    /// `all-minilm`) — the server's own identifier, NOT the registry id.
+    server_model: String,
     dim: usize,
-    /// Max texts per `/api/embed` request (`[local_ai.embedding.remote] batch_size`).
+    /// Max texts per `/api/embed` request (`[llm.embedding.remote] batch_size`).
     /// `embed_batch` splits its input into sub-batches of at most this, so a request never
     /// exceeds the configured cap regardless of the reconcile/runtime batch size. Clamped to
     /// `>= 1` at construction so the `chunks()` split can't panic on a misconfigured `0`.
@@ -49,32 +55,101 @@ pub struct OllamaEmbedder {
     auth_header: Option<String>,
 }
 
+/// Construction params for [`OllamaEmbedder::from_provisioned`] — groups the handshake outputs
+/// (`endpoint`, `auth_token`) with the model identity + transport knobs so the constructor takes
+/// one struct instead of seven positional args.
+pub struct ProvisionedEmbedderParams<'a> {
+    /// The serving endpoint from the cookbook handshake (`https://...`).
+    pub endpoint: &'a str,
+    /// A DIRECT bearer token from the handshake (NOT an env-var name), or `None` for an open box.
+    pub auth_token: Option<&'a str>,
+    /// The Ollama API model name sent in the request body (`[remote] model`).
+    pub server_model: &'a str,
+    /// The SELECTED model's registry id (what `model_id()` returns — chunks key by the model).
+    pub selected_model_id: &'a str,
+    /// The dim parity contract (the selected model's `spec.dim`).
+    pub dim: usize,
+    /// Per-request HTTP timeout, seconds.
+    pub request_timeout_s: u64,
+    /// Max texts per `/api/embed` request.
+    pub batch_size: u32,
+}
+
 impl OllamaEmbedder {
-    /// Build the embedder from the `[local_ai.embedding.remote]` config and the registry spec's
-    /// dim. `registry_dim` is the dim parity contract (the `ollama-all-minilm` row, 384) — it is
-    /// the single source of truth for the expected vector length, never re-declared in config.
+    /// Build the embedder for the SELECTED model served over Ollama. `selected_model_id` + `dim`
+    /// come from the model the user picked (`model = "sentence-transformers/all-MiniLM-L6-v2"`,
+    /// 384): `model_id()` returns that id so chunk_embeddings key by the model regardless of
+    /// runtime, and `dim` is the parity contract the embedder checks every response vector
+    /// against — the single source of truth for the expected vector length, never re-declared
+    /// in config. The `[remote]` block supplies only the transport: endpoint, auth, timeout,
+    /// batch, and the SERVER-side model name (`cfg.model`).
     ///
-    /// Errors when the endpoint is absent (config validation already guarantees it in `Connect`
-    /// mode, but the construction site refuses to build a half-formed embedder) or when `auth_env`
-    /// names an env var that is missing or empty.
+    /// Errors when the endpoint is absent (the use layer requires it in connect mode, but the
+    /// construction site refuses to build a half-formed embedder) or when `auth_env` names an env
+    /// var that is missing or empty.
     pub fn from_remote_config(
         cfg: &RemoteEmbeddingConfig,
-        registry_dim: usize,
+        selected_model_id: &str,
+        dim: usize,
     ) -> anyhow::Result<Self> {
         let endpoint =
             cfg.endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!(
                     "remote embedding endpoint is required in connect mode but was not configured \
-                     (`[local_ai.embedding.remote] endpoint`)"
+                     (`[llm.embedding.remote] endpoint`)"
                 )
             })?;
-        let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
-
+        // CONNECT auth comes from the env var NAMED by `auth_env` (the token never enters config).
         let auth_header =
             resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
+        Ok(Self::build(
+            endpoint,
+            auth_header,
+            selected_model_id,
+            cfg.model.trim(),
+            dim,
+            cfg.request_timeout_s,
+            cfg.batch_size,
+        ))
+    }
 
+    /// Build the embedder against a freshly PROVISIONED ephemeral box (#318) from
+    /// [`ProvisionedEmbedderParams`]. The `endpoint` + `auth_token` come from the cookbook
+    /// handshake — `auth_token` is a DIRECT bearer token (the box's per-run credential), NOT an
+    /// env-var name (contrast [`Self::from_remote_config`], which resolves `auth_env`). The
+    /// model identity (`selected_model_id` + `dim`) + transport knobs (server `model`, timeout,
+    /// batch) come from the config the same way.
+    pub fn from_provisioned(params: ProvisionedEmbedderParams<'_>) -> Self {
+        let auth_header = params
+            .auth_token
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|token| format!("Bearer {token}"));
+        Self::build(
+            params.endpoint.trim(),
+            auth_header,
+            params.selected_model_id,
+            params.server_model.trim(),
+            params.dim,
+            params.request_timeout_s,
+            params.batch_size,
+        )
+    }
+
+    /// Shared assembler: build the `ureq::Agent` (with the loopback proxy bypass) + the struct.
+    /// `endpoint` is already trimmed/validated by the caller.
+    fn build(
+        endpoint: &str,
+        auth_header: Option<String>,
+        selected_model_id: &str,
+        server_model: &str,
+        dim: usize,
+        request_timeout_s: u64,
+        batch_size: u32,
+    ) -> Self {
+        let embed_url = format!("{}/api/embed", endpoint.trim_end_matches('/'));
         let mut builder = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(cfg.request_timeout_s)))
+            .timeout_global(Some(Duration::from_secs(request_timeout_s)))
             .user_agent(concat!("rag-rat/", env!("CARGO_PKG_VERSION"), " (ollama-embed)"));
         // ureq's default config inherits `HTTP_PROXY`/`HTTPS_PROXY` from the env. A local Ollama
         // (`http://127.0.0.1:11434`) routed through a corporate proxy 403s, so disable the proxy for
@@ -84,17 +159,17 @@ impl OllamaEmbedder {
             builder = builder.proxy(None);
         }
         let agent: ureq::Agent = builder.build().into();
-
-        Ok(Self {
+        Self {
             agent,
             embed_url,
-            model: cfg.model.trim().to_string(),
-            dim: registry_dim,
+            selected_model_id: selected_model_id.to_string(),
+            server_model: server_model.to_string(),
+            dim,
             // Clamp to >= 1: a configured 0 would panic `slice::chunks`; treat it as "one per
             // request" rather than failing construction.
-            batch_size: (cfg.batch_size as usize).max(1),
+            batch_size: (batch_size as usize).max(1),
             auth_header,
-        })
+        }
     }
 
     /// Send ONE `/api/embed` request for `texts` (already sized to `<= self.batch_size` by the
@@ -102,7 +177,7 @@ impl OllamaEmbedder {
     /// Factored out of `embed_batch` so the sub-batch loop reuses the exact request/validation
     /// logic.
     fn embed_one_request(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        let payload = EmbedRequest { model: &self.model, input: texts };
+        let payload = EmbedRequest { model: &self.server_model, input: texts };
         // The `json` ureq feature is not enabled (workspace ureq is rustls-only), so serialize the
         // body ourselves and send it with an explicit content-type.
         let body = serde_json::to_vec(&payload)
@@ -148,12 +223,12 @@ impl OllamaEmbedder {
             if vector.len() != self.dim {
                 anyhow::bail!(
                     "ollama embed dim mismatch: server returned a {}-dim vector at index {} but \
-                     this model is configured for {} dims (model `{}`). The configured registry \
-                     model and the Ollama server model must match.",
+                     this model is configured for {} dims (server model `{}`). The selected \
+                     registry model and the Ollama server model must match.",
                     vector.len(),
                     i,
                     self.dim,
-                    self.model
+                    self.server_model
                 );
             }
         }
@@ -204,9 +279,11 @@ fn endpoint_is_loopback(endpoint: &str) -> bool {
 
 impl Embedder for OllamaEmbedder {
     fn model_id(&self) -> &str {
-        // The stable registry id, not the server-side Ollama model name (`self.model`): callers key
-        // freshness/parity off the registry identity, which is what the rest of the pipeline knows.
-        OLLAMA_ALL_MINILM_MODEL_ID
+        // The SELECTED model's registry id (e.g. `fastembed-all-minilm-l6-v2`), NOT the server-side
+        // Ollama model name (`self.server_model`): chunk_embeddings key by the selected model, so
+        // the same rows are reused whether the model runs locally or via Ollama. The
+        // freshness version (not the model_id) is what distinguishes local vs remote.
+        &self.selected_model_id
     }
 
     fn dim(&self) -> usize {
@@ -241,6 +318,14 @@ mod tests {
     use super::*;
 
     const DIM: usize = 384;
+    // The SELECTED model's registry id — what `model_id()` must return regardless of the runtime.
+    const SELECTED_ID: &str = crate::embedding_models::FASTEMBED_MODEL_ID;
+
+    /// Construct the embedder for the selected model over the given remote config + dim. Thin
+    /// wrapper so the many tests don't repeat the `selected_model_id` arg.
+    fn build(cfg: &RemoteEmbeddingConfig, dim: usize) -> anyhow::Result<OllamaEmbedder> {
+        OllamaEmbedder::from_remote_config(cfg, SELECTED_ID, dim)
+    }
 
     /// Spawn a one-shot HTTP/1.1 server on `127.0.0.1:0` that accepts a single connection, drains
     /// the request, optionally sleeps, then writes `status` + `body`. Returns the bound base URL
@@ -292,9 +377,10 @@ mod tests {
 
     fn config_for(endpoint: &str, timeout_s: u64) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: crate::config::RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(endpoint.to_string()),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: timeout_s,
@@ -309,7 +395,7 @@ mod tests {
     fn embed_batch_returns_vectors_in_order() {
         let want = vec![vec![1.0f32; DIM], vec![2.0f32; DIM], vec![3.0f32; DIM]];
         let (url, handle) = spawn_stub("200 OK", embeddings_json(&want), None);
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let got = embedder.embed_batch(&texts(3)).expect("happy batch");
         handle.join().unwrap();
@@ -409,7 +495,7 @@ mod tests {
         let (url, handle, requests) = spawn_counting_stub(3);
         let mut cfg = config_for(&url, 5);
         cfg.batch_size = 2;
-        let embedder = OllamaEmbedder::from_remote_config(&cfg, DIM).unwrap();
+        let embedder = build(&cfg, DIM).unwrap();
 
         let got = embedder.embed_batch(&texts(5)).expect("sub-batched embed");
         handle.join().unwrap();
@@ -429,7 +515,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (url, handle, requests) = spawn_counting_stub(1);
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let got = embedder.embed_batch(&texts(3)).expect("single-request embed");
         handle.join().unwrap();
@@ -447,7 +533,7 @@ mod tests {
         let (url, handle, requests) = spawn_counting_stub(3);
         let mut cfg = config_for(&url, 5);
         cfg.batch_size = 0;
-        let embedder = OllamaEmbedder::from_remote_config(&cfg, DIM).unwrap();
+        let embedder = build(&cfg, DIM).unwrap();
 
         let got = embedder.embed_batch(&texts(3)).expect("clamped embed");
         handle.join().unwrap();
@@ -462,7 +548,7 @@ mod tests {
         let want =
             vec![vec![1.0f32; server_dim], vec![2.0f32; server_dim], vec![3.0f32; server_dim]];
         let (url, handle) = spawn_stub("200 OK", embeddings_json(&want), None);
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let err = embedder.embed_batch(&texts(3)).expect_err("dim mismatch must error");
         handle.join().unwrap();
@@ -479,7 +565,7 @@ mod tests {
         // validated here.
         let want = vec![vec![1.0f32; DIM], vec![2.0f32; DIM + 1], vec![3.0f32; DIM]];
         let (url, handle) = spawn_stub("200 OK", embeddings_json(&want), None);
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let err = embedder.embed_batch(&texts(3)).expect_err("late wrong-width vector must error");
         handle.join().unwrap();
@@ -495,7 +581,7 @@ mod tests {
         // 2 vectors returned for 3 inputs.
         let want = vec![vec![1.0f32; DIM], vec![2.0f32; DIM]];
         let (url, handle) = spawn_stub("200 OK", embeddings_json(&want), None);
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let err = embedder.embed_batch(&texts(3)).expect_err("count mismatch must error");
         handle.join().unwrap();
@@ -510,7 +596,7 @@ mod tests {
     #[test]
     fn embed_batch_errors_on_http_500() {
         let (url, handle) = spawn_stub("500 Internal Server Error", "boom".to_string(), None);
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let err = embedder.embed_batch(&texts(1)).expect_err("non-2xx must error");
         handle.join().unwrap();
@@ -525,7 +611,7 @@ mod tests {
             listener.local_addr().unwrap().port()
         };
         let url = format!("http://127.0.0.1:{port}");
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 5), DIM).unwrap();
+        let embedder = build(&config_for(&url, 5), DIM).unwrap();
 
         let err = embedder.embed_batch(&texts(1)).expect_err("connection refused must error");
         assert!(!err.to_string().is_empty());
@@ -537,7 +623,7 @@ mod tests {
         let want = vec![vec![1.0f32; DIM]];
         let (url, handle) =
             spawn_stub("200 OK", embeddings_json(&want), Some(Duration::from_secs(2)));
-        let embedder = OllamaEmbedder::from_remote_config(&config_for(&url, 1), DIM).unwrap();
+        let embedder = build(&config_for(&url, 1), DIM).unwrap();
 
         let started = std::time::Instant::now();
         let err = embedder.embed_batch(&texts(1)).expect_err("timeout must error");
@@ -556,8 +642,7 @@ mod tests {
     fn from_remote_config_errors_when_endpoint_missing() {
         let mut cfg = config_for("unused", 5);
         cfg.endpoint = None;
-        let err =
-            OllamaEmbedder::from_remote_config(&cfg, DIM).expect_err("missing endpoint errors");
+        let err = build(&cfg, DIM).expect_err("missing endpoint errors");
         assert!(err.to_string().contains("endpoint"), "{err}");
     }
 
@@ -614,10 +699,12 @@ mod tests {
     }
 
     #[test]
-    fn model_id_is_the_stable_registry_id() {
-        let embedder =
-            OllamaEmbedder::from_remote_config(&config_for("http://127.0.0.1:1", 5), DIM).unwrap();
-        assert_eq!(embedder.model_id(), OLLAMA_ALL_MINILM_MODEL_ID);
+    fn model_id_is_the_selected_model_not_the_server_model() {
+        // `model_id()` returns the SELECTED model's registry id (so chunks key by the model, not
+        // the runtime), NOT the server-side `model` from the remote config (`all-minilm`).
+        let embedder = build(&config_for("http://127.0.0.1:1", 5), DIM).unwrap();
+        assert_eq!(embedder.model_id(), SELECTED_ID);
+        assert_ne!(embedder.model_id(), "all-minilm", "must not echo the server-side model name");
         assert_eq!(embedder.dim(), DIM);
     }
 }

@@ -103,7 +103,7 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
 fn run_pass(config: &Config, run_gc: bool) -> anyhow::Result<()> {
     let started = Instant::now();
     let (mut db, content_changed) = IndexDatabase::index_discover_reporting(config)?;
-    let runtime = &config.local_ai.embedding.runtime;
+    let runtime = &config.llm.embedding.runtime;
     let options = ReconcileOptions {
         batch_size: Some(runtime.batch_size),
         changed_first: true,
@@ -825,7 +825,7 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        Config, EmbeddingConfig, LocalAiConfig, ResolvedTarget, TargetKind, WatchConfig,
+        Config, EmbeddingConfig, LlmConfig, ResolvedTarget, TargetKind, WatchConfig,
     };
     use crate::language::Language;
 
@@ -848,7 +848,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -869,7 +869,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -965,7 +965,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1008,7 +1008,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1069,7 +1069,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1141,7 +1141,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1285,7 +1285,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),
@@ -1546,7 +1546,7 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            local_ai: LocalAiConfig { embedding: EmbeddingConfig::default() },
+            llm: LlmConfig { embedding: EmbeddingConfig::default() },
             watch: WatchConfig::default(),
             version_check: Default::default(),
             oracle: Default::default(),

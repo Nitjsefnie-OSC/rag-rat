@@ -1,8 +1,12 @@
 use super::*;
 use crate::config::RemoteEmbeddingConfig;
+use crate::embedding_models::{Backend, EMBEDDING_MODELS, HASH_MODEL_ID, spec};
+// `FASTEMBED_MODEL_ID` is only referenced by the fastembed-gated cache recovery (and tests);
+// the manifest's stale-`'v1'` check now scopes to `HASH_MODEL_ID` only (the old fastembed id
+// was renamed to an HF path in #317 and is legacy-cleaned), so the prod import is
+// feature-gated.
 #[cfg(feature = "fastembed")]
-use crate::embedding_models::FASTEMBED_EMBEDDING_DIM;
-use crate::embedding_models::{Backend, EMBEDDING_MODELS, FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
+use crate::embedding_models::{FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID};
 
 pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     // Read-first: skip the (write-locking) DML entirely when the manifest already matches what we
@@ -56,12 +60,15 @@ pub(crate) fn model_manifest_is_current(conn: &Connection) -> anyhow::Result<boo
             return Ok(false);
         }
     }
+    // Only `embedding-hash` can still carry the pre-#112 bare `'v1'` model_version: the old
+    // fastembed id was renamed to an HF path in #317 and is now legacy (deleted above), and the new
+    // HF-path id is fresh. Mirror `normalize_embedding_model_versions`.
     let stale_version: bool = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM chunk_embeddings
-             WHERE model_version = 'v1' AND model_id IN (?1, ?2)
+             WHERE model_version = 'v1' AND model_id = ?1
          )",
-        params![HASH_MODEL_ID, FASTEMBED_MODEL_ID],
+        params![HASH_MODEL_ID],
         |row| row.get(0),
     )?;
     Ok(!stale_version)
@@ -71,25 +78,38 @@ pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
     for model_id in LEGACY_MODEL_IDS {
         conn.execute("DELETE FROM chunk_embeddings WHERE model_id = ?1", params![model_id])?;
         conn.execute("DELETE FROM ai_models WHERE model_id = ?1", params![model_id])?;
-        conn.execute("DELETE FROM index_meta WHERE key = ?1 AND value = ?2", params![
-            ACTIVE_EMBEDDING_MODEL_META,
-            model_id
-        ])?;
+        // If this legacy id was the ACTIVE model, its active-model meta AND any persisted
+        // remote-config meta (a legacy `ollama-*` id was a remote install — #317) must both go.
+        // Leaving the remote config behind would let `active_embedder` keep reconstructing an
+        // `OllamaEmbedder` against a now-removed endpoint after the active model fell back to hash,
+        // so clear it whenever we delete the matching active-model meta.
+        let was_active =
+            conn.execute("DELETE FROM index_meta WHERE key = ?1 AND value = ?2", params![
+                ACTIVE_EMBEDDING_MODEL_META,
+                model_id
+            ])?;
+        if was_active > 0 {
+            clear_active_remote_config(conn)?;
+            // ALSO drop the legacy model's freshness-version meta (R3a): otherwise the hash
+            // fallback inherits the removed model's `model_version` key and reports the
+            // wrong freshness. The next install re-stamps it; clearing here keeps the
+            // gap correct.
+            clear_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META)?;
+        }
     }
     Ok(())
 }
 
 pub(crate) fn normalize_embedding_model_versions(conn: &Connection) -> anyhow::Result<()> {
+    // One-time fix for the pre-#112 bare `'v1'` model_version. Only `embedding-hash` is still a
+    // current id: the old `fastembed-all-minilm-l6-v2` was renamed to an HF path in #317 and is now
+    // a LEGACY id (its rows are deleted by `remove_legacy_models`), so it no longer needs
+    // normalizing here.
     conn.execute(
         "
         UPDATE chunk_embeddings
-        SET model_version = CASE model_id
-            WHEN 'embedding-hash' THEN 'hash-v1'
-            WHEN 'fastembed-all-minilm-l6-v2' THEN 'fastembed-all-minilm-l6-v2-v1'
-            ELSE model_version
-        END
-        WHERE model_version = 'v1'
-          AND model_id IN ('embedding-hash', 'fastembed-all-minilm-l6-v2')
+        SET model_version = 'hash-v1'
+        WHERE model_version = 'v1' AND model_id = 'embedding-hash'
         ",
         [],
     )?;
@@ -138,7 +158,14 @@ pub(crate) fn recover_cached_fastembed_model_at(
         )?;
     }
     if active_embedding_model_is_missing(conn)? {
-        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID)?;
+        // Activate the recovered model AND stamp its freshness version in ONE call (R3b): a bare
+        // `set_meta(ACTIVE_EMBEDDING_MODEL_META, ...)` without the version would leave
+        // `active_embedding_model_version` returning a STALE legacy key, so new embeddings bake
+        // under the wrong `model_version` and a later install flips it → a spurious full
+        // re-embed.
+        let spec = spec(FASTEMBED_MODEL_ID)
+            .ok_or_else(|| anyhow::anyhow!("unknown model `{FASTEMBED_MODEL_ID}`"))?;
+        activate_model_with_version(conn, FASTEMBED_MODEL_ID, spec.version)?;
     }
     Ok(())
 }
@@ -175,53 +202,85 @@ pub(crate) fn fastembed_cache_ready(cache_dir: &Path) -> bool {
     !revision.is_empty() && repo.join("snapshots").join(revision).is_dir()
 }
 
+/// Activate `model_id` as the active embedding model AND stamp its freshness `version` in ONE call
+/// — the SINGLE place that writes both metas, so no activation site can set the active model
+/// without its version (the bug R3b fixed in recovery). `install_model` and
+/// `recover_cached_fastembed_model` both go through here.
+pub(crate) fn activate_model_with_version(
+    conn: &Connection,
+    model_id: &str,
+    version: &str,
+) -> anyhow::Result<()> {
+    set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
+    set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, version)?;
+    Ok(())
+}
+
 pub(crate) fn install_model(
     conn: &Connection,
     model_id: &str,
     remote: Option<&RemoteEmbeddingConfig>,
 ) -> anyhow::Result<ModelInfo> {
     ensure_model_manifest(conn)?;
+    // The arg is the model_id — the HF path (no aliases, #317). Resolve to its spec and use the
+    // canonical id downstream.
     let spec =
-        spec(model_id).ok_or_else(|| anyhow::anyhow!("unknown local AI model `{model_id}`"))?;
-    match spec.backend {
-        Backend::Hash => {
-            conn.execute(
-                "UPDATE ai_models
-                 SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
-                     embedding_dim = ?3, runtime = 'hash', last_error = NULL
-                 WHERE model_id = ?1",
-                params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
-            )?;
-        },
-        Backend::FastEmbed => install_fastembed_model(conn, model_id)?,
-        Backend::Model2Vec => install_model2vec_model(conn, model_id)?,
-        // Ollama install is a reachability + dim probe (no download), #317 task 6. It REQUIRES the
-        // remote config — `model = "ollama"` without a `[remote]` block can't reach a server. The
-        // config layer already rejects that incoherence (`RemoteEmbeddingMissingConfig`), so a
-        // `None` here means a caller forgot to thread `config.local_ai.embedding.remote`.
-        Backend::Ollama => {
-            let remote = remote.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "installing the ollama model requires a [local_ai.embedding.remote] config \
-                     (endpoint + model)"
-                )
-            })?;
-            install_ollama_model(conn, model_id, remote)?;
-        },
+        spec(model_id).ok_or_else(|| anyhow::anyhow!("unknown embedding model `{model_id}`"))?;
+    let model_id = spec.model_id;
+    // The PRESENCE of a remote block — NOT `spec.backend` — selects the Ollama transport (#317
+    // rework): any transformer model can be served over Ollama. The SAME ai_models row toggles its
+    // `runtime` local↔ollama. Remote present → reachability + dim probe (no download); else → the
+    // local install for the model's backend.
+    if let Some(remote) = remote {
+        // A remote block serves the model over Ollama, which can only serve TRANSFORMER models. The
+        // CLI passes the config's remote block for WHATEVER model id the user typed, so guard HERE
+        // too — the config-layer guard only checks `config.model`, not an explicit
+        // `models install <other-id>`. Without this, `models install embedding-hash` against a
+        // 384-dim Ollama would mark the hash row `runtime='ollama'` and store the served model's
+        // vectors under the hash id.
+        if spec.backend != Backend::FastEmbed {
+            anyhow::bail!(
+                "remote embedding requires a transformer model, but `{model_id}` is a {} model — \
+                 remove the [llm.embedding.remote] block to install it locally, or install a \
+                 transformer model over Ollama",
+                spec.backend.runtime()
+            );
+        }
+        install_ollama_model(conn, model_id, spec, remote)?;
+    } else {
+        match spec.backend {
+            Backend::Hash => {
+                conn.execute(
+                    "UPDATE ai_models
+                     SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
+                         embedding_dim = ?3, runtime = 'hash', last_error = NULL
+                     WHERE model_id = ?1",
+                    params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
+                )?;
+            },
+            Backend::FastEmbed => install_fastembed_model(conn, model_id)?,
+            Backend::Model2Vec => install_model2vec_model(conn, model_id)?,
+            // Transport-only runtime — never a local install target (the remote branch above owns
+            // the Ollama path).
+            Backend::Ollama => anyhow::bail!(
+                "internal error: Backend::Ollama is a transport, not a local install target"
+            ),
+        }
+        // A LOCAL install must drop any remote-config meta a PRIOR Ollama install of this model
+        // left behind — otherwise `active_embedder` reads it back unconditionally and keeps
+        // building an OllamaEmbedder against the now-removed endpoint instead of the local
+        // model.
+        clear_active_remote_config(conn)?;
     }
-    set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, model_id)?;
-    // SINGLE WRITER of the active freshness version — for EVERY backend, AFTER activation. It must
-    // run for the local backends too, not just ollama: `active_embedding_model_version` reads this
-    // meta UNCONDITIONALLY for whatever model is active, so switching back from ollama to a
-    // hash/fastembed model would otherwise leave the stale ollama endpoint-hash as the freshness
-    // key — reconciling/searching the local model under the wrong key (worst case reusing vectors
-    // across models). Ollama folds the endpoint+model into the key (so re-pointing forces a clean
-    // re-embed); every other backend uses its static `spec.version`.
-    let freshness = match (spec.backend, remote) {
-        (Backend::Ollama, Some(remote)) => remote_freshness_version(spec, remote),
-        _ => spec.version.to_string(),
+    // Activate + stamp the freshness version in one call (the single writer). The version must
+    // reflect the runtime actually installed: a remote install uses the endpoint-INDEPENDENT remote
+    // key (so an ephemeral box's new URL with the same `remote.model` does NOT re-embed), and a
+    // local install uses the static `spec.version` (so flipping remote→local re-embeds).
+    let freshness = match remote {
+        Some(remote) => remote_freshness_version(spec, remote),
+        None => spec.version.to_string(),
     };
-    set_reconcile_meta(conn, ACTIVE_EMBEDDING_MODEL_VERSION_META, &freshness)?;
+    activate_model_with_version(conn, model_id, &freshness)?;
     model(conn, model_id)
 }
 
@@ -239,7 +298,7 @@ pub(crate) fn models(conn: &Connection) -> anyhow::Result<Vec<ModelInfo>> {
     collect_rows(rows)
 }
 
-pub(crate) fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
+pub(crate) fn status(conn: &Connection) -> anyhow::Result<LlmStatus> {
     ensure_model_manifest(conn)?;
     let total_chunks = chunk_count(conn)?;
     let active_model_id = active_embedding_model_id(conn)?;
@@ -252,7 +311,7 @@ pub(crate) fn status(conn: &Connection) -> anyhow::Result<LocalAiStatus> {
     let missing = total_chunks.saturating_sub(current + stale + failed + blocked);
     let skipped_chunks = fastembed.skipped_embeddings;
     let eligible_chunks = total_chunks.saturating_sub(skipped_chunks);
-    Ok(LocalAiStatus {
+    Ok(LlmStatus {
         embedding,
         artifacts: ArtifactCounts {
             total_chunks,
@@ -455,7 +514,100 @@ pub(crate) fn reconcile_with_options_progress(
     let attempt_id = conn.last_insert_rowid();
     let timer = Instant::now();
 
-    let embedder = active_embedder(conn, options.intra_threads);
+    // The reconcile scan identity (model id/version/dim + char cap), built ONCE up front so the
+    // ephemeral pending-work check inside `acquire_chunk_embedder` sizes candidates exactly like
+    // the embed loop below (which reuses this same `scan`).
+    let scan = EmbeddingScan {
+        model_id: &active_model_id,
+        model_version: &model_version,
+        dim: embedding_dim,
+        max_embedding_chars,
+    };
+
+    // The chunk-embed embedder. For an EPHEMERAL active model on a provisioning reconcile, this
+    // PROVISIONS a cookbook box (held by `_provisioned` for the whole loop — its `Drop` tears the
+    // box down on success/error/panic) — but only AFTER confirming there's pending work, so a no-op
+    // reconcile never cold-starts a paid box (#330-6). Otherwise it's `active_embedder`
+    // (connect/local). The `acquire_chunk_embedder` result distinguishes ready / skip-ephemeral /
+    // no-ephemeral-work / not-ready.
+    //
+    // Acquire FIRST, then decide whether to do any work — `embedding_policy_skip_summary` streams +
+    // decompresses EVERY chunk (O(repo)). The skip/not-ready paths embed nothing, so they must NOT
+    // pay that scan: a watcher pass with an ephemeral active model + `provision_remote=false` fires
+    // on every file change, and running a full-repo scan per pass just to return "Blocked" is pure
+    // waste. Only the Ready path (which actually walks the candidates) runs the policy summary.
+    let acquired = acquire_chunk_embedder(conn, options.intra_threads, &scan, &options);
+
+    // SkipEphemeral and NoEphemeralWork are the ONLY paths that return BEFORE the policy scan, and
+    // both embed nothing:
+    //  - SkipEphemeral: the watcher/maintenance pass with an ephemeral active model +
+    //    `provision_remote=false`. It fires on every file change, so paying the O(repo)
+    //    `embedding_policy_skip_summary` just to return "Blocked" is pure per-edit waste.
+    //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model.
+    //    `acquire_chunk_embedder` already confirmed ZERO candidates, so it deliberately did NOT
+    //    provision a paid box (#330-6) — and the policy scan would likewise be wasted work.
+    // Both carry an empty `skipped_by_policy` (no policy counts on these early-return paths). The
+    // NotReady path below DOES report policy skips
+    // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
+    // like the Ready path.
+    let acquired = match acquired {
+        skip @ (ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork) => {
+            let (status, message) = match skip {
+                ChunkEmbedder::SkipEphemeral => (
+                    "Blocked",
+                    Some(
+                        "ephemeral remote embedding needs an explicit `rag-rat reconcile` (the \
+                         watcher does not provision a GPU box for incremental edits)"
+                            .to_string(),
+                    ),
+                ),
+                // Already current → nothing to embed; no paid box was provisioned.
+                _ => ("Current", None),
+            };
+            let report = ReconcileReport {
+                processed_chunks: 0,
+                embeddings_written: 0,
+                skipped_chunks: 0,
+                failed_chunks: 0,
+                blocked_chunks: 0,
+                model_id: active_model_id.clone(),
+                model_version: model_version.clone(),
+                embedding_dim,
+                batch_size,
+                max_embedding_chars,
+                forced: options.force,
+                changed_first: options.changed_first,
+                until_clean: options.until_clean,
+                max_seconds: options.max_seconds,
+                work_reasons: BTreeMap::new(),
+                skipped_by_policy: BTreeMap::new(),
+                input_chars: 0,
+                truncated_inputs: 0,
+                elapsed_ms: 0,
+                chunks_per_sec: 0.0,
+                chars_per_sec: 0.0,
+                avg_chars_per_chunk: 0.0,
+                status: status.to_string(),
+                message,
+            };
+            finish_reconcile_attempt(conn, attempt_id, &report)?;
+            progress(ReconcileProgress::Started {
+                model_id: active_model_id,
+                total_chunks: 0,
+                batch_size,
+            });
+            progress(ReconcileProgress::Finished {
+                processed_chunks: 0,
+                embeddings_written: 0,
+                blocked_chunks: 0,
+            });
+            return Ok(report);
+        },
+        other => other,
+    };
+
+    // Ready / NotReady: BOTH report the per-policy skip counts, so run the O(repo) policy summary
+    // now. (SkipEphemeral already returned above without paying it.)
     let skipped_by_policy = embedding_policy_skip_summary(conn, max_embedding_chars)?;
     let skipped_chunks = skipped_by_policy.values().sum();
     let mut report = ReconcileReport {
@@ -485,13 +637,19 @@ pub(crate) fn reconcile_with_options_progress(
         message: None,
     };
 
-    let embedder = match embedder {
-        Ok(embedder) => embedder,
-        Err(_) => {
+    // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
+    // scope here (not inside the match) so it lives until the function returns.
+    let (embedder, _provisioned) = match acquired {
+        ChunkEmbedder::Ready { embedder, provisioned } => (embedder, provisioned),
+        ChunkEmbedder::NotReady(err) => {
+            // Surface the cause (e.g. a cookbook provisioning failure with its captured stderr) so
+            // a remote outage isn't swallowed; the report keeps the actionable "install" hint AND
+            // the policy-skip counts already computed above.
+            eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
             report.status = "Blocked".to_string();
             report.message = Some(format!(
-                "{} model is not ready; run `rag-rat models install {}`",
-                active_model_id, active_model_id
+                "{active_model_id} model is not ready; run `rag-rat models install \
+                 {active_model_id}`"
             ));
             finish_reconcile_attempt(conn, attempt_id, &report)?;
             progress(ReconcileProgress::Started {
@@ -506,13 +664,9 @@ pub(crate) fn reconcile_with_options_progress(
             });
             return Ok(report);
         },
-    };
-
-    let scan = EmbeddingScan {
-        model_id: &active_model_id,
-        model_version: &model_version,
-        dim: embedding_dim,
-        max_embedding_chars,
+        // SkipEphemeral / NoEphemeralWork already returned above.
+        ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork =>
+            unreachable!("SkipEphemeral / NoEphemeralWork handled before the policy scan"),
     };
     let mut progress_total_chunks = estimated_reconcile_jobs(conn, &scan, &options)?;
     progress(ReconcileProgress::Started {
@@ -946,10 +1100,7 @@ mod freshness_version_tests {
     use std::thread;
 
     use super::*;
-    use crate::config::RemoteMode;
-    use crate::embedding_models::{
-        HASH_MODEL_ID, OLLAMA_ALL_MINILM_EMBEDDING_DIM, OLLAMA_ALL_MINILM_MODEL_ID,
-    };
+    use crate::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID};
 
     /// One-shot HTTP/1.1 stub replying to the install probe's `/api/embed` with a `dim`-wide
     /// vector.
@@ -974,6 +1125,10 @@ mod freshness_version_tests {
         (format!("http://127.0.0.1:{port}"), handle)
     }
 
+    fn fastembed_dim() -> usize {
+        spec(FASTEMBED_MODEL_ID).unwrap().dim
+    }
+
     fn schema_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::index::schema::apply(&conn).unwrap();
@@ -983,9 +1138,10 @@ mod freshness_version_tests {
 
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
-            mode: RemoteMode::Connect,
             model: "all-minilm".to_string(),
             endpoint: Some(endpoint.to_string()),
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 5,
@@ -997,52 +1153,316 @@ mod freshness_version_tests {
     }
 
     #[test]
-    fn install_model_stamps_the_endpoint_hash_for_ollama() {
-        let (url, handle) = spawn_embed_stub(OLLAMA_ALL_MINILM_EMBEDDING_DIM);
+    fn install_with_remote_toggles_the_row_to_ollama_and_stamps_the_remote_key() {
+        // #317 rework: a remote block serves the SELECTED model over Ollama — the SAME ai_models
+        // row toggles its runtime to `ollama`, and the freshness key is the remote (not
+        // local) version.
+        let (url, handle) = spawn_embed_stub(fastembed_dim());
         let conn = schema_conn();
         let remote = remote_at(&url);
 
-        install_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID, Some(&remote)).expect("ollama installs");
+        let model =
+            install_model(&conn, FASTEMBED_MODEL_ID, Some(&remote)).expect("ollama installs");
         handle.join().unwrap();
 
-        let spec = spec(OLLAMA_ALL_MINILM_MODEL_ID).unwrap();
+        assert_eq!(model.runtime, "ollama", "the row's runtime toggled to ollama");
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
         assert_eq!(active_version(&conn), remote_freshness_version(spec, &remote));
-        assert_ne!(active_version(&conn), spec.version, "ollama folds the endpoint, not bare ver");
+        assert_ne!(
+            active_version(&conn),
+            spec.version,
+            "remote key differs from the local version"
+        );
     }
 
     #[test]
-    fn switching_from_ollama_to_a_local_model_resets_the_freshness_version() {
-        // THE P2-1 REGRESSION: install ollama (meta = endpoint hash), then install the local hash
-        // model. `active_embedding_model_version` reads this meta unconditionally for the active
-        // model, so it MUST become the hash model's static `spec.version` — not the stale ollama
-        // endpoint-hash. A stale key would reconcile/search the local model under the wrong
-        // freshness and could reuse vectors across models.
-        let (url, handle) = spawn_embed_stub(OLLAMA_ALL_MINILM_EMBEDDING_DIM);
+    fn install_rejects_an_unknown_model_id() {
+        // No aliases (#317): an unrecognized selector (e.g. the old `minilm` alias) is rejected —
+        // the arg must be a registered model_id (the HF path).
+        let conn = schema_conn();
+        let err = install_model(&conn, "minilm", None).expect_err("alias is no longer accepted");
+        assert!(err.to_string().contains("unknown embedding model"), "{err}");
+    }
+
+    #[test]
+    fn install_rejects_a_remote_block_for_a_non_transformer_target() {
+        // A remote block serves the model over Ollama (transformers only). `models install
+        // embedding-hash` with a remote block present must be rejected BEFORE any probe — else the
+        // hash row would be marked runtime='ollama' with the served model's vectors under its id.
+        let conn = schema_conn();
+        let remote = remote_at("http://127.0.0.1:1"); // guard fires before any connection attempt
+        let err =
+            install_model(&conn, HASH_MODEL_ID, Some(&remote)).expect_err("hash + remote rejected");
+        assert!(err.to_string().contains("requires a transformer model"), "{err}");
+    }
+
+    #[test]
+    fn local_install_clears_a_stale_remote_config_meta() {
+        // After an Ollama install persists a remote config, re-installing the model LOCALLY must
+        // DELETE that meta — otherwise active_embedder keeps building an OllamaEmbedder against the
+        // dead endpoint. Uses the hash model so the local install is feature-free.
+        let conn = schema_conn();
+        set_active_remote_config(&conn, &remote_at("http://box:11434")).unwrap();
+        assert!(active_remote_config(&conn).unwrap().is_some(), "precondition: remote meta set");
+        install_model(&conn, HASH_MODEL_ID, None).unwrap();
+        assert!(
+            active_remote_config(&conn).unwrap().is_none(),
+            "a local install must clear the stale remote-config meta",
+        );
+    }
+
+    #[test]
+    fn legacy_active_ollama_model_is_cleaned_on_manifest_ensure() {
+        // An index that had the pre-#317 REMOTE id `ollama-all-minilm` installed + active keeps its
+        // `ai_models` row + active-model meta + remote-config meta. That id is gone from the
+        // registry (Ollama is now a transport), so without legacy cleanup `active_embedder` bails
+        // with "unknown active embedding model" — breaking search/reconcile.
+        // `ensure_model_manifest` must drop ALL THREE (row, active meta, remote config) and
+        // fall back to hash. Feature-free: the legacy row is seeded by raw SQL (no
+        // fastembed/model2vec install), and the fallback is the always-available hash
+        // embedder.
+        const LEGACY_OLLAMA_ID: &str = "ollama-all-minilm";
+        let conn = schema_conn();
+
+        // Mirror a real pre-#317 remote install's DB state: a Ready, active `ai_models` row for the
+        // removed id, the active-model meta, and a persisted (secret-free) remote config.
+        conn.execute(
+            "INSERT INTO ai_models(model_id, capability, embedding_dim, runtime, installed, \
+             disabled, status, installed_at_ms) VALUES (?1, 'embedding', 384, 'ollama', 1, 0, \
+             'Ready', 1)",
+            params![LEGACY_OLLAMA_ID],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
+        set_active_remote_config(&conn, &remote_at("http://box:11434")).unwrap();
+        assert!(!model_manifest_is_current(&conn).unwrap(), "a lingering legacy active id is work");
+
+        ensure_model_manifest(&conn).unwrap();
+
+        // The row, the active-model meta, and the remote config are all gone.
+        let row_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ai_models WHERE model_id = ?1)",
+                params![LEGACY_OLLAMA_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!row_present, "the legacy ai_models row is removed");
+        assert_eq!(meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap(), None, "active meta cleared");
+        assert!(
+            active_remote_config(&conn).unwrap().is_none(),
+            "the stale remote config is cleared so no OllamaEmbedder is reconstructed",
+        );
+
+        // With no active model + no remote config, the active model falls back to hash. Mark the
+        // (always-feature-free) hash row Ready as a normal index would, and assert
+        // `active_embedder` resolves it WITHOUT the "unknown active embedding model" error
+        // the stale legacy row caused.
+        install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
+        let embedder =
+            active_embedder(&conn, None).expect("falls back to hash, no unknown-model err");
+        assert_eq!(embedder.model_id(), HASH_MODEL_ID, "active embedder falls back to hash");
+    }
+
+    #[test]
+    fn legacy_active_model_cleanup_clears_the_stale_version_meta() {
+        // R3a: a pre-#317 legacy-active model (id removed from the registry) had its freshness
+        // version meta stamped. `remove_legacy_models` must clear
+        // `ACTIVE_EMBEDDING_MODEL_VERSION_META` too when the legacy id was active — else
+        // `active_embedding_model_version(HASH)` would inherit the legacy key (it reads the
+        // meta for the active model) and bake new hash embeddings under the wrong
+        // `model_version`.
+        const LEGACY_OLLAMA_ID: &str = "ollama-all-minilm";
+        let conn = schema_conn();
+        conn.execute(
+            "INSERT INTO ai_models(model_id, capability, embedding_dim, runtime, installed, \
+             disabled, status, installed_at_ms) VALUES (?1, 'embedding', 384, 'ollama', 1, 0, \
+             'Ready', 1)",
+            params![LEGACY_OLLAMA_ID],
+        )
+        .unwrap();
+        set_meta(&conn, ACTIVE_EMBEDDING_MODEL_META, LEGACY_OLLAMA_ID).unwrap();
+        set_reconcile_meta(
+            &conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            "ollama-all-minilm-v1-deadbeef",
+        )
+        .unwrap();
+
+        ensure_model_manifest(&conn).unwrap();
+
+        // The stale version meta is gone. With the active model now the hash fallback,
+        // `active_embedding_model_version(HASH)` falls back to the hash spec's static version — NOT
+        // the legacy key.
+        assert_eq!(
+            reconcile_meta(&conn, ACTIVE_EMBEDDING_MODEL_VERSION_META).unwrap(),
+            None,
+            "the legacy freshness-version meta is cleared",
+        );
+        assert_eq!(
+            active_embedding_model_version(&conn, HASH_MODEL_ID).unwrap(),
+            spec(HASH_MODEL_ID).unwrap().version,
+            "hash fallback gets its OWN version, not the stale legacy key",
+        );
+    }
+
+    #[test]
+    fn activate_model_with_version_writes_both_metas() {
+        // R3b centralization: the helper every activation site goes through stamps BOTH the active
+        // model AND its version — so no site can activate without a version (the recovery bug).
+        let conn = schema_conn();
+        activate_model_with_version(&conn, HASH_MODEL_ID, "hash-v1").unwrap();
+        assert_eq!(
+            meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap().as_deref(),
+            Some(HASH_MODEL_ID)
+        );
+        assert_eq!(active_version(&conn), "hash-v1");
+    }
+
+    // Needs a real fastembed install (the no-default-features CI build bails without the feature);
+    // HF-path id resolution is also exercised by the rejection + registry tests, which run
+    // everywhere.
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn install_activates_a_model_by_its_hf_path_id() {
+        let conn = schema_conn();
+        let model = install_model(&conn, FASTEMBED_MODEL_ID, None).expect("hf-path id installs");
+        assert_eq!(model.model_id, FASTEMBED_MODEL_ID);
+    }
+
+    // The LOCAL re-install is a real fastembed install — gated for the no-default-features build.
+    // (`remote_freshness_version` itself + the endpoint-independence are unit-tested feature-free.)
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn flipping_remote_to_local_resets_the_freshness_version_to_the_static_version() {
+        // Install the model over Ollama (remote key), then re-install it LOCALLY (no remote). The
+        // active freshness key must flip to the static `spec.version` — a local↔remote flip is a
+        // re-embed, and the meta is the single source the reconcile/search path reads.
+        let (url, handle) = spawn_embed_stub(fastembed_dim());
         let conn = schema_conn();
         let remote = remote_at(&url);
 
-        install_model(&conn, OLLAMA_ALL_MINILM_MODEL_ID, Some(&remote)).expect("ollama installs");
+        install_model(&conn, FASTEMBED_MODEL_ID, Some(&remote)).expect("ollama installs");
         handle.join().unwrap();
-        let ollama_version = active_version(&conn);
+        let remote_version = active_version(&conn);
 
-        // Now switch back to the local hash model — no remote config.
-        install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
+        // Re-install the SAME model locally (no remote).
+        install_model(&conn, FASTEMBED_MODEL_ID, None).expect("local re-install");
 
-        let hash_spec = spec(HASH_MODEL_ID).unwrap();
-        assert_eq!(
-            active_version(&conn),
-            hash_spec.version,
-            "switching to a local model must reset the freshness key to its static spec.version",
-        );
-        assert_ne!(active_version(&conn), ollama_version, "must NOT keep the stale ollama hash");
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        assert_eq!(active_version(&conn), spec.version, "flip to local resets to static version");
+        assert_ne!(active_version(&conn), remote_version, "must NOT keep the stale remote key");
+    }
+
+    #[test]
+    fn the_remote_freshness_key_is_endpoint_independent_across_installs() {
+        // Two installs at DIFFERENT endpoints (same server model) must stamp the SAME freshness key
+        // — an ephemeral box's per-run URL must not re-embed the whole repo.
+        let conn = schema_conn();
+        let (url_a, h_a) = spawn_embed_stub(fastembed_dim());
+        install_model(&conn, FASTEMBED_MODEL_ID, Some(&remote_at(&url_a))).unwrap();
+        h_a.join().unwrap();
+        let version_a = active_version(&conn);
+
+        let (url_b, h_b) = spawn_embed_stub(fastembed_dim());
+        install_model(&conn, FASTEMBED_MODEL_ID, Some(&remote_at(&url_b))).unwrap();
+        h_b.join().unwrap();
+        let version_b = active_version(&conn);
+
+        assert_eq!(version_a, version_b, "different endpoints → same freshness key (no re-embed)");
     }
 
     #[test]
     fn installing_a_local_model_stamps_its_static_version() {
-        // Even with no prior ollama install, a local-model install writes its static version (the
-        // meta is no longer ollama-only).
         let conn = schema_conn();
         install_model(&conn, HASH_MODEL_ID, None).expect("hash installs");
         assert_eq!(active_version(&conn), spec(HASH_MODEL_ID).unwrap().version);
+    }
+
+    /// Activate an ephemeral remote config WITHOUT provisioning (mark the model Ready + persist a
+    /// cookbook remote config + freshness meta), mirroring a real ephemeral install's DB state.
+    fn activate_ephemeral(conn: &Connection) {
+        let spec = spec(FASTEMBED_MODEL_ID).unwrap();
+        conn.execute(
+            "UPDATE ai_models
+             SET installed = 1, disabled = 0, status = 'Ready', embedding_dim = ?2, runtime = \
+             'ollama'
+             WHERE model_id = ?1",
+            params![FASTEMBED_MODEL_ID, i64::try_from(spec.dim).unwrap()],
+        )
+        .unwrap();
+        set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
+        let remote = RemoteEmbeddingConfig {
+            model: "all-minilm".to_string(),
+            endpoint: None,
+            cookbook: Some("@rag-rat/cookbook/modal".to_string()),
+            query_endpoint: Some("http://localhost:11434".to_string()),
+            auth_env: None,
+            batch_size: 256,
+            request_timeout_s: 5,
+        };
+        set_active_remote_config(conn, &remote).unwrap();
+        set_reconcile_meta(
+            conn,
+            ACTIVE_EMBEDDING_MODEL_VERSION_META,
+            &remote_freshness_version(spec, &remote),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reconcile_skips_ephemeral_chunk_embed_without_provision_remote() {
+        // The watcher/maintenance pass (`provision_remote: false`) must NOT cold-start a cookbook
+        // box for an ephemeral active model — it returns Blocked with a "needs explicit
+        // reconcile" message and never spawns a subprocess. (No cookbook is actually
+        // runnable here, so a provisioning attempt would error/hang; the skip is what keeps
+        // this test fast + offline.)
+        let conn = schema_conn();
+        activate_ephemeral(&conn);
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { provision_remote: false, ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .expect("reconcile returns a report (skips, does not error)");
+
+        assert_eq!(report.status, "Blocked");
+        assert_eq!(report.embeddings_written, 0);
+        assert!(
+            report.message.as_deref().unwrap_or_default().contains("explicit `rag-rat reconcile`"),
+            "skip message: {:?}",
+            report.message
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_provision_when_an_ephemeral_model_is_already_current() {
+        // #330-6: an explicit `rag-rat reconcile` (`provision_remote: true`) on an ephemeral active
+        // model that has NOTHING pending must NOT cold-start (and immediately tear down) a paid GPU
+        // box. The repo here has ZERO chunks, so there are zero candidates. The cookbook spec
+        // (`@rag-rat/cookbook/modal`) is NOT runnable in the test env, so IF provisioning were
+        // attempted it would fail → a "Blocked" / error report. A clean "Current" report with no
+        // embeddings is the proof that `acquire_chunk_embedder` short-circuited to
+        // `NoEphemeralWork` BEFORE provisioning. (Contrast the `provision_remote: false`
+        // skip test above, which returns "Blocked".)
+        let conn = schema_conn();
+        activate_ephemeral(&conn);
+
+        let report = reconcile_with_options_progress(
+            &conn,
+            ReconcileOptions { provision_remote: true, ..ReconcileOptions::default() },
+            |_| {},
+        )
+        .expect("reconcile returns a report (no provision attempt, no error)");
+
+        assert_eq!(report.status, "Current", "no pending work → Current, not Blocked: {report:?}");
+        assert_eq!(report.embeddings_written, 0);
+        assert_eq!(report.processed_chunks, 0);
+        assert!(
+            report.message.is_none(),
+            "no-op reconcile carries no failure message: {:?}",
+            report.message
+        );
     }
 }

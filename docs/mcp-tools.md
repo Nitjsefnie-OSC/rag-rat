@@ -15,7 +15,7 @@ recommended setup is `rag-rat init` from the target repo, which indexes it and r
 cd /path/to/your/repo
 cargo install rag-rat                 # or: cargo install --path crates/rag-rat-cli --bin rag-rat
 rag-rat index --discover
-rag-rat models install fastembed-all-minilm-l6-v2
+rag-rat models install sentence-transformers/all-MiniLM-L6-v2
 rag-rat reconcile --changed-first --limit 500 --batch-size 64
 rag-rat doctor
 ```
@@ -73,7 +73,7 @@ To run from a checkout without installing, use a project-scoped server whose com
 - `github_issue_search`: `{ "query": string, "limit"?: number }`
 - `github_refs_for_path`: `{ "path": string, "limit"?: number }`
 - `rationale_search`: `{ "query": string, "limit"?: number, "include"?: ("fallback")[] }`
-- `local_ai_status`: `{}`
+- `llm_status`: `{}`
 - `heal_index`: `{ "limit"?: number }`
 - `github_sync_status`: `{}`
 - `index_status`: `{}`
@@ -347,11 +347,11 @@ last sync time, and whether the `gh` CLI capability is available.
 already-indexed files whose current source no longer matches the stored SQLite index, then refreshes
 SQLite FTS. It does not discover brand-new files; run `rag-rat index` for discovery.
 
-Local AI artifacts are explicit and current-only. `local_ai_status` reports embedding model state,
+Embedding artifacts are explicit and current-only. `llm_status` reports embedding model state,
 artifact counts, FastEmbed build/cache/model details, and the last reconcile throughput summary when
 available. The CLI-only `models install embedding-hash` command selects the deterministic baseline
 embedder. Building with `--features fastembed` enables the real local
-`fastembed-all-minilm-l6-v2` backend; `models install fastembed-all-minilm-l6-v2` is the intended
+`sentence-transformers/all-MiniLM-L6-v2` backend; `models install sentence-transformers/all-MiniLM-L6-v2` is the intended
 FastEmbed cache-population step. `doctor` reports FastEmbed build support, cache path, model,
 dimension, current/stale/missing/failed embedding counts, last reconcile throughput, and the next
 command needed to make local AI current. `reconcile` writes model-id, dimension, text-hash-bound, and

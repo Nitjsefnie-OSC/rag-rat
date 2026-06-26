@@ -6,7 +6,9 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::embedding_models::{Backend, EmbeddingModelSpec, spec_for_alias};
+use crate::embedding_models::{
+    Backend, EmbeddingModelSpec, FASTEMBED_MODEL_ID, MODEL2VEC_MODEL_ID, spec,
+};
 use crate::language::{Language, LanguageError};
 
 #[derive(Debug, Clone)]
@@ -14,7 +16,7 @@ pub struct Config {
     pub root: PathBuf,
     pub database: PathBuf,
     pub targets: Vec<ResolvedTarget>,
-    pub local_ai: LocalAiConfig,
+    pub llm: LlmConfig,
     pub watch: WatchConfig,
     pub version_check: VersionCheckConfig,
     pub oracle: OracleConfig,
@@ -97,7 +99,7 @@ impl Default for WatchConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LocalAiConfig {
+pub struct LlmConfig {
     pub embedding: EmbeddingConfig,
 }
 
@@ -107,7 +109,7 @@ pub struct EmbeddingConfig {
     /// on repo size; see [`EmbeddingBackend`].
     pub backend: EmbeddingBackend,
     pub runtime: EmbeddingRuntimeConfig,
-    /// Optional remote-embedding offload (`[local_ai.embedding.remote]`). When present, the
+    /// Optional remote-embedding offload (`[llm.embedding.remote]`). When present, the
     /// indexer can hand embedding work to an HTTP server (Ollama's `/api/embed`) instead of
     /// running the model in-process — see [`RemoteEmbeddingConfig`]. Absent → `None` → in-process
     /// embedding only. Parsed + validated here; the dispatch that consumes it lands in #317 task
@@ -115,21 +117,22 @@ pub struct EmbeddingConfig {
     pub remote: Option<RemoteEmbeddingConfig>,
 }
 
-/// The embedding backend selector (`[local_ai.embedding] model = "..."`).
+/// The embedding backend selector (`[llm.embedding] model = "..."`).
 ///
-/// Resolves the toml `model = "..."` string through the [`crate::embedding_models`] registry, so
-/// ANY registered model (`minilm` / `bge` / `jina` / `model2vec` / `hash`, or any of their aliases)
-/// is selectable — adding a model to the registry makes it selectable here with no edit. The
-/// embeddings-off choice (`none` / `off`) carries `None`. Kept a thin wrapper over a registry spec
-/// reference so `config` resolves model identity without depending on `index`
-/// (`crate::embedding_models` has no `index` dependency, so there is no cycle).
+/// Resolves the toml `model = "..."` string through the [`crate::embedding_models`] registry by its
+/// `model_id` (the HF path — NO aliases, #317), so ANY registered model is selectable by its full
+/// name — adding a model to the registry makes it selectable here with no edit. The embeddings-off
+/// choice (`none` / `off`) carries `None`. Kept a thin wrapper over a registry spec reference so
+/// `config` resolves model identity without depending on `index` (`crate::embedding_models` has no
+/// `index` dependency, so there is no cycle).
 ///
 /// The common tiers, for reference:
-/// - `minilm` (the `EmbeddingBackend::default`): MiniLM transformer — best general quality, but the
-///   cold backfill is CPU-bound (~10-100 chunks/sec), so impractical for very large repos.
-/// - `model2vec`: static token-vector lookup + mean-pool — ~100-500× faster on CPU at some
-///   retrieval-quality cost (no context/word-order). The choice for huge repos that still want
-///   vectors.
+/// - `sentence-transformers/all-MiniLM-L6-v2` (the `EmbeddingBackend::default`): MiniLM transformer
+///   — best general quality, but the cold backfill is CPU-bound (~10-100 chunks/sec), so
+///   impractical for very large repos.
+/// - `minishlab/potion-retrieval-32M`: static token-vector lookup + mean-pool — ~100-500× faster on
+///   CPU at some retrieval-quality cost (no context/word-order). The choice for huge repos that
+///   still want vectors.
 /// - `none`: structural + BM25 only; no dense vectors. `semantic_search` degrades to BM25. The
 ///   cheapest option for enormous codebases where any embedding backfill is too slow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,21 +143,21 @@ impl EmbeddingBackend {
     pub const NONE: Self = Self(None);
 
     /// The FastEmbed MiniLM tier — the default backend (`init` recommends it for smaller repos).
-    /// Resolved from the registry; the `minilm` alias is guaranteed present by the registry test.
+    /// Resolved from the registry by model_id.
     pub fn fast_embed() -> Self {
-        Self(spec_for_alias("minilm"))
+        Self(spec(FASTEMBED_MODEL_ID))
     }
 
     /// The Model2Vec static tier (`init` recommends it for very large repos).
     pub fn model2vec() -> Self {
-        Self(spec_for_alias("model2vec"))
+        Self(spec(MODEL2VEC_MODEL_ID))
     }
 
-    /// The canonical toml selector for this backend — the spec's FIRST alias (`init` renders this
-    /// back into `rag-rat.toml`), or `"none"` for the embeddings-off choice.
+    /// The toml selector for this backend — the model_id (the HF path `init` renders back into
+    /// `rag-rat.toml`), or `"none"` for the embeddings-off choice.
     pub fn as_str(self) -> &'static str {
         match self.0 {
-            Some(spec) => spec.aliases.first().copied().unwrap_or(spec.model_id),
+            Some(spec) => spec.model_id,
             None => "none",
         }
     }
@@ -166,9 +169,9 @@ impl EmbeddingBackend {
     }
 
     /// The registry [`Backend`] this selector resolves to (`None` for the embeddings-off choice).
-    /// Lets `config` reason about which runtime a `model = "..."` picks — e.g. the
-    /// `[embedding.remote]` coherence check that pairs an Ollama backend with a remote block —
-    /// without re-deriving the mapping the registry already owns.
+    /// Lets `config` reason about a `model = "..."` selection without re-deriving the mapping the
+    /// registry owns — e.g. the `[embedding.remote]` guardrail that rejects serving a
+    /// non-transformer (static/hash) model over Ollama.
     pub fn registry_backend(self) -> Option<Backend> {
         self.0.map(|spec| spec.backend)
     }
@@ -184,12 +187,15 @@ impl FromStr for EmbeddingBackend {
     type Err = ConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim().to_ascii_lowercase();
-        match value.as_str() {
+        let value = value.trim();
+        // The embeddings-off keywords are case-insensitive; the MODEL selector is the HF path,
+        // which is CASE-SENSITIVE (`all-MiniLM-L6-v2`, `BAAI/...`) — match it verbatim via
+        // `spec`, never lowercased, or the case-sensitive model_id lookup would miss.
+        match value.to_ascii_lowercase().as_str() {
             "none" | "off" | "bm25" => Ok(Self::NONE),
-            other => spec_for_alias(other)
+            _ => spec(value)
                 .map(|spec| Self(Some(spec)))
-                .ok_or_else(|| ConfigError::UnknownEmbeddingBackend(other.to_string())),
+                .ok_or_else(|| ConfigError::UnknownEmbeddingBackend(value.to_string())),
         }
     }
 }
@@ -213,34 +219,46 @@ impl Default for EmbeddingRuntimeConfig {
     }
 }
 
-/// Remote-embedding offload (`[local_ai.embedding.remote]`). Hands embedding work to an HTTP
+/// Remote-embedding offload (`[llm.embedding.remote]`). Hands embedding work to an HTTP
 /// server (Ollama's `/api/embed`) instead of running the model in-process — the lever for huge
 /// repos whose in-process backfill is too slow on the indexing box. Optional: absent → in-process
 /// embedding only.
 ///
 /// Deliberately carries NO `dim` or `backend` field. The vector dimension comes from the registry
-/// spec of the selected model (the `ollama-all-minilm` row, dim 384) and is validated against the
-/// server's first response at runtime by the embedder (#317 task 4); the backend is implied by the
-/// selected registry model. Duplicating either here would be redundant and drift-prone.
+/// spec of the SELECTED model (`model = "sentence-transformers/all-MiniLM-L6-v2"`, dim 384) and is
+/// validated against the server's first response at runtime by the embedder; the runtime is implied
+/// by this block's mere PRESENCE (#317 rework). Duplicating either here would be redundant and
+/// drift-prone.
 ///
-/// `Serialize` (#317 task 5) lets the install step persist this verbatim into the secret-free
+/// The mode is INFERRED, not configured — there is no `mode` field (#318). EXACTLY ONE of
+/// `endpoint` / `cookbook` is set:
+/// - `endpoint` present → CONNECT: talk to an already-running Ollama at that URL.
+/// - `cookbook` present → EPHEMERAL: the bulk-`reconcile` path provisions an on-demand box via the
+///   cookbook subprocess, embeds the repo against it, then tears it down. Queries use the LOCAL box
+///   at `query_endpoint` (same model → same GGUF vector space as the remote-embedded chunks).
+///
+/// `Serialize` lets the install step persist this verbatim into the secret-free
 /// `active_embedding_remote_config` meta, so the `conn`-based `active_embedder` can reconstruct the
 /// remote embedder for both chunk-embed (reconcile) and query-embed (search) without threading
 /// config through the search path. SECRET-FREE: `auth_env` is the env-var NAME, never a token, so
 /// the serialized JSON holds no secret. `Deserialize` is the read side of that meta round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEmbeddingConfig {
-    /// How the remote server is reached. `Connect` (the v1 default) talks to an
-    /// already-running server at `endpoint`; `Ephemeral` (provision-on-demand) is not yet
-    /// supported — see [`RemoteMode`].
-    pub mode: RemoteMode,
     /// The Ollama API model name sent to `/api/embed` (e.g. `"all-minilm"`). This is the server's
     /// own model identifier, NOT a `rag-rat` registry alias — the registry only supplies the dim
     /// parity contract.
     pub model: String,
-    /// Base URL of the remote server (e.g. `"http://localhost:11434"`). Required in `Connect`
-    /// mode; `/api/embed` is appended by the embedder.
+    /// CONNECT: base URL of an already-running Ollama (e.g. `"http://localhost:11434"`);
+    /// `/api/embed` is appended by the embedder. Mutually exclusive with `cookbook`.
     pub endpoint: Option<String>,
+    /// EPHEMERAL: the cookbook recipe rag-rat spawns to provision an on-demand box — an npm
+    /// package spec (`"@rag-rat/cookbook/modal"`, run via `npx -y`) or a recipe file path
+    /// (`.mjs`/`.js` → `node`, `.ts` → `npx tsx`). Mutually exclusive with `endpoint`.
+    pub cookbook: Option<String>,
+    /// EPHEMERAL: the LOCAL Ollama used for QUERY embedding (queries embed the same model as the
+    /// remote-embedded chunks → identical vector space). Defaults to `http://localhost:11434` when
+    /// ephemeral and omitted. Ignored in connect mode.
+    pub query_endpoint: Option<String>,
     /// Name of the environment variable holding the bearer token, if the server needs auth. Local
     /// Ollama needs none, so this is optional; the embedder reads the var once at construction.
     pub auth_env: Option<String>,
@@ -250,12 +268,16 @@ pub struct RemoteEmbeddingConfig {
     pub request_timeout_s: u64,
 }
 
+/// The default LOCAL Ollama URL for ephemeral query embedding when `query_endpoint` is omitted.
+pub const DEFAULT_QUERY_ENDPOINT: &str = "http://localhost:11434";
+
 impl Default for RemoteEmbeddingConfig {
     fn default() -> Self {
         Self {
-            mode: RemoteMode::Connect,
             model: String::new(),
             endpoint: None,
+            cookbook: None,
+            query_endpoint: None,
             auth_env: None,
             batch_size: 256,
             request_timeout_s: 60,
@@ -263,37 +285,16 @@ impl Default for RemoteEmbeddingConfig {
     }
 }
 
-/// How the remote-embedding server is obtained (`[local_ai.embedding.remote] mode = "..."`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum RemoteMode {
-    /// Connect to an already-running server at the configured `endpoint`. The v1 default and the
-    /// only supported mode today.
-    #[default]
-    Connect,
-    /// Provision an ephemeral server on demand. Not yet supported — needs the provisioning
-    /// cookbook (#318); selecting it is a [`ConfigError::RemoteEmbeddingEphemeralUnsupported`].
-    Ephemeral,
-}
-
-impl RemoteMode {
-    /// The canonical toml selector for this mode.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Connect => "connect",
-            Self::Ephemeral => "ephemeral",
-        }
+impl RemoteEmbeddingConfig {
+    /// CONNECT mode: an already-running server at `endpoint`. Exactly one of connect/ephemeral
+    /// holds (config validation guarantees it), so `is_connect() == !is_ephemeral()`.
+    pub fn is_connect(&self) -> bool {
+        self.endpoint.is_some()
     }
-}
 
-impl FromStr for RemoteMode {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "connect" => Ok(Self::Connect),
-            "ephemeral" => Ok(Self::Ephemeral),
-            other => Err(ConfigError::UnknownRemoteMode(other.to_string())),
-        }
+    /// EPHEMERAL mode: provision an on-demand box via `cookbook` for the bulk reconcile.
+    pub fn is_ephemeral(&self) -> bool {
+        self.cookbook.is_some()
     }
 }
 
@@ -419,6 +420,11 @@ impl Config {
         let path = path.as_ref();
         let text = fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&text)?;
+        // Reject the renamed `[local_ai]` table loudly (#317) — a silently-ignored old table would
+        // drop the user's embedding settings on upgrade. See `RawConfig::local_ai`.
+        if raw.local_ai.is_some() {
+            return Err(ConfigError::LocalAiTableRenamed);
+        }
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let root = config_dir.join(raw.index.root.unwrap_or_else(|| ".".to_string()));
         // The root of the checkout the config was actually READ from (a linked worktree has its own
@@ -463,13 +469,24 @@ impl Config {
         // (`refresh_worktree_overlays`) and indexes the branch with its own target set (#219
         // review).
         let targets = main_base_targets(&root, &local_root).unwrap_or(local_targets);
-        let local_ai = LocalAiConfig::try_from(raw.local_ai)?;
+        let mut llm = LlmConfig::try_from(raw.llm)?;
+        // Resolve a RELATIVE cookbook recipe PATH against the config dir, not the process CWD (R6):
+        // the recipe is handed to `node`/`npx`, which resolve it against wherever reconcile/the
+        // watcher runs — ENOENT from a subdir or a daemon. npm-package specs (`@scope/pkg`) are
+        // left untouched. Done here (not in the config TryFrom) because only `load` knows
+        // the config dir.
+        if let Some(remote) = llm.embedding.remote.as_mut()
+            && let Some(cookbook) = remote.cookbook.as_ref()
+            && let Some(resolved) = resolve_relative_cookbook_path(cookbook, config_dir)
+        {
+            remote.cookbook = Some(resolved);
+        }
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
         let oracle = raw.oracle.into();
         let search = raw.search.into();
 
-        Ok(Self { root, database, targets, local_ai, watch, version_check, oracle, search })
+        Ok(Self { root, database, targets, llm, watch, version_check, oracle, search })
     }
 }
 
@@ -619,7 +636,14 @@ struct RawConfig {
     #[serde(default)]
     index: RawIndex,
     #[serde(default)]
-    local_ai: RawLocalAi,
+    llm: RawLlm,
+    /// Presence-capture for the OLD `[local_ai]` table (renamed to `[llm]` in #317). Serde would
+    /// otherwise SILENTLY DROP this now-unknown table, loading every embedding setting as a
+    /// default (re-enabling FastEmbed, dropping a configured remote/runtime) on upgrade. We
+    /// capture it so `load` can reject it loudly with a migration instruction instead of
+    /// misconfiguring silently.
+    #[serde(default)]
+    local_ai: Option<toml::Value>,
     #[serde(default)]
     watch: RawWatch,
     #[serde(default)]
@@ -709,27 +733,27 @@ struct RawIndex {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct RawLocalAi {
+struct RawLlm {
     #[serde(default)]
     embedding: RawEmbedding,
 }
 
-impl TryFrom<RawLocalAi> for LocalAiConfig {
+impl TryFrom<RawLlm> for LlmConfig {
     type Error = ConfigError;
 
-    fn try_from(raw: RawLocalAi) -> Result<Self, Self::Error> {
+    fn try_from(raw: RawLlm) -> Result<Self, Self::Error> {
         Ok(Self { embedding: EmbeddingConfig::try_from(raw.embedding)? })
     }
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawEmbedding {
-    /// `model = "<registered alias>" | "none"` — the embedding backend selector (`minilm`, `bge`,
-    /// `jina`, `model2vec`, … resolve through the embedding-model registry).
+    /// `model = "<model_id>" | "none"` — the embedding model selector, the registry model_id (the
+    /// HF path, e.g. `sentence-transformers/all-MiniLM-L6-v2`; no aliases, #317).
     model: Option<String>,
     #[serde(default)]
     runtime: RawEmbeddingRuntime,
-    /// `[local_ai.embedding.remote]` — absent → no remote offload (`remote: None`).
+    /// `[llm.embedding.remote]` — absent → no remote offload (`remote: None`).
     remote: Option<RawRemoteEmbedding>,
 }
 
@@ -742,17 +766,22 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
             None => EmbeddingBackend::default(),
         };
         let remote = raw.remote.map(RemoteEmbeddingConfig::try_from).transpose()?;
-        // Cross-field coherence: the `[embedding.remote]` block and the `model = "..."` selector
-        // must AGREE on whether embedding is remote. Run AFTER `RemoteEmbeddingConfig::try_from`
-        // (above) so a malformed block fails with its own specific error first. We REJECT
-        // incoherent configs rather than auto-selecting a backend — silently running the LOCAL
-        // model while the user believes remote offload is on (a remote block but a fastembed
-        // `model`) is the trap this guards.
-        let selects_ollama = backend.registry_backend() == Some(Backend::Ollama);
-        match (selects_ollama, remote.is_some()) {
-            (false, true) => return Err(ConfigError::RemoteEmbeddingBackendMismatch),
-            (true, false) => return Err(ConfigError::RemoteEmbeddingMissingConfig),
-            _ => {},
+        // #317 rework: the `model = "..."` selector names the MODEL; a `[remote]` block serves THAT
+        // model over Ollama. The two no longer have to "agree on a backend" — the old
+        // model="ollama" coupling (`RemoteEmbeddingBackendMismatch` /
+        // `RemoteEmbeddingMissingConfig`) is gone. The only coherence left: Ollama can only
+        // serve TRANSFORMER models, so a `[remote]` block on a static/hash model is a
+        // misconfiguration the dim probe couldn't usefully explain — reject it here with a
+        // clear message.
+        // A `[remote]` block REQUIRES a transformer (FastEmbed) selected model — Ollama can only
+        // serve those. Reject when the selected backend is NOT FastEmbed: that covers static/hash
+        // (`registry_backend()` is `Some(Hash | Model2Vec)`) AND `model = "none"` (embeddings
+        // disabled → `registry_backend()` is `None`), which would otherwise slip through and leave
+        // a remote block that never installs or provisions anything.
+        if remote.is_some() && !matches!(backend.registry_backend(), Some(Backend::FastEmbed)) {
+            return Err(ConfigError::RemoteEmbeddingNonTransformerModel(
+                backend.as_str().to_string(),
+            ));
         }
         Ok(Self { backend, runtime: raw.runtime.into(), remote })
     }
@@ -760,9 +789,10 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawRemoteEmbedding {
-    mode: Option<String>,
     model: Option<String>,
     endpoint: Option<String>,
+    cookbook: Option<String>,
+    query_endpoint: Option<String>,
     auth_env: Option<String>,
     batch_size: Option<u32>,
     request_timeout_s: Option<u64>,
@@ -778,46 +808,83 @@ fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
     authority.contains('@')
 }
 
+/// If the cookbook spec's FIRST token is a RELATIVE recipe PATH, return the spec with that token
+/// resolved against `config_dir` (the `rag-rat.toml` directory). Returns `None` — leave the spec
+/// unchanged — for an npm-package spec (`@scope/pkg`, a bare name) or an ALREADY-ABSOLUTE path; the
+/// recipe runner (`node`/`npx`) would otherwise resolve a relative path against the process CWD
+/// (wherever reconcile/the watcher runs), giving ENOENT from a subdir or a daemon (R6).
+///
+/// "Path-shaped" = starts with `./` or `../`, OR ends in a recipe extension (`.mjs`/`.js`/`.ts`/
+/// `.mts`). Only the first whitespace token (the path) is rewritten; provider subcommand/args after
+/// it are preserved verbatim.
+fn resolve_relative_cookbook_path(cookbook: &str, config_dir: &Path) -> Option<String> {
+    let mut tokens = cookbook.split_whitespace();
+    let first = tokens.next()?;
+    let lower = first.to_ascii_lowercase();
+    let is_path_shaped = first.starts_with("./")
+        || first.starts_with("../")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".mts");
+    if !is_path_shaped || Path::new(first).is_absolute() {
+        return None; // npm spec or already absolute → leave verbatim
+    }
+    let resolved = config_dir.join(first);
+    let mut out = resolved.to_string_lossy().into_owned();
+    for arg in tokens {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    Some(out)
+}
+
 impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
     type Error = ConfigError;
 
     fn try_from(raw: RawRemoteEmbedding) -> Result<Self, Self::Error> {
         let default = RemoteEmbeddingConfig::default();
-        // `mode` absent → `Connect` (the v1 default). `Ephemeral` parses but isn't wired yet.
-        let mode = match raw.mode.as_deref() {
-            Some(value) => value.parse()?,
-            None => default.mode,
-        };
-        if mode == RemoteMode::Ephemeral {
-            return Err(ConfigError::RemoteEmbeddingEphemeralUnsupported);
-        }
+        let trimmed = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         // The Ollama API model name (e.g. `all-minilm`) — required, non-empty.
         let model = raw.model.unwrap_or_default();
         let model = model.trim();
         if model.is_empty() {
             return Err(ConfigError::RemoteEmbeddingMissingModel);
         }
-        // `Connect` mode needs a non-empty server URL to reach.
-        let endpoint = raw.endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
-        if mode == RemoteMode::Connect && endpoint.is_none() {
-            return Err(ConfigError::RemoteEmbeddingMissingEndpoint);
+        // The MODE is INFERRED from which URL field is set (#318): EXACTLY ONE of `endpoint`
+        // (connect) / `cookbook` (ephemeral). Both → ambiguous; neither → no server to reach.
+        let endpoint = trimmed(raw.endpoint);
+        let cookbook = trimmed(raw.cookbook);
+        match (endpoint.is_some(), cookbook.is_some()) {
+            (true, true) | (false, false) => {
+                return Err(ConfigError::RemoteEmbeddingModeAmbiguous);
+            },
+            _ => {},
         }
-        // SECRET HYGIENE: the endpoint string is persisted WHOLE into the (secret-free) index meta
-        // at install. A URL with userinfo (`https://user:token@host`) would copy that credential
-        // into the SQLite index — reject it here and direct the user to `auth_env`. Checked against
-        // the URL authority only (between `scheme://` and the next `/`), so an `@` in a path/query
-        // is fine.
-        if let Some(endpoint) = endpoint.as_deref()
-            && endpoint_authority_has_userinfo(endpoint)
-        {
-            return Err(ConfigError::RemoteEmbeddingEndpointHasCredentials);
+        // SECRET HYGIENE: `endpoint`/`query_endpoint` are persisted WHOLE into the (secret-free)
+        // index meta. A URL with userinfo (`https://user:token@host`) would copy that credential
+        // into the SQLite index — reject it and direct the user to `auth_env`. Checked against the
+        // URL authority only (between `scheme://` and the next `/`), so an `@` in a path/query is
+        // fine. `cookbook` is a recipe spec, not a URL, so it is not checked.
+        // EPHEMERAL: the LOCAL query box. Defaults to `DEFAULT_QUERY_ENDPOINT`; ignored for
+        // connect.
+        let query_endpoint = if cookbook.is_some() {
+            Some(trimmed(raw.query_endpoint).unwrap_or_else(|| DEFAULT_QUERY_ENDPOINT.to_string()))
+        } else {
+            None
+        };
+        for url in [endpoint.as_deref(), query_endpoint.as_deref()].into_iter().flatten() {
+            if endpoint_authority_has_userinfo(url) {
+                return Err(ConfigError::RemoteEmbeddingEndpointHasCredentials);
+            }
         }
         // Optional — local Ollama needs no auth; trim if present.
-        let auth_env = raw.auth_env.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        let auth_env = trimmed(raw.auth_env);
         Ok(Self {
-            mode,
             model: model.to_string(),
             endpoint,
+            cookbook,
+            query_endpoint,
             auth_env,
             batch_size: raw.batch_size.unwrap_or(default.batch_size),
             request_timeout_s: raw.request_timeout_s.unwrap_or(default.request_timeout_s),
@@ -866,43 +933,41 @@ pub enum ConfigError {
     #[error("unknown target kind `{0}`")]
     UnknownTargetKind(String),
     #[error(
-        "unknown embedding backend `{0}` (expected a registered model alias such as `minilm`, \
-         `bge`, `jina`, `model2vec`, or `none`)"
+        "unknown embedding model `{0}` (expected a registered model id — the HF path, e.g. \
+         `sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`, \
+         `jinaai/jina-embeddings-v2-base-code`, `minishlab/potion-retrieval-32M` — or `none`)"
     )]
     UnknownEmbeddingBackend(String),
-    #[error("unknown remote embedding mode `{0}` (expected `connect` or `ephemeral`)")]
-    UnknownRemoteMode(String),
     #[error(
-        "[local_ai.embedding.remote] requires a non-empty `model` (the Ollama API model name, \
-         such as `all-minilm`)"
+        "[llm.embedding.remote] requires a non-empty `model` (the Ollama API model name, such as \
+         `all-minilm`)"
     )]
     RemoteEmbeddingMissingModel,
     #[error(
-        "[local_ai.embedding.remote] mode = \"connect\" requires a non-empty `endpoint` (the \
-         remote server URL, such as `http://localhost:11434`)"
+        "[llm.embedding.remote] requires EXACTLY ONE of `endpoint` (connect to a running Ollama) \
+         or `cookbook` (provision an ephemeral box) — set neither both nor zero"
     )]
-    RemoteEmbeddingMissingEndpoint,
+    RemoteEmbeddingModeAmbiguous,
     #[error(
-        "[local_ai.embedding.remote] mode = \"ephemeral\" is not yet supported (needs the \
-         provisioning cookbook, #318); use mode = \"connect\" for now"
-    )]
-    RemoteEmbeddingEphemeralUnsupported,
-    #[error(
-        "[local_ai.embedding.remote] `endpoint` must not embed credentials in the URL (no \
+        "[llm.embedding.remote] `endpoint` must not embed credentials in the URL (no \
          `user:pass@host`) — the endpoint is persisted into the index; put any token in an env \
          var and name it via `auth_env` instead"
     )]
     RemoteEmbeddingEndpointHasCredentials,
     #[error(
-        "an [local_ai.embedding.remote] block is set but `model` doesn't select an Ollama model; \
-         set `model = \"ollama\"` or remove the remote block"
+        "[llm.embedding.remote] can only serve a transformer model over Ollama, but `model = \
+         \"{0}\"` is not a transformer (it is a static/hash model, or `none`/disabled) — remove \
+         the remote block, or select a transformer model (e.g. \
+         `sentence-transformers/all-MiniLM-L6-v2`, `BAAI/bge-small-en-v1.5`, \
+         `jinaai/jina-embeddings-v2-base-code`)"
     )]
-    RemoteEmbeddingBackendMismatch,
+    RemoteEmbeddingNonTransformerModel(String),
     #[error(
-        "the Ollama embedding backend (`model = \"ollama\"`) requires an \
-         [local_ai.embedding.remote] block with `endpoint` + `model`"
+        "the `[local_ai]` table was renamed to `[llm]` (#317). Update your rag-rat.toml: rename \
+         `[local_ai.embedding]` → `[llm.embedding]` (and any `[local_ai.embedding.remote]` / \
+         `[local_ai.embedding.runtime]` → `[llm.embedding.remote]` / `[llm.embedding.runtime]`)"
     )]
-    RemoteEmbeddingMissingConfig,
+    LocalAiTableRenamed,
     #[error("duplicate target name `{0}`")]
     DuplicateTarget(String),
     #[error("configured directory does not exist: {0}")]
@@ -1210,7 +1275,7 @@ mod tests {
             root = "."
             database = ".rag-rat/index.sqlite"
 
-            [local_ai.embedding.runtime]
+            [llm.embedding.runtime]
             batch_size = 128
             ort_threads = 2
             omp_threads = 1
@@ -1219,9 +1284,9 @@ mod tests {
         )
         .unwrap();
 
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
 
-        assert_eq!(local_ai.embedding.runtime, EmbeddingRuntimeConfig {
+        assert_eq!(llm.embedding.runtime, EmbeddingRuntimeConfig {
             batch_size: 128,
             ort_threads: Some(2),
             omp_threads: Some(1),
@@ -1236,66 +1301,101 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "minilm"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
-        assert_eq!(local_ai.embedding.remote, None, "no [remote] block → remote: None");
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
+        assert_eq!(llm.embedding.remote, None, "no [remote] block → remote: None");
     }
 
     #[test]
     fn remote_embedding_connect_happy_path_applies_defaults() {
+        // CONNECT is inferred from `endpoint` being set (#318) — no `mode` field. The selector
+        // names a real MODEL; the [remote] block serves it via Ollama.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
-            mode = "connect"
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
         assert_eq!(
-            local_ai.embedding.remote,
+            llm.embedding.remote,
             Some(RemoteEmbeddingConfig {
-                mode: RemoteMode::Connect,
                 model: "all-minilm".to_string(),
                 endpoint: Some("http://localhost:11434".to_string()),
+                cookbook: None,
+                query_endpoint: None, // connect mode: no local query box
                 auth_env: None,
                 // defaults applied when omitted
                 batch_size: 256,
                 request_timeout_s: 60,
             })
         );
+        let remote = llm.embedding.remote.as_ref().unwrap();
+        assert!(remote.is_connect() && !remote.is_ephemeral());
+        // The selector still resolves to the LOCAL fastembed model — the [remote] block overrides
+        // the RUNTIME, not the model identity.
+        assert_eq!(
+            llm.embedding.backend.model_id(),
+            Some(crate::embedding_models::FASTEMBED_MODEL_ID)
+        );
     }
 
     #[test]
-    fn remote_embedding_mode_omitted_defaults_to_connect() {
+    fn remote_embedding_ephemeral_infers_mode_and_defaults_query_endpoint() {
+        // EPHEMERAL is inferred from `cookbook` being set; `query_endpoint` defaults to the local
+        // Ollama when omitted (queries embed the same model → same vector space as remote chunks).
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
-            endpoint = "http://localhost:11434"
+            cookbook = "@rag-rat/cookbook/modal"
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
-        let remote = local_ai.embedding.remote.expect("remote block present");
-        assert_eq!(remote.mode, RemoteMode::Connect, "absent mode → Connect (the v1 default)");
+        let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
+        assert!(remote.is_ephemeral() && !remote.is_connect());
+        assert_eq!(remote.cookbook.as_deref(), Some("@rag-rat/cookbook/modal"));
+        assert_eq!(remote.endpoint, None);
+        assert_eq!(remote.query_endpoint.as_deref(), Some(DEFAULT_QUERY_ENDPOINT));
+    }
+
+    #[test]
+    fn remote_embedding_ephemeral_honors_explicit_query_endpoint() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [llm.embedding.remote]
+            model = "all-minilm"
+            cookbook = "./recipe.mjs"
+            query_endpoint = "http://127.0.0.1:11999"
+            "#,
+        )
+        .unwrap();
+        let remote = LlmConfig::try_from(raw.llm).unwrap().embedding.remote.unwrap();
+        assert_eq!(remote.query_endpoint.as_deref(), Some("http://127.0.0.1:11999"));
     }
 
     #[test]
@@ -1305,10 +1405,10 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "http://localhost:11434"
             auth_env = "OLLAMA_TOKEN"
@@ -1317,13 +1417,14 @@ mod tests {
             "#,
         )
         .unwrap();
-        let local_ai = LocalAiConfig::try_from(raw.local_ai).unwrap();
+        let llm = LlmConfig::try_from(raw.llm).unwrap();
         assert_eq!(
-            local_ai.embedding.remote,
+            llm.embedding.remote,
             Some(RemoteEmbeddingConfig {
-                mode: RemoteMode::Connect,
                 model: "all-minilm".to_string(),
                 endpoint: Some("http://localhost:11434".to_string()),
+                cookbook: None,
+                query_endpoint: None,
                 auth_env: Some("OLLAMA_TOKEN".to_string()),
                 batch_size: 512,
                 request_timeout_s: 120,
@@ -1332,29 +1433,39 @@ mod tests {
     }
 
     #[test]
-    fn remote_embedding_connect_without_endpoint_is_rejected() {
-        // `model = "ollama"` keeps the config coherent on the cross-field axis, so the block's own
-        // missing-endpoint error (which fires first, in RemoteEmbeddingConfig::try_from) is the
-        // ONLY error in play — not the mismatch guard.
-        let raw: RawConfig = toml::from_str(
-            r#"
+    fn remote_embedding_requires_exactly_one_of_endpoint_or_cookbook() {
+        // Neither → no server to reach; both → ambiguous mode. Both reject with the exactly-one
+        // rule.
+        let neither = r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
-            mode = "connect"
+            [llm.embedding.remote]
             model = "all-minilm"
-            "#,
-        )
-        .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::RemoteEmbeddingMissingEndpoint),
-            "connect mode without endpoint → RemoteEmbeddingMissingEndpoint, got {err:?}",
-        );
+            "#;
+        let both = r#"
+            [index]
+            root = "."
+
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
+
+            [llm.embedding.remote]
+            model = "all-minilm"
+            endpoint = "http://localhost:11434"
+            cookbook = "@rag-rat/cookbook/modal"
+            "#;
+        for (label, toml_str) in [("neither", neither), ("both", both)] {
+            let raw: RawConfig = toml::from_str(toml_str).unwrap();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RemoteEmbeddingModeAmbiguous),
+                "{label} endpoint/cookbook → RemoteEmbeddingModeAmbiguous, got {err:?}",
+            );
+        }
     }
 
     #[test]
@@ -1366,16 +1477,16 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "all-minilm"
             endpoint = "https://user:token@host:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingEndpointHasCredentials),
             "endpoint with userinfo → RemoteEmbeddingEndpointHasCredentials, got {err:?}",
@@ -1392,12 +1503,12 @@ mod tests {
             "http://localhost:11434/v1/embeddings?user=a@b",
         ] {
             let raw: RawConfig = toml::from_str(&format!(
-                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
-                 \"ollama\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
-                 \"{endpoint}\"\n"
+                "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                 \"sentence-transformers/all-MiniLM-L6-v2\"\n\n[llm.embedding.remote]\nmodel = \
+                 \"all-minilm\"\nendpoint = \"{endpoint}\"\n"
             ))
             .unwrap();
-            let remote = LocalAiConfig::try_from(raw.local_ai)
+            let remote = LlmConfig::try_from(raw.llm)
                 .unwrap_or_else(|e| panic!("`{endpoint}` must be accepted: {e:?}"))
                 .embedding
                 .remote
@@ -1417,52 +1528,77 @@ mod tests {
     }
 
     #[test]
-    fn remote_embedding_ephemeral_mode_is_unsupported() {
+    fn resolve_relative_cookbook_path_anchors_relative_recipe_paths_to_config_dir() {
+        let dir = Path::new("/repo/sub");
+        // Relative path-shaped specs → resolved against config_dir; the trailing args are
+        // preserved.
+        assert_eq!(
+            resolve_relative_cookbook_path("./recipes/x.mts", dir).as_deref(),
+            Some("/repo/sub/./recipes/x.mts")
+        );
+        assert_eq!(
+            resolve_relative_cookbook_path("../cookbook.mjs modal", dir).as_deref(),
+            Some("/repo/sub/../cookbook.mjs modal")
+        );
+        // A bare relative `.ts`/`.mts`/`.js` path (no `./`) is still path-shaped → resolved.
+        assert_eq!(
+            resolve_relative_cookbook_path("recipe.mts", dir).as_deref(),
+            Some("/repo/sub/recipe.mts")
+        );
+        // npm package specs and a bare token are LEFT VERBATIM (None).
+        assert_eq!(resolve_relative_cookbook_path("@rag-rat/cookbook modal", dir), None);
+        assert_eq!(resolve_relative_cookbook_path("some-pkg", dir), None);
+        // An ALREADY-ABSOLUTE recipe path is left verbatim (None).
+        assert_eq!(resolve_relative_cookbook_path("/abs/recipe.mjs runpod", dir), None);
+    }
+
+    #[test]
+    fn remote_embedding_query_endpoint_with_credentials_is_rejected() {
+        // The query_endpoint is persisted too, so userinfo in it is rejected the same as
+        // `endpoint`.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
-            mode = "ephemeral"
+            [llm.embedding.remote]
             model = "all-minilm"
+            cookbook = "@rag-rat/cookbook/modal"
+            query_endpoint = "http://user:tok@127.0.0.1:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
-            matches!(err, ConfigError::RemoteEmbeddingEphemeralUnsupported),
-            "ephemeral mode → RemoteEmbeddingEphemeralUnsupported, got {err:?}",
+            matches!(err, ConfigError::RemoteEmbeddingEndpointHasCredentials),
+            "query_endpoint with userinfo → RemoteEmbeddingEndpointHasCredentials, got {err:?}",
         );
     }
 
     #[test]
     fn remote_embedding_missing_model_is_rejected() {
-        // `model = "ollama"` (the backend selector) keeps the config coherent so the block's own
-        // missing-model error is the only one in play. NOTE the two `model` keys are distinct: the
-        // `[local_ai.embedding] model` is the registry SELECTOR; the `[remote] model` is the Ollama
-        // API model name — it's the latter that's missing here.
-        // Block present (so it parses to Some) but `[remote] model` omitted → missing-model error.
+        // The two `model` keys are distinct: `[llm.embedding] model` is the registry SELECTOR;
+        // `[remote] model` is the Ollama API model name — it's the latter that's required here.
         let raw: RawConfig = toml::from_str(
             r#"
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             endpoint = "http://localhost:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
-            "omitted model → RemoteEmbeddingMissingModel, got {err:?}",
+            "omitted [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
         );
 
         // A whitespace-only `[remote] model` trims to empty and is rejected the same way.
@@ -1471,64 +1607,83 @@ mod tests {
             [index]
             root = "."
 
-            [local_ai.embedding]
-            model = "ollama"
+            [llm.embedding]
+            model = "sentence-transformers/all-MiniLM-L6-v2"
 
-            [local_ai.embedding.remote]
+            [llm.embedding.remote]
             model = "   "
             endpoint = "http://localhost:11434"
             "#,
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = LlmConfig::try_from(raw.llm).unwrap_err();
         assert!(
             matches!(err, ConfigError::RemoteEmbeddingMissingModel),
-            "whitespace-only model → RemoteEmbeddingMissingModel, got {err:?}",
+            "whitespace-only [remote] model → RemoteEmbeddingMissingModel, got {err:?}",
         );
     }
 
     #[test]
-    fn remote_block_without_ollama_backend_is_a_mismatch() {
-        // A fully-valid [remote] block but `model` selects (defaults to) fastembed — the trap: the
-        // user believes remote offload is on, but the LOCAL model would run. Rejected, not
-        // auto-selected.
-        let raw: RawConfig = toml::from_str(
-            r#"
-            [index]
-            root = "."
+    fn remote_block_on_a_non_transformer_model_is_rejected() {
+        // #317 rework guardrail: Ollama can only serve transformer models. A [remote] block on the
+        // static model2vec, the hash model, or `none` (embeddings disabled) is a misconfiguration —
+        // reject at parse with a clear message rather than leaving a remote block that never
+        // installs/provisions anything. Selectors are the HF-path model_ids now.
+        for model in ["minishlab/potion-retrieval-32M", "embedding-hash", "none"] {
+            let raw: RawConfig = toml::from_str(&format!(
+                "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                 \"{model}\"\n\n[llm.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                 \"http://localhost:11434\"\n"
+            ))
+            .unwrap();
+            let err = LlmConfig::try_from(raw.llm).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RemoteEmbeddingNonTransformerModel(_)),
+                "remote block + {model} → RemoteEmbeddingNonTransformerModel, got {err:?}",
+            );
+        }
+    }
 
-            [local_ai.embedding.remote]
-            model = "all-minilm"
-            endpoint = "http://localhost:11434"
-            "#,
+    #[test]
+    fn the_renamed_local_ai_table_is_rejected_with_a_migration_message() {
+        // #317 renamed [local_ai] → [llm]. An old config's [local_ai] table must error LOUDLY:
+        // serde would otherwise silently DROP it, reverting embedding settings to defaults on
+        // upgrade. The error fires in Config::load before any directory resolution.
+        let id = CFG_TEMP.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("ragrat-localai-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("rag-rat.toml"),
+            "[index]\nroot = \".\"\n[local_ai.embedding]\nmodel = \"none\"\n",
         )
         .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        let err = Config::load(tmp.join("rag-rat.toml")).unwrap_err();
         assert!(
-            matches!(err, ConfigError::RemoteEmbeddingBackendMismatch),
-            "remote block + non-ollama model → RemoteEmbeddingBackendMismatch, got {err:?}",
+            matches!(err, ConfigError::LocalAiTableRenamed),
+            "[local_ai] table → LocalAiTableRenamed, got {err:?}",
         );
     }
 
     #[test]
-    fn ollama_backend_without_remote_block_is_missing_config() {
-        // `model = "ollama"` selects the Ollama backend, but there's no [remote] block to tell it
-        // where/how to reach the server → incoherent, rejected.
-        let raw: RawConfig = toml::from_str(
-            r#"
-            [index]
-            root = "."
-
-            [local_ai.embedding]
-            model = "ollama"
-            "#,
-        )
-        .unwrap();
-        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::RemoteEmbeddingMissingConfig),
-            "ollama backend without remote block → RemoteEmbeddingMissingConfig, got {err:?}",
-        );
+    fn remote_block_with_a_transformer_model_is_accepted() {
+        // The inverse of the guardrail: the FastEmbed (transformer) HF-path models accept a
+        // [remote] block.
+        for model in [
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "BAAI/bge-small-en-v1.5",
+            "jinaai/jina-embeddings-v2-base-code",
+        ] {
+            let raw: RawConfig = toml::from_str(&format!(
+                "[index]\nroot = \".\"\n\n[llm.embedding]\nmodel = \
+                 \"{model}\"\n\n[llm.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                 \"http://localhost:11434\"\n"
+            ))
+            .unwrap();
+            assert!(
+                LlmConfig::try_from(raw.llm).is_ok(),
+                "remote block + {model} (transformer) must be accepted",
+            );
+        }
     }
 
     #[test]

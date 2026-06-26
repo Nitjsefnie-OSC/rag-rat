@@ -17,7 +17,9 @@ pub use providers::FastEmbedEmbedder;
 pub use providers::MockEmbedder;
 #[cfg(feature = "model2vec")]
 pub use providers::Model2VecEmbedder;
-pub(crate) use providers::active_embedder;
+pub(crate) use providers::{
+    ChunkEmbedder, acquire_chunk_embedder, active_embedder, provision_and_build,
+};
 // Curate the provider surface onto the `index::ai` path so existing `super::*` callers
 // (`reconcile`, `status`, `helpers`) and the external `ai::Embedder` /
 // `ai::FASTEMBED_MISSING_*` references keep resolving after the move into `providers/`. mod.rs
@@ -28,8 +30,8 @@ pub(crate) use providers::active_embedder;
 // `#[cfg(not(...))]`-only consts). A `pub(crate)` re-export would narrow that and redden `-D
 // warnings`.
 pub use providers::{
-    Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder, MODEL2VEC_HF_REPO,
-    MODEL2VEC_MISSING_FEATURE_MESSAGE, OllamaEmbedder,
+    CookbookInput, CookbookProvisioner, Embedder, FASTEMBED_MISSING_FEATURE_MESSAGE, HashEmbedder,
+    MODEL2VEC_HF_REPO, MODEL2VEC_MISSING_FEATURE_MESSAGE, OllamaEmbedder, ProvisionedBox,
 };
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
@@ -56,7 +58,23 @@ const DEFAULT_BATCH_SIZE: usize = 64;
 pub const DEFAULT_MAX_EMBEDDING_CHARS: usize = 4_000;
 const MIN_EMBEDDING_CHARS: usize = 80;
 pub const EMBEDDING_TEXT_VERSION: &str = "embedding-text-v2";
-const LEGACY_MODEL_IDS: &[&str] = &["embedding-small"];
+// Old model ids that must be cleaned on open. `embedding-small` is the pre-#112 id; the four
+// dashed ids are the pre-#317 ids renamed to HF paths (existing vectors re-key → re-embed, fine
+// pre-launch). `ollama-all-minilm` is the pre-#317 REMOTE id: Ollama is now a transport (a
+// `[remote]` block on a real model), not a registry row, so an index that had it installed+active
+// would otherwise keep an `ai_models` row + active-model meta + remote-config meta whose `spec()`
+// is gone — `active_embedder` then fails with "unknown active embedding model" (its aliases
+// `ollama`/`ollama-minilm` were never stored ids, so only the canonical id needs cleaning).
+// `remove_legacy_models` drops their `ai_models`/`chunk_embeddings`/active-meta (and, for a legacy
+// ACTIVE model, the stale remote-config meta) rows.
+const LEGACY_MODEL_IDS: &[&str] = &[
+    "embedding-small",
+    "fastembed-all-minilm-l6-v2",
+    "fastembed-bge-small-en-v1.5",
+    "fastembed-jina-v2-base-code",
+    "model2vec-potion-retrieval-32m",
+    "ollama-all-minilm",
+];
 #[cfg(feature = "fastembed")]
 const FASTEMBED_HF_CACHE_REPO_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 
@@ -84,7 +102,7 @@ impl ArtifactStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct LocalAiStatus {
+pub struct LlmStatus {
     pub embedding: CapabilityStatus,
     pub artifacts: ArtifactCounts,
     pub fastembed: FastEmbedOperationalStatus,
@@ -267,6 +285,13 @@ pub struct ReconcileOptions {
     pub max_embedding_chars: usize,
     /// ONNX Runtime intra-op thread cap (`ort_threads`). `None` lets the backend pick (all cores).
     pub intra_threads: Option<usize>,
+    /// Whether this reconcile may PROVISION an ephemeral cookbook box for chunk embedding (#318).
+    /// The explicit `rag-rat reconcile` (a deliberate bulk pass) sets this TRUE; the
+    /// watcher/maintenance incremental pass sets it FALSE — a 2-chunk edit must never cold-start a
+    /// GPU box. With an ephemeral active model and this FALSE, the chunk embed is SKIPPED (chunks
+    /// stay pending; lexical search still works; query embedding uses the local box). Ignored for
+    /// connect / local models.
+    pub provision_remote: bool,
 }
 
 impl Default for ReconcileOptions {
@@ -280,6 +305,9 @@ impl Default for ReconcileOptions {
             max_seconds: None,
             max_embedding_chars: DEFAULT_MAX_EMBEDDING_CHARS,
             intra_threads: None,
+            // Default FALSE: only the explicit `rag-rat reconcile` opts into provisioning. The
+            // watcher (which uses `..ReconcileOptions::default()`) must never provision.
+            provision_remote: false,
         }
     }
 }
