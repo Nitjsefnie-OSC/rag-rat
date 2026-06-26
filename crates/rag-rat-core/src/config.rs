@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec_for_alias};
@@ -222,7 +222,13 @@ impl Default for EmbeddingRuntimeConfig {
 /// spec of the selected model (the `ollama-all-minilm` row, dim 384) and is validated against the
 /// server's first response at runtime by the embedder (#317 task 4); the backend is implied by the
 /// selected registry model. Duplicating either here would be redundant and drift-prone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize` (#317 task 5) lets the install step persist this verbatim into the secret-free
+/// `active_embedding_remote_config` meta, so the `conn`-based `active_embedder` can reconstruct the
+/// remote embedder for both chunk-embed (reconcile) and query-embed (search) without threading
+/// config through the search path. SECRET-FREE: `auth_env` is the env-var NAME, never a token, so
+/// the serialized JSON holds no secret. `Deserialize` is the read side of that meta round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEmbeddingConfig {
     /// How the remote server is reached. `Connect` (the v1 default) talks to an
     /// already-running server at `endpoint`; `Ephemeral` (provision-on-demand) is not yet
@@ -258,7 +264,7 @@ impl Default for RemoteEmbeddingConfig {
 }
 
 /// How the remote-embedding server is obtained (`[local_ai.embedding.remote] mode = "..."`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum RemoteMode {
     /// Connect to an already-running server at the configured `endpoint`. The v1 default and the
     /// only supported mode today.
@@ -762,6 +768,16 @@ struct RawRemoteEmbedding {
     request_timeout_s: Option<u64>,
 }
 
+/// Whether the URL's authority embeds userinfo (`user[:pass]@host`). Parses the authority as
+/// everything after `scheme://` up to the next `/`, `?`, or `#`, and reports an `@` in it. A bare
+/// host, an `@` in the path/query, or a URL with no scheme separator all return false. Used to keep
+/// credentials out of the endpoint string before it is persisted into the index meta.
+fn endpoint_authority_has_userinfo(endpoint: &str) -> bool {
+    let after_scheme = endpoint.split_once("://").map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    authority.contains('@')
+}
+
 impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
     type Error = ConfigError;
 
@@ -785,6 +801,16 @@ impl TryFrom<RawRemoteEmbedding> for RemoteEmbeddingConfig {
         let endpoint = raw.endpoint.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
         if mode == RemoteMode::Connect && endpoint.is_none() {
             return Err(ConfigError::RemoteEmbeddingMissingEndpoint);
+        }
+        // SECRET HYGIENE: the endpoint string is persisted WHOLE into the (secret-free) index meta
+        // at install. A URL with userinfo (`https://user:token@host`) would copy that credential
+        // into the SQLite index — reject it here and direct the user to `auth_env`. Checked against
+        // the URL authority only (between `scheme://` and the next `/`), so an `@` in a path/query
+        // is fine.
+        if let Some(endpoint) = endpoint.as_deref()
+            && endpoint_authority_has_userinfo(endpoint)
+        {
+            return Err(ConfigError::RemoteEmbeddingEndpointHasCredentials);
         }
         // Optional — local Ollama needs no auth; trim if present.
         let auth_env = raw.auth_env.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
@@ -861,6 +887,12 @@ pub enum ConfigError {
          provisioning cookbook, #318); use mode = \"connect\" for now"
     )]
     RemoteEmbeddingEphemeralUnsupported,
+    #[error(
+        "[local_ai.embedding.remote] `endpoint` must not embed credentials in the URL (no \
+         `user:pass@host`) — the endpoint is persisted into the index; put any token in an env \
+         var and name it via `auth_env` instead"
+    )]
+    RemoteEmbeddingEndpointHasCredentials,
     #[error(
         "an [local_ai.embedding.remote] block is set but `model` doesn't select an Ollama model; \
          set `model = \"ollama\"` or remove the remote block"
@@ -1323,6 +1355,65 @@ mod tests {
             matches!(err, ConfigError::RemoteEmbeddingMissingEndpoint),
             "connect mode without endpoint → RemoteEmbeddingMissingEndpoint, got {err:?}",
         );
+    }
+
+    #[test]
+    fn remote_embedding_endpoint_with_credentials_is_rejected() {
+        // The endpoint is persisted whole into the index meta, so a `user:token@host` URL would
+        // copy the credential into the index. Reject it and direct the user to `auth_env`.
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [index]
+            root = "."
+
+            [local_ai.embedding]
+            model = "ollama"
+
+            [local_ai.embedding.remote]
+            model = "all-minilm"
+            endpoint = "https://user:token@host:11434"
+            "#,
+        )
+        .unwrap();
+        let err = LocalAiConfig::try_from(raw.local_ai).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RemoteEmbeddingEndpointHasCredentials),
+            "endpoint with userinfo → RemoteEmbeddingEndpointHasCredentials, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn remote_embedding_endpoint_without_credentials_is_accepted() {
+        // A plain host and a loopback endpoint both pass the userinfo guard (and an `@` in a path
+        // is not userinfo).
+        for endpoint in [
+            "https://host:11434",
+            "http://127.0.0.1:11434",
+            "http://localhost:11434/v1/embeddings?user=a@b",
+        ] {
+            let raw: RawConfig = toml::from_str(&format!(
+                "[index]\nroot = \".\"\n\n[local_ai.embedding]\nmodel = \
+                 \"ollama\"\n\n[local_ai.embedding.remote]\nmodel = \"all-minilm\"\nendpoint = \
+                 \"{endpoint}\"\n"
+            ))
+            .unwrap();
+            let remote = LocalAiConfig::try_from(raw.local_ai)
+                .unwrap_or_else(|e| panic!("`{endpoint}` must be accepted: {e:?}"))
+                .embedding
+                .remote
+                .expect("remote block present");
+            assert_eq!(remote.endpoint.as_deref(), Some(endpoint));
+        }
+    }
+
+    #[test]
+    fn endpoint_authority_has_userinfo_classifies_urls() {
+        assert!(endpoint_authority_has_userinfo("https://user:token@host:11434"));
+        assert!(endpoint_authority_has_userinfo("http://u@127.0.0.1"));
+        assert!(!endpoint_authority_has_userinfo("https://host:11434"));
+        assert!(!endpoint_authority_has_userinfo("http://127.0.0.1:11434"));
+        // An `@` in the PATH/query is not userinfo.
+        assert!(!endpoint_authority_has_userinfo("http://host:11434/path?x=a@b"));
     }
 
     #[test]
