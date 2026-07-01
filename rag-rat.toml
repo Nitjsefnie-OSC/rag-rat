@@ -3,32 +3,34 @@ root = "."
 database = ".rag-rat/index.sqlite"
 
 [llm.embedding]
-# The MODEL by its full id (the HF path). all-MiniLM-L6-v2 (384-dim) — served over this box's local
-# Ollama below (CONNECT mode) instead of in-process. "none" disables embeddings; the static
-# model2vec tier (minishlab/potion-retrieval-32M) is the no-Ollama-dependency alternative.
-model = "sentence-transformers/all-MiniLM-L6-v2"
+# DOGFOOD: jina-embeddings-v2-base-code (768-dim, 8192-token ALiBi context) — a CODE-specialized
+# long-context embedder. On a code repo this is the right pick (see the init wizard's context-window
+# guidance): whole code chunks fit inside 8192 tokens, so there is no tail truncation the way
+# all-MiniLM's 256-token window would clip long functions. The registry supplies dim=768; the
+# `[remote]` block below serves it on an EPHEMERAL Modal L4 box via michaelfeil/infinity.
+model = "jinaai/jina-embeddings-v2-base-code"
 
-# Serve that model over the local Ollama (`ollama pull all-minilm`) — see docs/config.md "Remote
-# embedding over Ollama". CONNECT = a fixed endpoint; reconcile + queries both embed against it. If
-# the Ollama is unreachable, reconcile leaves embeddings pending and semantic_search degrades to
-# BM25 (so a contributor without Ollama still gets a working lexical index). The mode is INFERRED:
-# set EXACTLY ONE of `endpoint` (connect) or `cookbook` (provision an ephemeral box).
+# EPHEMERAL mode (`cookbook` set, not `endpoint`): reconcile provisions a fresh Modal L4 box running
+# infinity, embeds the whole index over OpenAI-compatible `/embeddings`, then tears the box down.
+# Because the box is transient, QUERY embedding happens at `query_endpoint` (a LOCAL server) — run a
+# local infinity there or semantic_search degrades to BM25 until you do. The mode is INFERRED: set
+# EXACTLY ONE of `endpoint` (connect) or `cookbook` (ephemeral).
 [llm.embedding.remote]
-endpoint = "http://localhost:11434"   # this box's Ollama server
-model = "all-minilm"                  # the Ollama-side model name
-num_ctx = 4096                        # Ollama context window for code chunks
-batch_size = 32                       # texts per /api/embed request
-concurrency = 32                      # 1..=128 concurrent /api/embed requests
-max_batch_chars = 384000              # max input chars per /api/embed request
-# To EPHEMERALLY provision a box instead, drop `endpoint` and set `cookbook` (see docs/config.md).
-# Only then may you pick the GPU (a connect endpoint + gpu is rejected):
-# gpu = "A10G"                        # cookbook-only; Modal GPU class / RunPod gpuTypeId
+cookbook = "@rag-rat/cookbook modal"          # provision an ephemeral Modal box (published npm package)
+backend = "infinity"                          # michaelfeil/infinity serves /embeddings
+model = "jinaai/jina-embeddings-v2-base-code" # server-side HF model id infinity downloads
+gpu = "L4"                                    # Modal GPU class (cookbook-only)
+query_endpoint = "http://localhost:7997"      # local infinity for query embedding (box is ephemeral)
+batch_size = 8                                # texts per /embeddings request (small: jina is heavy)
+concurrency = 128                             # client fan-out cap; the tuner sweeps within it
+max_batch_chars = 384000                      # max input chars per request
+request_timeout_s = 120                       # generous per-request timeout for heavy jina batches
 
 [llm.embedding.runtime]
 batch_size = 64
 ort_threads = 4
 omp_threads = 1
-max_embedding_chars = 1400
+max_embedding_chars = 2000    # conservative retry: ~500 tokens/chunk (well within jina's 8192 window)
 
 [target_bindings]
 rust = ["crates"]
