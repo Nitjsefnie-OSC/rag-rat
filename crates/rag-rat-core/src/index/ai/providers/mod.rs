@@ -113,6 +113,45 @@ fn query_embed_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
     }
 }
 
+/// Per-request timeout ceiling for the LIGHT (local `query_endpoint`) path — bounds both the route
+/// probe and each single-flight incremental embed so a slow/hung local server can't stall a watcher
+/// pass. The provisioned-box path is unaffected (it keeps the configured timeout).
+const LIGHT_REQUEST_TIMEOUT_S: u64 = 30;
+
+/// The remote config for a LIGHT (watcher / incremental) embed against the local `query_endpoint`:
+/// `query_embed_config` (connect-shaped, local endpoint, backend preserved) but clamped to
+/// SINGLE-FLIGHT concurrency and a SHORT request timeout. The query server is a user's local box
+/// that may not have been launched with the cookbook's parallelism, so a background watcher edit
+/// must not fan out concurrent requests at it (connect endpoints are single-flight for the same
+/// reason); the short timeout bounds the route probe + each incremental request so a slow/hung
+/// local server can't stall the watcher. Only this local light path is clamped; the provisioned-box
+/// path keeps its tuned concurrency + timeout.
+fn light_incremental_config(remote: &RemoteEmbeddingConfig) -> RemoteEmbeddingConfig {
+    let transport = query_embed_config(remote);
+    RemoteEmbeddingConfig {
+        concurrency: 1,
+        request_timeout_s: transport.request_timeout_s.min(LIGHT_REQUEST_TIMEOUT_S),
+        ..transport
+    }
+}
+
+/// Build the active model's embedder against a caller-supplied connect-shaped `transport` — used by
+/// the light path to point at the local `query_endpoint` at clamped concurrency. Like
+/// `active_embedder`, but the transport is the passed config, not `query_embed_config` of the
+/// persisted remote.
+fn light_embedder(
+    conn: &Connection,
+    intra_threads: Option<usize>,
+    transport: &RemoteEmbeddingConfig,
+) -> anyhow::Result<Box<dyn Embedder>> {
+    let model_id = active_embedding_model_id(conn)?;
+    let model = model(conn, &model_id)?;
+    validate_ready_model(&model)?;
+    let spec = spec(&model.model_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown active embedding model `{}`", model.model_id))?;
+    embedder_for_spec(spec, intra_threads, Some(transport))
+}
+
 /// The outcome of acquiring the CHUNK-embed embedder for a reconcile. `Ready` carries the optional
 /// `ProvisionedBox` guard so the caller keeps it alive for the whole embed loop (its `Drop` is the
 /// box teardown). This is the ONE place that branches on `is_ephemeral()` for chunk embedding — the
@@ -126,7 +165,12 @@ pub(crate) enum ChunkEmbedder {
         provisioned: Option<ProvisionedBox>,
         remote: Option<Box<RemoteEmbeddingConfig>>,
     },
-    /// Ephemeral active model on a non-provisioning pass — skip remote chunk embedding entirely.
+    /// Ephemeral active model on a non-provisioning pass whose local `query_endpoint` is absent or
+    /// fails a probe embed (down, a wrong service on the port, the model not pulled, a dim
+    /// mismatch) — defer incremental embedding to an explicit provisioning `rag-rat reconcile`.
+    /// When a `query_endpoint` IS set and a probe embed SUCCEEDS, the light path embeds locally
+    /// against it instead (returns `Ready` with `provisioned: None`) — see
+    /// [`acquire_chunk_embedder`].
     SkipEphemeral,
     /// Ephemeral active model on a PROVISIONING reconcile, but there is NOTHING to embed (the model
     /// is already current). We return this INSTEAD of provisioning so a no-op `rag-rat reconcile`
@@ -141,10 +185,13 @@ pub(crate) enum ChunkEmbedder {
 /// Acquire the CHUNK-embed embedder for a reconcile. EPHEMERAL active model: on a provisioning
 /// reconcile, FIRST check for pending candidate chunks — if none, `NoEphemeralWork` (never
 /// provision a paid box for zero work, #330-6); otherwise provision the cookbook box + build an
-/// embedder against it (the bulk path, `provision_and_build`). On a non-provisioning pass
-/// (watcher), `SkipEphemeral`. CONNECT/local: the usual `active_embedder`. Provisioning happens
-/// ONCE here, not per batch. `provision_remote` gates the cold-start (only an explicit `rag-rat
-/// reconcile` sets it); `scan`/`options` size the pending-work check exactly like the embed loop.
+/// embedder against it (the bulk path, `provision_and_build`). On a non-provisioning pass (watcher
+/// / maintenance): embed the changed chunks LOCALLY against `query_endpoint` when a probe embed on
+/// it SUCCEEDS (the light/incremental path — no cold-start, single-flight, same vector space as the
+/// box); `SkipEphemeral` when there is no local query server or the probe fails. CONNECT/local: the
+/// usual `active_embedder`. Provisioning happens ONCE here, not per batch. `provision_remote` gates
+/// the cold-start (only an explicit `rag-rat reconcile` sets it); `scan`/`options` size the
+/// provision-path pending-work check.
 pub(crate) fn acquire_chunk_embedder(
     conn: &Connection,
     intra_threads: Option<usize>,
@@ -157,7 +204,43 @@ pub(crate) fn acquire_chunk_embedder(
     };
     if let Some(remote) = remote.as_ref().filter(|r| r.is_ephemeral()) {
         if !options.provision_remote {
-            return ChunkEmbedder::SkipEphemeral;
+            // LIGHT / incremental pass (watcher, maintenance): NEVER cold-start a paid box. Embed
+            // the changed chunks against the local `query_endpoint` — but ONLY after PROVING the
+            // configured model can actually embed on it. Build the single-flight light embedder,
+            // then probe the real embeddings route with a tiny request:
+            //  - no `query_endpoint`, or the probe fails (server down, a DIFFERENT service on the
+            //    port, the model not pulled, a dim mismatch) → `SkipEphemeral` (defer to an
+            //    explicit provisioning reconcile). A refused connect returns at once, so the common
+            //    no-local-server pass stays cheap (BEFORE any O(repo) candidate scan), and a broken
+            //    or wrong endpoint never persists `Failed` chunk_embeddings — a bare TCP connect
+            //    would only prove SOMETHING listens, so the actual embed probe is what makes this
+            //    safe.
+            //  - probe OK → embed locally, same backend + model as the box, so the vectors share
+            //    ONE space (freshness is endpoint-independent) and semantic search stays current
+            //    between big reindexes.
+            // NO work-count gate here on purpose: `estimated_reconcile_jobs` decompresses the whole
+            // repo, so it is NOT a cheap idle-pass guard — the fast-failing probe is. A reachable
+            // server's no-work pass then costs the same policy summary a connect-mode pass already
+            // pays. The probe (and every light embed) is bounded by the transport's clamped
+            // timeout, so a hung server can't stall the watcher.
+            if remote.query_endpoint.is_none() {
+                return ChunkEmbedder::SkipEphemeral;
+            }
+            let transport = light_incremental_config(remote);
+            let embedder = match light_embedder(conn, intra_threads, &transport) {
+                Ok(embedder) => embedder,
+                // Construction shouldn't fail for a Ready model, but on any error defer rather than
+                // fail the watcher pass.
+                Err(_) => return ChunkEmbedder::SkipEphemeral,
+            };
+            if embedder.embed_batch(&["ping".to_string()]).is_err() {
+                return ChunkEmbedder::SkipEphemeral;
+            }
+            return ChunkEmbedder::Ready {
+                embedder,
+                provisioned: None,
+                remote: Some(Box::new(transport)),
+            };
         }
         // BEFORE provisioning a paid box, confirm there's actually work to do. An explicit
         // `rag-rat reconcile` on an already-current ephemeral model would otherwise cold-start +
