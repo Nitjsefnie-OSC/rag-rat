@@ -7,7 +7,7 @@
 //!
 //! BACKEND-AGNOSTIC. The sweep engine ([`run_sweep`]) knows nothing about ollama — it measures
 //! texts/s for each candidate over the `Embedder` trait and picks the knee. A per-backend adapter
-//! (today [`tune_ollama_concurrency`]) supplies the candidate list, a `build(candidate) ->
+//! (today [`tune_remote_concurrency`]) supplies the candidate list, a `build(candidate) ->
 //! Embedder` closure, and a RUNTIME discriminator folded into the cache key so an ollama tune and a
 //! future infinity/vLLM tune for the same model never collide.
 //!
@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::EmbeddingModelSpec;
 use crate::index::ai::helpers::{meta, set_meta};
-use crate::index::ai::providers::{Embedder, OllamaEmbedder, ProvisionedEmbedderParams};
+use crate::index::ai::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
 use crate::index::util::now_ms;
 
 /// `index_meta` key holding the throughput-tune cache (a JSON map, so no schema migration).
@@ -56,7 +56,7 @@ struct SweepResult {
 }
 
 /// The result of a sweep, so the caller can distinguish "measured a knee" from "ran but nothing was
-/// stable" from "didn't run" — each wants a DIFFERENT fallback (see [`tune_ollama_concurrency`]).
+/// stable" from "didn't run" — each wants a DIFFERENT fallback (see [`tune_remote_concurrency`]).
 #[cfg_attr(test, derive(Debug))]
 enum SweepOutcome {
     /// A knee (already clamped to the cap) and its measured texts/s. `complete` is false if the
@@ -92,7 +92,7 @@ struct TuneCacheFile {
 /// `endpoint`/`auth_token` from the handshake. Never errors — any failure falls back to the cap
 /// (tuning is best-effort).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn tune_ollama_concurrency(
+pub(crate) fn tune_remote_concurrency(
     conn: &Connection,
     provider: &str,
     endpoint: &str,
@@ -106,13 +106,17 @@ pub(crate) fn tune_ollama_concurrency(
     if tuning_disabled() {
         return cap;
     }
-    // Normalize `batch_size` the SAME way `OllamaEmbedder` does (clamp to >=1): a configured 0
+    // Normalize `batch_size` the SAME way `OpenAiEmbedder` does (clamp to >=1): a configured 0
     // serves one text per request live, so the probe (and cache key) must treat it as 1 —
     // otherwise every candidate window collapses to a single text and the sweep never exercises
     // fan-out.
     let batch_size = remote.batch_size.max(1);
     let key = tune_cache_key(TuneKey {
-        runtime: "ollama",
+        // The backend discriminator keeps an ollama tune from colliding with an infinity/vLLM tune
+        // for the same box shape (each server has its own throughput curve). Server-launch knobs
+        // (vLLM `--max-num-seqs`, infinity batch) are set at PROVISION time — fold them in here
+        // once the cookbook input carries them (Phase 2).
+        runtime: remote.backend.as_db_str(),
         provider,
         gpu: remote.gpu.as_deref().unwrap_or("cpu"),
         model: remote.model.trim(),
@@ -141,9 +145,10 @@ pub(crate) fn tune_ollama_concurrency(
     // is cacheable) except: `concurrency` is the fan-out being measured, and
     // `request_timeout_s` is bounded by the tune budget so one blocking probe can't hold the
     // box for the full HTTP timeout.
-    let build = |concurrency: u32, request_timeout_s: u64| -> OllamaEmbedder {
-        OllamaEmbedder::from_provisioned(ProvisionedEmbedderParams {
+    let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
+        OpenAiEmbedder::from_provisioned(ProvisionedEmbedderParams {
             endpoint,
+            embed_path: remote.backend.embed_path(),
             auth_token,
             server_model: remote.model.trim(),
             selected_model_id: spec.model_id,
@@ -152,7 +157,6 @@ pub(crate) fn tune_ollama_concurrency(
             batch_size,
             concurrency,
             max_batch_chars: remote.max_batch_chars,
-            num_ctx: remote.num_ctx,
         })
     };
 
@@ -215,7 +219,7 @@ pub(crate) fn sweep_is_worthwhile(
     estimated_jobs.is_none_or(|jobs| jobs > u64::from(per_request))
 }
 
-/// Texts the live `OllamaEmbedder` puts in ONE `/api/embed` request: bounded by BOTH the count cap
+/// Texts the live `OpenAiEmbedder` puts in ONE `/api/embed` request: bounded by BOTH the count cap
 /// (`batch_size`, clamped to >=1 like the embedder) and the char budget (`max_batch_chars` / a
 /// representative per-text size), whichever is smaller. A small `max_batch_chars` splits work into
 /// many small requests, so the fan-out threshold must use the smaller of the two.
@@ -749,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn tune_ollama_concurrency_returns_a_fresh_cached_knee_without_probing() {
+    fn tune_remote_concurrency_returns_a_fresh_cached_knee_without_probing() {
         let conn = mem_conn();
         let remote = tune_remote(32);
         let spec =
@@ -769,7 +773,7 @@ mod tests {
         });
         write_cached_knee(&conn, &key, 6, 32, 100.0);
         // The endpoint is never contacted: the cache hits first, even with `allow_sweep = false`.
-        let knee = tune_ollama_concurrency(
+        let knee = tune_remote_concurrency(
             &conn,
             "modal",
             "http://127.0.0.1:1",
@@ -783,14 +787,14 @@ mod tests {
     }
 
     #[test]
-    fn tune_ollama_concurrency_uses_the_cap_on_a_miss_when_sweep_disallowed() {
+    fn tune_remote_concurrency_uses_the_cap_on_a_miss_when_sweep_disallowed() {
         let conn = mem_conn();
         let remote = tune_remote(8);
         let spec =
             crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
         // No cache entry + `allow_sweep = false` (a bounded / non-fan-out run) → the raw cap, and
         // the unreachable endpoint is never probed (no sweep runs).
-        let knee = tune_ollama_concurrency(
+        let knee = tune_remote_concurrency(
             &conn,
             "modal",
             "http://127.0.0.1:1",
@@ -805,14 +809,14 @@ mod tests {
     }
 
     #[test]
-    fn tune_ollama_concurrency_falls_back_conservatively_when_every_probe_fails() {
+    fn tune_remote_concurrency_falls_back_conservatively_when_every_probe_fails() {
         let conn = mem_conn();
         // Small cap → few candidates; unreachable endpoint → every probe fails fast (connection
         // refused), so the sweep finds no stable candidate.
         let remote = tune_remote(2);
         let spec =
             crate::embedding_models::spec(crate::embedding_models::FASTEMBED_MODEL_ID).unwrap();
-        let knee = tune_ollama_concurrency(
+        let knee = tune_remote_concurrency(
             &conn,
             "modal",
             "http://127.0.0.1:1",

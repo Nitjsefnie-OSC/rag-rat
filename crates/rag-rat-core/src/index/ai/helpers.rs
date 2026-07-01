@@ -435,7 +435,7 @@ pub(crate) fn active_remote_config(
 }
 
 /// Drop the persisted remote-embedding config meta — called when a model is installed LOCALLY, so
-/// `active_embedder` stops reconstructing an `OllamaEmbedder` from a stale prior remote install of
+/// `active_embedder` stops reconstructing an `OpenAiEmbedder` from a stale prior remote install of
 /// the same model (a no-op when the meta is already absent).
 pub(crate) fn clear_active_remote_config(conn: &Connection) -> anyhow::Result<()> {
     conn.execute("DELETE FROM index_meta WHERE key = ?1", params![
@@ -515,6 +515,7 @@ mod tests {
     fn sample_remote() -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some("http://localhost:11434".to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -614,6 +615,7 @@ mod tests {
         activate_model(&conn, FASTEMBED_MODEL_ID);
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(format!("http://127.0.0.1:{port}")),
             cookbook: None,
             query_endpoint: None,

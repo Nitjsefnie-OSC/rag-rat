@@ -85,7 +85,7 @@ pub(crate) fn remove_legacy_models(conn: &Connection) -> anyhow::Result<()> {
         // If this legacy id was the ACTIVE model, its active-model meta AND any persisted
         // remote-config meta (a legacy `ollama-*` id was a remote install — #317) must both go.
         // Leaving the remote config behind would let `active_embedder` keep reconstructing an
-        // `OllamaEmbedder` against a now-removed endpoint after the active model fell back to hash,
+        // `OpenAiEmbedder` against a now-removed endpoint after the active model fell back to hash,
         // so clear it whenever we delete the matching active-model meta.
         let was_active =
             conn.execute("DELETE FROM index_meta WHERE key = ?1 AND value = ?2", params![
@@ -245,12 +245,12 @@ pub(crate) fn install_model(
         if spec.backend != Backend::FastEmbed {
             anyhow::bail!(
                 "remote embedding requires a transformer model, but `{model_id}` is a {} model — \
-                 remove the [llm.embedding.remote] block to install it locally, or install a \
-                 transformer model over Ollama",
+                 remove the [llm.embedding.remote] block to install it locally, or select a \
+                 transformer model to serve over the remote backend",
                 spec.backend.runtime()
             );
         }
-        install_ollama_model(conn, model_id, spec, remote)?;
+        install_remote_model(conn, model_id, spec, remote)?;
     } else {
         match spec.backend {
             Backend::Hash => {
@@ -272,7 +272,7 @@ pub(crate) fn install_model(
         }
         // A LOCAL install must drop any remote-config meta a PRIOR Ollama install of this model
         // left behind — otherwise `active_embedder` reads it back unconditionally and keeps
-        // building an OllamaEmbedder against the now-removed endpoint instead of the local
+        // building an OpenAiEmbedder against the now-removed endpoint instead of the local
         // model.
         clear_active_remote_config(conn)?;
     }
@@ -1365,7 +1365,7 @@ mod freshness_version_tests {
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf);
                 let nums = vec!["0.1"; dim].join(",");
-                let body = format!("{{\"embeddings\":[[{nums}]]}}");
+                let body = format!("{{\"data\":[{{\"embedding\":[{nums}],\"index\":0}}]}}");
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
                      {}\r\nConnection: close\r\n\r\n{body}",
@@ -1392,6 +1392,7 @@ mod freshness_version_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -1526,10 +1527,10 @@ mod freshness_version_tests {
                             let inputs = body.matches("path: ").count().max(1);
                             let vector = vec!["0.1"; dim].join(",");
                             let rows = (0..inputs)
-                                .map(|_| format!("[{vector}]"))
+                                .map(|i| format!("{{\"embedding\":[{vector}],\"index\":{i}}}"))
                                 .collect::<Vec<_>>()
                                 .join(",");
-                            let response_body = format!("{{\"embeddings\":[{rows}]}}");
+                            let response_body = format!("{{\"data\":[{rows}]}}");
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: \
                                  application/json\r\nContent-Length: {}\r\nConnection: \
@@ -1589,10 +1590,10 @@ mod freshness_version_tests {
                                 let inputs = body.matches("path: ").count().max(1);
                                 let vector = vec!["0.1"; dim].join(",");
                                 let rows = (0..inputs)
-                                    .map(|_| format!("[{vector}]"))
+                                    .map(|i| format!("{{\"embedding\":[{vector}],\"index\":{i}}}"))
                                     .collect::<Vec<_>>()
                                     .join(",");
-                                let response_body = format!("{{\"embeddings\":[{rows}]}}");
+                                let response_body = format!("{{\"data\":[{rows}]}}");
                                 format!(
                                     "HTTP/1.1 200 OK\r\nContent-Type: \
                                      application/json\r\nContent-Length: {}\r\nConnection: \
@@ -2062,7 +2063,7 @@ mod freshness_version_tests {
     #[test]
     fn local_install_clears_a_stale_remote_config_meta() {
         // After an Ollama install persists a remote config, re-installing the model LOCALLY must
-        // DELETE that meta — otherwise active_embedder keeps building an OllamaEmbedder against the
+        // DELETE that meta — otherwise active_embedder keeps building an OpenAiEmbedder against the
         // dead endpoint. Uses the hash model so the local install is feature-free.
         let conn = schema_conn();
         set_active_remote_config(&conn, &remote_at("http://box:11434")).unwrap();
@@ -2114,7 +2115,7 @@ mod freshness_version_tests {
         assert_eq!(meta(&conn, ACTIVE_EMBEDDING_MODEL_META).unwrap(), None, "active meta cleared");
         assert!(
             active_remote_config(&conn).unwrap().is_none(),
-            "the stale remote config is cleared so no OllamaEmbedder is reconstructed",
+            "the stale remote config is cleared so no OpenAiEmbedder is reconstructed",
         );
 
         // With no active model + no remote config, the active model falls back to hash. Mark the
@@ -2257,6 +2258,7 @@ mod freshness_version_tests {
         set_meta(conn, ACTIVE_EMBEDDING_MODEL_META, FASTEMBED_MODEL_ID).unwrap();
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some("http://localhost:11434".to_string()),

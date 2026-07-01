@@ -14,7 +14,7 @@ mod hash;
 mod model2vec;
 // Ungated: the Ollama backend uses `ureq` (already a non-optional workspace dep — see the crates.io
 // version check), so there is no heavy optional dependency to gate. No `remote-embed` feature.
-mod ollama;
+mod openai;
 
 use rusqlite::Connection;
 
@@ -31,13 +31,13 @@ pub use self::hash::HashEmbedder;
 pub use self::model2vec::MODEL2VEC_HF_REPO;
 #[cfg(feature = "model2vec")]
 pub use self::model2vec::Model2VecEmbedder;
-// Ungated `pub` re-export (crate-public path `crate::index::ai::providers::OllamaEmbedder`):
+// Ungated `pub` re-export (crate-public path `crate::index::ai::providers::OpenAiEmbedder`):
 // wired into `embedder_for_spec` in #317 task 5, so nothing constructs it yet. The `pub`
 // visibility (same pattern as the other backends) exempts it from dead-code/unused-import
 // analysis under `-D warnings` until the dispatch arm lands.
-pub use self::ollama::OllamaEmbedder;
+pub use self::openai::OpenAiEmbedder;
 // The tuning sweep (index::ai::throughput_tune) builds embedders at varied concurrencies.
-pub(crate) use self::ollama::ProvisionedEmbedderParams;
+pub(crate) use self::openai::ProvisionedEmbedderParams;
 use crate::config::RemoteEmbeddingConfig;
 use crate::embedding_models::{Backend, EmbeddingModelSpec, spec};
 use crate::index::ai::{
@@ -204,7 +204,7 @@ pub(crate) fn acquire_chunk_embedder(
                 // multiplies by `concurrency`, so a 128-cap config with a knee of 4
                 // would otherwise load a 32x-too-wide window the embedder only
                 // drains 4-at-a-time. This `remote` is window-sizing only (NOT persisted
-                // — the active-config meta is written from the cap by `install_ollama_model`).
+                // — the active-config meta is written from the cap by `install_remote_model`).
                 let mut window_remote = effective_remote;
                 window_remote.concurrency = window_concurrency;
                 ChunkEmbedder::Ready {
@@ -240,7 +240,7 @@ pub(crate) fn embedder_for_spec(
     // vectors against that dim.
     if let Some(remote) = remote {
         let _ = intra_threads;
-        return Ok(Box::new(OllamaEmbedder::from_remote_config(remote, spec.model_id, spec.dim)?));
+        return Ok(Box::new(OpenAiEmbedder::from_remote_config(remote, spec.model_id, spec.dim)?));
     }
     // No remote block → in-process embedder, dispatched on the model's local backend. `Ollama` is a
     // transport-only runtime (no registry row carries it), so it cannot appear here.
@@ -338,6 +338,7 @@ mod dispatch_tests {
     fn remote_at(endpoint: &str) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: Some(endpoint.to_string()),
             cookbook: None,
             query_endpoint: None,
@@ -373,7 +374,7 @@ mod dispatch_tests {
     #[test]
     fn embedder_for_spec_with_remote_serves_any_model_over_ollama() {
         // The effective runtime is `remote.is_some() ? Ollama : spec.backend`: passing a remote
-        // config builds an OllamaEmbedder for the selected spec regardless of its local backend.
+        // config builds an OpenAiEmbedder for the selected spec regardless of its local backend.
         let spec = spec(FASTEMBED_MODEL_ID).unwrap();
         let embedder =
             embedder_for_spec(spec, None, Some(&remote_at("http://127.0.0.1:1"))).unwrap();
@@ -392,6 +393,7 @@ mod dispatch_tests {
     fn ephemeral_at(query_endpoint: &str, auth_env: Option<&str>) -> RemoteEmbeddingConfig {
         RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
+            backend: crate::config::RemoteBackend::Ollama,
             endpoint: None,
             cookbook: Some("@rag-rat/cookbook/modal".to_string()),
             query_endpoint: Some(query_endpoint.to_string()),
