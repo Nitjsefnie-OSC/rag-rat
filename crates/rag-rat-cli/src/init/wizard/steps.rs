@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 
 use rag_rat_core::config::{
-    DEFAULT_QUERY_ENDPOINT, MAX_REMOTE_EMBEDDING_CONCURRENCY, RemoteEmbeddingConfig,
+    DEFAULT_QUERY_ENDPOINT, MAX_REMOTE_EMBEDDING_CONCURRENCY, RemoteBackend, RemoteEmbeddingConfig,
 };
 use rag_rat_core::embedding_models::{Backend, EMBEDDING_MODELS, EmbeddingModelSpec, spec};
 #[cfg(feature = "fastembed")]
@@ -30,7 +30,8 @@ use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::catalog::CookbookEntry;
 use super::draft::{
-    OLLAMA_EMBEDDING_MODELS, RemoteDraft, RemoteMode, ollama_model_dim, ollama_model_for,
+    OLLAMA_EMBEDDING_MODELS, RemoteDraft, RemoteMode, default_backend_endpoint,
+    is_default_backend_endpoint, ollama_model_dim, ollama_model_for, wizard_query_endpoint,
 };
 use super::probe::{ProbeKind, ProbeStatus};
 use super::state::{PROVISION_CONFIRM_WORD, WizardState, provision_confirm_satisfied};
@@ -132,6 +133,7 @@ pub(crate) enum EmbedFocus {
     Mode,
     Endpoint,
     Cookbook,
+    Backend,
     ServerModel,
     Gpu,
     BatchSize,
@@ -140,6 +142,14 @@ pub(crate) enum EmbedFocus {
     AuthEnv,
     ProvisionConfirm,
 }
+
+/// The remote embedding backends, ordered most-efficient-first.
+///
+/// Order (and the ephemeral default) reflect a measured L4-GPU throughput benchmark on
+/// all-MiniLM-L6-v2: infinity ~1517 texts/s > vLLM ~1029 > ollama ~299. The picker lists them in
+/// this order and ephemeral mode defaults to the fastest (infinity).
+const BACKENDS_BY_EFFICIENCY: [RemoteBackend; 3] =
+    [RemoteBackend::Infinity, RemoteBackend::Vllm, RemoteBackend::Ollama];
 
 pub(crate) enum StepState {
     Indexing {
@@ -152,6 +162,7 @@ pub(crate) enum StepState {
     Embedding {
         model_cursor: usize,
         mode_cursor: usize,
+        backend_cursor: usize,
         cookbook_cursor: usize,
         server_model_cursor: usize,
         gpu_cursor: usize,
@@ -238,14 +249,16 @@ fn init_embedding_step(state: &WizardState) -> StepState {
     let rows = model_rows();
     let model_cursor = rows.iter().position(|(id, _)| id == &state.draft.model).unwrap_or(0);
     let mode_cursor = remote_mode(state);
+    let backend = draft_backend(state);
+    let backend_cursor = BACKENDS_BY_EFFICIENCY.iter().position(|&b| b == backend).unwrap_or(0);
     let cookbook_cursor = selected_cookbook_idx(state).unwrap_or(0);
     let server_model = state
         .draft
         .remote
         .as_ref()
         .map(|r| r.model.as_str())
-        .unwrap_or_else(|| default_remote_model_for(&state.draft.model));
-    let server_models = compatible_server_models(&state.draft.model);
+        .unwrap_or_else(|| default_remote_model_for(&state.draft.model, backend));
+    let server_models = compatible_server_models(&state.draft.model, backend);
     let server_model_cursor = server_models.iter().position(|&m| m == server_model).unwrap_or(0);
     let gpu_options = current_gpu_options(state);
     let gpu_cursor = state
@@ -258,6 +271,7 @@ fn init_embedding_step(state: &WizardState) -> StepState {
     StepState::Embedding {
         model_cursor,
         mode_cursor,
+        backend_cursor,
         cookbook_cursor,
         server_model_cursor,
         gpu_cursor,
@@ -267,13 +281,21 @@ fn init_embedding_step(state: &WizardState) -> StepState {
     }
 }
 
-fn compatible_server_models(local_model: &str) -> Vec<&'static str> {
+/// The server-side model names the user may pick for a given local model + remote backend.
+///
+/// For `ollama` this is the curated, dimension-compatible Ollama model list. For infinity/vLLM
+/// the server downloads the HuggingFace model directly, so the only valid server-side name is the
+/// selected local model's `model_id` (the HF id) — a single-entry list.
+fn compatible_server_models(local_model: &str, backend: RemoteBackend) -> Vec<&'static str> {
     let Some(local) = spec(local_model) else {
         return Vec::new();
     };
     if local.backend != Backend::FastEmbed {
         return Vec::new();
     };
+    if backend != RemoteBackend::Ollama {
+        return vec![local.model_id];
+    }
     OLLAMA_EMBEDDING_MODELS
         .iter()
         .copied()
@@ -994,7 +1016,14 @@ fn model_rows() -> Vec<(String, String)> {
         .collect()
 }
 
-fn default_remote_model_for(local_model: &str) -> &'static str {
+/// The default server-side model name for a given local model + remote backend.
+///
+/// `ollama` maps to a same-family curated Ollama build; infinity/vLLM download the HuggingFace
+/// model, so the default is the selected local model's `model_id` (the HF id).
+fn default_remote_model_for(local_model: &str, backend: RemoteBackend) -> &'static str {
+    if backend != RemoteBackend::Ollama {
+        return spec(local_model).map_or("all-minilm", |s| s.model_id);
+    }
     ollama_model_for(local_model).unwrap_or("all-minilm")
 }
 
@@ -1003,6 +1032,23 @@ fn remote_mode(state: &WizardState) -> usize {
         Some(RemoteMode::Connect(_)) => 1,
         Some(RemoteMode::Ephemeral(_)) => 2,
         None => 0,
+    }
+}
+
+/// The remote backend the draft currently carries (`Ollama` when no remote block is configured).
+fn draft_backend(state: &WizardState) -> RemoteBackend {
+    state.draft.remote.as_ref().map_or(RemoteBackend::Ollama, |r| r.backend)
+}
+
+/// Re-sync the Embedding step's `backend_cursor` to the position of the draft's current backend in
+/// `BACKENDS_BY_EFFICIENCY` — mirrors how `init_embedding_step` seeds it. Call after any change
+/// that replaces `state.draft.remote` (a mode switch), so the picker cursor tracks the selected
+/// backend.
+fn sync_backend_cursor(state: &mut WizardState) {
+    let backend = draft_backend(state);
+    let cursor = BACKENDS_BY_EFFICIENCY.iter().position(|&b| b == backend).unwrap_or(0);
+    if let Some(StepState::Embedding { backend_cursor, .. }) = &mut state.step {
+        *backend_cursor = cursor;
     }
 }
 
@@ -1050,6 +1096,7 @@ fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
     let Some(StepState::Embedding {
         model_cursor,
         mode_cursor,
+        backend_cursor,
         cookbook_cursor,
         server_model_cursor,
         gpu_cursor,
@@ -1193,10 +1240,53 @@ fn render_embedding(f: &mut Frame, area: Rect, state: &WizardState) {
         );
     }
 
-    let server_models = compatible_server_models(&state.draft.model);
+    // Backend + server-model row: the backend picker (efficiency-ordered) drives what a server
+    // model name means, so it sits immediately left of the server-model list. Shown in BOTH
+    // connect and ephemeral modes — the backend selects the embeddings route in either.
+    let backend = draft_backend(state);
+    // Backend names are short (`infinity`/`vllm`/`ollama`), so a fixed narrow column leaves the
+    // server-model list its full width (its HF ids / ollama names are the long strings).
+    let picker = Layout::horizontal([Constraint::Length(16), Constraint::Min(0)]).split(right[2]);
+    let backend_items: Vec<ListItem> = BACKENDS_BY_EFFICIENCY
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let cursor = if i == *backend_cursor { ">" } else { " " };
+            let selected = if *b == backend { "*" } else { " " };
+            let style = if i == *backend_cursor { theme::selected() } else { theme::base() };
+            ListItem::new(format!("{cursor} [{selected}] {}", b.as_db_str())).style(style)
+        })
+        .collect();
+    f.render_widget(
+        List::new(backend_items)
+            .style(theme::base())
+            .block(theme::block("backend").border_style(dim(EmbedFocus::Backend))),
+        picker[0],
+    );
+
+    // vLLM needs a GPU and rejects any chunk over the model's context. The relevant knob is the
+    // per-text cap `[llm.embedding.runtime] max_embedding_chars` (NOT the wizard's max_batch_chars,
+    // which is a batch TOTAL) — surface a short, actionable note.
+    let server_area = if backend == RemoteBackend::Vllm {
+        let split = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(picker[1]);
+        f.render_widget(
+            Paragraph::new(
+                "vLLM: GPU required; rejects chunks past model context. Lower [runtime] \
+                 max_embedding_chars or use a long-context model.",
+            )
+            .style(theme::base())
+            .wrap(Wrap { trim: true }),
+            split[1],
+        );
+        split[0]
+    } else {
+        picker[1]
+    };
+
+    let server_models = compatible_server_models(&state.draft.model, backend);
     render_server_model_list(
         f,
-        right[2],
+        server_area,
         &server_models,
         m,
         *server_model_cursor,
@@ -1525,6 +1615,7 @@ fn embed_focus_order(rmode: usize, model_none: bool) -> &'static [EmbedFocus] {
         EmbedFocus::Model,
         EmbedFocus::Mode,
         EmbedFocus::Endpoint,
+        EmbedFocus::Backend,
         EmbedFocus::ServerModel,
         EmbedFocus::BatchSize,
         EmbedFocus::Concurrency,
@@ -1536,6 +1627,7 @@ fn embed_focus_order(rmode: usize, model_none: bool) -> &'static [EmbedFocus] {
         EmbedFocus::Mode,
         EmbedFocus::Cookbook,
         EmbedFocus::Gpu,
+        EmbedFocus::Backend,
         EmbedFocus::ServerModel,
         EmbedFocus::BatchSize,
         EmbedFocus::Concurrency,
@@ -1591,14 +1683,16 @@ fn move_embedding_cursor(state: &mut WizardState, delta: isize) {
     }
     let cookbook_len = cookbook_choices(state).len();
     let gpu_len = current_gpu_options(state).len();
+    let backend = draft_backend(state);
     let server_model_len = if focus == EmbedFocus::ServerModel {
-        compatible_server_models(&state.draft.model).len()
+        compatible_server_models(&state.draft.model, backend).len()
     } else {
         0
     };
     if let Some(StepState::Embedding {
         model_cursor,
         mode_cursor,
+        backend_cursor,
         cookbook_cursor,
         server_model_cursor,
         gpu_cursor,
@@ -1616,6 +1710,12 @@ fn move_embedding_cursor(state: &mut WizardState, delta: isize) {
             },
             EmbedFocus::Mode => {
                 *mode_cursor = (*mode_cursor as isize).saturating_add(delta).clamp(0, 2) as usize;
+            },
+            EmbedFocus::Backend => {
+                let last = BACKENDS_BY_EFFICIENCY.len().saturating_sub(1);
+                *backend_cursor = (*backend_cursor as isize)
+                    .saturating_add(delta)
+                    .clamp(0, last as isize) as usize;
             },
             EmbedFocus::Cookbook => {
                 let last = cookbook_len.saturating_sub(1);
@@ -1645,8 +1745,9 @@ fn move_embedding_cursor_to_edge(state: &mut WizardState, end: bool) {
         Some(f) => f,
         None => return,
     };
+    let backend = draft_backend(state);
     let server_model_len = if focus == EmbedFocus::ServerModel {
-        compatible_server_models(&state.draft.model).len()
+        compatible_server_models(&state.draft.model, backend).len()
     } else {
         0
     };
@@ -1655,6 +1756,7 @@ fn move_embedding_cursor_to_edge(state: &mut WizardState, end: bool) {
     let target = match focus {
         EmbedFocus::Model => model_rows().len().saturating_sub(1),
         EmbedFocus::Mode => 2,
+        EmbedFocus::Backend => BACKENDS_BY_EFFICIENCY.len().saturating_sub(1),
         EmbedFocus::Cookbook => cookbook_len.saturating_sub(1),
         EmbedFocus::ServerModel => server_model_len.saturating_sub(1),
         EmbedFocus::Gpu => gpu_len.saturating_sub(1),
@@ -1663,6 +1765,7 @@ fn move_embedding_cursor_to_edge(state: &mut WizardState, end: bool) {
     if let Some(StepState::Embedding {
         model_cursor,
         mode_cursor,
+        backend_cursor,
         cookbook_cursor,
         server_model_cursor,
         gpu_cursor,
@@ -1678,6 +1781,7 @@ fn move_embedding_cursor_to_edge(state: &mut WizardState, end: bool) {
                 list_window(*model_cursor, model_scroll);
             },
             EmbedFocus::Mode => *mode_cursor = value,
+            EmbedFocus::Backend => *backend_cursor = value,
             EmbedFocus::Cookbook => *cookbook_cursor = value,
             EmbedFocus::ServerModel => {
                 *server_model_cursor = value;
@@ -1708,10 +1812,13 @@ fn select_embedding_focus(state: &mut WizardState) {
                 _ => 0,
             };
             if let Some((id, _)) = rows.get(cursor) {
-                let previous_default = default_remote_model_for(&state.draft.model).to_string();
+                let backend = draft_backend(state);
+                let previous_default =
+                    default_remote_model_for(&state.draft.model, backend).to_string();
                 changed |= state.draft.model != *id;
                 state.draft.model = id.clone();
-                let default_model = default_remote_model_for(&state.draft.model).to_string();
+                let default_model =
+                    default_remote_model_for(&state.draft.model, backend).to_string();
                 if let Some(remote) = &mut state.draft.remote
                     && (remote.model.is_empty() || remote.model == previous_default)
                 {
@@ -1739,9 +1846,43 @@ fn select_embedding_focus(state: &mut WizardState) {
                     )),
                     _ => None,
                 };
+                // A new remote may default to a different backend than the cursor points at (e.g.
+                // ephemeral defaults to infinity while the fresh cursor is on ollama). Re-sync the
+                // backend_cursor so the picker `>` sits on the actually-selected backend — else
+                // Space on Backend would silently flip to whatever the stale cursor pointed at.
+                sync_backend_cursor(state);
                 changed = true;
             }
             state.ui.show_remote_mode_help_once(cursor);
+        },
+        EmbedFocus::Backend => {
+            let cursor = match &state.step {
+                Some(StepState::Embedding { backend_cursor, .. }) => *backend_cursor,
+                _ => 0,
+            };
+            let selected = BACKENDS_BY_EFFICIENCY.get(cursor).copied().unwrap_or_default();
+            if let Some(remote) = &mut state.draft.remote
+                && remote.backend != selected
+            {
+                remote.backend = selected;
+                // The server-side model NAME differs by backend (an ollama name vs the HF id), so
+                // reset it to the new backend's default rather than leave a mismatched name.
+                remote.model = default_remote_model_for(&state.draft.model, selected).to_string();
+                // Keep a wizard-default connect endpoint coherent with the new backend's
+                // route/port; a custom endpoint the user typed is left alone.
+                if let RemoteMode::Connect(ep) = &mut remote.mode
+                    && is_default_backend_endpoint(ep)
+                {
+                    *ep = default_backend_endpoint(selected).to_string();
+                }
+                // Track the ephemeral query_endpoint to the new backend when it is unset or a known
+                // wizard default; a custom value the user set is left alone.
+                if remote.query_endpoint.as_deref().is_none_or(is_default_backend_endpoint) {
+                    remote.query_endpoint =
+                        wizard_query_endpoint(&remote.mode, selected).map(str::to_string);
+                }
+                changed = true;
+            }
         },
         EmbedFocus::Cookbook => {
             let cursor = match &state.step {
@@ -1765,7 +1906,7 @@ fn select_embedding_focus(state: &mut WizardState) {
                 Some(StepState::Embedding { server_model_cursor, .. }) => *server_model_cursor,
                 _ => 0,
             };
-            let server_models = compatible_server_models(&state.draft.model);
+            let server_models = compatible_server_models(&state.draft.model, draft_backend(state));
             if let Some(model) = server_models.get(cursor)
                 && let Some(remote) = &mut state.draft.remote
             {
@@ -1794,9 +1935,14 @@ fn select_embedding_focus(state: &mut WizardState) {
 }
 
 fn new_connect_remote(local_model: &str) -> RemoteDraft {
+    // Connect default = the common existing local server (Ollama).
+    let backend = RemoteBackend::Ollama;
     RemoteDraft {
-        model: default_remote_model_for(local_model).to_string(),
+        model: default_remote_model_for(local_model, backend).to_string(),
+        backend,
         mode: RemoteMode::Connect(DEFAULT_QUERY_ENDPOINT.to_string()),
+        // CONNECT ignores query_endpoint (queries hit the endpoint directly).
+        query_endpoint: None,
         gpu: None,
         num_ctx: None,
         batch_size: 256,
@@ -1809,7 +1955,22 @@ fn new_connect_remote(local_model: &str) -> RemoteDraft {
 fn new_connect_remote_from(local_model: &str, existing: Option<&RemoteDraft>) -> RemoteDraft {
     let mut remote = new_connect_remote(local_model);
     if let Some(existing) = existing {
+        // Carry the previously chosen backend across a mode switch.
+        remote.backend = existing.backend;
         remote.model = preserved_server_model(local_model, existing);
+        // Pick the connect endpoint in priority order: (a) a CUSTOM connect endpoint the user
+        // typed; (b) a CUSTOM ephemeral query_endpoint (the user's reachable LOCAL query server —
+        // switching ephemeral→connect should reuse it, not fall back to a localhost default); (c)
+        // the (preserved) backend's default local endpoint — so a mode switch never leaves e.g. an
+        // infinity backend pointed at the ollama default port.
+        let connect_endpoint = match &existing.mode {
+            RemoteMode::Connect(ep) if !is_default_backend_endpoint(ep) => ep.clone(),
+            _ => match &existing.query_endpoint {
+                Some(qe) if !is_default_backend_endpoint(qe) => qe.clone(),
+                _ => default_backend_endpoint(remote.backend).to_string(),
+            },
+        };
+        remote.mode = RemoteMode::Connect(connect_endpoint);
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
         if matches!(existing.mode, RemoteMode::Connect(_)) {
@@ -1827,9 +1988,16 @@ fn new_ephemeral_remote(local_model: &str) -> RemoteDraft {
 }
 
 fn new_ephemeral_remote_with_command(local_model: &str, cookbook: &str) -> RemoteDraft {
+    // Ephemeral default = the fastest measured backend (infinity, ~1517 texts/s on L4 vs vLLM
+    // ~1029 and ollama ~299 for all-MiniLM).
+    let backend = RemoteBackend::Infinity;
+    let mode = RemoteMode::Ephemeral(cookbook.to_string());
     RemoteDraft {
-        model: default_remote_model_for(local_model).to_string(),
-        mode: RemoteMode::Ephemeral(cookbook.to_string()),
+        model: default_remote_model_for(local_model, backend).to_string(),
+        backend,
+        // The backend's default LOCAL query endpoint (None for ollama → config default 11434).
+        query_endpoint: wizard_query_endpoint(&mode, backend).map(str::to_string),
+        mode,
         gpu: None,
         num_ctx: None,
         batch_size: 256,
@@ -1846,7 +2014,16 @@ fn new_ephemeral_remote_from(
 ) -> RemoteDraft {
     let mut remote = new_ephemeral_remote_with_command(local_model, default_cookbook);
     if let Some(existing) = existing {
+        // Carry the previously chosen backend across a mode switch.
+        remote.backend = existing.backend;
         remote.model = preserved_server_model(local_model, existing);
+        // Carry a CUSTOM query_endpoint the user set; otherwise recompute the (preserved) backend's
+        // default — a value left over from a different backend would point queries at the wrong
+        // local server.
+        remote.query_endpoint = match &existing.query_endpoint {
+            Some(qe) if !is_default_backend_endpoint(qe) => Some(qe.clone()),
+            _ => wizard_query_endpoint(&remote.mode, remote.backend).map(str::to_string),
+        };
         remote.gpu = existing.gpu.clone();
         remote.num_ctx = existing.num_ctx;
         remote.batch_size = existing.batch_size;
@@ -1861,7 +2038,7 @@ fn new_ephemeral_remote_from(
 
 fn preserved_server_model(local_model: &str, existing: &RemoteDraft) -> String {
     if existing.model.trim().is_empty() {
-        default_remote_model_for(local_model).to_string()
+        default_remote_model_for(local_model, existing.backend).to_string()
     } else {
         existing.model.clone()
     }
@@ -2156,13 +2333,12 @@ fn remote_config_for(d: &RemoteDraft) -> RemoteEmbeddingConfig {
     };
     RemoteEmbeddingConfig {
         model: d.model.clone(),
-        // The wizard's Remote step does not yet offer a backend picker (follow-up), so it drafts
-        // the default `ollama` backend; a user wanting infinity/vLLM sets `[remote]
-        // backend` in the TOML.
-        backend: rag_rat_core::config::RemoteBackend::Ollama,
+        backend: d.backend,
         endpoint: ep,
         cookbook: cb,
-        query_endpoint: None,
+        // The draft is the single source of truth: for EPHEMERAL it carries the backend default
+        // (or a preserved custom value); for CONNECT it is `None` (queries hit the endpoint).
+        query_endpoint: d.query_endpoint.clone(),
         auth_env: d.auth_env.clone(),
         gpu: d.gpu.clone(),
         num_ctx: d.num_ctx,
@@ -2726,15 +2902,20 @@ mod tests {
         assert!(
             matches!(remote.mode, RemoteMode::Connect(ref endpoint) if endpoint == DEFAULT_QUERY_ENDPOINT)
         );
-        assert_eq!(remote.model, default_remote_model_for(&state.draft.model));
+        assert_eq!(
+            remote.model,
+            default_remote_model_for(&state.draft.model, RemoteBackend::Ollama)
+        );
         assert_eq!(remote.concurrency, RemoteEmbeddingConfig::omitted_concurrency_default(true));
-        assert_eq!(compatible_server_models(&state.draft.model), vec![
+        assert_eq!(compatible_server_models(&state.draft.model, RemoteBackend::Ollama), vec![
             "all-minilm",
             "qllama/bge-small-en-v1.5:f16"
         ]);
 
-        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
-        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        // Focus is on Mode; tab past Endpoint + Backend to reach the server-model list.
+        while embed_focus(&state) != Some(EmbedFocus::ServerModel) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
         step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
         step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
 
@@ -2848,7 +3029,9 @@ mod tests {
         state.step = Some(init_step(StepId::Embedding, &state));
         let target_cursor = model_rows()
             .iter()
-            .position(|(id, _)| default_remote_model_for(id) != original_server_model)
+            .position(|(id, _)| {
+                default_remote_model_for(id, RemoteBackend::Ollama) != original_server_model
+            })
             .expect("registry should contain a model with a different remote default");
         if let Some(StepState::Embedding { model_cursor, .. }) = &mut state.step {
             *model_cursor = target_cursor;
@@ -2858,7 +3041,10 @@ mod tests {
 
         let remote = state.draft.remote.as_ref().unwrap();
         assert_ne!(remote.model, original_server_model);
-        assert_eq!(remote.model, default_remote_model_for(&state.draft.model));
+        assert_eq!(
+            remote.model,
+            default_remote_model_for(&state.draft.model, RemoteBackend::Ollama)
+        );
     }
 
     #[test]
@@ -2875,11 +3061,229 @@ mod tests {
     }
 
     #[test]
+    fn embedding_ephemeral_defaults_to_infinity_and_connect_to_ollama() {
+        // Ephemeral mode defaults to the fastest measured backend (infinity); connect defaults to
+        // the common local server (ollama).
+        let ephemeral = new_ephemeral_remote("sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(ephemeral.backend, RemoteBackend::Infinity);
+        // Infinity downloads the HuggingFace model → server model = the local model_id.
+        assert_eq!(ephemeral.model, "sentence-transformers/all-MiniLM-L6-v2");
+
+        let connect = new_connect_remote("sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(connect.backend, RemoteBackend::Ollama);
+        // Ollama uses its own model name.
+        assert_eq!(connect.model, "all-minilm");
+    }
+
+    #[test]
+    fn connect_from_ephemeral_infinity_keeps_backend_with_matching_endpoint() {
+        // A mode switch ephemeral→connect PRESERVES the backend, so the connect endpoint default
+        // must MATCH it (infinity → 7997), not fall back to the ollama default (11434) — otherwise
+        // the connect probe posts infinity's route to a local ollama server.
+        let existing = new_ephemeral_remote("sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(existing.backend, RemoteBackend::Infinity, "ephemeral defaults to infinity");
+        let connect =
+            new_connect_remote_from("sentence-transformers/all-MiniLM-L6-v2", Some(&existing));
+        assert_eq!(connect.backend, RemoteBackend::Infinity);
+        assert!(
+            matches!(connect.mode, RemoteMode::Connect(ref ep) if ep == "http://localhost:7997"),
+            "connect endpoint must match the preserved backend, got {:?}",
+            connect.mode,
+        );
+    }
+
+    #[test]
+    fn embedding_backend_pick_switches_to_infinity_and_sets_hf_model() {
+        // Start from a connect (ollama) remote whose server model is the ollama name.
+        let mut state = empty_state();
+        state.draft.remote = Some(new_connect_remote(&state.draft.model));
+        assert_eq!(state.draft.remote.as_ref().unwrap().model, "all-minilm");
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        // Focus the backend picker; cursor 0 is infinity (efficiency-ordered).
+        while embed_focus(&state) != Some(EmbedFocus::Backend) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Home), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+
+        let remote = state.draft.remote.as_ref().unwrap();
+        assert_eq!(remote.backend, RemoteBackend::Infinity);
+        // Switching to infinity must reset the server model to the HF id, not leave an ollama name.
+        assert_eq!(remote.model, "sentence-transformers/all-MiniLM-L6-v2");
+        assert_ne!(remote.model, "all-minilm");
+
+        // The persisted config carries the picked backend through.
+        let config = remote_config_for(remote);
+        assert_eq!(config.backend, RemoteBackend::Infinity);
+    }
+
+    #[test]
+    fn connect_from_ephemeral_custom_query_endpoint_uses_it_as_connect_endpoint() {
+        // Switching an EPHEMERAL config that had a CUSTOM query_endpoint (the user's reachable
+        // LOCAL query server) to CONNECT must reuse that endpoint, not fall back to the backend's
+        // localhost default. The backend is preserved across the switch.
+        let mut existing = new_ephemeral_remote("sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(existing.backend, RemoteBackend::Infinity);
+        existing.query_endpoint = Some("http://gpu-box.local:9999".to_string());
+
+        let connect =
+            new_connect_remote_from("sentence-transformers/all-MiniLM-L6-v2", Some(&existing));
+
+        assert_eq!(connect.backend, RemoteBackend::Infinity, "backend must be preserved");
+        assert!(
+            matches!(connect.mode, RemoteMode::Connect(ref ep) if ep == "http://gpu-box.local:9999"),
+            "custom ephemeral query_endpoint must become the connect endpoint, got {:?}",
+            connect.mode,
+        );
+    }
+
+    #[test]
+    fn mode_select_ephemeral_syncs_backend_cursor_to_infinity() {
+        // A fresh wizard seeds backend_cursor from the ollama default (position of Ollama in
+        // BACKENDS_BY_EFFICIENCY). Selecting Ephemeral mode creates a remote defaulting to Infinity
+        // — the cursor MUST move to Infinity so an immediate Space on Backend keeps infinity,
+        // rather than silently re-selecting whatever the stale cursor pointed at (ollama).
+        let mut state = empty_state();
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        // Tab to Mode, cursor down to ephemeral (index 2), Space to select.
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::Mode));
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+        assert_eq!(state.draft.remote.as_ref().unwrap().backend, RemoteBackend::Infinity);
+
+        // The cursor must now sit on Infinity (position 0 in BACKENDS_BY_EFFICIENCY).
+        let cursor = match &state.step {
+            Some(StepState::Embedding { backend_cursor, .. }) => *backend_cursor,
+            _ => panic!("expected embedding step"),
+        };
+        assert_eq!(BACKENDS_BY_EFFICIENCY[cursor], RemoteBackend::Infinity);
+
+        // Focus Backend and press Space immediately: the backend must STAY infinity, not flip.
+        while embed_focus(&state) != Some(EmbedFocus::Backend) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+        assert_eq!(
+            state.draft.remote.as_ref().unwrap().backend,
+            RemoteBackend::Infinity,
+            "Space on Backend right after selecting ephemeral must keep infinity, not flip to \
+             ollama",
+        );
+    }
+
+    #[test]
+    fn backend_pick_tracks_ephemeral_query_endpoint_to_new_backend() {
+        // On an ephemeral config, switching the backend must re-point the wizard-default
+        // query_endpoint at the new backend's local port (a stale value points queries at the wrong
+        // server). Start on infinity (7997), switch to vLLM (8000).
+        let mut state = empty_state();
+        state.draft.remote = Some(new_ephemeral_remote(&state.draft.model));
+        assert_eq!(
+            state.draft.remote.as_ref().unwrap().query_endpoint.as_deref(),
+            Some("http://localhost:7997"),
+        );
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        while embed_focus(&state) != Some(EmbedFocus::Backend) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        // Cursor 1 is vLLM in BACKENDS_BY_EFFICIENCY = [Infinity, Vllm, Ollama].
+        step_handle_key(StepId::Embedding, key(KeyCode::Home), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+
+        let remote = state.draft.remote.as_ref().unwrap();
+        assert_eq!(remote.backend, RemoteBackend::Vllm);
+        assert_eq!(remote.query_endpoint.as_deref(), Some("http://localhost:8000"));
+
+        // A CUSTOM query_endpoint is preserved across a backend switch.
+        state.draft.remote.as_mut().unwrap().query_endpoint =
+            Some("http://gpu-box.local:9999".to_string());
+        step_handle_key(StepId::Embedding, key(KeyCode::Home), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state); // → infinity
+        assert_eq!(state.draft.remote.as_ref().unwrap().backend, RemoteBackend::Infinity);
+        assert_eq!(
+            state.draft.remote.as_ref().unwrap().query_endpoint.as_deref(),
+            Some("http://gpu-box.local:9999"),
+            "a custom query_endpoint must survive a backend switch",
+        );
+    }
+
+    #[test]
+    fn embedding_backend_pick_switches_to_vllm() {
+        let mut state = empty_state();
+        state.draft.remote = Some(new_connect_remote(&state.draft.model));
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        while embed_focus(&state) != Some(EmbedFocus::Backend) {
+            step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        }
+        // Cursor 1 is vLLM in BACKENDS_BY_EFFICIENCY = [Infinity, Vllm, Ollama].
+        step_handle_key(StepId::Embedding, key(KeyCode::Home), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+
+        let remote = state.draft.remote.as_ref().unwrap();
+        assert_eq!(remote.backend, RemoteBackend::Vllm);
+        assert_eq!(remote.model, "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(compatible_server_models(&state.draft.model, RemoteBackend::Vllm), vec![
+            "sentence-transformers/all-MiniLM-L6-v2"
+        ]);
+    }
+
+    #[test]
+    fn embedding_backend_shows_in_connect_mode_and_surfaces_vllm_caveat() {
+        let mut state = empty_state();
+        let mut remote = new_connect_remote(&state.draft.model);
+        remote.backend = RemoteBackend::Vllm;
+        remote.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
+        state.draft.remote = Some(remote);
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        let cells = render_embedding_cells(&state, 120, 24);
+        let screen = screen_text(&cells);
+        // The backend picker renders in connect mode too.
+        assert!(screen.contains("backend"), "{screen}");
+        assert!(screen.contains("[*] vllm"), "{screen}");
+        // The vLLM caveat is surfaced near the picker and points at the ACTUAL per-text knob
+        // (`max_embedding_chars`), not the wizard's batch-total `max_batch_chars`.
+        assert!(screen.contains("max_embedding_chars"), "{screen}");
+    }
+
+    #[test]
+    fn embedding_backend_pick_visits_before_server_model() {
+        let mut state = empty_state();
+        state.step = Some(init_step(StepId::Embedding, &state));
+
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::Mode));
+        step_handle_key(StepId::Embedding, key(KeyCode::Down), &mut state);
+        step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
+        assert!(matches!(
+            state.draft.remote.as_ref().map(|remote| &remote.mode),
+            Some(RemoteMode::Connect(_))
+        ));
+
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::Endpoint));
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::Backend));
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::ServerModel));
+    }
+
+    #[test]
     fn embedding_mode_reselect_preserves_remote_settings() {
         let mut state = empty_state();
         state.draft.remote = Some(RemoteDraft {
             model: "custom-model".to_string(),
+            backend: RemoteBackend::Ollama,
             mode: RemoteMode::Connect("http://remote:11434".to_string()),
+            query_endpoint: None,
             gpu: None,
             num_ctx: Some(4096),
             batch_size: 17,
@@ -3161,6 +3565,9 @@ mod tests {
         assert_eq!(embed_focus(&state), Some(EmbedFocus::Gpu));
 
         step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
+        assert_eq!(embed_focus(&state), Some(EmbedFocus::Backend));
+
+        step_handle_key(StepId::Embedding, key(KeyCode::Tab), &mut state);
         assert_eq!(embed_focus(&state), Some(EmbedFocus::ServerModel));
     }
 
@@ -3170,7 +3577,8 @@ mod tests {
         state.draft.remote = Some(new_connect_remote(&state.draft.model));
         state.step = Some(init_step(StepId::Embedding, &state));
 
-        let cells = render_embedding_cells(&state, 100, 18);
+        // Wide enough for the full server-model names beside the (fixed-width) backend picker.
+        let cells = render_embedding_cells(&state, 130, 18);
         let screen = screen_text(&cells);
 
         assert!(screen.contains("all-minilm"), "{screen}");
@@ -3182,7 +3590,7 @@ mod tests {
         state.draft.remote = Some(new_connect_remote(&state.draft.model));
         state.step = Some(init_step(StepId::Embedding, &state));
 
-        let cells = render_embedding_cells(&state, 100, 18);
+        let cells = render_embedding_cells(&state, 130, 18);
         let screen = screen_text(&cells);
 
         assert!(screen.contains("ordis/jina-embeddings-v2-base-code"), "{screen}");
@@ -3193,7 +3601,7 @@ mod tests {
         let hash_model =
             EMBEDDING_MODELS.iter().find(|spec| spec.backend == Backend::Hash).unwrap().model_id;
         assert!(
-            compatible_server_models(hash_model).is_empty(),
+            compatible_server_models(hash_model, RemoteBackend::Ollama).is_empty(),
             "unsupported local models must not expose remote server choices"
         );
     }
@@ -3252,6 +3660,7 @@ mod tests {
             EmbedFocus::Mode,
             EmbedFocus::Cookbook,
             EmbedFocus::Gpu,
+            EmbedFocus::Backend,
             EmbedFocus::ServerModel,
             EmbedFocus::BatchSize,
             EmbedFocus::Concurrency,

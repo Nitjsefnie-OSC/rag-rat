@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use rag_rat_core::config::{
-    Config, EmbeddingBackend, OracleConfig, RemoteEmbeddingConfig, VersionCheckConfig,
+    Config, DEFAULT_QUERY_ENDPOINT, EmbeddingBackend, OracleConfig, RemoteBackend,
+    RemoteEmbeddingConfig, VersionCheckConfig,
 };
 use rag_rat_core::language::Language;
 use toml_edit::{Array, DocumentMut, Item, Table};
@@ -30,10 +31,16 @@ pub(crate) enum RemoteMode {
 /// The remote-embedding draft block — mirrors `RemoteEmbeddingConfig` with the mode explicit.
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteDraft {
-    /// The Ollama API model name (e.g. `"all-minilm"`).
+    /// The server-side embedding model name (an ollama name for `backend = ollama`, the
+    /// HuggingFace id for infinity/vLLM).
     pub model: String,
+    /// Which OpenAI-compatible server serves this block (`ollama` | `infinity` | `vllm`).
+    pub backend: RemoteBackend,
     /// CONNECT (existing Ollama endpoint) or EPHEMERAL (cookbook recipe).
     pub mode: RemoteMode,
+    /// EPHEMERAL-only: the LOCAL server queries embed against after the box is torn down; must run
+    /// the same backend + model. Defaults per backend; a custom value is preserved.
+    pub query_endpoint: Option<String>,
     /// EPHEMERAL-only: GPU to provision (provider-specific value).
     pub gpu: Option<String>,
     /// Optional Ollama context window for `/api/embed` requests.
@@ -142,6 +149,44 @@ pub(crate) fn ollama_model_for(embedding_model_id: &str) -> Option<&'static str>
         "jinaai/jina-embeddings-v2-base-code" => Some("ordis/jina-embeddings-v2-base-code"),
         _ => None,
     }
+}
+
+/// The LOCAL query-embedding endpoint the wizard writes for an EPHEMERAL infinity/vLLM config.
+/// After the provisioned box is torn down, queries embed against a LOCAL server (same backend +
+/// model), and config validation REQUIRES an explicit `query_endpoint` for non-ollama backends —
+/// the ollama-default `localhost:11434` only fits ollama, so a wizard-written infinity/vLLM
+/// ephemeral config would otherwise fail to load. Defaults to the backend's standard local port.
+/// `None` when the config default already suffices: ollama (11434) and connect mode (queries hit
+/// the endpoint).
+pub(crate) fn wizard_query_endpoint(
+    mode: &RemoteMode,
+    backend: RemoteBackend,
+) -> Option<&'static str> {
+    match (mode, backend) {
+        (RemoteMode::Ephemeral(_), RemoteBackend::Infinity | RemoteBackend::Vllm) =>
+            Some(default_backend_endpoint(backend)),
+        _ => None,
+    }
+}
+
+/// The default LOCAL endpoint the wizard uses for a backend: ollama 11434, infinity 7997, vLLM
+/// 8000. The single source for BOTH the connect `endpoint` default and the ephemeral
+/// `query_endpoint` default, so the endpoint always matches the selected backend's route + port.
+pub(crate) fn default_backend_endpoint(backend: RemoteBackend) -> &'static str {
+    match backend {
+        RemoteBackend::Ollama => DEFAULT_QUERY_ENDPOINT,
+        RemoteBackend::Infinity => "http://localhost:7997",
+        RemoteBackend::Vllm => "http://localhost:8000",
+    }
+}
+
+/// Whether `url` is one of the wizard's known default LOCAL endpoints (any backend's) — a value the
+/// wizard itself wrote, so it is safe to REPLACE when the backend or mode changes. A URL outside
+/// this set is a user customization and is preserved.
+pub(crate) fn is_default_backend_endpoint(url: &str) -> bool {
+    [RemoteBackend::Ollama, RemoteBackend::Infinity, RemoteBackend::Vllm]
+        .into_iter()
+        .any(|b| default_backend_endpoint(b) == url)
 }
 
 /// Hook installation selections.
@@ -429,6 +474,7 @@ impl WizardDraft {
             }
             if let Some(t) = remote_item.as_table_like_mut() {
                 t.insert("model", toml_edit::value(remote.model.clone()));
+                t.insert("backend", toml_edit::value(remote.backend.as_db_str()));
                 match &remote.mode {
                     RemoteMode::Connect(ep) => {
                         t.insert("endpoint", toml_edit::value(ep.clone()));
@@ -437,6 +483,24 @@ impl WizardDraft {
                     RemoteMode::Ephemeral(cb) => {
                         t.insert("cookbook", toml_edit::value(cb.clone()));
                         t.remove("endpoint");
+                    },
+                }
+                // `query_endpoint` is DRIVEN by the draft — the draft is the single source of
+                // truth. For EPHEMERAL: write `remote.query_endpoint` when `Some` (the per-backend
+                // default or a preserved custom value, both managed by the steps constructors),
+                // else drop it so ollama falls back to the config default (11434). CONNECT ignores
+                // query_endpoint entirely, so it is always removed.
+                match &remote.mode {
+                    RemoteMode::Ephemeral(_) => match &remote.query_endpoint {
+                        Some(qe) => {
+                            t.insert("query_endpoint", toml_edit::value(qe.clone()));
+                        },
+                        None => {
+                            t.remove("query_endpoint");
+                        },
+                    },
+                    RemoteMode::Connect(_) => {
+                        t.remove("query_endpoint");
                     },
                 }
                 t.insert("batch_size", toml_edit::value(i64::from(remote.batch_size)));
@@ -493,7 +557,9 @@ fn remote_draft_from_config(r: &RemoteEmbeddingConfig) -> RemoteDraft {
     };
     RemoteDraft {
         model: r.model.clone(),
+        backend: r.backend,
         mode,
+        query_endpoint: r.query_endpoint.clone(),
         gpu: r.gpu.clone(),
         num_ctx: r.num_ctx,
         batch_size: r.batch_size,
@@ -578,9 +644,13 @@ fn raw_remote_draft(doc: &DocumentMut) -> Option<RemoteDraft> {
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or_else(|| RemoteEmbeddingConfig::default().max_batch_chars)
         .max(1);
+    let backend =
+        string("backend").and_then(|s| RemoteBackend::from_db_str(&s)).unwrap_or_default();
     Some(RemoteDraft {
         model,
+        backend,
         mode,
+        query_endpoint: string("query_endpoint"),
         gpu: string("gpu"),
         num_ctx: remote
             .get("num_ctx")
@@ -787,7 +857,9 @@ mod tests {
         d.version_check = false;
         d.remote = Some(RemoteDraft {
             model: "all-minilm".to_string(),
+            backend: RemoteBackend::Ollama,
             mode: RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            query_endpoint: None,
             gpu: None,
             num_ctx: None,
             batch_size: 128,
@@ -801,6 +873,7 @@ mod tests {
         let remote = doc["llm"]["embedding"]["remote"].as_table_like().unwrap();
 
         assert_eq!(remote.get("cookbook").and_then(Item::as_str), Some("@rag-rat/cookbook modal"));
+        assert_eq!(remote.get("backend").and_then(Item::as_str), Some("ollama"));
         assert_eq!(remote.get("batch_size").and_then(Item::as_integer), Some(128));
         assert_eq!(remote.get("concurrency").and_then(Item::as_integer), Some(16));
         assert_eq!(remote.get("max_batch_chars").and_then(Item::as_integer), Some(192_000));
@@ -819,7 +892,9 @@ mod tests {
         d.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
         d.remote = Some(RemoteDraft {
             model: "all-minilm".to_string(),
+            backend: RemoteBackend::Ollama,
             mode: RemoteMode::Connect("http://new:11434".to_string()),
+            query_endpoint: None,
             gpu: None,
             num_ctx: Some(4096),
             batch_size: 64,
@@ -833,11 +908,201 @@ mod tests {
         let remote = doc["llm"]["embedding"]["remote"].as_table_like().unwrap();
 
         assert_eq!(remote.get("endpoint").and_then(Item::as_str), Some("http://new:11434"));
+        assert_eq!(remote.get("backend").and_then(Item::as_str), Some("ollama"));
         assert_eq!(remote.get("model").and_then(Item::as_str), Some("all-minilm"));
         assert_eq!(remote.get("num_ctx").and_then(Item::as_integer), Some(4096));
         assert_eq!(remote.get("concurrency").and_then(Item::as_integer), Some(12));
         assert_eq!(remote.get("max_batch_chars").and_then(Item::as_integer), Some(144_000));
         assert!(remote.get("cookbook").is_none());
+    }
+
+    #[test]
+    fn remote_backend_round_trips_through_raw_and_patch() {
+        // The wizard-owned `[remote] backend` key must survive a patch write and a raw re-parse.
+        for (backend, token) in [
+            (RemoteBackend::Ollama, "ollama"),
+            (RemoteBackend::Infinity, "infinity"),
+            (RemoteBackend::Vllm, "vllm"),
+        ] {
+            let mut d = WizardDraft::from_scan(
+                &RepoScan::default(),
+                ".".into(),
+                std::path::PathBuf::from("."),
+            );
+            d.bindings.insert(Language::Rust, vec!["src".into()]);
+            d.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
+            let mode = RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string());
+            d.remote = Some(RemoteDraft {
+                model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+                backend,
+                query_endpoint: wizard_query_endpoint(&mode, backend).map(str::to_string),
+                mode,
+                gpu: None,
+                num_ctx: None,
+                batch_size: 256,
+                concurrency: 32,
+                max_batch_chars: 192_000,
+                auth_env: None,
+            });
+
+            let out = d.write_fresh();
+            let doc: DocumentMut = out.parse().unwrap();
+            assert_eq!(
+                doc["llm"]["embedding"]["remote"]["backend"].as_str(),
+                Some(token),
+                "backend must render to `{token}`"
+            );
+            let parsed = raw_remote_draft(&doc).expect("remote block must re-parse");
+            assert_eq!(parsed.backend, backend, "backend must round-trip via raw_remote_draft");
+        }
+    }
+
+    #[test]
+    fn raw_remote_draft_defaults_backend_to_ollama_when_absent() {
+        // A pre-backend-selector `[remote]` block (no `backend` key) must default to ollama.
+        let raw = "[index]\nroot = \".\"\n[target_bindings]\nrust = \
+                   [\"src\"]\n[llm.embedding]\nmodel = \
+                   \"sentence-transformers/all-MiniLM-L6-v2\"\n[llm.embedding.remote]\nmodel = \
+                   \"all-minilm\"\nendpoint = \"http://localhost:11434\"\n";
+        let doc: DocumentMut = raw.parse().unwrap();
+        assert_eq!(raw_remote_draft(&doc).unwrap().backend, RemoteBackend::Ollama);
+    }
+
+    #[test]
+    fn from_config_reads_infinity_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let config_path = dir.path().join("rag-rat.toml");
+        std::fs::write(
+            &config_path,
+            "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n\n[llm.embedding]\nmodel \
+             = \"sentence-transformers/all-MiniLM-L6-v2\"\n\n[llm.embedding.remote]\nmodel = \
+             \"sentence-transformers/all-MiniLM-L6-v2\"\nbackend = \"infinity\"\nendpoint = \
+             \"http://localhost:7997\"\nquery_endpoint = \"http://localhost:7997\"\n",
+        )
+        .unwrap();
+        let cfg = rag_rat_core::config::Config::load(&config_path).unwrap();
+        let d = WizardDraft::from_existing(
+            &std::fs::read_to_string(&config_path).unwrap(),
+            &cfg,
+            &config_path,
+        );
+        assert_eq!(d.remote.unwrap().backend, RemoteBackend::Infinity);
+    }
+
+    #[test]
+    fn wizard_written_ephemeral_infinity_config_carries_query_endpoint_and_loads() {
+        // Regression: an ephemeral infinity/vLLM config MUST carry a `query_endpoint` or
+        // `Config::load` rejects it (`RemoteQueryEndpointRequiredForBackend`). The wizard writes
+        // the backend's default local port so the generated config loads out of the box.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let config_path = dir.path().join("rag-rat.toml");
+        let mut d =
+            WizardDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
+        d.bindings.insert(Language::Rust, vec!["src".into()]);
+        d.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
+        d.remote = Some(RemoteDraft {
+            model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            backend: RemoteBackend::Infinity,
+            mode: RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            query_endpoint: Some("http://localhost:7997".to_string()),
+            gpu: None,
+            num_ctx: None,
+            batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
+            auth_env: None,
+        });
+        let out = d.write_fresh();
+        std::fs::write(&config_path, &out).unwrap();
+
+        let doc: DocumentMut = out.parse().unwrap();
+        let remote = doc["llm"]["embedding"]["remote"].as_table_like().unwrap();
+        assert_eq!(remote.get("backend").and_then(Item::as_str), Some("infinity"));
+        assert_eq!(
+            remote.get("query_endpoint").and_then(Item::as_str),
+            Some("http://localhost:7997"),
+            "ephemeral infinity must get a default query_endpoint"
+        );
+
+        // The written config must LOAD — this is exactly what regressed without the query_endpoint.
+        let cfg = rag_rat_core::config::Config::load(&config_path)
+            .expect("wizard-written ephemeral infinity config must load");
+        let r = cfg.llm.embedding.remote.expect("remote present");
+        assert_eq!(r.backend, RemoteBackend::Infinity);
+        assert_eq!(r.query_endpoint.as_deref(), Some("http://localhost:7997"));
+    }
+
+    #[test]
+    fn from_existing_recovers_custom_query_endpoint() {
+        // A custom ephemeral `query_endpoint` in the raw TOML must land on the draft (via
+        // `raw_remote_draft`), so a reconfigure switching ephemeral→connect can reuse it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let config_path = dir.path().join("rag-rat.toml");
+        let raw = "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n\n[llm.embedding]\n\
+                   model = \"sentence-transformers/all-MiniLM-L6-v2\"\n\n[llm.embedding.remote]\n\
+                   model = \"sentence-transformers/all-MiniLM-L6-v2\"\nbackend = \"infinity\"\n\
+                   cookbook = \"@rag-rat/cookbook modal\"\nquery_endpoint = \
+                   \"http://gpu-box.local:9999\"\n";
+        std::fs::write(&config_path, raw).unwrap();
+        let cfg = Config::load(&config_path).unwrap();
+
+        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let remote = d.remote.expect("remote present");
+        assert_eq!(remote.backend, RemoteBackend::Infinity);
+        assert_eq!(remote.query_endpoint.as_deref(), Some("http://gpu-box.local:9999"));
+    }
+
+    #[test]
+    fn patch_drives_ephemeral_query_endpoint_from_the_draft() {
+        // `query_endpoint` is DRIVEN by the draft (the single source of truth), NOT recomputed from
+        // the raw doc: `patch_existing` writes exactly `remote.query_endpoint` for an EPHEMERAL
+        // config (steps.rs owns computing the per-backend default / preserving a custom value), and
+        // drops it entirely for a CONNECT config. Whatever the raw doc held is overwritten.
+        let raw = "[index]\nroot = \".\"\n[target_bindings]\nrust = [\"src\"]\n\
+                   [llm.embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\n\
+                   [llm.embedding.remote]\nmodel = \"x\"\nbackend = \"infinity\"\ncookbook = \
+                   \"@rag-rat/cookbook modal\"\nquery_endpoint = \"http://stale:1234\"\n";
+        let mut d = WizardDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
+        d.bindings.insert(Language::Rust, vec!["src".into()]);
+        let mut remote = RemoteDraft {
+            model: "x".to_string(),
+            backend: RemoteBackend::Vllm,
+            mode: RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            query_endpoint: Some("http://localhost:8000".to_string()),
+            gpu: None,
+            num_ctx: None,
+            batch_size: 256,
+            concurrency: 32,
+            max_batch_chars: 384_000,
+            auth_env: None,
+        };
+        d.remote = Some(remote.clone());
+        let q = |out: &str| -> Option<String> {
+            let doc: DocumentMut = out.parse().unwrap();
+            doc["llm"]["embedding"]["remote"]
+                .as_table_like()
+                .unwrap()
+                .get("query_endpoint")
+                .and_then(Item::as_str)
+                .map(str::to_string)
+        };
+
+        // Ephemeral with `Some` → the draft value is written, overwriting the stale raw-doc value.
+        assert_eq!(q(&d.patch_existing(raw).unwrap()), Some("http://localhost:8000".to_string()));
+
+        // Ephemeral with `None` (e.g. ollama, which uses the config default) → the key is dropped.
+        remote.query_endpoint = None;
+        d.remote = Some(remote.clone());
+        assert_eq!(q(&d.patch_existing(raw).unwrap()), None);
+
+        // CONNECT ignores query_endpoint → the key is dropped even if the draft still carries one.
+        remote.mode = RemoteMode::Connect("http://localhost:8000".to_string());
+        remote.query_endpoint = Some("http://localhost:8000".to_string());
+        d.remote = Some(remote);
+        assert_eq!(q(&d.patch_existing(raw).unwrap()), None);
     }
 
     #[test]
