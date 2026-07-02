@@ -1173,6 +1173,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_036_ID => Some(36),
             MIGRATION_037_ID => Some(37),
             MIGRATION_038_ID => Some(38),
+            MIGRATION_039_ID => Some(39),
             _ => None,
         })
         .max()
@@ -1220,6 +1221,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_036_ID
             | MIGRATION_037_ID
             | MIGRATION_038_ID
+            | MIGRATION_039_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1264,6 +1266,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
         MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
         MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
+        MIGRATION_039_ID => migration.checksum != MIGRATION_039_CHECKSUM,
         _ => false,
     }
 }
@@ -1622,6 +1625,109 @@ pub(crate) const REPOS_REGISTRY_DDL: &str = "
         SELECT '__unassigned__', '', 0
         WHERE NOT EXISTS (SELECT 1 FROM repos WHERE repo_id != '__unassigned__');
 ";
+
+/// The `index_meta` keys V039 relocates into `repo_meta` (memory-sync phase A2) — the per-repo
+/// singletons that were global-by-accident under the one-DB-per-repo assumption. Kept as ONE list
+/// so the copy and the matching delete cannot drift. Machine/db-level keys
+/// (`generated_flags_version`, the reencode DONE gate, the active-model provenance flag + remote
+/// config, the throughput-tune cache) deliberately STAY in `index_meta` — they are not per-repo, or
+/// are scoped by a later workstream.
+const V039_INDEX_META_KEYS: &[&str] = &[
+    "source_root",
+    "content_revision",
+    "git_commit",
+    "git_dirty",
+    "graph_index_version",
+    "active_embedding_model",
+    "clone_graph_live_generation",
+    "github_last_sync_ms",
+    "git_history_indexed_head",
+    "git_history_indexed_root",
+    "git_history_indexed_shallow",
+    "local_crate_roots",
+    "indexed_at_ms",
+    "fts_dirty",
+    "fts_source_revision",
+    "fts_synced_at_ms",
+];
+
+/// The `reconcile_meta` keys V039 relocates into `repo_meta`. The `reconcile_meta` TABLE is
+/// intentionally NOT dropped here — a later cleanup migration owns that (the remaining reconcile
+/// timing keys still live in it); only these two per-repo keys move.
+const V039_RECONCILE_META_KEYS: &[&str] =
+    &["embedding_active_model_version", "vector_int8_reencode_cursor"];
+
+/// V039 (memory-sync phase A2): relocate the per-repo singleton meta keys out of the global
+/// `index_meta` / `reconcile_meta` into `repo_meta`, under the SOLE `repos` row that owns this DB
+/// (see [`sole_repo_id`]) — the real repo_id when the DB was already adopted, else the
+/// [`super::LEGACY_REPO_ID`] placeholder V038 seeds. Targeting the sole row (not a hardcoded
+/// placeholder) is what keeps the `repo_meta → repos` FK satisfied on an ADOPTED DB, where the
+/// placeholder row is gone. The read/write call sites move to the `repo_meta` accessors in the same
+/// change, so a moved key is never read from the table it was deleted from.
+///
+/// Idempotent (`INSERT OR IGNORE` deduped by the `(repo_id, key)` PK + `DELETE` of the source
+/// rows): a fresh DB has empty meta tables → the copy/delete are no-ops, and a forward-migrated
+/// legacy DB converges on the identical shape. Copy-before-delete on each table means even a torn
+/// run (crash between the copy and the delete) re-converges: the re-run's copy is ignored and the
+/// delete finishes, and readers already read `repo_meta` (the authoritative side).
+pub(crate) fn apply_move_per_repo_meta(conn: &Connection) -> rusqlite::Result<()> {
+    relocate_meta_keys(conn, "index_meta", V039_INDEX_META_KEYS)?;
+    relocate_meta_keys(conn, "reconcile_meta", V039_RECONCILE_META_KEYS)?;
+    Ok(())
+}
+
+/// Copy the listed keys from `source_table` (a `(key, value)` k/v table) into `repo_meta` under the
+/// repo that owns this DB ([`sole_repo_id`]), then delete them from the source. Resolving the
+/// target HERE — inside the shared helper — means every future key-move caller inherits the correct
+/// target (real-after-adoption / placeholder-before), instead of each re-deriving a placeholder
+/// that a prior adoption may have deleted. `source_table` and `keys` are internal string literals
+/// (never user input), so interpolating them into the SQL is safe.
+fn relocate_meta_keys(
+    conn: &Connection,
+    source_table: &str,
+    keys: &[&str],
+) -> rusqlite::Result<()> {
+    let target_repo_id = sole_repo_id(conn)?;
+    let in_list = keys.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(", ");
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO repo_meta(repo_id, key, value)
+             SELECT ?1, key, value FROM {source_table} WHERE key IN ({in_list})"
+        ),
+        [target_repo_id.as_str()],
+    )?;
+    conn.execute(&format!("DELETE FROM {source_table} WHERE key IN ({in_list})"), [])?;
+    Ok(())
+}
+
+/// The single `repos` row that owns this DB at migration time — the real repo_id if it was already
+/// adopted via [`super::register_repo`], else the [`super::LEGACY_REPO_ID`] placeholder V038 seeds.
+///
+/// The relocation MUST target this id, not a hardcoded placeholder: on an adopted DB the
+/// placeholder row is deleted, so an `INSERT` into `repo_meta` under it trips the `repo_meta →
+/// repos` FK — with `foreign_keys = ON` (production) that aborts the whole `migrate_forward`; with
+/// it off it orphans rows the per-repo accessors ([`super::single_repo_id`]) can never resolve.
+/// V038 always leaves exactly one `repos` row and `register_repo` keeps it at one, so 0 or >1 is a
+/// broken invariant — surfaced as an attributable migration error rather than a silent FK abort or
+/// a wrong-scope pick. (Distinct from [`super::single_repo_id`], the runtime stand-in: that one
+/// `debug_assert`s the one-row invariant and `LIMIT 1`s in release; a migration needs the hard
+/// error on `!= 1`.)
+fn sole_repo_id(conn: &Connection) -> rusqlite::Result<String> {
+    let mut stmt = conn.prepare("SELECT repo_id FROM repos")?;
+    let mut ids =
+        stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if ids.len() == 1 {
+        return Ok(ids.pop().expect("length checked to be exactly 1"));
+    }
+    Err(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+        Some(format!(
+            "V039 per-repo meta relocation expects exactly one repos row (the sole repo owning \
+             this DB), found {}",
+            ids.len()
+        )),
+    ))
+}
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see
 /// `parser::detect_is_test`) so clone detection can keep tests out of the corpus. Idempotent via
