@@ -96,6 +96,15 @@ impl IndexDatabase {
             db.refresh_clone_token_df()?;
             mem_trace("after refresh_clone_token_df");
             db.set_meta("indexed_at_ms", &now_ms().to_string())?;
+            // Adopt the configured embedding model as this index's active model INSIDE the rebuild
+            // transaction, so reconcile targets it (and read-only opens serve immediately) rather
+            // than the hash fallback (#394) — and a failed rebuild rolls the seed back with the
+            // rest, leaving the pre-rebuild active model intact rather than pointing at
+            // a missing model (#394 review).
+            ai::seed_active_embedding_model(
+                db.storage.connection(),
+                config.llm.embedding.backend.model_id(),
+            )?;
             db.storage.execute_batch("COMMIT")?;
             mem_trace("after COMMIT");
             progress(IndexProgress::Finished { files: indexed });

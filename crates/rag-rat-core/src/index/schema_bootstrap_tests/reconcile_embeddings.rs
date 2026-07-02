@@ -125,10 +125,15 @@ fn fastembed_missing_feature_reports_rebuild_command() {
 
 #[test]
 fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
-    let (root, config) = markdown_config(
+    let (root, mut config) = markdown_config(
         "alpha token\nsecond line with enough detail for the semantic embedding policy to keep \
          this chunk\nthird line with runtime context\n",
     );
+    // Select the deterministic hash embedder explicitly — this test exercises the reconcile flow
+    // with the no-download test embedder. A fresh index adopts the CONFIGURED model (#394), so
+    // without this it would adopt the default all-MiniLM and the HASH_MODEL_ID assertions below
+    // would not hold.
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
     let db = IndexDatabase::rebuild(&config).unwrap();
     let chunk_id = first_chunk_id(&db);
 
@@ -207,6 +212,77 @@ fn reconcile_requires_explicit_model_install_and_ignores_stale_artifacts() {
     assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 1);
     let stale_embedding_hits = db.search("alpha", 10, false).unwrap();
     assert_eq!(stale_embedding_hits.len(), 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_confirms_a_provisional_model_against_a_config_change() {
+    // #394 review: a PROVISIONAL active model (a config seed or a fastembed-cache recovery) yields
+    // to a differing config — but once a reconcile COMMITS embeddings under it, the model is
+    // confirmed (provisional flag cleared) and a later config-model edit must NOT silently switch
+    // it (that would strand the vectors and force a re-embed).
+    let (root, mut config) = markdown_config(
+        "alpha token\nsecond line with enough detail for the semantic embedding policy to keep \
+         this chunk\nthird line with runtime context\n",
+    );
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+    // Simulate a PROVISIONAL-but-Ready active model, as a fastembed-cache recovery produces: Ready
+    // to embed, but not yet user-confirmed. (Mirrors ACTIVE_EMBEDDING_MODEL_PROVISIONAL_META.)
+    db.storage
+        .connection()
+        .execute(
+            "INSERT OR REPLACE INTO index_meta(key, value) VALUES \
+             ('active_embedding_model_provisional', '1')",
+            [],
+        )
+        .unwrap();
+    // A reconcile that commits embeddings CONFIRMS the model — it clears the provisional flag.
+    assert!(
+        db.reconcile(None, Some(8)).unwrap().embeddings_written >= 1,
+        "hash embeddings are committed"
+    );
+    drop(db);
+
+    // Edit the config to a DIFFERENT model, then reopen: the active model stays hash because the
+    // reconcile confirmed it — the seed only reseeds a still-provisional model.
+    config.llm.embedding.backend = "sentence-transformers/all-MiniLM-L6-v2".parse().unwrap();
+    let db = IndexDatabase::open_config(&config).unwrap();
+    assert_eq!(
+        ai::active_embedding_model_id(db.storage.connection()).unwrap(),
+        HASH_MODEL_ID,
+        "a reconcile-confirmed model is not switched by a config change"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_incremental_pass_heals_a_missing_active_model_atomically() {
+    // A pre-#394 index (active model unset) opened on the config-blind incremental / maintenance /
+    // watch path must re-seed the active model from config — and, because the seed lives INSIDE the
+    // incremental transaction and counts as a mutation, the heal is COMMITTED rather than rolled
+    // back as an idle no-write pass (#394 review).
+    let (root, mut config) = markdown_config("alpha token\nenough detail for a chunk to survive\n");
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Simulate a pre-#394 index: drop the seeded active-model meta.
+    db.storage
+        .connection()
+        .execute("DELETE FROM index_meta WHERE key = 'active_embedding_model'", [])
+        .unwrap();
+    drop(db);
+
+    // An incremental discover pass re-seeds inside its transaction and commits the heal (had it
+    // been treated as an idle pass, the ROLLBACK would leave the active model unset).
+    let db = IndexDatabase::index_discover(&config).unwrap();
+    assert_eq!(
+        ai::active_embedding_model_id(db.storage.connection()).unwrap(),
+        HASH_MODEL_ID,
+        "the incremental pass healed the active model and committed it"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
