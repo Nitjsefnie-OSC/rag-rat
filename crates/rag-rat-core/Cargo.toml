@@ -33,6 +33,9 @@ sha2.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 toon-format.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 ureq.workspace = true
 # Dictionary-trained zstd compression of stored chunk text (#77 Phase 2). One shared dictionary
 # trained on a corpus sample (zdict_builder) + bulk one-shot compress/decompress per chunk blob.
@@ -64,6 +67,7 @@ iai-callgrind = "0.16"
 # Wall-clock benchmarking (full-index time on a larger corpus). default-features off to skip the
 # plotting deps — Bencher parses criterion's stdout estimates.
 criterion = { version = "0.8", default-features = false }
+tempfile.workspace = true
 
 # iai-callgrind: deterministic instruction counts (index + cold/warm query).
 [[bench]]
