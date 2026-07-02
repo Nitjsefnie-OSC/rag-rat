@@ -1172,6 +1172,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_035_ID => Some(35),
             MIGRATION_036_ID => Some(36),
             MIGRATION_037_ID => Some(37),
+            MIGRATION_038_ID => Some(38),
             _ => None,
         })
         .max()
@@ -1218,6 +1219,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_035_ID
             | MIGRATION_036_ID
             | MIGRATION_037_ID
+            | MIGRATION_038_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1261,6 +1263,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_035_ID => migration.checksum != MIGRATION_035_CHECKSUM,
         MIGRATION_036_ID => migration.checksum != MIGRATION_036_CHECKSUM,
         MIGRATION_037_ID => migration.checksum != MIGRATION_037_CHECKSUM,
+        MIGRATION_038_ID => migration.checksum != MIGRATION_038_CHECKSUM,
         _ => false,
     }
 }
@@ -1558,6 +1561,67 @@ pub(crate) fn apply_clone_subblock_postings_tables(conn: &Connection) -> rusqlit
     )?;
     Ok(())
 }
+
+/// V038 (memory-sync phase A1): the per-machine `repos` registry + per-repo `repo_meta` k/v store —
+/// the substrate the global-DB consolidation scopes every other table against. All greenfield,
+/// STRICT per repo convention.
+///
+/// The seed placeholder row (`repo_id = '__unassigned__'`, which MUST equal
+/// [`super::LEGACY_REPO_ID`]) marks a legacy single-repo DB awaiting adoption: the first
+/// post-migration open calls [`super::register_repo`], which rewrites the placeholder to the real
+/// content-derived `repo_id` in one step. A consolidated DB holding more than one repo never
+/// carries the placeholder — `register_repo` refuses to adopt when a different real id already
+/// owns the DB.
+///
+/// `repo_roots`/`repo_meta` carry an `ON DELETE CASCADE` FK to `repos` (NOT to a reindex-volatile
+/// parent), so the volatile-FK trip-wire does not flag them and they need no allowlist entry.
+///
+/// Idempotent AND adoption-safe: `CREATE TABLE IF NOT EXISTS` + a placeholder seed guarded by "no
+/// real repo row exists yet". `schema::apply` re-runs every additive migration, and
+/// `IndexDatabase::rebuild` takes that path (via `create_or_migrate`) on an ALREADY-adopted DB — so
+/// the seed must not re-mint the placeholder after `register_repo` UPDATE'd its PK to the real id.
+/// A fresh DB (empty `repos`), a forward-migrated V037 index (empty `repos`), and a re-apply of an
+/// adopted DB (a real row present) all converge correctly: the first two seed the placeholder, the
+/// last leaves the real row untouched.
+pub(crate) fn apply_repos_registry(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(REPOS_REGISTRY_DDL)
+}
+
+/// V038 DDL. The placeholder literal `'__unassigned__'` MUST equal [`super::LEGACY_REPO_ID`] —
+/// `super::register_repo` reads that constant when it adopts the row (a matching bootstrap test
+/// pins the two together).
+pub(crate) const REPOS_REGISTRY_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS repos(
+        repo_id          TEXT PRIMARY KEY,
+        display_name     TEXT NOT NULL,
+        registered_at_ms INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS repo_roots(
+        repo_id          TEXT NOT NULL REFERENCES repos(repo_id) ON DELETE CASCADE,
+        root             TEXT NOT NULL,
+        registered_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(repo_id, root)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS repo_meta(
+        repo_id TEXT NOT NULL REFERENCES repos(repo_id) ON DELETE CASCADE,
+        key     TEXT NOT NULL,
+        value   TEXT,
+        PRIMARY KEY(repo_id, key)
+    ) STRICT;
+    -- Adoption placeholder (MUST equal schema::LEGACY_REPO_ID). A legacy single-repo DB carries
+    -- exactly this one row until register_repo() rewrites it to the real content-derived repo_id.
+    -- Seed ONLY when no real (non-placeholder) repo already owns the DB: schema::apply re-runs \
+                                             every
+    -- additive migration, and IndexDatabase::rebuild reaches it (via create_or_migrate) on an
+    -- ALREADY-adopted DB — where the placeholder's PK has been UPDATE'd to the real id, so a plain
+    -- INSERT OR IGNORE would find no conflict and resurrect the marker beside the real row. The
+    -- WHERE NOT EXISTS guard makes the seed a no-op once a real repo exists; INSERT OR IGNORE \
+                                             keeps
+    -- it idempotent when only the placeholder is present (fresh / forward-migrated re-apply).
+    INSERT OR IGNORE INTO repos(repo_id, display_name, registered_at_ms)
+        SELECT '__unassigned__', '', 0
+        WHERE NOT EXISTS (SELECT 1 FROM repos WHERE repo_id != '__unassigned__');
+";
 
 /// V035: add `symbols.is_test` (cross-language test-code marker computed at parse time; see
 /// `parser::detect_is_test`) so clone detection can keep tests out of the corpus. Idempotent via
