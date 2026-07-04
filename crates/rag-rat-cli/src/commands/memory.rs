@@ -10,10 +10,24 @@ use crate::render::print_output;
 
 /// Dream-mode worklist (#122): run the deterministic memory-maintenance pass (coverage gaps +
 /// stale references), sync it into `dream_findings`, and render the open worklist. Writes ONLY to
-/// `dream_findings` — never mutates a memory.
+/// `dream_findings` / the derived `memory_reality` + `memory_summaries` siblings — never mutates a
+/// `repo_memories` row.
+///
+/// `--verify` turns on the dream v2 verification pass: the deterministic `memory_unverifiable`
+/// findings always, and — when `[dream.model] enabled = true` — the out-of-process model verdict
+/// pass (writing `memory_reality` verdicts + `memory_divergence` findings). `--compact`
+/// (independent of `--verify`) turns on the compaction pass: when the model is enabled it rewrites
+/// un-summarized memories into `memory_summaries`. With neither flag the run is byte-identical to
+/// the v1 deterministic worklist.
 pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // `dream` WRITES dream_findings — serialize with the watcher/index like every other write
     // command (index/maintenance/oracle); WriteLock is reentrant so the open-time migrate is safe.
+    //
+    // ACCEPTED v1 POSTURE: with the model enabled, the verdict/compact passes run their whole
+    // budget (minutes of out-of-process network I/O) while HOLDING this lock, so the watcher and
+    // indexer block for the run's duration. That is acceptable because `dream --verify/--compact`
+    // is an EXPLICIT, human-invoked batch command run at most a few times a day — not a hot path.
+    // A finer-grained lock (release during model I/O) is deferred until that cadence proves wrong.
     let lock_repo = rag_rat_core::locks::write_lock_repo_id(config);
     let _lock = rag_rat_core::locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
     let db = open_index(config)?;
@@ -21,10 +35,34 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let report = db.dream_run(rag_rat_core::dream::DreamOptions {
+    let opts = rag_rat_core::dream::DreamOptions {
         now_ms,
         limit: args.limit.unwrap_or(20) as usize,
-    })?;
+        verify: args.verify,
+    };
+    // The model passes run only when the operator asked for the matching flag AND enabled the model
+    // in config — the generative-model dependency stays strictly opt-in (#122). One client is built
+    // (out-of-process) and borrowed by whichever passes are active; with the model disabled, both
+    // are `None` and the run stays 100% deterministic.
+    let model_enabled = config.dream.model.enabled;
+    // A model-pass flag with the model disabled would otherwise run silently as a
+    // deterministic-only pass; name the config key so the operator knows why no
+    // verdicts/summaries were written.
+    if (args.verify || args.compact) && !model_enabled {
+        eprintln!(
+            "note: --verify/--compact was requested but [dream.model] enabled = false — running \
+             the deterministic passes only; set [dream.model] enabled = true to run the model \
+             verdict/compaction pass."
+        );
+    }
+    let budget = args.max_memories.unwrap_or(20) as usize;
+    let model = (model_enabled && (args.verify || args.compact))
+        .then(|| rag_rat_core::dream::HttpVerdictModel::from_config(&config.dream.model));
+    let verdict_pass = (args.verify && model_enabled)
+        .then(|| rag_rat_core::dream::VerdictPass { model: model.as_ref().unwrap(), budget });
+    let compact_pass = (args.compact && model_enabled)
+        .then(|| rag_rat_core::dream::CompactPass { model: model.as_ref().unwrap(), budget });
+    let report = db.dream_run_with_passes(opts, verdict_pass, compact_pass)?;
     print_output(&report)
 }
 

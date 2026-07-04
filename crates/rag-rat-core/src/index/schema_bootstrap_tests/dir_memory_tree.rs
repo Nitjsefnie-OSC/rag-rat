@@ -318,6 +318,8 @@ fn dir_tree_label_depth_collapse_single_child_chain() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -547,6 +549,8 @@ fn dir_tree_truncates_at_max_nodes() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();
@@ -693,6 +697,8 @@ fn dir_tree_children_of_collapsed_node_use_leaf_labels() {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     let db = IndexDatabase::rebuild(&config).unwrap();

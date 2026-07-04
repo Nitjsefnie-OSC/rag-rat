@@ -199,6 +199,23 @@ pub(crate) struct DreamArgs {
     /// Max coverage-gap findings to surface (stale-reference findings are always all reported).
     #[arg(long)]
     pub limit: Option<u32>,
+    /// Run the memory verification pass (dream v2). Emits `memory_unverifiable` findings
+    /// deterministically; with `[dream.model] enabled = true` it also runs the out-of-process
+    /// model verdict pass, writing `memory_reality` verdicts and `memory_divergence` findings.
+    /// Off by default, so plain `rag-rat dream` stays byte-identical.
+    #[arg(long)]
+    pub verify: bool,
+    /// Run the memory compaction pass (dream v2 pass 2). With `[dream.model] enabled = true` it
+    /// runs the out-of-process model compaction pass, rewriting un-summarized memories into 3–4
+    /// sentence summaries in `memory_summaries`. Off by default; independent of `--verify`, so
+    /// plain `rag-rat dream` stays byte-identical.
+    #[arg(long)]
+    pub compact: bool,
+    /// Max memories each model pass may process in one run (the budget the churn-skip queues are
+    /// capped at). Defaults to 20. Only meaningful with `--verify` / `--compact` and an enabled
+    /// model.
+    #[arg(long)]
+    pub max_memories: Option<u32>,
 }
 
 #[derive(Debug, Args)]

@@ -83,6 +83,8 @@ fn rag_rat_config(root: &Path) -> Config {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     }
 }
@@ -212,6 +214,8 @@ fn markdown_config_for_root(root: PathBuf) -> Config {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     }
 }
@@ -348,6 +352,8 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     }
 }
@@ -695,6 +701,8 @@ fn git_fixture_for_overlay_tests() -> (PathBuf, Config) {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     (root, config)
@@ -816,6 +824,8 @@ fn write_four_renamed_clones(root: &PathBuf) -> IndexDatabase {
         version_check: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
+        dream: Default::default(),
+        memory: Default::default(),
         log: Default::default(),
     };
     IndexDatabase::rebuild(&config).unwrap()

@@ -366,3 +366,65 @@ maintenance --max-seconds 30` in the background so branch switches, merges, reba
 refresh the current worktree index and advance changed-first embedding reconciliation without
 blocking normal Git operations. Each maintenance pass also runs a worktree-safe `gc` that prunes
 index rows for commits no longer held by any live worktree (run `rag-rat gc` to prune on demand).
+
+## Dream verdict model (`[dream.model]`)
+
+`[dream.model]` configures the dream verify pass's **model verdict** — rag-rat's only
+generative-model dependency. It is **out-of-process, opt-in, and gated by a deterministic layer**:
+`rag-rat dream` stays 100% deterministic unless you pass `--verify` *and* enable the model here.
+
+```toml
+[dream.model]
+enabled = false                     # off by default — the model turn is skipped
+endpoint = "http://localhost:11434" # OpenAI-compatible chat server (a local Ollama by default)
+model = "qwen3:4b-instruct"    # server-side model name sent in the request body
+request_timeout_s = 300             # per-request HTTP timeout (CPU inference over a large evidence pack is slow)
+```
+
+The client speaks the standard `/v1/chat/completions` route (temperature 0, no streaming), so any
+compatible server works (Ollama, vLLM, …). Run it with:
+
+```bash
+rag-rat dream --verify --max-memories 20
+```
+
+`--verify` always runs the **deterministic** verification findings (`memory_unverifiable`). When
+`enabled = true`, it additionally runs the model verdict pass: for each memory in a **churn-skip
+queue** (only memories whose body or bound files changed, or that were never checked — capped by
+`--max-memories`), it renders a mechanical evidence pack, asks the model for a `current | diverged`
+verdict (a fabricated citation is rejected, retried once, then discarded), and records the verdict in
+the derived `memory_reality` table. A `diverged` verdict opens a `memory_divergence` finding for the
+review flow. The model **proposes**; it never changes a memory's status. Leaving `enabled = false`
+skips the model turn entirely — no network calls, deterministic findings only.
+
+`--compact` (independent of `--verify`, and gated the same way on `[dream.model] enabled = true`)
+runs the **compaction pass**, which rewrites each un-summarized memory into a 3–4 sentence,
+self-contained summary and stores it in the derived `memory_summaries` table:
+
+```bash
+rag-rat dream --compact --max-memories 20
+```
+
+It is a churn-skip queue too — a memory is (re)compacted only when it has no summary for its
+**current** body (a body edit self-invalidates the old one). The summary is generated from the note
+body alone (no code context, no tools — measured to give the highest fidelity), and it must pass
+deterministic acceptance guards (3–4 sentences, ≤110 words, no paragraph breaks, and every tracker
+reference it cites must resolve in the indexed papertrail); a failing summary is retried once, then
+dropped (no row is stored, so the surface falls back to the title). The pass **never** writes a
+`repo_memories` column.
+
+## Memory surfacing (`[memory] surface`)
+
+`[memory] surface` controls how drive-by memory attachments render. The default is `full`
+(byte-identical to today's mechanical header). Set it to `summary` to have the primary MCP
+attachment (`impact_surface`'s compact `repo_memories`) show the dream-compacted summary plus a
+plain-text verdict marker (`[verdict: diverged]` / `[verdict: current @<short-commit>]`) for each
+memory that has one:
+
+```toml
+[memory]
+surface = "full"   # or "summary" — render title + compacted summary + verdict marker
+```
+
+A memory with no summary for its current body falls back to title-only. `memory show` /
+`memory_show` **always** return the full body, regardless of this setting — it is the expand path.
