@@ -161,9 +161,12 @@ fn consolidate_custom_pin_remedy_moves_then_imports() {
     let out = run(&root, &data_dir, &model_cache, &["consolidate"]);
     assert!(!out.status.success(), "a custom pin must be refused");
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // The remedy interpolates real paths via `Path::display()` (native `\` on Windows); normalize
+    // separators for the suffix checks — the message content, not the separator, is what matters.
+    let stderr_norm = stderr.replace('\\', "/");
     assert!(stderr.contains("mv "), "the custom remedy prints the literal move: {stderr}");
     assert!(
-        stderr.contains("my-index.sqlite") && stderr.contains(".rag-rat/index.sqlite"),
+        stderr_norm.contains("my-index.sqlite") && stderr_norm.contains(".rag-rat/index.sqlite"),
         "the move names the user's actual paths: {stderr}"
     );
     assert!(custom.exists(), "REFUSED: the custom index is untouched");
@@ -293,7 +296,7 @@ fn consolidate_refuses_a_pin_at_a_missing_path_and_accepts_a_pin_at_global() {
         root.join("rag-rat.toml"),
         format!(
             "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
-            global.display()
+            common::toml_path(&global)
         ),
     )
     .unwrap();
@@ -466,7 +469,7 @@ fn consolidate_imports_a_lingering_legacy_under_a_pin_at_global() {
         root.join("rag-rat.toml"),
         format!(
             "[index]\nroot = \".\"\ndatabase = \"{}\"\n\n[target_bindings]\nrust = [\"src\"]\n",
-            global.display()
+            common::toml_path(&global)
         ),
     )
     .unwrap();

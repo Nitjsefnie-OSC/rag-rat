@@ -1737,6 +1737,13 @@ fn resolve_relative_cookbook_path(cookbook: &str, config_dir: &Path) -> Option<S
         return None; // npm spec or already absolute → leave verbatim
     }
     let resolved = config_dir.join(first);
+    // NATIVE separator, no slash rewrite. This string is a single `argv` entry for `node`/`npx tsx
+    // <path>` (spawned directly, not through a shell), and both accept the platform-native
+    // separator — `\` on Windows, `/` on Unix — so the join output is already correct as-is.
+    // Rewriting `\`→`/` would be wrong two ways: on Windows it corrupts a verbatim
+    // extended-length prefix (canonicalize can yield `\\?\C:\repo`, where the suffix MUST stay
+    // backslash-delimited), and on Unix it would mangle a literal backslash in a filename.
+    // `to_string_lossy` touches neither.
     let mut out = resolved.to_string_lossy().into_owned();
     for arg in tokens {
         out.push(' ');
@@ -2021,6 +2028,11 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Test-only: forward-slashes a real filesystem path so it can be embedded in a
+    // double-quoted TOML string value without Windows `\U`/`\R` invalid-escape parse
+    // errors.
+    use path_slash::PathExt;
 
     use super::*;
 
@@ -2460,7 +2472,10 @@ mod tests {
             &config_path,
             format!(
                 "[index]\nroot = \".\"\ndatabase = \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                global.display()
+                // Forward-slash (path-slash): a Windows `C:\…` path has invalid TOML escapes
+                // (`\U`, …); `/` is TOML-safe and `Path` treats the separators as equivalent
+                // there.
+                global.to_slash_lossy()
             ),
         )
         .unwrap();
@@ -2476,7 +2491,10 @@ mod tests {
             format!(
                 "[index]\nroot = \".\"\nrepo_id = \"pinned-project\"\ndatabase = \
                  \"{}\"\n[target_bindings]\nrust = [\"src\"]\n",
-                global.display()
+                // Forward-slash (path-slash): a Windows `C:\…` path has invalid TOML escapes
+                // (`\U`, …); `/` is TOML-safe and `Path` treats the separators as equivalent
+                // there.
+                global.to_slash_lossy()
             ),
         )
         .unwrap();
@@ -3528,26 +3546,55 @@ mod tests {
     #[test]
     fn resolve_relative_cookbook_path_anchors_relative_recipe_paths_to_config_dir() {
         let dir = Path::new("/repo/sub");
-        // Relative path-shaped specs → resolved against config_dir; the trailing args are
-        // preserved.
-        assert_eq!(
-            resolve_relative_cookbook_path("./recipes/x.mts", dir).as_deref(),
-            Some("/repo/sub/./recipes/x.mts")
-        );
-        assert_eq!(
-            resolve_relative_cookbook_path("../cookbook.mjs modal", dir).as_deref(),
-            Some("/repo/sub/../cookbook.mjs modal")
-        );
+
+        // A path-shaped spec resolves its FIRST token against `config_dir` and preserves any
+        // trailing provider args verbatim. The resolved token carries the platform-NATIVE
+        // separator (`\` on Windows), so assert it as a `Path`, not a `String`: `Path`
+        // equality is separator-agnostic on Windows and normalizes a mid-path `.` on every
+        // OS, so one assertion holds cross-platform without hardcoding a separator
+        // rendering.
+        let anchored = |spec: &str| -> (PathBuf, String) {
+            let out = resolve_relative_cookbook_path(spec, dir).expect("path-shaped spec resolves");
+            match out.split_once(' ') {
+                Some((path, rest)) => (PathBuf::from(path), rest.to_string()),
+                None => (PathBuf::from(out), String::new()),
+            }
+        };
+
+        let (path, rest) = anchored("./recipes/x.mts");
+        assert_eq!(path, dir.join("./recipes/x.mts"));
+        assert_eq!(rest, "");
+
+        let (path, rest) = anchored("../cookbook.mjs modal");
+        assert_eq!(path, dir.join("../cookbook.mjs"));
+        assert_eq!(rest, "modal");
+
         // A bare relative `.ts`/`.mts`/`.js` path (no `./`) is still path-shaped → resolved.
-        assert_eq!(
-            resolve_relative_cookbook_path("recipe.mts", dir).as_deref(),
-            Some("/repo/sub/recipe.mts")
-        );
+        let (path, rest) = anchored("recipe.mts");
+        assert_eq!(path, dir.join("recipe.mts"));
+        assert_eq!(rest, "");
+
         // npm package specs and a bare token are LEFT VERBATIM (None).
         assert_eq!(resolve_relative_cookbook_path("@rag-rat/cookbook modal", dir), None);
         assert_eq!(resolve_relative_cookbook_path("some-pkg", dir), None);
-        // An ALREADY-ABSOLUTE recipe path is left verbatim (None).
-        assert_eq!(resolve_relative_cookbook_path("/abs/recipe.mjs runpod", dir), None);
+        // An ALREADY-ABSOLUTE recipe path is left verbatim (None). Use a platform-absolute path: a
+        // bare `/abs/...` is NOT absolute on Windows (no drive), so it wouldn't reach the
+        // absolute-bailout branch there.
+        #[cfg(windows)]
+        let abs_recipe = r"C:\abs\recipe.mjs runpod";
+        #[cfg(not(windows))]
+        let abs_recipe = "/abs/recipe.mjs runpod";
+        assert_eq!(resolve_relative_cookbook_path(abs_recipe, dir), None);
+
+        // Drive-agnostic on Windows: a NON-C drive anchors the same way (the `E:` prefix survives
+        // untouched). An absolute `E:\…` recipe is still left verbatim.
+        #[cfg(windows)]
+        {
+            let out = resolve_relative_cookbook_path("./r/x.mts", Path::new(r"E:\proj"))
+                .expect("relative recipe on a non-C drive resolves");
+            assert_eq!(PathBuf::from(out), Path::new(r"E:\proj").join("./r/x.mts"));
+            assert_eq!(resolve_relative_cookbook_path(r"E:\abs\recipe.mjs", dir), None);
+        }
     }
 
     #[test]
