@@ -66,8 +66,11 @@ export interface BackendServerSpec {
    * itself — that's baked into the image. Capability-aware via `input.capability` (default `embed`):
    * vLLM includes `--runner pooling` (embedding mode) for `embed` and OMITS it for `chat` (the
    * default generation runner). Absent/null capability → `embed`, so existing callers are unaffected.
+   *
+   * MAY be async: the vLLM chat path fetches the model's context length from HuggingFace to size
+   * `--max-model-len` (see {@link chatMaxModelLen}). Providers `await` the result.
    */
-  entrypointArgs(input: CookbookInput): readonly string[];
+  entrypointArgs(input: CookbookInput): readonly string[] | Promise<readonly string[]>;
   /** Container env as a plain record; a provider maps it to its own shape. */
   env(input: CookbookInput): Record<string, string>;
   /**
@@ -85,6 +88,49 @@ const OLLAMA_PORT = 11434;
 const INFINITY_PORT = 7997;
 /** vLLM's OpenAI server default port. */
 const VLLM_PORT = 8000;
+
+/**
+ * The chat context cap. Without `--max-model-len`, vLLM sizes its KV cache for the model's FULL
+ * native context — for a modern instruct model that is huge (Qwen3's is 262144), needing ~36 GiB of
+ * KV cache, so on a modest GPU (an L4 holds ~12 GiB of KV → ~86K tokens) vLLM aborts engine startup
+ * with a ValueError and the box never becomes ready. The dream verdict/compaction prompts are small,
+ * so bounding the window is ample and keeps startup inside a single-GPU budget.
+ */
+const VLLM_CHAT_MAX_MODEL_LEN_CAP = 32768;
+
+/**
+ * Timeout for the model-config lookup — a tiny JSON fetch, so a few seconds is ample. Bounds a
+ * DNS/TCP/proxy stall so it can't hold provisioning open until the Rust-side hard timeout (the
+ * cookbook contract requires provisioning fetches to be bounded).
+ */
+const HF_CONFIG_FETCH_TIMEOUT_MS = 8000;
+
+/**
+ * `--max-model-len` for a vLLM CHAT box, or `null` to pass NO cap. The cap bounds a huge-context
+ * model so vLLM's KV cache fits a single GPU, but must NEVER exceed the model's own context (a
+ * `--max-model-len` larger than the model's `max_position_embeddings` makes vLLM error the other
+ * way — a 4K/8K chat model must not be forced to 32K). We read the model's context from its public
+ * HuggingFace `config.json` (the box downloads from the same host anyway) and take the min.
+ *
+ * When the context can't be determined — fetch/parse error, timeout, gated model, or a config
+ * without `max_position_embeddings` — we return `null` and pass NO `--max-model-len`, letting vLLM
+ * use the model's own default. We deliberately do NOT fall back to the cap: forcing 32K on an
+ * unknown (possibly short) model would recreate the very startup failure this guards against.
+ */
+async function chatMaxModelLen(model: string): Promise<number | null> {
+  try {
+    const res = await fetch(`https://huggingface.co/${model}/resolve/main/config.json`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(HF_CONFIG_FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) return null;
+    const cfg = (await res.json()) as { max_position_embeddings?: unknown };
+    const ctx = cfg.max_position_embeddings;
+    return typeof ctx === "number" && ctx > 0 ? Math.min(VLLM_CHAT_MAX_MODEL_LEN_CAP, ctx) : null;
+  } catch {
+    return null;
+  }
+}
 
 const OLLAMA_SPEC: BackendServerSpec = {
   backend: "ollama",
@@ -154,11 +200,18 @@ const VLLM_SPEC: BackendServerSpec = {
   // is deprecated as of v0.11); for `chat` we OMIT it so vLLM uses its default GENERATION runner and
   // serves `/v1/chat/completions`. Passing `--runner pooling` for chat would force embedding mode and
   // 404 the chat route — the whole reason chat drops the flag.
-  entrypointArgs: (input) => {
+  entrypointArgs: async (input) => {
     const capability = input.capability ?? "embed";
     const args = [input.model];
     if (capability === "embed") {
       args.push("--runner", "pooling");
+    } else {
+      // chat: bound the context so vLLM's KV cache fits a single-GPU budget, but ONLY when we could
+      // read the model's context — otherwise pass no cap and let vLLM default (see chatMaxModelLen).
+      const maxLen = await chatMaxModelLen(input.model);
+      if (maxLen != null) {
+        args.push("--max-model-len", String(maxLen));
+      }
     }
     args.push("--host", "0.0.0.0", "--port", String(VLLM_PORT));
     // Map the concurrency cap to vLLM's max concurrent sequences when set.
