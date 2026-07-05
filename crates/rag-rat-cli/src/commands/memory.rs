@@ -14,7 +14,7 @@ use crate::render::print_output;
 /// `repo_memories` row.
 ///
 /// `--verify` turns on the dream v2 verification pass: the deterministic `memory_unverifiable`
-/// findings always, and — when `[dream.model] enabled = true` — the out-of-process model verdict
+/// findings always, and — when `[llm.dream] enabled = true` — the out-of-process model verdict
 /// pass (writing `memory_reality` verdicts + `memory_divergence` findings). `--compact`
 /// (independent of `--verify`) turns on the compaction pass: when the model is enabled it rewrites
 /// un-summarized memories into `memory_summaries`. With neither flag the run is byte-identical to
@@ -44,23 +44,48 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // in config — the generative-model dependency stays strictly opt-in (#122). One client is built
     // (out-of-process) and borrowed by whichever passes are active; with the model disabled, both
     // are `None` and the run stays 100% deterministic.
-    let model_enabled = config.dream.model.enabled;
+    let model_enabled = config.llm.dream.enabled;
     // A model-pass flag with the model disabled would otherwise run silently as a
     // deterministic-only pass; name the config key so the operator knows why no
     // verdicts/summaries were written.
     if (args.verify || args.compact) && !model_enabled {
         eprintln!(
-            "note: --verify/--compact was requested but [dream.model] enabled = false — running \
-             the deterministic passes only; set [dream.model] enabled = true to run the model \
+            "note: --verify/--compact was requested but [llm.dream] enabled = false — running the \
+             deterministic passes only; set [llm.dream] enabled = true to run the model \
              verdict/compaction pass."
         );
     }
     let budget = args.max_memories.unwrap_or(20) as usize;
-    let model = (model_enabled && (args.verify || args.compact))
-        .then(|| rag_rat_core::dream::HttpVerdictModel::from_config(&config.dream.model));
-    let verdict_pass = (args.verify && model_enabled)
+    let remote = &config.llm.dream.remote;
+    // Build the model client when a model pass is asked-for AND enabled. For an EPHEMERAL
+    // `[llm.dream.remote]` (cookbook set), provision a GPU box first — but a ZERO-WORK GUARD skips
+    // that entirely when the churn-skip queues are already drained, so an idle `dream --verify`
+    // never cold-starts a paid box. `_provisioned` holds the box for the whole run; its `Drop`
+    // tears it down after the passes finish. Connect mode (or the local-Ollama default) builds
+    // directly.
+    let mut _provisioned = None;
+    let model = if model_enabled && (args.verify || args.compact) {
+        if remote.is_ephemeral() {
+            if db.dream_model_work_pending(opts, budget, args.verify, args.compact)? {
+                let (m, provisioned) = rag_rat_core::dream::provision_verdict_model(remote)?;
+                _provisioned = Some(provisioned);
+                Some(m)
+            } else {
+                eprintln!(
+                    "note: no memories pending verification/compaction — skipping the ephemeral \
+                     `[llm.dream.remote]` GPU box for this run."
+                );
+                None
+            }
+        } else {
+            Some(rag_rat_core::dream::HttpVerdictModel::from_config(remote)?)
+        }
+    } else {
+        None
+    };
+    let verdict_pass = (args.verify && model.is_some())
         .then(|| rag_rat_core::dream::VerdictPass { model: model.as_ref().unwrap(), budget });
-    let compact_pass = (args.compact && model_enabled)
+    let compact_pass = (args.compact && model.is_some())
         .then(|| rag_rat_core::dream::CompactPass { model: model.as_ref().unwrap(), budget });
     let report = db.dream_run_with_passes(opts, verdict_pass, compact_pass)?;
     print_output(&report)

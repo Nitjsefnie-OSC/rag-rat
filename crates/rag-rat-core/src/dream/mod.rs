@@ -41,9 +41,9 @@ pub use compact::CompactPass;
 // `repo_id`.
 pub(crate) use findings::rederive_finding_ids;
 // The phase-B model verdict pass: the out-of-process verdict-model trait + its HTTP client
-// (the CLI builds one from `[dream.model]`) and the `VerdictPass` handle
+// (the CLI builds one from `[llm.dream.remote]`) and the `VerdictPass` handle
 // `dream_run_with_passes` consumes.
-pub use model::{HttpVerdictModel, VerdictModel};
+pub use model::{HttpVerdictModel, VerdictModel, provision_verdict_model};
 use rusqlite::Connection;
 use serde::Serialize;
 pub(crate) use verdict::PROMPT_VERSION as VERDICT_PROMPT_VERSION;
@@ -164,7 +164,7 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> rusqlite::Result<Drea
 
 /// [`dream_run`] plus the phase-B model verdict pass and the phase-C model compaction pass. Both
 /// model passes run BEFORE the deterministic finding computation (the CLI builds each only when
-/// `[dream.model] enabled = true`):
+/// `[llm.dream] enabled = true`):
 ///   - the VERDICT pass (gated on `verify` + a supplied [`VerdictPass`]) checks the budget-capped
 ///     churn-skip queue and writes accepted verdicts into `memory_reality`, which [`dream_run`]
 ///     then reads to derive `memory_divergence` findings (so a fresh `diverged` verdict opens a
@@ -194,6 +194,38 @@ pub fn dream_run_with_passes(
         compact::run_compact_pass(conn, pass, opts.now_ms)?;
     }
     Ok(dream_run(conn, opts)?)
+}
+
+/// Whether the model passes would call the model AT ALL this run — the zero-work guard for
+/// EPHEMERAL `[llm.dream.remote]`. A fully churn-skipped (or all-uncitable) repo returns `false`,
+/// so `rag-rat dream --verify/--compact` never cold-starts a paid GPU box that would then do zero
+/// inference — mirroring the embedding path's "never provision for zero work" rule.
+///
+/// `verify` is CITABILITY-aware, not just queue-emptiness: `run_verdict_pass` records an UNCITABLE
+/// entry (prose-only / all-`NOT FOUND`, no excerpts) as a terminal row WITHOUT calling the model,
+/// so a queue whose every entry is uncitable is zero model work. The guard therefore builds each
+/// queued entry's evidence pack and returns `true` on the FIRST citable one — matching exactly what
+/// reaches the model. `compact` has no uncitable short-circuit (every queued memory is summarized),
+/// so a non-empty compaction queue IS model work. Runs once before provisioning, budget-capped, and
+/// short-circuits — the paid box it gates makes the extra pack builds worth it.
+pub fn model_work_pending(
+    conn: &Connection,
+    opts: DreamOptions,
+    budget: usize,
+    verify: bool,
+    compact: bool,
+) -> anyhow::Result<bool> {
+    if verify {
+        for entry in verify::verification_queue(conn, opts.now_ms, budget)? {
+            if verify::evidence_pack(conn, &entry.memory_id)?.is_citable() {
+                return Ok(true);
+            }
+        }
+    }
+    if compact && compact::compaction_pending(conn, budget)? {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
