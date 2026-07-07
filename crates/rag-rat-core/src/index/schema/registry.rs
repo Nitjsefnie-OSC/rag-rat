@@ -137,11 +137,46 @@ const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 ///
 /// `now_ms` is the injected clock (see the repo's time-injection convention), stamped as the
 /// registration time on adoption / first insert.
+///
+/// Records this checkout's working-tree `root` in `repo_roots` (the "this checkout was INDEXED
+/// here" signal). This is the INDEXING entry point — rebuild / incremental / consolidate / the
+/// tests. A read-only `open_config` (doctor / MCP / query) must NOT record the root; it calls
+/// [`register_repo_read_only`] instead (see that function for why, #427).
 pub fn register_repo(
     conn: &Connection,
     identity: &RepoIdentity,
     root: &Path,
     now_ms: i64,
+) -> rusqlite::Result<String> {
+    register_repo_inner(conn, identity, root, now_ms, true)
+}
+
+/// Register/adopt `identity` WITHOUT recording the working-tree `root` in `repo_roots` — the
+/// read-only open path (`open_config`: doctor / MCP / query, #427). A recorded root is the "this
+/// checkout was INDEXED here" signal `is_root_already_indexed` / `same_identity_join_note` key on,
+/// so a mere read must not create one: otherwise a fresh same-identity clone that was only ever
+/// opened for reading would masquerade as indexed and let a later empty index prune the shared
+/// scope. All the identity work (adopt placeholder → real, `local:` → Portable upgrade, refuse a
+/// conflicting owner) still runs — a read on a legacy DB still adopts it — only the `repo_roots`
+/// INSERT is skipped; the next indexing pass records the root.
+pub fn register_repo_read_only(
+    conn: &Connection,
+    identity: &RepoIdentity,
+    root: &Path,
+    now_ms: i64,
+) -> rusqlite::Result<String> {
+    register_repo_inner(conn, identity, root, now_ms, false)
+}
+
+/// The registration impl shared by [`register_repo`] (records the root) and
+/// [`register_repo_read_only`] (does not). `record_root` gates ONLY the `repo_roots` INSERT; every
+/// identity decision below is identical.
+fn register_repo_inner(
+    conn: &Connection,
+    identity: &RepoIdentity,
+    root: &Path,
+    now_ms: i64,
+    record_root: bool,
 ) -> rusqlite::Result<String> {
     // Defense in depth: the resolver already refuses a pinned placeholder and never derives it, but
     // a caller can hand-build a `RepoIdentity`. Registering the placeholder (or an empty/whitespace
@@ -215,7 +250,14 @@ pub fn register_repo(
         // retires the local id into the registered one.
         if let Some(owner) = real_root_owner(conn, &root_str, &identity.repo_id)? {
             if late_upgrade_is_proven(conn, &owner, identity, root)? {
-                merge_local_incumbent_into_registered(conn, identity, &owner, &root_str, now_ms)?;
+                merge_local_incumbent_into_registered(
+                    conn,
+                    identity,
+                    &owner,
+                    &root_str,
+                    now_ms,
+                    record_root,
+                )?;
                 persist_shallow_boundary(conn, identity)?;
                 return Ok(identity.repo_id.clone());
             }
@@ -225,7 +267,9 @@ pub fn register_repo(
                 &root_str,
             )));
         }
-        record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
+        if record_root {
+            record_repo_root(conn, &identity.repo_id, &root_str, now_ms)?;
+        }
         persist_shallow_boundary(conn, identity)?;
         return Ok(identity.repo_id.clone());
     }
@@ -419,7 +463,9 @@ pub fn register_repo(
         crate::index::graph_index::realign_logical_symbol_ids(&tx)?;
         tx.execute("DELETE FROM repos WHERE repo_id = ?1", [source_id])?;
     }
-    record_repo_root(&tx, &identity.repo_id, &root_str, now_ms)?;
+    if record_root {
+        record_repo_root(&tx, &identity.repo_id, &root_str, now_ms)?;
+    }
     // Record a fresh LocalOnly adoption's shallow boundary INSIDE the transaction (atomic with the
     // `repos` row it references), so a future deepened clone can prove the upgrade against it. A
     // no-op for a Portable identity (empty boundary) and for the upgrade path itself (Portable
@@ -564,6 +610,7 @@ fn merge_local_incumbent_into_registered(
     owner: &str,
     root_str: &str,
     now_ms: i64,
+    record_root: bool,
 ) -> rusqlite::Result<()> {
     let _merge_locks = match conn.path().filter(|p| !p.is_empty()) {
         Some(db_path) =>
@@ -613,7 +660,9 @@ fn merge_local_incumbent_into_registered(
         owner
     ])?;
     tx.execute("DELETE FROM repos WHERE repo_id = ?1", [owner])?;
-    record_repo_root(&tx, &identity.repo_id, root_str, now_ms)?;
+    if record_root {
+        record_repo_root(&tx, &identity.repo_id, root_str, now_ms)?;
+    }
     tx.commit()?;
     tracing::warn!(
         old_repo_id = %owner,
@@ -726,8 +775,13 @@ fn find_upgradeable_local_incumbent(
 
 /// Whether `repo_id` has `root` recorded in `repo_roots` — the upgrade scan's working-tree match
 /// (both sides store the identical `to_string_lossy` rendering of a `Config::load`-canonicalized
-/// root, so equality is exact).
-fn repo_has_recorded_root(conn: &Connection, repo_id: &str, root: &str) -> rusqlite::Result<bool> {
+/// root, so equality is exact). Also the #427 same-identity-join hint's known-checkout test:
+/// telling a repo's own re-index from a NEW physical checkout adopting its scope.
+pub(crate) fn repo_has_recorded_root(
+    conn: &Connection,
+    repo_id: &str,
+    root: &str,
+) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM repo_roots WHERE repo_id = ?1 AND root = ?2)",
         params![repo_id, root],
@@ -998,7 +1052,7 @@ pub(crate) fn resolve_config_repo_id(
 
 /// Whether `repo_id` is a REGISTERED real repo (present in `repos`, and not the placeholder
 /// marker).
-fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
+pub(crate) fn repo_id_is_registered(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
     if repo_id == LEGACY_REPO_ID {
         return Ok(false);
     }
@@ -1036,6 +1090,20 @@ fn real_repo_ids(conn: &Connection) -> rusqlite::Result<Vec<String>> {
         conn.prepare("SELECT repo_id FROM repos WHERE repo_id != ?1 ORDER BY repo_id")?;
     let ids = stmt.query_map([LEGACY_REPO_ID], |row| row.get::<_, String>(0))?;
     ids.collect()
+}
+
+/// The earliest-registered recorded root for `repo_id` (a representative "home" checkout to name
+/// in the #427 join hint), or `None` when the repo has no recorded roots. Read-only.
+pub(crate) fn earliest_recorded_root(
+    conn: &Connection,
+    repo_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT root FROM repo_roots WHERE repo_id = ?1 ORDER BY registered_at_ms, root LIMIT 1",
+        params![repo_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
 }
 
 /// Append a working-tree root for `repo_id` (idempotent per `(repo_id, root)` — worktrees of one

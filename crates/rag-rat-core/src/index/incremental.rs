@@ -56,14 +56,35 @@ impl IndexDatabase {
         // correct repo — the exact sequence `open_config` uses.
         let mut db =
             Self::open_bare(&config.database, super::lifecycle::BareOpenMode::AdoptionPending)?;
+        // #427 — enforce the empty-index invariant HERE, BEFORE `adopt_repo_from_config` records
+        // this checkout's root. Enforcing after adoption would defeat the check: adoption registers
+        // the repo + records the root, so a post-adoption "was this already indexed?" test would
+        // see the just-recorded root and wave an empty first-time registration through (the
+        // exact seam the earlier rebuild-only guard missed on the incremental/discover
+        // path). `open_bare` already migrated the schema, so this reads current
+        // `source_root` on the live connection: an ESTABLISHED repo whose files were just
+        // deleted still counts as indexed (its persisted `source_root` matches) and is
+        // allowed through to prune, while a genuinely first-time-empty checkout is refused
+        // before anything is registered. Callers react to the error: the watcher / git-hook
+        // `maintenance` `let _ =`-discard it and wait for content; the one-shot
+        // `index` surfaces it. `--allow-empty` (`config.allow_empty`) opts in.
+        if !config.allow_empty
+            && crate::index::is_first_time_empty_conn(db.storage.connection(), config)?
+        {
+            return Err(crate::index::EmptyIndexRefused {
+                root: config.root.display().to_string(),
+            }
+            .into());
+        }
         // Register/adopt the config's repo BEFORE `set_context` stamps `active_repo_id` into the
         // scope view (A3). `Self::open` scoped to the SOLE repo via the config-blind fallback; on a
         // consolidated DB that would pick the lexicographically-first repo, so this incremental
         // pass could delete/stamp rows under the WRONG repo. Adopting here — the same step
         // `open_config` and `rebuild` run — resolves the config's own identity and points
         // every repo-scoped write below at it. Idempotent on an already-adopted single-repo
-        // DB (the common case).
-        db.adopt_repo_from_config(config)?;
+        // DB (the common case). INDEXING intent: an incremental/discover pass records this
+        // checkout's root (#427).
+        db.adopt_repo_from_config(config, super::lifecycle::AdoptIntent::Indexing)?;
         let (commit_sha, worktree_id) = resolve_git_context(&config.root);
         db.set_context(&commit_sha, &worktree_id)?;
         // ADOPTION RESETS ALL CONNECTION-CARRIED REPO-DERIVED STATE BEFORE ANY DEFERRED HEAL (the
