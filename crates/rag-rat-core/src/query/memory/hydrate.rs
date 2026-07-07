@@ -2,15 +2,22 @@ use super::*;
 
 pub(crate) fn duplicate_memory_id(
     conn: &Connection,
+    kind: &str,
     title: &str,
     body: &str,
+    payload_json: Option<&str>,
     binding: Option<&ResolvedBinding>,
 ) -> anyhow::Result<Option<String>> {
-    // Dedupe NEVER crosses repos (spec §4.4): a duplicate is a same-repo title+body+binding match.
-    // The `{repo_clause}` is empty on the pre-A5 schema (memory still repo-global), so this stays
-    // the original global dedupe until the periphery-scoping migration lands. An UNANCHORED node
-    // (#463) has no binding, so its dupe is a same-repo title+body match with NO bindings — never a
-    // false collision with an anchored memory that happens to share text.
+    // Dedupe NEVER crosses repos (spec §4.4): a duplicate is a same-repo KIND+title+body+PAYLOAD+
+    // binding match — every dimension `memory_input_hash` folds, so two DISTINCT graph-node kinds
+    // (a `Concept` and a `Task`) sharing text+payload are NOT duplicates (the second must not be
+    // lost). The `{repo_clause}` is empty on the pre-A5 schema (memory still repo-global), so this
+    // stays the original global dedupe until the periphery-scoping migration lands. An UNANCHORED
+    // node (#463) has no binding, so its dupe is a same-repo title+body+payload match with NO
+    // bindings — never a false collision with an anchored memory that happens to share text. The
+    // `payload_json IS ?` compare is NULL-safe (both-null OR equal), so two polymorphic nodes
+    // (#465) with identical text but DIFFERENT payloads are NOT duplicates — neither collapses
+    // onto the other (which would silently drop the second's payload).
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
     match binding {
@@ -20,15 +27,24 @@ pub(crate) fn duplicate_memory_id(
         SELECT repo_memories.id AS memory_id
         FROM repo_memories
         JOIN repo_memory_bindings ON repo_memory_bindings.memory_id = repo_memories.id
-        WHERE lower(repo_memories.title) = lower(?1)
+        WHERE repo_memories.kind = ?6
+          AND lower(repo_memories.title) = lower(?1)
           AND lower(repo_memories.body) = lower(?2)
           AND repo_memory_bindings.binding_kind = ?3
           AND repo_memory_bindings.binding_id = ?4
+          AND repo_memories.payload_json IS ?5
           AND repo_memories.status != 'obsolete'{repo_clause}
         LIMIT 1
         "
             ),
-            params![title.trim(), body.trim(), binding.binding_kind, binding.binding_id],
+            params![
+                title.trim(),
+                body.trim(),
+                binding.binding_kind,
+                binding.binding_id,
+                payload_json,
+                kind
+            ],
             |row| row.get("memory_id"),
         ),
         None => conn.query_row(
@@ -36,8 +52,10 @@ pub(crate) fn duplicate_memory_id(
                 "
         SELECT repo_memories.id AS memory_id
         FROM repo_memories
-        WHERE lower(repo_memories.title) = lower(?1)
+        WHERE repo_memories.kind = ?4
+          AND lower(repo_memories.title) = lower(?1)
           AND lower(repo_memories.body) = lower(?2)
+          AND repo_memories.payload_json IS ?3
           AND repo_memories.status != 'obsolete'{repo_clause}
           AND NOT EXISTS (
               SELECT 1 FROM repo_memory_bindings WHERE repo_memory_bindings.memory_id = \
@@ -46,7 +64,7 @@ pub(crate) fn duplicate_memory_id(
         LIMIT 1
         "
             ),
-            params![title.trim(), body.trim()],
+            params![title.trim(), body.trim(), payload_json, kind],
             |row| row.get("memory_id"),
         ),
     }
@@ -114,6 +132,7 @@ pub(crate) fn memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoMemory
         created_at_ms: row.get("created_at_ms")?,
         updated_at_ms: row.get("updated_at_ms")?,
         source: row.get("source")?,
+        payload_json: row.get("payload_json")?,
         source_text_hash: row.get("source_text_hash")?,
         input_hash: row.get("input_hash")?,
         memory_version: row.get("memory_version")?,

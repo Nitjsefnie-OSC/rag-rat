@@ -493,10 +493,47 @@ pub(crate) fn validate_kind(kind: &str) -> anyhow::Result<()> {
         | "PlatformQuirk"
         | "FollowUp"
         | "OpenQuestion"
-        | "Obsolete" => Ok(()),
+        | "Obsolete"
+        // Polymorphic graph-node kinds (#465): legitimately unanchored (a Concept / standalone
+        // Task lives as a graph node with no code binding — see resolve_binding / #463).
+        | "Task"
+        | "Concept" => Ok(()),
         _ => anyhow::bail!("invalid memory kind `{kind}`"),
     }
 }
+/// The polymorphic graph-node kinds — `Task` and `Concept` (#463/#465). They ALONE may be created
+/// UNANCHORED (no code binding) AND may carry a structured `payload_json`; every other kind is a
+/// plain note (anchors to code, no payload). The SINGLE source of truth for the unanchored-create
+/// gate (`create`/`update_memory`), the payload-kind gate (`validate_payload`), and the dream
+/// verifier's `memory_unverifiable` exemption — they must never drift, or a create the gate allows
+/// becomes self-inflicted dream noise, or an off-contract payload/anchor slips through.
+pub(crate) fn is_polymorphic_node_kind(kind: &str) -> bool {
+    matches!(kind, "Task" | "Concept")
+}
+
+/// Validate a memory's `payload_json` for its `kind`. Only the polymorphic graph-node kinds
+/// (`is_polymorphic_node_kind`) may carry a payload, and it must be a JSON OBJECT (so it
+/// round-trips and can be folded into the identity hash). A payload on a plain-note kind, or a
+/// non-object payload, is rejected; `None` (no payload) is always fine. Payload-closure (a payload
+/// carries no node/edge references) is enforced once the edge model (#464) defines what a reference
+/// IS.
+pub(crate) fn validate_payload(kind: &str, payload_json: Option<&str>) -> anyhow::Result<()> {
+    let Some(payload) = payload_json else {
+        return Ok(());
+    };
+    if !is_polymorphic_node_kind(kind) {
+        anyhow::bail!(
+            "a `{kind}` memory carries no payload (only Task/Concept may have a payload_json)"
+        );
+    }
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|e| anyhow::anyhow!("payload_json is not valid JSON: {e}"))?;
+    if !value.is_object() {
+        anyhow::bail!("payload_json must be a JSON object");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_confidence(confidence: &str) -> anyhow::Result<()> {
     match confidence {
         "high" | "medium" | "low" => Ok(()),
@@ -542,12 +579,29 @@ pub(crate) fn memory_id(now: i64, input_hash: &str, scope: &Option<String>) -> S
     };
     format!("mem_{now:x}_{suffix}")
 }
-pub(crate) fn memory_input_hash(kind: &str, title: &str, body: &str, tags: &[String]) -> String {
+pub(crate) fn memory_input_hash(
+    kind: &str,
+    title: &str,
+    body: &str,
+    tags: &[String],
+    payload_json: Option<&str>,
+) -> String {
     let mut normalized_tags = tags.iter().map(|tag| tag.trim()).collect::<Vec<_>>();
     normalized_tags.sort_unstable();
+    // The payload is folded RAW (not canonicalized): this is the create-time dedup / id seed, which
+    // wants EXACT-input identity so two nodes with identical text but different payloads get
+    // different ids and neither collapses onto the other (#465). This is NOT the dream content
+    // identity — `dream::note_content_hash` is separate, and its CANONICAL payload fold is deferred
+    // to phase B (#404).
     hex_sha256(
-        format!("{kind}\n{}\n{}\n{}", title.trim(), body.trim(), normalized_tags.join(","))
-            .as_bytes(),
+        format!(
+            "{kind}\n{}\n{}\n{}\n{}",
+            title.trim(),
+            body.trim(),
+            normalized_tags.join(","),
+            payload_json.unwrap_or("")
+        )
+        .as_bytes(),
     )
 }
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
