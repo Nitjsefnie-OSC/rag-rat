@@ -7,6 +7,13 @@ pub(crate) fn call_tool_with_db(
     graded_history: bool,
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
+    // A JSON-RPC `tools/call` with the `arguments` object OMITTED reaches here as `Value::Null`
+    // (server.rs maps `None` → Null). `serde_json::from_value` of Null into an all-optional arg
+    // struct (e.g. `DreamArgs`) fails ("invalid type: null") BEFORE serde field defaults apply, so
+    // a bare no-arg call like `dream` would error. Normalize an absent/null argument object to
+    // an empty object so every tool's field defaults apply; a tool with REQUIRED fields still
+    // errors with a precise "missing field" message rather than a confusing type error (#514).
+    let arguments = if arguments.is_null() { json!({}) } else { arguments };
     let result = match name {
         "semantic_search" => {
             let args: SearchArgs = serde_json::from_value(arguments)?;
@@ -236,6 +243,24 @@ pub(crate) fn call_tool_with_db(
         "memory_mark_obsolete" => {
             let args: MemoryIdArgs = serde_json::from_value(arguments)?;
             json!(db.memory_mark_obsolete(&args.memory_id)?)
+        },
+        "dream" => {
+            let args: DreamArgs = serde_json::from_value(arguments)?;
+            // The MCP surface is DETERMINISTIC-ONLY: never provision a GPU box or run minutes-long
+            // model inference from a tool call — the model verdict/compaction passes stay on the
+            // CLI/cron `rag-rat dream --verify|--compact`. `verify: false` also preserves any
+            // model-derived findings a prior `--verify` run persisted (dream_run's resolve sweep is
+            // kind-scoped), so `memory_divergence` etc. still surface in this worklist.
+            json!(db.dream_run(rag_rat_core::dream::DreamOptions {
+                now_ms: now_ms(),
+                limit: args.limit as usize,
+                verify: false,
+                include_reviewed: args.all,
+            })?)
+        },
+        "dream_review" => {
+            let args: DreamReviewArgs = serde_json::from_value(arguments)?;
+            json!(db.review_dream_finding(&args.finding, args.verdict.core(), now_ms())?)
         },
         "find_clones" => {
             let args: FindClonesArgs = serde_json::from_value(arguments)?;
@@ -688,6 +713,16 @@ pub(crate) fn graph_symbol_selector(args: &SymbolGraphArgs) -> anyhow::Result<Sy
         allow_ambiguous: args.allow_ambiguous,
         limit: args.limit,
     })
+}
+
+/// Wall-clock milliseconds for the dream write tools (finding first/last-seen + review stamps).
+/// Mirrors the CLI `dream` command's inline clock — the core `now_ms` helpers are crate-private, so
+/// the MCP surface computes its own; the dream lifecycle only needs a monotonic-enough stamp.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn find_clones_tool(db: &IndexDatabase, args: FindClonesArgs) -> anyhow::Result<Value> {
