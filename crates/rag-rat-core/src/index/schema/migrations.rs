@@ -1184,6 +1184,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_047_ID => Some(47),
             MIGRATION_048_ID => Some(48),
             MIGRATION_049_ID => Some(49),
+            MIGRATION_050_ID => Some(50),
             _ => None,
         })
         .max()
@@ -1242,6 +1243,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_047_ID
             | MIGRATION_048_ID
             | MIGRATION_049_ID
+            | MIGRATION_050_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1297,6 +1299,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_047_ID => migration.checksum != MIGRATION_047_CHECKSUM,
         MIGRATION_048_ID => migration.checksum != MIGRATION_048_CHECKSUM,
         MIGRATION_049_ID => migration.checksum != MIGRATION_049_CHECKSUM,
+        MIGRATION_050_ID => migration.checksum != MIGRATION_050_CHECKSUM,
         _ => false,
     }
 }
@@ -3431,6 +3434,42 @@ pub(crate) fn apply_repo_node_edges(conn: &Connection) -> rusqlite::Result<()> {
             ON repo_node_edges(target_kind, target_anchor);
         ",
     )
+}
+
+/// V050 (#473): incremental clone-graph delta maintenance. The delta pass deletes a changed file's
+/// postings by `(build_generation, path)` — unindexed until now (the PK leads with `token_hash`) —
+/// and tracks how many files the live generation has absorbed since its full build
+/// (`delta_files_applied`, the df-drift signal that schedules the next full rebuild). Both
+/// additive + idempotent; the column type is STRICT-valid and defaulted so existing generation
+/// rows read back 0 (no deltas absorbed).
+///
+/// Pre-freeze postings are NOT delta-ready (#477 review): binaries before the df epoch freeze
+/// bumped `clone_token_df` on incremental passes WITHOUT invalidating the postings, so an
+/// upgraded index can hold a live generation whose postings are ordered by an older df than the
+/// current table — a delta patching it would compute sub-blocks under the moved df and silently
+/// miss edges. Clear `postings_written` so those generations take one full rebuild (which re-pins
+/// the epoch at its own build). Gated on the delta column being freshly ADDED, so only the first
+/// run (a genuinely pre-freeze index) invalidates — a re-apply on an already-frozen index must
+/// not throw away a valid graph.
+pub(crate) fn apply_clone_delta_maintenance(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_clone_subblock_postings_path
+             ON clone_subblock_postings(build_generation, path);",
+    )?;
+    // ORDER IS LOAD-BEARING (torn-retry safety): the invalidation runs BEFORE the gate column is
+    // added. A kill between the two leaves the column absent, so the retry re-runs the
+    // (idempotent) invalidation and then adds the column — the gate can never read "already
+    // frozen" while the clear is still owed.
+    if !column_exists(conn, "clone_graph_generations", "delta_files_applied")? {
+        conn.execute_batch("UPDATE clone_graph_generations SET postings_written = 0;")?;
+    }
+    add_column_if_missing(
+        conn,
+        "clone_graph_generations",
+        "delta_files_applied",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
 }
 
 pub(crate) fn apply_symbols_is_test(conn: &Connection) -> rusqlite::Result<()> {
