@@ -2712,7 +2712,7 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
     ))
     .unwrap();
     // Mirror state before any reclaim: derived from the stranded base rows.
-    crate::index::github::rebuild_fts(&conn).unwrap();
+    crate::index::papertrail::rebuild_fts(&conn).unwrap();
 
     // Pin the connection's active repo to repo-a (what `set_context` installs on a real open).
     conn.execute_batch(
@@ -2723,7 +2723,7 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
 
     // repo-a's sync touches o/r#7: re-discovers the ref (same natural key as the stranded row),
     // refetches the issue with fresh content, and marks the sync cursor.
-    let reference = crate::index::github::GitHubRef {
+    let reference = crate::index::papertrail::PapertrailRef {
         owner: "o".to_string(),
         repo: "r".to_string(),
         number: 7,
@@ -2733,24 +2733,24 @@ fn v044_a_syncing_repo_is_isolated_from_stranded_placeholder_github_rows() {
         source_commit: None,
         source_text: "o/r#7".to_string(),
     };
-    crate::index::github::store_ref(&conn, &reference).unwrap();
-    crate::index::github::store_issue(&conn, &crate::index::github::GitHubIssue {
-        owner: "o".to_string(),
-        repo: "r".to_string(),
-        number: 7,
-        html_url: "http://fresh".to_string(),
+    crate::index::papertrail::store_ref(&conn, &reference).unwrap();
+    crate::index::papertrail::store_item(&conn, &crate::index::papertrail::PapertrailItem {
+        project: "o/r".to_string(),
+        item_kind: crate::index::papertrail::ItemKind::Issue,
+        item_key: "7".to_string(),
+        url: "http://fresh".to_string(),
         state: "closed".to_string(),
         title: "fresh title".to_string(),
         body: "fresh body".to_string(),
         author: None,
         created_at: None,
         updated_at: None,
-        is_pull_request: false,
+        merged_at: None,
     })
     .unwrap();
-    crate::index::github::mark_ref_sync(&conn, &reference, "synced", None).unwrap();
+    crate::index::papertrail::mark_ref_sync(&conn, &reference, "synced", None).unwrap();
     // The sync tail: the whole-table mirror rebuild follows the reclaimed base rows.
-    crate::index::github::rebuild_fts(&conn).unwrap();
+    crate::index::papertrail::rebuild_fts(&conn).unwrap();
 
     // repo-a's sync wrote its OWN issue row with fresh content, under its own repo_id…
     let a_title: String = conn

@@ -3,9 +3,9 @@ pub mod anchors;
 pub mod chunker;
 pub mod edges;
 pub mod git_history;
-pub mod github;
 pub mod ignore_rules;
 pub mod oracle;
+pub mod papertrail;
 pub mod parser;
 pub mod schema;
 pub mod symbols;
@@ -102,7 +102,9 @@ use crate::index::git_history::{
     ChunkBlameSummary, CommitSearchHit, GitHistoryIndexStatus, PathHistoryItem, QueryCommitHit,
     SymbolHistoryItem,
 };
-use crate::index::github::{GitHubEvidence, GitHubStatus, GitHubSyncReport, Papertrail};
+use crate::index::papertrail::{
+    Papertrail, PapertrailEvidence, PapertrailStatus, PapertrailSyncReport,
+};
 use crate::index::symbols::Symbol;
 use crate::language::Language;
 use crate::query::graph_meta::{self, GraphMetaMode};
@@ -129,7 +131,7 @@ pub struct IndexDatabase {
     /// Injected GitHub repo context. Resolved from `gh` only in `open_config` (real usage);
     /// `rebuild`/`open` leave it offline, and tests set it explicitly — so the library never
     /// shells out to `gh` during tests (#60).
-    github: github::GitHubContext,
+    papertrail: papertrail::PapertrailContext,
     /// The config this index was opened against — present only on the config-bearing opens
     /// (`open_config` / `try_open_config_read_only`), `None` for `rebuild`/`open`/tests. Lets a
     /// read tool classify a working-tree change set against the indexed targets — the lazy
@@ -225,7 +227,7 @@ pub struct IndexStatus {
     pub parser_failures: u64,
     pub parser_failure_paths: Vec<ParserFailure>,
     pub git_history: GitHistoryIndexStatus,
-    pub github: GitHubStatus,
+    pub github: PapertrailStatus,
     pub llm: LlmStatus,
     pub anchor_health: AnchorHealth,
 }
