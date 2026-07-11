@@ -159,8 +159,10 @@ impl RagRatService {
             "status": "no_index",
             "message": "This rag-rat MCP server was started outside an indexed rag-rat repository, \
                         so it has no index to serve here.",
-            "remedy": "Run `rag-rat init` then `rag-rat index` in the repository root, then restart \
-                       (reconnect) the rag-rat MCP server so it activates against the new index.",
+            "remedy": "Run the `init-rag-rat` skill to set this repo up conversationally, or run \
+                       `rag-rat init` then `rag-rat index` in the repository root yourself. Either \
+                       way, restart (reconnect) the rag-rat MCP server afterward so it activates \
+                       against the new index.",
         });
         let text = rag_rat_core::render(&payload, self.output_format);
         CallToolResult::success(vec![Content::text(text)])
@@ -470,7 +472,7 @@ async fn run_stdio_unix(
     // match so it covers both cold start and hot-upgrade resume. On normal EOF shutdown the guard
     // aborts the task so the socket + election lock release promptly; on a hot-`exec` the process
     // image is replaced (task vanishes) and the new process re-elects.
-    let _hook_listener = AbortOnDrop(crate::claude_hook::spawn_listener(config.clone()));
+    let _hook_listener = AbortOnDrop(crate::agent_hook::spawn_listener(config.clone()));
 
     // Arm the SIGUSR1 hot-upgrade handler only when an install target is configured.
     if let Some(install_path) = install_path {

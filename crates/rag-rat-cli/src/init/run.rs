@@ -76,7 +76,9 @@ fn run_non_interactive(
     apply_embedding_runtime_env(&config.llm.embedding.runtime);
     let db = setup_index(&config)?;
     setup_model_and_reconcile(&config, &db, options.yes)?;
-    offer_hooks_install(&config, options.yes)?;
+    if !options.no_hooks {
+        offer_hooks_install(&config, options.yes)?;
+    }
     eprintln!("init: complete");
     print_mcp_connect_hint();
     Ok(())
@@ -193,18 +195,15 @@ fn config_dir(config_path: &Path) -> anyhow::Result<PathBuf> {
     Ok(dir.canonicalize().unwrap_or(dir))
 }
 
-/// Apply the hook selections the wizard returned: git maintenance hooks (honoring each foreign-hook
-/// conflict resolution) and/or the Claude Code AI hooks (project-local or global).
+/// Apply the git maintenance hooks the wizard selected, honoring each foreign-hook conflict
+/// resolution.
 ///
-/// Mirrors the install mechanics the `hooks` / `claude_hooks` commands use, but driven by the
-/// wizard's `HooksDraft` + per-hook `HookConflict` map instead of re-prompting.
+/// Mirrors the install mechanics the `hooks` command uses, but driven by the wizard's `HooksDraft`
+/// and per-hook `HookConflict` map instead of re-prompting. Claude/Codex agent hooks are installed
+/// by the rag-rat plugin, not here.
 fn apply_wizard_hooks(config: &Config, result: &WizardResult) -> anyhow::Result<()> {
     if result.hooks.git {
         apply_git_hooks(config, &result.hook_conflicts)?;
-    }
-    if result.hooks.claude {
-        // The Claude install path is identical to `rag-rat hooks install --claude [--global]`.
-        crate::claude_hooks(config, "install", result.hooks.claude_global)?;
     }
     Ok(())
 }
@@ -455,6 +454,7 @@ mod default_plan_tests {
             yes: false,
             dry_run: false,
             force: false,
+            no_hooks: false,
             config_path: config_path.clone(),
         };
         let existing = load_existing_for_wizard(&options).unwrap();
@@ -496,6 +496,7 @@ mod default_plan_tests {
             yes: false,
             dry_run: false,
             force: false,
+            no_hooks: false,
             config_path: config_path.clone(),
         };
 

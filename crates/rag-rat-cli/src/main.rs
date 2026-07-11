@@ -22,8 +22,7 @@ pub(crate) use render::*;
 
 use crate::cli::{Cli, Command as Cmd, DoctorArgs};
 
-mod claude_hook;
-mod claude_settings;
+mod agent_hook;
 mod init;
 
 // Idle-RSS fix: glibc malloc never hands freed pages back to the OS, so a long-lived `rag-rat mcp`
@@ -77,13 +76,13 @@ fn main() -> anyhow::Result<()> {
         rag_rat_core::OutputFormat::Toon
     });
 
-    // These commands must tolerate the ABSENCE of a config: `init` creates one; `claude-hook`
+    // These commands must tolerate the ABSENCE of a config: `init` creates one; `agent-hook`
     // reads its event from stdin; `mcp` serves a dormant server so a globally-registered MCP stays
     // alive outside a rag-rat repo (#603); `doctor` reports the machine-global store. Everything
     // else needs a resolved config and fails with a friendly hint when there isn't one.
     match &cli.command {
         Cmd::Init(args) => return init::run(args, cli.config.as_deref().unwrap_or("rag-rat.toml")),
-        Cmd::ClaudeHook => return claude_hook::run(),
+        Cmd::AgentHook => return agent_hook::run(),
         Cmd::Mcp => return run_mcp(cli.config.as_deref(), cli.json),
         Cmd::Doctor(args) => return run_doctor(args, cli.config.as_deref()),
         _ => {},
@@ -94,13 +93,13 @@ fn main() -> anyhow::Result<()> {
 
     // Debug logging (off unless `[log] enabled` or `RAG_RAT_LOG`). Writes are blocking (synchronous
     // to the file), so nothing is lost on exit or on the `Cmd::Mcp` hot-upgrade `exec()`.
-    // `Cmd::Init` / `Cmd::ClaudeHook` returned above (no config, and claude-hook fires
+    // `Cmd::Init` / `Cmd::AgentHook` returned above (no config, and agent-hook fires
     // per-tool-call — logging it would flood the per-process dir and evict the mcp/maintenance
     // signal).
     let _log = rag_rat_core::logging::init_logging(&config, log_role(&cli.command));
 
     match cli.command {
-        Cmd::Init(_) | Cmd::ClaudeHook | Cmd::Mcp | Cmd::Doctor(_) =>
+        Cmd::Init(_) | Cmd::AgentHook | Cmd::Mcp | Cmd::Doctor(_) =>
             unreachable!("handled before the config load above"),
         Cmd::Index(args) => index(&config, &args)?,
         Cmd::Query(args) => query(&config, &args)?,

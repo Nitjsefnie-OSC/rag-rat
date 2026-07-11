@@ -38,9 +38,10 @@ pub(crate) enum Command {
     /// Scan the repository and write a starter rag-rat.toml (interactive).
     Init(InitArgs),
 
-    /// Internal: Claude Code hook entrypoint (reads a JSON event on stdin).
+    /// Internal: coding-agent hook entrypoint (reads a JSON hook event on stdin; Claude Code,
+    /// Codex, Cursor).
     #[command(hide = true)]
-    ClaudeHook,
+    AgentHook,
 
     /// Index the repository (default: changed files only).
     Index(IndexArgs),
@@ -130,6 +131,10 @@ pub(crate) struct InitArgs {
     /// Overwrite an existing config without prompting.
     #[arg(long)]
     pub force: bool,
+    /// Skip installing the git maintenance hooks. `--yes` installs them by default; pass this to
+    /// leave `.git/hooks` untouched (e.g. an agent that asks for hook consent separately).
+    #[arg(long)]
+    pub no_hooks: bool,
 }
 
 #[derive(Debug, Args)]
@@ -620,12 +625,6 @@ pub(crate) struct HooksArgs {
     /// install, uninstall, or status.
     #[arg(value_enum)]
     pub action: HookAction,
-    /// Operate on Claude Code hooks (settings.json) instead of git hooks.
-    #[arg(long)]
-    pub claude: bool,
-    /// With --claude: target ~/.claude/settings.json instead of ./.claude.
-    #[arg(long)]
-    pub global: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -633,16 +632,6 @@ pub(crate) enum HookAction {
     Install,
     Uninstall,
     Status,
-}
-
-impl HookAction {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            HookAction::Install => "install",
-            HookAction::Uninstall => "uninstall",
-            HookAction::Status => "status",
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -762,13 +751,11 @@ mod tests {
     }
 
     #[test]
-    fn hooks_action_and_flags_parse() {
-        let cli = Cli::try_parse_from(["rag-rat", "hooks", "install", "--claude", "--global"])
-            .expect("parse");
+    fn hooks_action_parses() {
+        let cli = Cli::try_parse_from(["rag-rat", "hooks", "install"]).expect("parse");
         match cli.command {
             Command::Hooks(args) => {
                 assert_eq!(args.action, HookAction::Install);
-                assert!(args.claude && args.global);
             },
             other => panic!("expected hooks, got {other:?}"),
         }
