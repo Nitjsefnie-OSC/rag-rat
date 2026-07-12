@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use rag_rat_core::Config;
 use rmcp::model::{
@@ -12,12 +11,8 @@ use rmcp::transport::stdio;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{Map, Value};
 use tokio::sync::Semaphore;
-use tokio::task::JoinError;
 
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_TOOL_WORKERS: usize = 2;
-const TOOL_TIMEOUT_ENV: &str = "RAG_RAT_MCP_TOOL_TIMEOUT_SECS";
-const TOOL_WORKERS_ENV: &str = "RAG_RAT_MCP_TOOL_WORKERS";
+use crate::blocking::{self, ToolTimeoutPolicy};
 
 #[derive(Clone)]
 pub struct RagRatService {
@@ -61,7 +56,7 @@ impl RagRatService {
             output_format,
             #[cfg(unix)]
             inflight: crate::upgrade::Inflight::new(),
-            tool_workers: Arc::new(Semaphore::new(tool_workers())),
+            tool_workers: Arc::new(Semaphore::new(blocking::tool_workers())),
         }
     }
 
@@ -104,7 +99,7 @@ impl RagRatService {
 
     async fn call_async(&self, name: String, value: Value) -> Result<CallToolResult, ErrorData> {
         let service = self.clone();
-        let timeout = tool_timeout();
+        let timeout = blocking::tool_timeout();
         let worker_name = name.clone();
         let timeout_policy = ToolTimeoutPolicy::for_tool(&name);
         let workers = Arc::clone(&self.tool_workers);
@@ -113,7 +108,7 @@ impl RagRatService {
         // still keeps the process from hot-execing until the blocking closure actually exits.
         #[cfg(unix)]
         let inflight = self.inflight.guard();
-        run_blocking_tool(name, timeout, timeout_policy, workers, move || {
+        blocking::run_blocking_tool(name, timeout, timeout_policy, workers, move || {
             #[cfg(unix)]
             let _inflight = inflight;
             service.call(&worker_name, value)
@@ -210,171 +205,6 @@ impl ServerHandler for RagRatService {
             .collect();
         Ok(ListToolsResult { tools, meta: None, next_cursor: None })
     }
-}
-
-fn tool_timeout() -> Duration {
-    std::env::var(TOOL_TIMEOUT_ENV)
-        .ok()
-        .and_then(|raw| parse_tool_timeout(&raw))
-        .unwrap_or(DEFAULT_TOOL_TIMEOUT)
-}
-
-fn parse_tool_timeout(raw: &str) -> Option<Duration> {
-    let secs = raw.trim().parse::<u64>().ok()?;
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
-
-fn tool_workers() -> usize {
-    std::env::var(TOOL_WORKERS_ENV)
-        .ok()
-        .and_then(|raw| parse_tool_workers(&raw))
-        .unwrap_or(DEFAULT_TOOL_WORKERS)
-}
-
-fn parse_tool_workers(raw: &str) -> Option<usize> {
-    let workers = raw.trim().parse::<usize>().ok()?;
-    (workers > 0).then_some(workers)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolTimeoutPolicy {
-    ReturnTimeout,
-    WaitForCompletion,
-}
-
-impl ToolTimeoutPolicy {
-    fn for_tool(name: &str) -> Self {
-        if crate::tools::is_write_tool(name) {
-            Self::WaitForCompletion
-        } else {
-            Self::ReturnTimeout
-        }
-    }
-}
-
-async fn run_blocking_tool(
-    name: String,
-    timeout: Duration,
-    timeout_policy: ToolTimeoutPolicy,
-    workers: Arc<Semaphore>,
-    runner: impl FnOnce() -> Result<CallToolResult, ErrorData> + Send + 'static,
-) -> Result<CallToolResult, ErrorData> {
-    let started = Instant::now();
-    tracing::debug!(
-        target: "rag_rat_mcp::server",
-        tool = %name,
-        timeout_ms = timeout.as_millis(),
-        "mcp tool call started"
-    );
-
-    let Some(wait_budget) = remaining_timeout(started, timeout) else {
-        return tool_timeout_error(&name, started, timeout);
-    };
-    let permit = match tokio::time::timeout(wait_budget, workers.acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) =>
-            return Err(ErrorData::internal_error("tool worker limiter was closed", None)),
-        Err(_) => return tool_timeout_error(&name, started, timeout),
-    };
-
-    let mut handle = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        runner()
-    });
-    let Some(run_budget) = remaining_timeout(started, timeout) else {
-        return handle_elapsed_deadline(name, started, timeout, timeout_policy, &mut handle).await;
-    };
-
-    match tokio::time::timeout(run_budget, &mut handle).await {
-        Ok(joined) => finish_blocking_tool(&name, started, joined),
-        Err(_) =>
-            handle_elapsed_deadline(name, started, timeout, timeout_policy, &mut handle).await,
-    }
-}
-
-fn remaining_timeout(started: Instant, timeout: Duration) -> Option<Duration> {
-    timeout.checked_sub(started.elapsed()).filter(|remaining| !remaining.is_zero())
-}
-
-async fn handle_elapsed_deadline(
-    name: String,
-    started: Instant,
-    timeout: Duration,
-    timeout_policy: ToolTimeoutPolicy,
-    handle: &mut tokio::task::JoinHandle<Result<CallToolResult, ErrorData>>,
-) -> Result<CallToolResult, ErrorData> {
-    match timeout_policy {
-        ToolTimeoutPolicy::ReturnTimeout => tool_timeout_error(&name, started, timeout),
-        ToolTimeoutPolicy::WaitForCompletion => {
-            tracing::warn!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                timeout_ms = timeout.as_millis(),
-                duration_ms = started.elapsed().as_millis(),
-                "mcp write tool exceeded timeout; waiting for blocking work to finish"
-            );
-            finish_blocking_tool(&name, started, handle.await)
-        },
-    }
-}
-
-fn finish_blocking_tool(
-    name: &str,
-    started: Instant,
-    joined: Result<Result<CallToolResult, ErrorData>, JoinError>,
-) -> Result<CallToolResult, ErrorData> {
-    match joined {
-        Ok(Ok(result)) => {
-            tracing::debug!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                duration_ms = started.elapsed().as_millis(),
-                "mcp tool call finished"
-            );
-            Ok(result)
-        },
-        Ok(Err(err)) => {
-            tracing::warn!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                duration_ms = started.elapsed().as_millis(),
-                error = ?err,
-                "mcp tool call failed"
-            );
-            Err(err)
-        },
-        Err(err) => {
-            tracing::error!(
-                target: "rag_rat_mcp::server",
-                tool = %name,
-                duration_ms = started.elapsed().as_millis(),
-                error = %err,
-                "mcp tool call panicked"
-            );
-            Err(ErrorData::internal_error(format!("tool `{name}` panicked: {err}"), None))
-        },
-    }
-}
-
-fn tool_timeout_error(
-    name: &str,
-    started: Instant,
-    timeout: Duration,
-) -> Result<CallToolResult, ErrorData> {
-    tracing::error!(
-        target: "rag_rat_mcp::server",
-        tool = %name,
-        timeout_ms = timeout.as_millis(),
-        duration_ms = started.elapsed().as_millis(),
-        "mcp tool call timed out"
-    );
-    Err(ErrorData::internal_error(
-        format!(
-            "tool `{name}` timed out after {}s; see the rag-rat MCP log for details",
-            timeout.as_secs()
-        ),
-        None,
-    ))
 }
 
 /// Serve the stdio MCP server for a RESOLVED repo config — the ACTIVE server: keeps the index fresh
@@ -515,12 +345,14 @@ async fn run_stdio_unix(
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     use rag_rat_core::language::Language;
     use rag_rat_core::{Config, IndexDatabase, OutputFormat, ResolvedTarget, TargetKind};
     use serde_json::json;
 
     use super::*;
+    use crate::blocking;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -574,16 +406,16 @@ mod tests {
 
     #[test]
     fn timeout_and_worker_env_ignore_blank_zero_and_invalid_values() {
-        assert_eq!(parse_tool_timeout("5"), Some(Duration::from_secs(5)));
-        assert_eq!(parse_tool_timeout(" 9 "), Some(Duration::from_secs(9)));
-        assert_eq!(parse_tool_timeout(""), None);
-        assert_eq!(parse_tool_timeout("0"), None);
-        assert_eq!(parse_tool_timeout("nope"), None);
-        assert_eq!(parse_tool_workers("3"), Some(3));
-        assert_eq!(parse_tool_workers(" 4 "), Some(4));
-        assert_eq!(parse_tool_workers(""), None);
-        assert_eq!(parse_tool_workers("0"), None);
-        assert_eq!(parse_tool_workers("nope"), None);
+        assert_eq!(blocking::parse_tool_timeout("5"), Some(Duration::from_secs(5)));
+        assert_eq!(blocking::parse_tool_timeout(" 9 "), Some(Duration::from_secs(9)));
+        assert_eq!(blocking::parse_tool_timeout(""), None);
+        assert_eq!(blocking::parse_tool_timeout("0"), None);
+        assert_eq!(blocking::parse_tool_timeout("nope"), None);
+        assert_eq!(blocking::parse_tool_workers("3"), Some(3));
+        assert_eq!(blocking::parse_tool_workers(" 4 "), Some(4));
+        assert_eq!(blocking::parse_tool_workers(""), None);
+        assert_eq!(blocking::parse_tool_workers("0"), None);
+        assert_eq!(blocking::parse_tool_workers("nope"), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -635,7 +467,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_does_not_starve_the_runtime() {
         let workers = test_tool_workers(2);
-        let slow = tokio::spawn(run_blocking_tool(
+        let slow = tokio::spawn(blocking::run_blocking_tool(
             "slow_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -649,7 +481,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let quick = tokio::time::timeout(
             Duration::from_millis(100),
-            run_blocking_tool(
+            blocking::run_blocking_tool(
                 "quick_test_tool".to_string(),
                 Duration::from_secs(1),
                 ToolTimeoutPolicy::ReturnTimeout,
@@ -665,7 +497,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_returns_timeout_error() {
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "timeout_test_tool".to_string(),
             Duration::from_millis(10),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -688,7 +520,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_applies_worker_limit() {
         let workers = test_tool_workers(1);
-        let slow = tokio::spawn(run_blocking_tool(
+        let slow = tokio::spawn(blocking::run_blocking_tool(
             "slow_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -700,7 +532,7 @@ mod tests {
         ));
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "queued_test_tool".to_string(),
             Duration::from_millis(20),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -720,7 +552,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn write_tool_deadline_waits_for_blocking_work_to_finish() {
         let started = Instant::now();
-        let result = run_blocking_tool(
+        let result = blocking::run_blocking_tool(
             "memory_create".to_string(),
             Duration::from_millis(10),
             ToolTimeoutPolicy::WaitForCompletion,
@@ -742,7 +574,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_propagates_tool_errors() {
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "error_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
@@ -761,7 +593,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_tool_work_reports_panics_as_mcp_errors() {
-        let err = run_blocking_tool(
+        let err = blocking::run_blocking_tool(
             "panic_test_tool".to_string(),
             Duration::from_secs(1),
             ToolTimeoutPolicy::ReturnTimeout,
