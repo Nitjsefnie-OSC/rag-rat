@@ -77,6 +77,17 @@ fn arg_struct_handles_survive_an_rmcp_style_serde_round_trip() {
 }
 
 #[test]
+fn memory_bind_rejects_removed_github_fields_instead_of_dropping_the_anchor() {
+    let error = serde_json::from_value::<MemoryBindArgs>(json!({
+        "github_owner": "o",
+        "github_repo": "r",
+        "github_number": 588
+    }))
+    .expect_err("legacy GitHub bind fields must not deserialize as an empty bind");
+    assert!(error.to_string().contains("unknown field"), "{error}");
+}
+
+#[test]
 fn include_accepts_a_json_string_encoded_array_from_buggy_clients() {
     // Some MCP clients serialize array args as JSON strings (Claude Code does this for array/object
     // params — anthropics/claude-code#24599), so `include` arrives as `"[\"git\"]"` not `["git"]`.
@@ -145,12 +156,12 @@ fn list_tools_exposes_complete_typed_schemas() {
         "papertrail_for_chunk",
         "papertrail_for_symbol",
         "papertrail_for_commit",
-        "github_issue_search",
-        "github_refs_for_path",
+        "papertrail_issue_search",
+        "papertrail_refs_for_path",
         "rationale_search",
         "llm_status",
         "heal_index",
-        "github_sync_status",
+        "papertrail_sync_status",
         "memory_create",
         "memory_update",
         "memory_search",
@@ -384,10 +395,10 @@ fn mcp_tool_calls_preserve_compatibility_shapes() {
     )
     .unwrap();
     assert!(papertrail["current_source"].is_object());
-    assert!(papertrail["github_evidence"].is_array());
+    assert!(papertrail["evidence"].is_array());
 
-    let github_status = call_tool(&config.database, "github_sync_status", json!({})).unwrap();
-    assert!(github_status["capability"].is_string());
+    let sync_status = call_tool(&config.database, "papertrail_sync_status", json!({})).unwrap();
+    assert!(sync_status["capability"].is_string());
 
     let llm = call_tool(&config.database, "llm_status", json!({})).unwrap();
     assert_eq!(llm["embedding"]["state"], "MissingModel");
