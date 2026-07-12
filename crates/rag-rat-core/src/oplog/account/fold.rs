@@ -28,10 +28,10 @@ use crate::oplog::op::DeviceFingerprint;
 /// The account CONTROL log the fold operates on (§11) — its registers are control-log scoped
 /// (`log: 0`). A known op on the secrets (1) or content (2) log is not a control op and is retained
 /// unfolded here (its own C2/C4 fold owns it), never minting control authority.
-const CONTROL_LOG: u8 = 0;
+pub(super) const CONTROL_LOG: u8 = 0;
 /// The account-op version this fold understands. A known `entry_type` at a different version may
 /// reuse the tag with new semantics, so it is retained-unfolded rather than folded as today's op.
-const SUPPORTED_OP_VERSION: u32 = 1;
+pub(super) const SUPPORTED_OP_VERSION: u32 = 1;
 
 /// The per-entry classification (§16.3 taxonomy). `RetainedUnfolded` is an unknown `entry_type`;
 /// `Rejected` will never be effective; `Parked` is undecided pending more entries.
@@ -47,6 +47,53 @@ pub(super) enum Outcome {
 impl Outcome {
     pub(super) fn is_effective(&self) -> bool {
         matches!(self, Outcome::Effective { .. })
+    }
+
+    /// The §16.3 stored-taxonomy `(status, detail)` for this outcome. `Effective` maps to
+    /// `("effective", None)` — the storage layer resolves accepted vs `forked` per slot (I10a) —
+    /// and a fold-semantic `Rejected` maps to `("rejected", reason)`; structural ingest rejects
+    /// are never folded (they are not stored). Kept beside the enum so the projection can't
+    /// drift.
+    pub(super) fn taxonomy(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Outcome::Effective { .. } => ("effective", None),
+            Outcome::RetainedUnfolded => ("retained_unfolded", None),
+            Outcome::Condemned(reason) => (
+                "condemned",
+                Some(match reason {
+                    CondemnedReason::BeyondCut => "beyond_cut",
+                    CondemnedReason::OffBranch => "off_branch",
+                    CondemnedReason::ClosedIncarnation => "closed_incarnation",
+                }),
+            ),
+            Outcome::Parked(reason) => (
+                "parked",
+                Some(match reason {
+                    ParkReason::UnknownOwnerRef => "unknown_owner_ref",
+                    ParkReason::UnknownCutTarget => "unknown_cut_target",
+                    ParkReason::IncompleteCutAncestry => "incomplete_cut_ancestry",
+                    ParkReason::ContestedSubject => "contested_subject",
+                    ParkReason::DeferredStreamAuthorization => "deferred_stream_authorization",
+                }),
+            ),
+            Outcome::Rejected(reason) => (
+                "rejected",
+                Some(match reason {
+                    RejectReason::StaleAuthority => "stale_authority",
+                    RejectReason::GenesisSelfHash => "genesis_self_hash",
+                    RejectReason::DuplicateGenesis => "duplicate_genesis",
+                    RejectReason::DuplicateAdd => "duplicate_add",
+                    RejectReason::TombstoneReAdd => "tombstone_re_add",
+                    RejectReason::BadPromote => "bad_promote",
+                    RejectReason::LastOwner => "last_owner",
+                    RejectReason::CutTargetMismatch => "cut_target_mismatch",
+                    RejectReason::WrongDevice => "wrong_device",
+                    RejectReason::Malformed => "malformed",
+                    RejectReason::NonGenesisOrigin => "non_genesis_origin",
+                    RejectReason::Ineffective => "ineffective",
+                }),
+            ),
+        }
     }
 }
 
@@ -2491,5 +2538,65 @@ mod tests {
             Some(Outcome::Rejected(RejectReason::StaleAuthority)),
             "an op under a rejected incarnation is stale_authority",
         );
+    }
+
+    #[test]
+    fn every_fold_outcome_has_a_stable_storage_taxonomy() {
+        // §16.3 is persisted API, not display text. Pin every closed-enum token so adding or
+        // renaming a fold reason cannot silently drift existing database rows or query behavior.
+        let cases = [
+            (Outcome::Effective { auth_epoch: 7 }, ("effective", None)),
+            (Outcome::RetainedUnfolded, ("retained_unfolded", None)),
+            (Outcome::Condemned(CondemnedReason::BeyondCut), ("condemned", Some("beyond_cut"))),
+            (Outcome::Condemned(CondemnedReason::OffBranch), ("condemned", Some("off_branch"))),
+            (
+                Outcome::Condemned(CondemnedReason::ClosedIncarnation),
+                ("condemned", Some("closed_incarnation")),
+            ),
+            (Outcome::Parked(ParkReason::UnknownOwnerRef), ("parked", Some("unknown_owner_ref"))),
+            (Outcome::Parked(ParkReason::UnknownCutTarget), ("parked", Some("unknown_cut_target"))),
+            (
+                Outcome::Parked(ParkReason::IncompleteCutAncestry),
+                ("parked", Some("incomplete_cut_ancestry")),
+            ),
+            (Outcome::Parked(ParkReason::ContestedSubject), ("parked", Some("contested_subject"))),
+            (
+                Outcome::Parked(ParkReason::DeferredStreamAuthorization),
+                ("parked", Some("deferred_stream_authorization")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::StaleAuthority),
+                ("rejected", Some("stale_authority")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::GenesisSelfHash),
+                ("rejected", Some("genesis_self_hash")),
+            ),
+            (
+                Outcome::Rejected(RejectReason::DuplicateGenesis),
+                ("rejected", Some("duplicate_genesis")),
+            ),
+            (Outcome::Rejected(RejectReason::DuplicateAdd), ("rejected", Some("duplicate_add"))),
+            (
+                Outcome::Rejected(RejectReason::TombstoneReAdd),
+                ("rejected", Some("tombstone_re_add")),
+            ),
+            (Outcome::Rejected(RejectReason::BadPromote), ("rejected", Some("bad_promote"))),
+            (Outcome::Rejected(RejectReason::LastOwner), ("rejected", Some("last_owner"))),
+            (
+                Outcome::Rejected(RejectReason::CutTargetMismatch),
+                ("rejected", Some("cut_target_mismatch")),
+            ),
+            (Outcome::Rejected(RejectReason::WrongDevice), ("rejected", Some("wrong_device"))),
+            (Outcome::Rejected(RejectReason::Malformed), ("rejected", Some("malformed"))),
+            (
+                Outcome::Rejected(RejectReason::NonGenesisOrigin),
+                ("rejected", Some("non_genesis_origin")),
+            ),
+            (Outcome::Rejected(RejectReason::Ineffective), ("rejected", Some("ineffective"))),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.taxonomy(), expected, "taxonomy drift for {outcome:?}");
+        }
     }
 }
