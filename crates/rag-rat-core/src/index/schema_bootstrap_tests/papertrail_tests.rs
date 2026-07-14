@@ -657,6 +657,52 @@ fn migration_063_persists_mirror_resume_state() {
 }
 
 #[test]
+fn migration_067_is_the_tip_and_persists_binding_health() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 67, "move this pin with the next schema migration");
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn).unwrap();
+    let columns = conn_table_columns(&conn, "papertrail_sync_cursor");
+    for name in [
+        "last_attempt_ms",
+        "last_successful_probe_ms",
+        "last_successful_mirror_ms",
+        "retry_not_before_ms",
+        "error_class",
+        "error_detail",
+    ] {
+        assert!(columns.contains(&name.to_string()), "missing {name}");
+    }
+    conn.execute(
+        "INSERT INTO papertrail_sync_cursor(
+             tracker, project, last_probe_ms, backfill_done, repo_id
+         ) VALUES ('github', 'o/complete', 1234, 1, '__unassigned__'),
+                  ('github', 'o/incomplete', 5678, 0, '__unassigned__')",
+        [],
+    )
+    .unwrap();
+    schema::apply_papertrail_binding_health(&conn).unwrap();
+    let (probe, mirror, full): (Option<i64>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT last_successful_probe_ms, last_successful_mirror_ms, last_full_sync_ms
+             FROM papertrail_sync_cursor WHERE project='o/complete'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(probe, Some(1234));
+    assert_eq!(mirror, Some(1234));
+    assert_eq!(full, Some(1234));
+    let incomplete_full: Option<i64> = conn
+        .query_row(
+            "SELECT last_full_sync_ms FROM papertrail_sync_cursor WHERE project='o/incomplete'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incomplete_full, None);
+}
+
+#[test]
 fn migration_063_checksum_replays_the_pre_replay_flag_shape() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn).unwrap();

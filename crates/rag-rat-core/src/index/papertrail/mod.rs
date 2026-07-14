@@ -3,6 +3,7 @@ mod evidence;
 mod github;
 mod mirror;
 mod parse;
+mod schedule;
 mod store;
 mod sync;
 mod trackers;
@@ -15,10 +16,11 @@ pub(crate) use api::*;
 pub(crate) use evidence::*;
 pub(crate) use github::*;
 pub use mirror::MirrorBindingReport;
-pub(crate) use mirror::mirror_binding;
+pub(crate) use mirror::{MirrorContinuation, load_mirror_continuation, mirror_binding};
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};
+pub(crate) use schedule::*;
 use serde::{Deserialize, Serialize};
 pub(crate) use store::*;
 pub(crate) use sync::*;
@@ -39,6 +41,7 @@ pub struct PapertrailContext {
     /// Production discovery, rationale lookup, and manual mirror sync consume every binding.
     pub trackers: Vec<ResolvedTracker>,
     pub(crate) transport_options: transport::TransportOptions,
+    pub(crate) schedule: crate::config::PapertrailConfig,
 }
 
 impl PapertrailContext {
@@ -54,6 +57,7 @@ impl PapertrailContext {
         Self {
             trackers,
             transport_options: transport::TransportOptions::from(&config.papertrail),
+            schedule: config.papertrail.clone(),
         }
     }
 
@@ -71,7 +75,11 @@ impl PapertrailContext {
             })
             .into_iter()
             .collect();
-        Self { trackers, transport_options: transport::TransportOptions::default() }
+        Self {
+            trackers,
+            transport_options: transport::TransportOptions::default(),
+            schedule: crate::config::PapertrailConfig::default(),
+        }
     }
 
     /// `owner/repo` qualifying a manually requested legacy GitHub reference. Production
@@ -111,6 +119,23 @@ pub struct PapertrailStatus {
     pub comments: u64,
     pub last_sync_ms: Option<i64>,
     pub capabilities: Vec<TrackerCapability>,
+    pub bindings: Vec<PapertrailBindingStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PapertrailBindingStatus {
+    pub tracker: Tracker,
+    pub project: String,
+    pub last_attempt_ms: Option<i64>,
+    pub last_successful_probe_ms: Option<i64>,
+    pub last_successful_mirror_ms: Option<i64>,
+    pub last_full_walk_ms: Option<i64>,
+    pub retry_not_before_ms: Option<i64>,
+    pub full_walk_in_progress: bool,
+    pub error_class: Option<PapertrailErrorClass>,
+    pub error_detail: Option<String>,
+    pub overdue: bool,
+    pub failed: bool,
 }
 
 /// Per-binding auth and live-sync capability. Environment auth reflects token presence; command

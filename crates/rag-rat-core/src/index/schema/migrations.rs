@@ -1261,6 +1261,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_064_ID => Some(64),
             MIGRATION_065_ID => Some(65),
             MIGRATION_066_ID => Some(66),
+            MIGRATION_067_ID => Some(67),
             _ => None,
         })
         .max()
@@ -1336,6 +1337,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_064_ID
             | MIGRATION_065_ID
             | MIGRATION_066_ID
+            | MIGRATION_067_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1408,6 +1410,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_064_ID => migration.checksum != MIGRATION_064_CHECKSUM,
         MIGRATION_065_ID => migration.checksum != MIGRATION_065_CHECKSUM,
         MIGRATION_066_ID => migration.checksum != MIGRATION_066_CHECKSUM,
+        MIGRATION_067_ID => migration.checksum != MIGRATION_067_CHECKSUM,
         _ => false,
     }
 }
@@ -3320,6 +3323,41 @@ pub(crate) fn apply_papertrail_mirror_resume_state(conn: &Connection) -> rusqlit
         "papertrail_items",
         "full_rewalk_seen",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+/// V067 (#592): scheduling and failures are binding-local. Error classes are stable machine
+/// values; detail is sanitized and bounded by the recording API rather than used for policy.
+pub(crate) fn apply_papertrail_binding_health(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "papertrail_sync_cursor", "last_attempt_ms", "INTEGER")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "last_successful_probe_ms", "INTEGER")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "last_successful_mirror_ms", "INTEGER")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "retry_not_before_ms", "INTEGER")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "error_class", "TEXT")?;
+    add_column_if_missing(conn, "papertrail_sync_cursor", "error_detail", "TEXT")?;
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET last_successful_probe_ms=last_probe_ms
+         WHERE last_successful_probe_ms IS NULL AND last_probe_ms IS NOT NULL",
+        [],
+    )?;
+    // Before V066, an ordinary initial backfill was a complete project walk but only forced
+    // `--full` runs populated `last_full_sync_ms`. Preserve that completed-walk fact using the
+    // cursor's last successful provider contact; incomplete cursors must remain due for healing.
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET last_full_sync_ms=last_probe_ms
+         WHERE backfill_done=1 AND last_full_sync_ms IS NULL AND last_probe_ms IS NOT NULL",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE papertrail_sync_cursor
+         SET last_successful_mirror_ms=last_probe_ms
+         WHERE backfill_done=1
+           AND last_successful_mirror_ms IS NULL
+           AND last_probe_ms IS NOT NULL",
+        [],
     )?;
     Ok(())
 }

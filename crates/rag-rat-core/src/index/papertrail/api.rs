@@ -15,6 +15,8 @@ pub(crate) async fn sync_mirror(
     let mut bindings = Vec::new();
     let mut errors = Vec::new();
     for binding in &ctx.trackers {
+        let attempted_at = now_ms();
+        record_attempt(conn, binding, attempted_at)?;
         if binding.provider != Tracker::Github {
             errors.push(PapertrailSyncError {
                 tracker: binding.provider,
@@ -32,23 +34,41 @@ pub(crate) async fn sync_mirror(
             Ok(client) => match mirror_binding(conn, binding, &client, full).await {
                 Ok(report) => {
                     synced_items += report.stored_items;
+                    if let Some(operation) = completed_mirror_operation(&report, full) {
+                        record_success(conn, binding, operation, now_ms())?;
+                    } else if let Some(resume_at_ms) = report.paused_until_ms {
+                        record_pause(conn, binding, resume_at_ms)?;
+                    }
                     bindings.push(report);
                 },
-                Err(error) => errors.push(PapertrailSyncError {
+                Err(error) => {
+                    let class = classify_mirror_failure(&error);
+                    record_failure(conn, binding, class, Some(&error.to_string()))?;
+                    errors.push(PapertrailSyncError {
+                        tracker: binding.provider,
+                        project: binding.project.clone(),
+                        item_key: String::new(),
+                        status: "failed".to_string(),
+                        error: error.to_string(),
+                    });
+                },
+            },
+            Err(error) => {
+                let persisted_detail = authentication_failure_detail(binding, &error);
+                record_failure(
+                    conn,
+                    binding,
+                    PapertrailErrorClass::Authentication,
+                    persisted_detail.as_deref(),
+                )?;
+                errors.push(PapertrailSyncError {
                     tracker: binding.provider,
                     project: binding.project.clone(),
                     item_key: String::new(),
-                    status: "failed".to_string(),
+                    status: "authentication_or_transport".to_string(),
                     error: error.to_string(),
-                }),
+                });
             },
-            Err(error) => errors.push(PapertrailSyncError {
-                tracker: binding.provider,
-                project: binding.project.clone(),
-                item_key: String::new(),
-                status: "authentication_or_transport".to_string(),
-                error: error.to_string(),
-            }),
         }
     }
     let repo_id = schema::active_repo_id(conn)?;
@@ -62,6 +82,51 @@ pub(crate) async fn sync_mirror(
         bindings,
         errors,
         status: status(conn, ctx)?,
+    })
+}
+
+fn authentication_failure_detail(
+    binding: &ResolvedTracker,
+    error: &anyhow::Error,
+) -> Option<String> {
+    match binding.auth {
+        Some(crate::config::TrackerAuth::TokenCommand(_)) =>
+            Some("configured token command failed".to_string()),
+        _ => Some(error.to_string()),
+    }
+}
+
+fn classify_mirror_failure(error: &anyhow::Error) -> PapertrailErrorClass {
+    for cause in error.chain() {
+        if cause.downcast_ref::<rusqlite::Error>().is_some() {
+            return PapertrailErrorClass::Storage;
+        }
+        if let Some(transport) = cause.downcast_ref::<transport::TransportError>() {
+            return match transport {
+                transport::TransportError::Http(_) => PapertrailErrorClass::Network,
+                transport::TransportError::Paused { .. } => PapertrailErrorClass::RateLimited,
+                transport::TransportError::UrlOutsideBinding { .. } =>
+                    PapertrailErrorClass::Provider,
+            };
+        }
+        if cause.downcast_ref::<reqwest::Error>().is_some() {
+            return PapertrailErrorClass::Network;
+        }
+    }
+    PapertrailErrorClass::Provider
+}
+
+fn completed_mirror_operation(
+    report: &MirrorBindingReport,
+    full: bool,
+) -> Option<SuccessfulOperation> {
+    if report.paused_until_ms.is_some() {
+        return None;
+    }
+    Some(if full || report.completed_full_walk {
+        SuccessfulOperation::FullMirror
+    } else {
+        SuccessfulOperation::IncrementalMirror
     })
 }
 
@@ -188,6 +253,33 @@ pub(crate) fn status(
         )?;
         Ok(u64::try_from(count).unwrap_or_default())
     };
+    let now = now_ms();
+    let bindings = ctx
+        .trackers
+        .iter()
+        .map(|binding| {
+            let (health, error_class, error_detail, stored_filter_fingerprint) =
+                load_persisted_health(conn, &repo_id, binding)?;
+            let filter_changed = stored_filter_fingerprint != binding.filter_fingerprint();
+            let synchronization = tracker_synchronization(binding);
+            let decision = decide_schedule(now, &ctx.schedule, health, filter_changed);
+            let (overdue, failed) = binding_status_flags(synchronization, decision, error_class);
+            Ok(PapertrailBindingStatus {
+                tracker: binding.provider,
+                project: binding.project.clone(),
+                last_attempt_ms: health.last_attempt_ms,
+                last_successful_probe_ms: health.last_successful_probe_ms,
+                last_successful_mirror_ms: health.last_successful_mirror_ms,
+                last_full_walk_ms: health.last_full_walk_ms,
+                retry_not_before_ms: health.retry_not_before_ms,
+                full_walk_in_progress: health.continuation == MirrorContinuation::Full,
+                error_class,
+                error_detail,
+                overdue,
+                failed,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(PapertrailStatus {
         refs: scoped_table_row_count(conn, "papertrail_refs", &repo_id)?,
         issues: items_by_kind(ItemKind::Issue)?,
@@ -205,6 +297,7 @@ pub(crate) fn status(
                 synchronization: tracker_synchronization(binding),
             })
             .collect(),
+        bindings,
     })
 }
 
@@ -241,6 +334,20 @@ fn tracker_synchronization(binding: &ResolvedTracker) -> TrackerSynchronization 
         Tracker::Github => TrackerSynchronization::Native,
         _ => TrackerSynchronization::ProviderClientPending,
     }
+}
+
+fn binding_status_flags(
+    synchronization: TrackerSynchronization,
+    decision: ScheduleDecision,
+    error_class: Option<PapertrailErrorClass>,
+) -> (bool, bool) {
+    if synchronization == TrackerSynchronization::ProviderClientPending {
+        return (false, false);
+    }
+    (
+        decision != ScheduleDecision::Skip,
+        error_class.is_some_and(|class| class != PapertrailErrorClass::RateLimited),
+    )
 }
 pub(crate) fn issue_search(
     conn: &Connection,
@@ -422,6 +529,93 @@ mod capability_tests {
     }
 
     #[test]
+    fn public_binding_status_distinguishes_capability_pause_and_failure() {
+        assert_eq!(
+            binding_status_flags(
+                TrackerSynchronization::ProviderClientPending,
+                ScheduleDecision::Full,
+                Some(PapertrailErrorClass::Provider),
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            binding_status_flags(
+                TrackerSynchronization::Native,
+                ScheduleDecision::Skip,
+                Some(PapertrailErrorClass::RateLimited),
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            binding_status_flags(
+                TrackerSynchronization::Native,
+                ScheduleDecision::Incremental,
+                Some(PapertrailErrorClass::Authentication),
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn persisted_rate_limit_pause_is_not_reported_as_a_failure() {
+        let binding = github(None);
+        let ctx =
+            PapertrailContext { trackers: vec![binding.clone()], ..PapertrailContext::default() };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::apply(&conn).unwrap();
+        record_pause(&conn, &binding, i64::MAX).unwrap();
+
+        let binding_status = status(&conn, &ctx).unwrap().bindings.remove(0);
+        assert_eq!(binding_status.error_class, Some(PapertrailErrorClass::RateLimited));
+        assert!(!binding_status.overdue);
+        assert!(!binding_status.failed);
+    }
+
+    #[test]
+    fn paused_mirror_is_not_a_successful_operation() {
+        let report = MirrorBindingReport {
+            tracker: Tracker::Github,
+            project: "o/r".to_string(),
+            stored_items: 1,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: Some(42),
+            pause_reason: Some("rate_limited".to_string()),
+            completed_full_walk: false,
+        };
+        assert_eq!(completed_mirror_operation(&report, false), None);
+        assert_eq!(completed_mirror_operation(&report, true), None);
+
+        let completed = MirrorBindingReport { paused_until_ms: None, ..report };
+        assert_eq!(
+            completed_mirror_operation(&completed, false),
+            Some(SuccessfulOperation::IncrementalMirror)
+        );
+        assert_eq!(
+            completed_mirror_operation(&completed, true),
+            Some(SuccessfulOperation::FullMirror)
+        );
+    }
+
+    #[test]
+    fn completed_initial_backfill_is_a_full_walk() {
+        let report = MirrorBindingReport {
+            tracker: Tracker::Github,
+            project: "o/r".to_string(),
+            stored_items: 1,
+            stored_comments: 0,
+            pruned_items: 0,
+            paused_until_ms: None,
+            pause_reason: None,
+            completed_full_walk: true,
+        };
+        assert_eq!(
+            completed_mirror_operation(&report, false),
+            Some(SuccessfulOperation::FullMirror)
+        );
+    }
+
+    #[test]
     fn manual_mirror_dispatches_every_resolved_github_binding() {
         let script = |project: &str| {
             vec![
@@ -457,6 +651,8 @@ mod capability_tests {
         assert_eq!(report.bindings.len(), 2);
         assert_eq!(report.bindings[0].project, "a/one");
         assert_eq!(report.bindings[1].project, "b/two");
+        assert!(report.bindings.iter().all(|binding| binding.completed_full_walk));
+        assert!(report.status.bindings.iter().all(|binding| binding.last_full_walk_ms.is_some()));
         assert_eq!(report.status.issues, 2);
         assert_eq!(first_handle.join().unwrap().len(), 7);
         assert_eq!(second_handle.join().unwrap().len(), 7);
@@ -480,6 +676,33 @@ mod capability_tests {
         let refs: i64 =
             conn.query_row("SELECT COUNT(*) FROM papertrail_refs", [], |row| row.get(0)).unwrap();
         assert_eq!(refs, 0);
+    }
+
+    #[test]
+    fn token_command_failure_detail_is_redacted_before_persistence() {
+        let mut binding = github(None);
+        binding.auth =
+            Some(crate::config::TrackerAuth::TokenCommand("secret-bearing command".to_string()));
+        let error = anyhow::anyhow!("token_command `secret-bearing command` failed: secret stderr");
+        assert_eq!(
+            authentication_failure_detail(&binding, &error).as_deref(),
+            Some("configured token command failed")
+        );
+    }
+
+    #[test]
+    fn mirror_failure_classification_uses_the_error_chain() {
+        let storage =
+            anyhow::Error::new(rusqlite::Error::InvalidQuery).context("commit mirror page");
+        assert_eq!(classify_mirror_failure(&storage), PapertrailErrorClass::Storage);
+
+        let network =
+            anyhow::Error::new(reqwest::Client::new().get("://invalid").build().unwrap_err())
+                .context("fetch mirror page");
+        assert_eq!(classify_mirror_failure(&network), PapertrailErrorClass::Network);
+
+        let provider = anyhow::anyhow!("provider payload did not match the expected schema");
+        assert_eq!(classify_mirror_failure(&provider), PapertrailErrorClass::Provider);
     }
 
     #[test]
@@ -513,5 +736,10 @@ mod capability_tests {
             vec!["provider_client_pending", "authentication_or_transport", "failed"]
         );
         assert_eq!(failed_handle.join().unwrap().len(), 1);
+        let pending =
+            report.status.bindings.iter().find(|binding| binding.project == "group/repo").unwrap();
+        assert!(!pending.failed);
+        assert!(!pending.overdue);
+        assert_eq!(pending.error_class, None);
     }
 }
