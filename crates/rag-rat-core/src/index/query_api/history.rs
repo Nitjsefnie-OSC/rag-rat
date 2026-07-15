@@ -5,7 +5,11 @@ use super::*;
 
 impl IndexDatabase {
     pub fn commit_search(&self, query: &str, limit: u32) -> anyhow::Result<Vec<CommitSearchHit>> {
-        git_history::commit_search(self.storage.connection(), query, limit)
+        // #582: ranked commit_fts read — heal-and-retry on shadow corruption.
+        crate::index::retry_once_on_fts_corruption(
+            || git_history::commit_search(self.storage.connection(), query, limit),
+            || self.heal_corrupt_fts(),
+        )
     }
 
     /// Commit-replay eval cases (#120) from the indexed git history — commit message as query, the
@@ -76,7 +80,19 @@ impl IndexDatabase {
         limit: u32,
     ) -> anyhow::Result<Vec<QueryCommitHit>> {
         let current_hits = self.search(query, limit, true)?;
-        git_history::commits_touching_query(self.storage.connection(), query, limit, &current_hits)
+        // #582: an INDEPENDENT ranked commit_fts path — it calls git_history::commit_search
+        // internally, not the wrapped commit_search above, so it needs its own heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                git_history::commits_touching_query(
+                    self.storage.connection(),
+                    query,
+                    limit,
+                    &current_hits,
+                )
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn git_blame_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<ChunkBlameSummary>> {
@@ -179,7 +195,10 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-        papertrail::issue_search(self.storage.connection(), query, limit)
+        crate::index::retry_once_on_fts_corruption(
+            || papertrail::issue_search(self.storage.connection(), query, limit),
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn rationale_search(
@@ -187,7 +206,17 @@ impl IndexDatabase {
         query: &str,
         limit: u32,
     ) -> anyhow::Result<Vec<PapertrailEvidence>> {
-        papertrail::rationale_search(self.storage.connection(), query, limit, &self.papertrail)
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                papertrail::rationale_search(
+                    self.storage.connection(),
+                    query,
+                    limit,
+                    &self.papertrail,
+                )
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn papertrail_refs_for_path(

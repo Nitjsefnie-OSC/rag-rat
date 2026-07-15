@@ -22,6 +22,8 @@ mod discovery;
 mod file_index;
 mod file_rows;
 mod fts;
+pub(crate) use fts::retry_once_on_fts_corruption;
+pub use fts::{FtsHealOutcome, error_is_fts_corruption};
 mod git_context;
 mod git_meta;
 mod graph_index;
@@ -252,6 +254,15 @@ pub struct HealIndexReport {
     pub removed_files: u64,
     pub skipped_files: u64,
     pub fts_fresh: bool,
+    /// FTS mirrors whose RANKED probe hit SQLITE_CORRUPT and were rebuilt from source (#582).
+    /// Ranked because only rank/bm25 decodes docsize — the corruption class both
+    /// `PRAGMA integrity_check` and FTS5's own `'integrity-check'` miss.
+    pub fts_healed: Vec<String>,
+    /// Mirrors whose probe hit corruption but whose repair was DEFERRED: a generation-staged
+    /// rebuild is in flight, and 'delete-all' + re-derive would drop its not-yet-durable rows.
+    /// Non-empty means ranked queries on these mirrors still fail — rerun `heal_index` once the
+    /// rebuild completes (or after gc sweeps an abandoned staging).
+    pub fts_deferred: Vec<String>,
     pub message: Option<String>,
 }
 

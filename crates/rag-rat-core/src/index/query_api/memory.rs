@@ -65,9 +65,17 @@ impl IndexDatabase {
         surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
-        let mut memories = crate::query::memory::memory_search(conn, query, limit)?;
-        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
-        Ok(memories)
+        // #582: both the MATCH and the surface hydration (whose Summary path runs a RANKED
+        // chunk_fts query) can hit FTS shadow corruption; heal-and-retry rather than surfacing
+        // a bare "database disk image is malformed" forever.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut memories = crate::query::memory::memory_search(conn, query, limit)?;
+                crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                Ok(memories)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn memory_for_symbol(
@@ -77,9 +85,15 @@ impl IndexDatabase {
         surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
-        let mut memories = crate::query::memory::memories_for_symbol(conn, symbol, limit)?;
-        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
-        Ok(memories)
+        // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut memories = crate::query::memory::memories_for_symbol(conn, symbol, limit)?;
+                crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                Ok(memories)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn memory_for_path(
@@ -89,9 +103,15 @@ impl IndexDatabase {
         surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
-        let mut memories = crate::query::memory::memories_for_path(conn, path, limit)?;
-        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
-        Ok(memories)
+        // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut memories = crate::query::memory::memories_for_path(conn, path, limit)?;
+                crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                Ok(memories)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn memory_for_edges(
@@ -101,9 +121,15 @@ impl IndexDatabase {
         surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
-        let mut memories = crate::query::memory::memories_for_edges(conn, edge_ids, limit)?;
-        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
-        Ok(memories)
+        // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut memories = crate::query::memory::memories_for_edges(conn, edge_ids, limit)?;
+                crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                Ok(memories)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn memory_evidence_for_symbol_and_edges(
@@ -119,16 +145,22 @@ impl IndexDatabase {
         // compact), so honor `[memory] surface` here by deferring each lane's bodies under
         // `Summary`.
         let conn = self.storage.connection();
-        let mut evidence = crate::query::memory::memory_evidence_for_symbol_and_edges(
-            conn,
-            symbol,
-            caller_edge_ids,
-            callee_edge_ids,
-            limit,
+        // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut evidence = crate::query::memory::memory_evidence_for_symbol_and_edges(
+                    conn,
+                    symbol,
+                    caller_edge_ids,
+                    callee_edge_ids,
+                    limit,
+                )
+                .map(|(evidence, _truncated)| evidence)?;
+                evidence.apply_surface(conn, surface)?;
+                Ok(evidence)
+            },
+            || self.heal_corrupt_fts(),
         )
-        .map(|(evidence, _truncated)| evidence)?;
-        evidence.apply_surface(conn, surface)?;
-        Ok(evidence)
     }
 
     pub fn memory_for_call_path_hash(
@@ -138,10 +170,19 @@ impl IndexDatabase {
         surface: crate::config::MemorySurface,
     ) -> anyhow::Result<Vec<crate::query::memory::RepoMemory>> {
         let conn = self.storage.connection();
-        let mut memories =
-            crate::query::memory::memories_for_call_path_hash(conn, edge_sequence_hash, limit)?;
-        crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
-        Ok(memories)
+        // #582: the Summary surface hydration runs a RANKED chunk_fts query — heal-and-retry.
+        crate::index::retry_once_on_fts_corruption(
+            || {
+                let mut memories = crate::query::memory::memories_for_call_path_hash(
+                    conn,
+                    edge_sequence_hash,
+                    limit,
+                )?;
+                crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                Ok(memories)
+            },
+            || self.heal_corrupt_fts(),
+        )
     }
 
     pub fn memory_rebind(

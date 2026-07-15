@@ -446,11 +446,19 @@ impl IndexDatabase {
         )?;
         if include_memories {
             let conn = self.storage.connection();
-            chunk.memories = crate::query::memory::memories_for_chunk(conn, chunk_id, 20)?;
             // Drive-by chunk attachments honor `[memory] surface`: under `Summary` each memory's
             // body is deferred to `memory show`, leaving the summary + verdict marker
-            // (title-only fallback).
-            crate::query::memory::apply_memory_surface(conn, &mut chunk.memories, surface)?;
+            // (title-only fallback). #582: the Summary hydration runs a RANKED chunk_fts query —
+            // heal-and-retry.
+            chunk.memories = crate::index::retry_once_on_fts_corruption(
+                || {
+                    let mut memories =
+                        crate::query::memory::memories_for_chunk(conn, chunk_id, 20)?;
+                    crate::query::memory::apply_memory_surface(conn, &mut memories, surface)?;
+                    Ok(memories)
+                },
+                || self.heal_corrupt_fts(),
+            )?;
         }
         Ok(Some(chunk))
     }
@@ -549,6 +557,8 @@ impl IndexDatabase {
                 removed_files: 0,
                 skipped_files: 0,
                 fts_fresh: !self.fts_dirty()?,
+                fts_healed: Vec::new(),
+                fts_deferred: Vec::new(),
                 message: Some(
                     "skipped: heal does not run under a linked-worktree overlay scope".to_string(),
                 ),
@@ -565,6 +575,8 @@ impl IndexDatabase {
             removed_files: 0,
             skipped_files: 0,
             fts_fresh: false,
+            fts_healed: Vec::new(),
+            fts_deferred: Vec::new(),
             message: None,
         };
 
@@ -599,12 +611,20 @@ impl IndexDatabase {
             report.healed_files += 1;
         }
 
+        // Probe for FTS shadow corruption BEFORE the freshness pass (#582): a dirty-flagged
+        // index would otherwise be incidentally repaired by `ensure_fts_fresh`'s rebuild and the
+        // report would under-attribute what was actually corrupt.
+        let fts_outcome = self.heal_fts_if_corrupt()?;
+        report.fts_healed = fts_outcome.healed;
+        report.fts_deferred = fts_outcome.deferred;
         if report.healed_files > 0 || report.removed_files > 0 {
             self.sync_fts()?;
         } else {
             self.ensure_fts_fresh()?;
         }
-        report.fts_fresh = !self.fts_dirty()?;
+        // A deferred corrupt mirror is NOT fresh, whatever the dirty flag says — operators key
+        // health off this field.
+        report.fts_fresh = !self.fts_dirty()? && report.fts_deferred.is_empty();
         Ok(report)
     }
 
