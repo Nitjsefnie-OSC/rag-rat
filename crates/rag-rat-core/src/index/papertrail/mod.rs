@@ -2,6 +2,8 @@ mod api;
 pub mod autosync;
 mod evidence;
 mod github;
+mod gitlab;
+mod http;
 mod mirror;
 mod parse;
 mod schedule;
@@ -16,8 +18,13 @@ use std::sync::OnceLock;
 pub(crate) use api::*;
 pub(crate) use evidence::*;
 pub(crate) use github::*;
+pub(crate) use gitlab::*;
+pub(crate) use http::*;
 pub use mirror::MirrorBindingReport;
-pub(crate) use mirror::{MirrorContinuation, load_mirror_continuation, mirror_binding};
+pub(crate) use mirror::{
+    MirrorContinuation, days_in_month, load_mirror_continuation, max_timestamp, mirror_binding,
+    parse_date,
+};
 pub(crate) use parse::*;
 pub use parse::{TrackerParsedRef, parse_tracker_refs};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -256,6 +263,14 @@ pub struct CurrentSourceEvidence {
     pub symbol: Option<String>,
 }
 
+/// Whether a provider's item keys are unique across kinds. GitHub's shared issue/PR numbering
+/// is the exception (a key names at most one item, and its repo comment feed cannot always name
+/// the kind); namespaced providers (GitLab iids, Bitbucket, Jira) always name the kind on their
+/// comments, so a comment there must NEVER attach across namespaces.
+pub(crate) fn item_numbering_is_shared(tracker: Tracker) -> bool {
+    matches!(tracker, Tracker::Github)
+}
+
 /// Provider-neutral item kind. GitHub's shared issue/PR numbering is the exception, not the
 /// rule — GitLab issues and merge requests live in separate iid namespaces and Jira has no
 /// change requests at all — so the kind is part of an item's identity, never inferred.
@@ -380,6 +395,14 @@ pub struct ItemsPage {
 pub struct CommentsPage {
     pub comments: Vec<PapertrailComment>,
     pub next: Option<PageCursor>,
+    /// Provider-confirmed consumed watermark for THIS page: everything in the stream at or
+    /// before it has been returned or deliberately skipped. The mirror trusts it on EVERY page
+    /// (unlike the returned comments, whose maximum is trusted only on the scan's first page),
+    /// so only feeds with immutable append-only ordering may set it — GitLab's events feed,
+    /// ordered by creation. It carries a drained multi-page window past its LAST page (a
+    /// first-page-only frontier pins a busy day forever) and advances past entries that map to
+    /// no comment (commit/snippet notes). Mutable updated-order pages (GitHub) leave it None.
+    pub frontier: Option<String>,
 }
 
 /// Provider outcomes that affect mirror control flow rather than representing a retryable
@@ -441,7 +464,11 @@ pub trait PapertrailClient {
         cursor: &PageCursor,
     ) -> anyhow::Result<CommentsPage> {
         anyhow::ensure!(cursor.page_token.is_none(), "legacy item comments cannot resume a page");
-        Ok(CommentsPage { comments: self.item_comments(project, kind, key).await?, next: None })
+        Ok(CommentsPage {
+            comments: self.item_comments(project, kind, key).await?,
+            next: None,
+            frontier: None,
+        })
     }
     /// Complete provider-specific item fields before the mirror starts the item's durable thread.
     /// The mirror invokes this one item at a time and checkpoints each completed item, so a

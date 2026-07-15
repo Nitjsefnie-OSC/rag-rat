@@ -588,8 +588,10 @@ Per-key notes:
   (the project key, e.g. `PROJ`): Jira is not a code host, so it is never auto-detected and has
   no remote to derive from.
 - `base_url` — self-hosted / enterprise instances (`https://gitlab.example.com`). Must be an
-  http(s) URL without inline credentials. Self-hosted GitHub Enterprise and Bitbucket instances
-  are configured this way — only the three cloud hosts auto-detect.
+  origin URL without inline credentials, and must use **https**: the transport never sends the
+  binding's token over plaintext, so `http` origins are accepted for loopback hosts only (local
+  testing). Self-hosted GitHub Enterprise and Bitbucket instances are configured this way —
+  only the three cloud hosts auto-detect.
 - `auth` — exactly one of `env` (the NAME of an env var holding the token — never the token
   itself) or `token_command` (a command printing the token to stdout). Omitted = anonymous /
   provider-native fallback.
@@ -607,9 +609,21 @@ URLs; Bitbucket `#N` (issues) and `/issues/N` / `/pull-requests/N` URLs; Jira ba
 only. A self-hosted binding's URL grammar matches its own host, not the cloud host.
 
 All bindings participate in production reference discovery, annotation lookup, and manual mirror
-dispatch. GitHub bindings use the native client now; GitLab, Bitbucket, and Jira bindings report a
-provider-client-pending result until their provider PRs land, and are never sent through the GitHub
-client. The shared runner keeps every result, cursor, auth source, and quota governor scoped to its
+dispatch. GitHub and GitLab bindings use their native clients now; Bitbucket and Jira bindings
+report a provider-client-pending result until their provider PRs land, and are never sent through
+another provider's client.
+
+GitLab notes: auth is a personal access token with `read_api` (sent as a bearer token) via
+`auth = { env = "GITLAB_TOKEN" }` or a `token_command`; subgroup project paths are fully
+supported; issues `#N` and merge requests `!N` are separate numbering namespaces and mirror as
+`issue` / `change_request` items. New comments arrive incrementally through the project events
+feed (GitLab has no "notes updated since" endpoint, and commenting does not touch the parent's
+`updated_at`); an EDIT to an old comment produces no event, so edited bodies converge at the
+daily full re-walk unless the comment's creation event is still inside the incremental replay
+window. Merge-request approvals mirror as review comments (`review_state`) — approving emits no
+`commented` event either, so approvals also converge at the daily full re-walk. A comment whose
+parent item is excluded by the `tags` filter is skipped; if that item later gains a tracked tag,
+its earlier comments appear at the next full re-walk. The shared runner keeps every result, cursor, auth source, and quota governor scoped to its
 binding. A repository may have at most one resolved binding for a given `(provider, project)`:
 the mirror rejects duplicates before dispatch because API origin and tag filters are not part of
 the persisted item/cache cursor identity. Use one binding and one combined tag set for that
