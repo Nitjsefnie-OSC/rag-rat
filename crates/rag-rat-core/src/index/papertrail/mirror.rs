@@ -117,6 +117,10 @@ pub struct MirrorBindingReport {
     pub paused_until_ms: Option<i64>,
     pub pause_reason: Option<String>,
     pub completed_full_walk: bool,
+    /// The item freshness probe answered not-modified. Combined with zero stored / pruned work
+    /// this classifies the run as a successful PROBE — advancing probe freshness only, never the
+    /// mirror or full-walk timestamps.
+    pub probe_not_modified: bool,
 }
 
 pub(crate) async fn mirror_binding<C: PapertrailClient>(
@@ -174,6 +178,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
         paused_until_ms: None,
         pause_reason: None,
         completed_full_walk: false,
+        probe_not_modified: false,
     };
     if filter_changed {
         report.pruned_items += prune_unmatched(conn, binding)?;
@@ -230,6 +235,7 @@ async fn mirror_binding_inner<C: PapertrailClient>(
                 save_cursor(conn, binding, cursor, false)?;
                 sync_item_delta(conn, binding, client, cursor, report).await?;
             } else {
+                report.probe_not_modified = true;
                 save_cursor(conn, binding, cursor, false)?;
             }
         }
@@ -248,6 +254,11 @@ async fn mirror_binding_inner<C: PapertrailClient>(
             cursor.backfill_done = true;
             cursor.high_mark_at.get_or_insert_with(|| EMPTY_PROJECT_HIGH_MARK.to_string());
             cursor.backfill_processed_keys.clear();
+            // The consumed continuation must not outlive the walk: a chained provider leg (the
+            // request that produced THIS empty page) was persisted as `backfill_page_cursor` on
+            // the previous iteration, and leaving it behind makes `continuation()` misread the
+            // COMPLETED walk as interrupted work forever.
+            cursor.backfill_page_cursor = None;
             save_cursor(conn, binding, cursor, false)?;
             break;
         }
