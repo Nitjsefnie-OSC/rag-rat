@@ -60,6 +60,15 @@ surface = "summary"
 rust = ["crates"]
 markdown = ["docs"]
 
+# DOGFOOD: explicit GitHub binding. Auto-detect from the origin remote would bind github.com
+# anyway; the explicit block exists to pin auth — without it the mirror only finds a token in
+# GH_TOKEN/GITHUB_TOKEN (unset on this box) and syncs anonymously at 60 req/h. `gh auth token`
+# yields the authenticated quota with no secret in the file and no env plumbing for the
+# watcher/hook processes. `project` stays derived from the remote.
+[[tracker]]
+provider = "github"
+auth = { token_command = "gh auth token" }
+
 # DIAGNOSTIC: observe the git-hook maintenance / reconcile / embedder lifecycle (#378 / #360).
 # Per-process files under .rag-rat/logs/ (liveness-aware retention, gitignored). info baseline +
 # debug for the maintenance + ai (reconcile/providers/embed) targets.
