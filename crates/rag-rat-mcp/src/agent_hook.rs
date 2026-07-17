@@ -64,6 +64,41 @@ mod listener {
         locks::hook_socket_lock_path_for(config)
     }
 
+    /// Test-only instrumentation hooks for the listener election loop. Tests can wait on the
+    /// receivers to observe readiness instead of polling or sleeping through scheduling races.
+    #[derive(Clone)]
+    #[cfg(test)]
+    pub struct ListenerHooks {
+        /// Set to true when this listener is about to sleep because the election lock is held by
+        /// another process.
+        pub waiting: tokio::sync::watch::Receiver<bool>,
+        waiting_tx: tokio::sync::watch::Sender<bool>,
+        /// Set to true when this listener has won the election and bound the socket, just before
+        /// entering the accept loop.
+        pub bound: tokio::sync::watch::Receiver<bool>,
+        bound_tx: tokio::sync::watch::Sender<bool>,
+    }
+
+    #[cfg(test)]
+    impl Default for ListenerHooks {
+        fn default() -> Self {
+            let (waiting_tx, waiting) = tokio::sync::watch::channel(false);
+            let (bound_tx, bound) = tokio::sync::watch::channel(false);
+            Self { waiting, waiting_tx, bound, bound_tx }
+        }
+    }
+
+    #[cfg(test)]
+    impl ListenerHooks {
+        fn signal_waiting(&self) {
+            let _ = self.waiting_tx.send(true);
+        }
+
+        fn signal_bound(&self) {
+            let _ = self.bound_tx.send(true);
+        }
+    }
+
     /// Per-session record of what was already injected. Pruned by LRU cap + TTL.
     #[derive(Default)]
     struct SessionState {
@@ -71,53 +106,89 @@ mod listener {
         last_used: Option<Instant>,
     }
 
+    /// Shared body of the listener task. In non-test builds the `$hooks` argument is compiled away.
+    macro_rules! spawn_listener_task {
+        ($config:expr, $hooks:expr) => {{
+            let config = $config;
+            tokio::spawn(async move {
+                let lock_path = socket_lock_path_for(&config);
+                let socket = socket_path_for(&config);
+                if let Some(parent) = socket.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // Win the socket election, then bind. The lock must live inside this task: aborting
+                // the task drops it, so a surviving process's retry loop can take over
+                // (election, watcher-identical). A bind that fails AFTER winning the
+                // election (a transient FS/permissions hiccup) must not strand the
+                // worktree serving nothing while holding the lock (#53): drop the
+                // election so a sibling can try, back off, and re-elect — the same
+                // die→next-process-takes-over model, made resilient for the single-process case
+                // too.
+                let (_lock, listener): (FileLock, UnixListener) = loop {
+                    let lock = loop {
+                        match FileLock::try_acquire(&lock_path) {
+                            Ok(Some(lock)) => break lock,
+                            _ => {
+                                #[cfg(test)]
+                                {
+                                    let hooks = $hooks.clone();
+                                    hooks.signal_waiting();
+                                }
+                                tokio::time::sleep(ELECTION_RETRY).await;
+                            },
+                        }
+                    };
+                    // Only the lock holder ever unlinks: race-free stale-socket cleanup.
+                    let _ = std::fs::remove_file(&socket);
+                    match UnixListener::bind(&socket) {
+                        Ok(listener) => break (lock, listener),
+                        Err(_) => {
+                            drop(lock);
+                            tokio::time::sleep(ELECTION_RETRY).await;
+                        },
+                    }
+                };
+                #[cfg(test)]
+                {
+                    let hooks = $hooks.clone();
+                    hooks.signal_bound();
+                }
+                let mut sessions: HashMap<String, SessionState> = HashMap::new();
+                loop {
+                    let Ok((stream, _addr)) = listener.accept().await else {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    };
+                    prune_sessions(&mut sessions);
+                    if let Err(err) = serve_one(stream, &config, &mut sessions).await
+                        && std::env::var_os("RAG_RAT_HOOK_DEBUG").is_some()
+                    {
+                        eprintln!("agent-hook listener: {err:#}");
+                    }
+                }
+            })
+        }};
+    }
+
     /// Spawn the hook listener task: win the socket election (retrying forever, like the
     /// watcher), then accept hook clients until the task is dropped. Returns the JoinHandle so
     /// the server can abort it on teardown; the lock and socket release with the process.
     pub fn spawn_listener(config: Config) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let lock_path = socket_lock_path_for(&config);
-            let socket = socket_path_for(&config);
-            if let Some(parent) = socket.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // Win the socket election, then bind. The lock must live inside this task: aborting the
-            // task drops it, so a surviving process's retry loop can take over (election,
-            // watcher-identical). A bind that fails AFTER winning the election (a transient
-            // FS/permissions hiccup) must not strand the worktree serving nothing while holding the
-            // lock (#53): drop the election so a sibling can try, back off, and re-elect — the same
-            // die→next-process-takes-over model, made resilient for the single-process case too.
-            let (_lock, listener): (FileLock, UnixListener) = loop {
-                let lock = loop {
-                    match FileLock::try_acquire(&lock_path) {
-                        Ok(Some(lock)) => break lock,
-                        _ => tokio::time::sleep(ELECTION_RETRY).await,
-                    }
-                };
-                // Only the lock holder ever unlinks: race-free stale-socket cleanup.
-                let _ = std::fs::remove_file(&socket);
-                match UnixListener::bind(&socket) {
-                    Ok(listener) => break (lock, listener),
-                    Err(_) => {
-                        drop(lock);
-                        tokio::time::sleep(ELECTION_RETRY).await;
-                    },
-                }
-            };
-            let mut sessions: HashMap<String, SessionState> = HashMap::new();
-            loop {
-                let Ok((stream, _addr)) = listener.accept().await else {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                };
-                prune_sessions(&mut sessions);
-                if let Err(err) = serve_one(stream, &config, &mut sessions).await
-                    && std::env::var_os("RAG_RAT_HOOK_DEBUG").is_some()
-                {
-                    eprintln!("agent-hook listener: {err:#}");
-                }
-            }
-        })
+        #[cfg(test)]
+        {
+            spawn_listener_with_hooks(config, ListenerHooks::default())
+        }
+        #[cfg(not(test))]
+        {
+            spawn_listener_task!(config, ())
+        }
+    }
+
+    /// Same as [`spawn_listener`], but with test hooks that signal readiness/waiting states.
+    /// Production logic is unchanged; the hooks are no-ops by default.
+    #[cfg(test)]
+    pub fn spawn_listener_with_hooks(config: Config, hooks: ListenerHooks) -> JoinHandle<()> {
+        spawn_listener_task!(config, hooks)
     }
 
     /// Drop sessions idle past the TTL, then evict least-recently-used down to the cap.
@@ -289,26 +360,6 @@ mod listener_tests {
         serde_json::from_str(&line).unwrap()
     }
 
-    /// Fallible `request`: `None` on any connect/write/read failure or an empty read. During a
-    /// listener takeover the connection can be reset or closed mid-handoff while the new owner is
-    /// still binding (the race widens under llvm-cov instrumentation — #84), which means "not
-    /// serving yet, retry," not a test failure. Callers must use a FRESH session per attempt so a
-    /// half-completed attempt can't dedupe the retry to a null context.
-    async fn try_request(
-        socket: &std::path::Path,
-        body: serde_json::Value,
-    ) -> Option<serde_json::Value> {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let stream = tokio::net::UnixStream::connect(socket).await.ok()?;
-        let (read, mut write) = stream.into_split();
-        write.write_all(format!("{body}\n").as_bytes()).await.ok()?;
-        let mut line = String::new();
-        if BufReader::new(read).read_line(&mut line).await.ok()? == 0 {
-            return None;
-        }
-        serde_json::from_str(&line).ok()
-    }
-
     #[tokio::test]
     async fn listener_serves_context_then_dedupes_per_session() {
         let config = test_config();
@@ -339,16 +390,27 @@ mod listener_tests {
 
     #[tokio::test]
     async fn second_listener_takes_over_when_winner_dies() {
+        use super::listener::{ListenerHooks, spawn_listener_with_hooks};
+
         let config = test_config();
-        let winner = spawn_listener(config.clone());
+        let winner_hooks = ListenerHooks::default();
+        let winner = spawn_listener_with_hooks(config.clone(), winner_hooks.clone());
+        // Wait for the winner to have bound the socket instead of polling socket.exists().
+        let mut winner_bound = winner_hooks.bound.clone();
+        tokio::time::timeout(Duration::from_secs(30), winner_bound.wait_for(|b| *b))
+            .await
+            .expect("winner should bind")
+            .expect("winner bound channel closed");
         let socket = socket_path_for(&config);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !socket.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+
         // The loser parks in the election retry loop while the winner holds the lock.
-        let loser = spawn_listener(config.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let loser_hooks = ListenerHooks::default();
+        let mut loser_waiting = loser_hooks.waiting.clone();
+        let loser = spawn_listener_with_hooks(config.clone(), loser_hooks.clone());
+        tokio::time::timeout(Duration::from_secs(30), loser_waiting.wait_for(|b| *b))
+            .await
+            .expect("loser should reach waiting state")
+            .expect("loser waiting channel closed");
         assert!(!loser.is_finished(), "loser must wait, not exit");
 
         // Kill the winner: its lock fd and bound socket drop with the task's process state.
@@ -356,26 +418,22 @@ mod listener_tests {
         let _ = winner.await;
         // NOTE: in-process abort drops the FileLock (held by the task) but the dead socket
         // file remains — exactly the stale-socket case. The loser must unlink + re-bind.
-        // Election retry is 5s; poll until the loser owns the socket and serves a real reply. The
-        // connection can be reset/closed mid-handoff while the loser is still binding, so use the
-        // fallible `try_request` with a FRESH session per attempt (so a half-completed attempt
-        // never dedupes the retry) rather than unwrap()-ing the first read (#84).
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let req = serde_json::json!({"v": 1, "kind": "grep_augment",
-                                         "session_id": format!("takeover-{attempt}"),
-                                         "pattern": "frobnicate", "search_path": null,
-                                         "source": "grep_tool"});
-            if let Some(reply) = try_request(&socket, req).await
-                && reply["context"].as_str().is_some_and(|c| c.contains("lib::frobnicate"))
-            {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "loser never took over the socket");
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        // Wait for explicit rebound signaling instead of polling try_request; the 30s cap is only
+        // a deadlock guard and is never reached on a healthy run.
+        let mut loser_bound = loser_hooks.bound.clone();
+        tokio::time::timeout(Duration::from_secs(30), loser_bound.wait_for(|b| *b))
+            .await
+            .expect("loser should take over the socket")
+            .expect("loser bound channel closed");
+        let req = serde_json::json!({"v": 1, "kind": "grep_augment",
+                                     "session_id": "takeover",
+                                     "pattern": "frobnicate", "search_path": null,
+                                     "source": "grep_tool"});
+        let reply = request(&socket, req).await;
+        assert!(
+            reply["context"].as_str().is_some_and(|c| c.contains("lib::frobnicate")),
+            "loser must serve real context after takeover"
+        );
         loser.abort();
     }
 }
