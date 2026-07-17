@@ -83,10 +83,21 @@ see the README's "Connect it to your agent (MCP)" section).
 
 ## Repo orientation
 
-- Rust workspace, four crates: `rag-rat-base` (foundation: config, repo identity/discovery,
-  language + embedding-model registries, locks, logging), `rag-rat-core` (engine: indexing,
-  tree-sitter graph, embeddings, git/GitHub, repo memories), `rag-rat-mcp` (the STDIO MCP server),
-  `rag-rat-cli` (the `rag-rat` binary). Rust 2024 edition.
+- Rust workspace, nine crates in a layered DAG (Rust 2024 edition):
+  - `rag-rat-base` — foundation: config, repo identity/discovery, language + embedding-model
+    registries, path classification, canonical JSON, locks, logging.
+  - `rag-rat-db` — the SQLite substrate: schema/migrations (+ the `MigrationHooks` seam),
+    storage, meta, chunk-text store/compression.
+  - satellites on db+base: `rag-rat-llm` (embedder providers, cookbook provisioning),
+    `rag-rat-papertrail` (tracker mirrors: GitHub/GitLab), `rag-rat-clones` (fingerprints,
+    postings, refine/antiunify), `rag-rat-oracle` (SCIP/LSP evidence, verdict store),
+    `rag-rat-query` (the read layer: graph/impact/symbol/tree queries, repo-memory reads +
+    evidence engine, pagerank), `rag-rat-dream` (memory-maintenance findings + verify/compact
+    model passes, on query+llm).
+  - `rag-rat-core` — the engine that remains: indexing + tree-sitter graph, the
+    `IndexDatabase` query surface, memory writes + op-log/account sync, watcher, eval.
+  - `rag-rat-mcp` (the STDIO MCP server), `rag-rat-cli` (the `rag-rat` binary).
+  All crates version in lockstep; see docs/releasing.md.
 - `rag-rat.toml` (repo root) configures what gets indexed and the SQLite database path.
 
 ## Style
