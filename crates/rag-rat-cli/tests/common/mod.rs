@@ -14,7 +14,6 @@
 //! module warning-clean under `clippy --all-targets -D warnings`.
 #![allow(dead_code)]
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,13 +30,12 @@ fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A throwaway temp dir under the system temp root, keyed by `tag`, the process id, and a unique
-/// counter. Any stale dir at the path is removed first.
+/// A throwaway scratch dir under the shared, self-healing test-scratch root
+/// (see [`rag_rat_base::test_scratch`]), keyed by `tag`, the process id, and a unique counter. Any
+/// stale dir at the path is removed first, and the shared helper sweeps dirs stranded by a
+/// killed/panicking run so they can't accumulate in the system temp (#726).
 pub fn unique_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("rag-rat-{tag}-{}-{}", std::process::id(), next_seq()));
-    let _ = fs::remove_dir_all(&dir);
-    dir
+    rag_rat_base::test_scratch::scratch_dir(tag)
 }
 
 /// A filesystem path formatted for embedding inside a double-quoted TOML string value. On Windows a
