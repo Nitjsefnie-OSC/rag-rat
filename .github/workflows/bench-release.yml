@@ -20,6 +20,10 @@ on:
         description: 'Full-rebuild wave size (RAG_RAT_INDEX_WAVE) — the memory/speed knob (default 2000)'
         required: false
         default: '2000'
+      vectors:
+        description: 'Set to 1 to add the +vectors pass (RAG_RAT_KERNEL_VECTORS) — reports db_size_with_vectors / db_size_vectors_delta on top of the structure-only headline (#78)'
+        required: false
+        default: ''
       mem_trace:
         description: 'Set to 1 to emit per-phase MEMTRACE (RSS + sqlite_memory) to the log for peak diagnosis'
         required: false
@@ -48,8 +52,8 @@ env:
 
 jobs:
   kernel:
-    # Self-hosted runner (62 GB RAM): the whole-kernel index peaks at ~5.5 GiB RSS (the embedding
-    # reconcile; see docs/benchmarks.md) plus the OS page cache over a ~10 GB index DB — runnable on
+    # Self-hosted runner (62 GB RAM): the whole-kernel index peaks at ~5.5 GiB RSS (a post-COMMIT
+    # plateau; see docs/benchmarks.md) plus the OS page cache over a multi-GB index DB — runnable on
     # a hosted box but with a noisy, contended wall-clock, which defeats the point of a headline
     # number. Only the release / workflow_dispatch triggers land here (never PRs), so a public-repo
     # self-hosted runner is safe. See docs/bencher.md.
@@ -68,6 +72,7 @@ jobs:
         env:
           RAG_RAT_KERNEL_SUBDIRS: ${{ github.event.inputs.kernel_subdirs || '.' }}
           RAG_RAT_INDEX_WAVE: ${{ github.event.inputs.wave_size || '2000' }}
+          RAG_RAT_KERNEL_VECTORS: ${{ github.event.inputs.vectors }}
           RAG_RAT_MEM_TRACE: ${{ github.event.inputs.mem_trace }}
           RAG_RAT_SQLITE_SOFT_HEAP_LIMIT_MB: ${{ github.event.inputs.soft_heap_limit_mb }}
           RAG_RAT_WAL_AUTOCHECKPOINT: ${{ github.event.inputs.wal_autocheckpoint }}
@@ -83,6 +88,7 @@ jobs:
             -v rag-rat-target:/repo/target \
             -e RAG_RAT_KERNEL_SUBDIRS="$RAG_RAT_KERNEL_SUBDIRS" \
             -e RAG_RAT_INDEX_WAVE="$RAG_RAT_INDEX_WAVE" \
+            -e RAG_RAT_KERNEL_VECTORS="$RAG_RAT_KERNEL_VECTORS" \
             -e RAG_RAT_MEM_TRACE="$RAG_RAT_MEM_TRACE" \
             -e RAG_RAT_SQLITE_SOFT_HEAP_LIMIT_MB="$RAG_RAT_SQLITE_SOFT_HEAP_LIMIT_MB" \
             -e RAG_RAT_WAL_AUTOCHECKPOINT="$RAG_RAT_WAL_AUTOCHECKPOINT" \

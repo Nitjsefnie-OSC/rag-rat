@@ -129,8 +129,9 @@ holds the API token. PR runs use `--start-point main --start-point-clone-thresho
 
 `tools/bench-kernel.sh` (run by `bench-release.yml`) is the "indexes the Linux kernel in X seconds"
 benchmark. It shallow-clones a pinned kernel tag (`KERNEL_TAG`, default `v7.0`), indexes its C/H
-sources **once** with the release `rag-rat` binary (`index --full`, `--no-default-features` =
-hash embedder, no model download), and writes a Bencher Metric Format JSON file with eight measures:
+sources **once** with the release `rag-rat` binary (`index --full`, `model = "none"`, built
+`--no-default-features` so there is no model download), and writes a Bencher Metric Format JSON file
+with nine measures:
 
 - `latency` — wall-clock seconds to index, in nanoseconds (Bencher's built-in Latency measure).
 - `throughput` — indexed files per second.
@@ -140,6 +141,17 @@ hash embedder, no model download), and writes a Bencher Metric Format JSON file 
   `kernel_rss_samples.csv` as the before/after curve).
 - `symbols`, `edges`, `resolved_edges`, `chunks` — extracted-fact counts, so a run is comparable
   per fact and not just per file (the unresolved-edge taxonomy goes to `kernel_unresolved_by_kind.csv`).
+- `db_size` — on-disk index size in bytes, post-WAL-checkpoint. The **structure-only** half of the
+  size split (#78): no vectors.
+
+Setting `RAG_RAT_KERNEL_VECTORS=1` runs a second pass that installs the hash embedder and embeds
+every chunk the embedding policy admits (not every chunk yields a vector — the policy skips e.g.
+generated and low-signal chunks), adding two more measures — `db_size_with_vectors` and
+`db_size_vectors_delta` (the marginal bytes the embedding tier costs). Off by default: at kernel
+scale it sweeps ~1.6M chunks, and hash-embedder vectors over the kernel are plumbing-validation, not
+retrieval value. When the pass doesn't run, both measures are **omitted** rather than reported as
+zero. See
+[`benchmarks.md`](./benchmarks.md#db-size-structure-vs-vectors).
 
 It's a **single cold rebuild**, not a criterion loop: the whole kernel is ~63k C/H files and takes
 tens of minutes, so criterion's 10-sample minimum (×10) is a non-starter. One run is also exactly
