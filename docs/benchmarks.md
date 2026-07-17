@@ -33,8 +33,10 @@ dominates wall-clock more than core count does. Peak RSS is governed by the grap
 ## Headline: indexing the Linux kernel
 
 Linux kernel **v7.0** (pinned at commit `028ef9c96e96197026887c0f092424679298aae8`, shallow-cloned),
-full index (`index --full`), whole tree (`RAG_RAT_KERNEL_SUBDIRS=.`), hash embedder
-(`--no-default-features`, no model download), release build, `RAG_RAT_INDEX_WAVE=2000`.
+full index (`index --full`), whole tree (`RAG_RAT_KERNEL_SUBDIRS=.`), no embedding model
+(`model = "none"`; built `--no-default-features`, so no model download), release build,
+`RAG_RAT_INDEX_WAVE=2000`. The on-disk size below is the structure-only half of the
+[size split](#db-size-structure-vs-vectors).
 
 | Metric | Value |
 |---|---|
@@ -63,6 +65,51 @@ Unresolved-edge taxonomy (the 41.8% / 3,823,653 edges the syntactic graph leaves
 bind without a compilation database; `references_type` is dominated by references whose type
 *definition* lives in an uncompiled or external header — both are exactly what the SCIP oracle
 recovers (below).
+
+### DB size: structure vs vectors
+
+"Indexing the kernel costs N GB" is only an honest number if it says what's *in* the N. The bench
+reports the size as a **split** (#78), because the two halves are bought separately:
+
+| Half | What it is | BMF measure |
+|---|---|---|
+| **Structure** (the headline) | files + symbols + graph + chunks + FTS + git history. `model = "none"` — zero vectors. What a base install actually builds. | `db_size` |
+| **+ Vectors** | every chunk embedded, on top of the same index. Opt-in second pass. | `db_size_with_vectors`, `db_size_vectors_delta` |
+
+The headline pass runs `model = "none"`, which is the honest config for this corpus: nobody does
+vector recall over the Linux kernel with a hash embedder, so those baseline vectors would be
+plumbing-validation, not retrieval value. `index --full` computes no embeddings regardless — the
+reconcile is a separate, explicit pass that refuses to embed under a model that was never installed
+— so the structure-only headline is what the run has always measured; the config now *says* so, and
+the vector tier gets priced instead of assumed.
+
+This is what makes the degradability claim ("base install ships zero AI; add what you use") a
+**measured** number rather than an assertion: `db_size_vectors_delta` is exactly the disk you avoid
+by not adding the embedding tier.
+
+The `+vectors` pass is off by default (at kernel scale it embeds ~1.6M chunks). Turn it on with:
+
+```bash
+RAG_RAT_KERNEL_VECTORS=1 RAG_RAT_BIN=target/release/rag-rat bash tools/bench-kernel.sh
+```
+
+**Kernel-scale `+Y` is not measured yet** — no whole-tree run with `RAG_RAT_KERNEL_VECTORS=1` has
+been published, so no number is quoted here. It lands from the next `bench-release` dispatch with
+the flag set, and is tracked as its own Bencher series from then on.
+
+For the *shape* of the split, one scope-bounded run — **`RAG_RAT_KERNEL_SUBDIRS=lib`, 673 files, not
+the headline**, on a 5-core / 15 GB box rather than the bench runner:
+
+| | Bytes | |
+|---|---|---|
+| structure + FTS + graph + git | 64,815,104 | 62 MiB |
+| add vectors (13,793 chunks → 10,151 embedded) | +13,271,040 | +13 MiB |
+| total | 78,086,144 | 74 MiB |
+
+So on that subtree the embedding tier is ~17% of the full DB. Vectors are stored int8-quantized
+(#112: a 4-byte scale + one byte per dim, ~4× smaller than the f32 blob), which is why the tier is a
+modest fraction rather than the dominant one. Whether the whole-tree ratio holds is exactly what the
+measured run will answer — don't extrapolate this row to the headline.
 
 ### v0.5.0 rebaseline: why the kernel got ~2.7× faster
 
@@ -206,19 +253,27 @@ higher one is missed by the named per-phase probes:
 1. **The edge-resolution window** (inside the rebuild transaction). The whole symbol + edge graph is
    held in memory until the single resolve-and-insert pass; once `index_targets` frees it, RSS drops
    to a flat resident baseline through logical-symbol building, FTS, and COMMIT.
-2. **The embedding reconcile** (after COMMIT, where the true peak lives). `index --full` runs the
-   embedding reconcile once the rebuild commits; the hash embedder is always ready, so embeddings are
-   actually computed. The reconcile materializes chunk rows to embed them, adding a few GiB on top of
-   the resident baseline for a sustained plateau — this is the process peak, and it is **not**
-   covered by the `RAG_RAT_MEM_TRACE=1` per-phase probes (which instrument the rebuild transaction and
-   stop at COMMIT). Only the whole-process sampler catches it.
+2. **A post-COMMIT plateau** (where the true peak lives), **cause not yet attributed**. A few GiB
+   land on top of the resident baseline after COMMIT for a sustained plateau — the process peak —
+   and it is **not** covered by the `RAG_RAT_MEM_TRACE=1` per-phase probes (which instrument the
+   rebuild transaction and stop at COMMIT). Only the whole-process sampler catches it.
 
-Both humps shrank from v0.4.x with the #61 symbol/chunk reduction: a smaller in-memory graph lowers
-the edge window, and ~62% fewer chunks lower the reconcile's materialization — together taking the
-peak from 5.60 GiB (v0.4.x) to 4.15 GiB (v0.5.0), and lower still to 3.49 GiB by v0.15.0. To
-regenerate the per-phase curve on your own run, set
-`RAG_RAT_MEM_TRACE=1` (rebuild transaction phases, to stderr) plus the sampler CSV the bench writes
-(`RSS_CSV`, the post-COMMIT reconcile the MEM_TRACE probes miss).
+   This plateau used to be attributed to the embedding reconcile. That attribution is **wrong**:
+   `index --full` never runs one. The CLI `index` path calls `rebuild_with_progress` and stops
+   (`crates/rag-rat-cli/src/commands/index_ops.rs:89`); neither it nor the core rebuild
+   (`crates/rag-rat-core/src/index/rebuild.rs`) ever reaches an embedder, and `reconcile` refuses to
+   embed under a model that was never explicitly installed — which the bench never does. A bench DB
+   accordingly contains **zero** rows in `chunk_embeddings`, which is why the headline `db_size` is
+   the structure-only number above. So whatever the plateau is, it is not chunk-embedding
+   materialization; the real cause is open (the pinned kernel's full-history `git log --numstat`
+   walk is the obvious suspect, since it is the other post-rebuild bulk pass — unverified).
+
+Both humps shrank from v0.4.x with the #61 symbol/chunk reduction — the peak went from 5.60 GiB
+(v0.4.x) to 4.15 GiB (v0.5.0), and lower still to 3.49 GiB by v0.15.0. A smaller in-memory graph
+lowers the edge window; why the post-COMMIT plateau also fell is part of the open attribution above.
+To regenerate the per-phase curve on your own run, set `RAG_RAT_MEM_TRACE=1` (rebuild transaction
+phases, to stderr) plus the sampler CSV the bench writes (`RSS_CSV`, the post-COMMIT plateau the
+MEM_TRACE probes miss).
 
 ### How the peak got here
 

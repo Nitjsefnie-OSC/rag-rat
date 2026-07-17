@@ -3,8 +3,16 @@
 #
 # Clones a pinned Linux kernel tag, indexes its C/H sources once with the *release* rag-rat binary
 # (dogfooding the shipped `index` command), and writes a Bencher Metric Format (BMF) JSON file with
-# three measures: latency (ns), throughput (files/s), and peak memory (bytes). The release workflow
-# (.github/workflows/bench_release.yml) feeds that file to `bencher run --adapter json`.
+# the run's measures: latency (ns), throughput (files/s), peak memory (bytes), the extracted-fact
+# counts, and on-disk size. The release workflow (.github/workflows/bench-release.yml) feeds that
+# file to `bencher run --adapter json`.
+#
+# DB size is reported as a SPLIT (#78), because "10 GB to index the kernel" is only honest if you say
+# what's in it. The headline `db_size` is the STRUCTURE-only index — files + symbols + graph + chunks
+# + FTS + git history, `model = "none"`, zero vectors — which is what a base install actually builds.
+# Vectors are a separate, opt-in pass (RAG_RAT_KERNEL_VECTORS=1) reported as `db_size_with_vectors`
+# and the `db_size_vectors_delta` on top. That makes the degradability claim ("base install ships
+# zero AI; add what you use") a measured number instead of an assertion.
 #
 # Single-shot on purpose: a full kernel index is ~tens of minutes, so criterion's 10-sample loop
 # isn't viable — this is one cold rebuild, the number a user actually sees. Runs only on release
@@ -18,6 +26,9 @@
 #   RAG_RAT_INDEX_WAVE       full-rebuild wave size (files prepared/inserted per wave before the
 #                            wave's prepared form is dropped) — the memory/speed knob. Read by the
 #                            binary; passed through this script's environment. (binary default: 2000)
+#   RAG_RAT_KERNEL_VECTORS   set to 1 to run the second, +vectors pass (default: 0 = headline only):
+#                            installs the hash embedder and reconciles every chunk, so the run also
+#                            reports db_size_with_vectors / db_size_vectors_delta
 #   BMF_OUT                  output BMF JSON path           (default: kernel_bmf.json)
 #   TAXONOMY_CSV             unresolved-edge-by-kind CSV    (default: kernel_unresolved_by_kind.csv)
 #   KERNEL_WORK              working dir                    (default: a fresh mktemp dir)
@@ -30,6 +41,7 @@ RSS_CSV="${RSS_CSV:-kernel_rss_samples.csv}"
 TAXONOMY_CSV="${TAXONOMY_CSV:-kernel_unresolved_by_kind.csv}"
 RAG_RAT_BIN="${RAG_RAT_BIN:-target/release/rag-rat}"
 RAG_RAT_KERNEL_SUBDIRS="${RAG_RAT_KERNEL_SUBDIRS:-.}"
+RAG_RAT_KERNEL_VECTORS="${RAG_RAT_KERNEL_VECTORS:-0}"
 BMF_OUT="${BMF_OUT:-kernel_bmf.json}"
 WORK="${KERNEL_WORK:-$(mktemp -d)}"
 mkdir -p "$WORK"
@@ -52,15 +64,41 @@ git -C "$WORK/linux" -c protocol.version=2 fetch -q --depth 1 origin "$KERNEL_SH
 git -C "$WORK/linux" checkout -q "$KERNEL_SHA"
 
 # Render a C-language config over the requested subtree(s). `c = [...]` maps to **/*.c + **/*.h.
+#
+# `model = "none"` is the HONEST headline config (#78), stated explicitly rather than left to the
+# default: nobody runs vector recall over the kernel with a hash embedder, so the baseline vectors
+# would be plumbing-validation, not retrieval value. It also pins what the headline measures — the
+# default selector would seed all-MiniLM as the provisional active model, which is not a model this
+# `--no-default-features` build can even load. `index --full` computes no embeddings either way
+# (the reconcile is a separate, explicit pass and refuses without an installed model), so this
+# names the run's real semantics instead of relying on that.
 subdirs_toml="$(printf '"%s", ' $RAG_RAT_KERNEL_SUBDIRS)"
 cat > "$WORK/rag-rat.toml" <<EOF
 [index]
 root = "$WORK/linux"
 database = "$WORK/kernel-index.sqlite"
 
+[llm.embedding]
+model = "none"
+
 [target_bindings]
 c = [${subdirs_toml%, }]
 EOF
+
+# Checkpoint the WAL into the main file, then print the DB's durable size in bytes. Called once per
+# size measurement (structure-only, then again after the +vectors pass), so each number is the real
+# on-disk footprint at that point and not a pre-checkpoint undercount.
+db_size_bytes() {
+  python3 - "$1" <<'PY'
+import os, sqlite3, sys
+
+db = sys.argv[1]
+conn = sqlite3.connect(db)
+conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+conn.close()
+print(os.path.getsize(db))
+PY
+}
 
 # Single cold full index, measured. We capture TWO memory numbers:
 #   - maxrss: getrusage(RUSAGE_CHILDREN).ru_maxrss — the kernel-true peak (catches sub-sample spikes),
@@ -111,18 +149,53 @@ if [ "${rc:-1}" -ne 0 ]; then
   exit 1
 fi
 
+# PASS 1 SIZE — the headline (#78): structure + FTS + graph + git, zero vectors. Measured HERE,
+# before the optional vectors pass below can grow the file.
+structure_db_size="$(db_size_bytes "$WORK/kernel-index.sqlite")"
+
+# PASS 2 (opt-in) — add vectors on top of the SAME index and re-measure, so the reported delta is
+# the marginal cost of the embedding tier over the structure this run already built, not two
+# independent indexes differenced. Off by default: at kernel scale it embeds ~1.6M chunks, and the
+# hash embedder's vectors are plumbing-validation rather than retrieval value — the point is to
+# price the tier, not to ship a recall claim. `models install` is required because `reconcile`
+# refuses to embed under a model that was never explicitly installed.
+vectors_db_size=""
+if [ "$RAG_RAT_KERNEL_VECTORS" = "1" ]; then
+  # The same index + config, with the embeddings-off selector swapped for the hash embedder. The
+  # selector must be a model this `--no-default-features` build can actually construct, so it is
+  # `embedding-hash` (the dependency-free tier) and not a transformer that needs a download.
+  cat > "$WORK/rag-rat-vectors.toml" <<EOF
+[index]
+root = "$WORK/linux"
+database = "$WORK/kernel-index.sqlite"
+
+[llm.embedding]
+model = "embedding-hash"
+
+[target_bindings]
+c = [${subdirs_toml%, }]
+EOF
+  echo "bench-kernel: +vectors pass — installing the hash embedder and reconciling every chunk…" >&2
+  "$RAG_RAT_BIN" --config "$WORK/rag-rat-vectors.toml" models install embedding-hash >/dev/null
+  "$RAG_RAT_BIN" --config "$WORK/rag-rat-vectors.toml" reconcile --until-clean >/dev/null
+  vectors_db_size="$(db_size_bytes "$WORK/kernel-index.sqlite")"
+fi
+
 # Read the extracted-fact counts from the DB and emit the BMF. Capturing symbols/edges/chunks (not
 # just files/s) makes the run comparable per extracted fact, not just per file — different tools
 # compute different products, so throughput alone is mush.
-python3 - "$WORK/kernel-index.sqlite" "$seconds" "$maxrss_kb" "$sampled_peak_kb" "$BMF_OUT" "$KERNEL_TAG" "$TAXONOMY_CSV" <<'PY'
+python3 - "$WORK/kernel-index.sqlite" "$seconds" "$maxrss_kb" "$sampled_peak_kb" "$BMF_OUT" "$KERNEL_TAG" "$TAXONOMY_CSV" "$structure_db_size" "$vectors_db_size" <<'PY'
 import json, os, sqlite3, sys
 db, seconds = sys.argv[1], float(sys.argv[2])
 maxrss_kb, sampled_peak_kb = int(sys.argv[3]), int(sys.argv[4])
 out, tag, taxonomy_csv = sys.argv[5], sys.argv[6], sys.argv[7]
+# Both sizes are measured by the shell (each right after its own WAL checkpoint, at the point in the
+# run where it is true); this step only reports them. An empty `vectors_db_size` = the +vectors pass
+# was not run, so the vector measures are OMITTED rather than reported as zero — a missing
+# measurement and a measured zero are different claims.
+structure_db_size = int(sys.argv[8])
+vectors_db_size = int(sys.argv[9]) if sys.argv[9] else None
 conn = sqlite3.connect(db)
-# Checkpoint the WAL into the main file first so db_size measures the real durable footprint.
-conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-db_size = os.path.getsize(db)
 count = lambda table: conn.execute(f"select count(*) from {table}").fetchone()[0]
 files, symbols, edges, chunks = count("files"), count("symbols"), count("edges"), count("chunks")
 resolved = conn.execute("select count(*) from edges where to_symbol_id is not null").fetchone()[0]
@@ -157,10 +230,20 @@ bmf = {
         "resolved_edges": {"value": resolved},
         "chunks": {"value": chunks},
         # On-disk index size, bytes (post-checkpoint) — the #79 interning headline at kernel
-        # scale; tracked so size regressions surface alongside latency/memory.
-        "db_size": {"value": db_size},
+        # scale; tracked so size regressions surface alongside latency/memory. This is the
+        # STRUCTURE-only index (#78): no vectors, `model = "none"`. It stays named `db_size` so the
+        # existing Bencher series keeps its history — the number's meaning is unchanged (the run
+        # never embedded), only now stated.
+        "db_size": {"value": structure_db_size},
     }
 }
+if vectors_db_size is not None:
+    # The +Y half of the split: the same index with every chunk embedded, and the marginal cost of
+    # the vector tier on top of the structure above.
+    bmf[f"linux-kernel-{tag}/full-index"]["db_size_with_vectors"] = {"value": vectors_db_size}
+    bmf[f"linux-kernel-{tag}/full-index"]["db_size_vectors_delta"] = {
+        "value": vectors_db_size - structure_db_size
+    }
 with open(out, "w") as f:
     json.dump(bmf, f, indent=2)
 
@@ -168,10 +251,27 @@ taxonomy = " ".join(f"{kind}={n}" for kind, n in unresolved_by_kind)
 print(
     f"bench-kernel: indexed {files} files of Linux {tag} in {seconds:.1f}s "
     f"({files/seconds:.1f} files/s, wave={wave}) — peak {maxrss_kb/1024:.0f} MiB maxrss "
-    f"(sampled {sampled_peak_kb/1024:.0f} MiB) — db {db_size/1024/1024:.0f} MiB — "
+    f"(sampled {sampled_peak_kb/1024:.0f} MiB) — db {structure_db_size/1024/1024:.0f} MiB — "
     f"{symbols} symbols, {edges} edges ({resolved} resolved, {resolved_pct:.1f}%), {chunks} chunks → {out}",
     file=sys.stderr,
 )
+# The #78 headline sentence, in the shape the docs quote it: structure X, add vectors +Y.
+if vectors_db_size is None:
+    print(
+        f"bench-kernel: db size — structure + FTS + graph + git: "
+        f"{structure_db_size/1024/1024:.0f} MiB (model=none, 0 vectors); "
+        f"add vectors: NOT MEASURED (set RAG_RAT_KERNEL_VECTORS=1 for the +vectors pass)",
+        file=sys.stderr,
+    )
+else:
+    delta = vectors_db_size - structure_db_size
+    print(
+        f"bench-kernel: db size — structure + FTS + graph + git: "
+        f"{structure_db_size/1024/1024:.0f} MiB; add vectors: +{delta/1024/1024:.0f} MiB "
+        f"= {vectors_db_size/1024/1024:.0f} MiB total "
+        f"({100.0*delta/vectors_db_size:.0f}% of the full DB is the embedding tier)",
+        file=sys.stderr,
+    )
 print(
     f"bench-kernel: {unresolved_total} unresolved edges by kind → {taxonomy} (full breakdown in {taxonomy_csv})",
     file=sys.stderr,
