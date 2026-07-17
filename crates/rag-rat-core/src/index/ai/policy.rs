@@ -1,5 +1,26 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Counts embed-path FromText re-classifications ([`policy_for_job`]) since the last reset — the
+    /// tree-sitter re-parse the #530 stamped-column fast path exists to avoid. A test resets it,
+    /// runs a reconcile, and asserts 0 (fast path: read the stamped column) vs > 0 (fallback: the
+    /// FromText recompute). This is what lets the fast-path tests DISAGREE with the fallback instead
+    /// of passing via identical output.
+    pub(crate) static POLICY_FROMTEXT_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_policy_fromtext_calls() {
+    POLICY_FROMTEXT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn policy_fromtext_calls() -> usize {
+    POLICY_FROMTEXT_CALLS.with(std::cell::Cell::get)
+}
+
 /// Behavior version of the embedding-policy classifier. It certifies that a persisted
 /// `chunks.embedding_policy` value reflects the CURRENT classifier — the reconcile skip-summary
 /// reads the column via `GROUP BY` (the always-fast path, #530) only when a full rebuild has
@@ -154,6 +175,8 @@ pub(crate) fn policy_for_job(
     chunk: &CurrentChunk,
     max_embedding_chars: usize,
 ) -> EmbeddingPolicyDecision {
+    #[cfg(test)]
+    POLICY_FROMTEXT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     embedding_policy_for_chunk(
         Path::new(&chunk.path),
         &chunk.language,
@@ -164,6 +187,26 @@ pub(crate) fn policy_for_job(
         max_embedding_chars,
         LowSignalCheck::FromText,
     )
+}
+
+/// One embed-path candidate's policy. Under `stamped_policy` (#530: the stamps certify the column
+/// at this run's cap) the decision comes straight from the stamped
+/// `chunks.embedding_policy`/`embedding_priority` — the index-time FromSpan truth, no per-chunk
+/// tree-sitter re-parse (#725; `Embed` is the sole eligible policy). Otherwise re-derive FromText
+/// via [`policy_for_job`], the pre-certification behavior.
+pub(crate) fn job_policy(
+    chunk: &CurrentChunk,
+    max_embedding_chars: usize,
+    stamped_policy: bool,
+) -> EmbeddingPolicyDecision {
+    if stamped_policy {
+        return policy(
+            &chunk.embedding_policy,
+            chunk.embedding_priority,
+            chunk.embedding_policy == "Embed",
+        );
+    }
+    policy_for_job(chunk, max_embedding_chars)
 }
 
 /// Embedding budget order: source symbols (0) before docs (1) before tests (2).

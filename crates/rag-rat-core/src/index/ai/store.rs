@@ -23,7 +23,7 @@ pub(crate) fn estimated_reconcile_job_calls() -> usize {
 /// the `chunks.text` column is gone, so the SELECT INNER JOINs `chunk_text`). The real `text` is
 /// filled in a post-loop via [`ChunkTextRow::resolve`] — decompress returns `anyhow::Result`, which
 /// can't cross this rusqlite closure (#77 Phase 2). The SELECT order is: 0-5 identity, 6-13
-/// embedding metadata, 14 blob, 15 raw_len, 16 dict_version.
+/// embedding metadata, 14 blob, 15 raw_len, 16 dict_version, 17-18 stamped policy columns.
 pub(crate) fn current_chunk_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(CurrentChunk, ChunkTextRow)> {
@@ -43,6 +43,8 @@ pub(crate) fn current_chunk_row(
         input_hash: row.get(11)?,
         embedding_text_version: row.get(12)?,
         next_retry_after_ms: row.get(13)?,
+        embedding_policy: row.get(17)?,
+        embedding_priority: row.get(18)?,
         reason: ReconcileReason::Forced,
     };
     let text_row =
@@ -90,7 +92,9 @@ pub(crate) fn for_each_embedding_candidate(
                chunk_embeddings.next_retry_after_ms,
                chunk_text.blob,
                chunk_text.raw_len,
-               chunk_text.dict_version
+               chunk_text.dict_version,
+               chunks.embedding_policy,
+               chunks.embedding_priority
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
@@ -178,8 +182,39 @@ pub(crate) fn embedding_candidate_ids(
     Ok(ids)
 }
 
+/// Snapshot the scoped `files` metadata (id/path/language/kind) into an indexed temp table for one
+/// reconcile run. The per-batch chunk query ([`current_chunks_by_ids`]) joins THIS table, not the
+/// live `files` view: that view is a repo-/generation-scoped `UNION ALL` compound (see
+/// `lifecycle.rs`), and SQLite re-evaluates it for EACH correlated `files.id = chunks.file_id`
+/// probe — so the per-batch join was O(chunks × files), ~15 ms/chunk and hours of wall-clock at
+/// kernel scale (#725). A plain indexed temp table probes in O(log files). Full-scan queries (the
+/// candidate-id list, the estimate) are unaffected — the planner materializes the view once for a
+/// scan — so only the per-id batch path reads the snapshot.
+///
+/// Built FROM the view, so the snapshot carries exactly this run's scope, frozen at loop start like
+/// `candidate_ids`; per-chunk freshness is still validated against `chunks`/`chunk_embeddings` at
+/// selection and write time, so a mid-run file change cannot embed stale text. Refreshed (DROP +
+/// CREATE) on every call and left on the connection between runs — nothing outside the embed loop
+/// references it. The embed loop MUST call this before its batch loop; the two batch readers are
+/// reachable only through that loop (no direct callers), so the table is always present.
+pub(crate) fn snapshot_reconcile_scope_files(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.reconcile_scope_files;
+         CREATE TEMP TABLE reconcile_scope_files(
+             id INTEGER PRIMARY KEY,
+             path TEXT NOT NULL,
+             language TEXT NOT NULL,
+             kind TEXT NOT NULL
+         );
+         INSERT INTO temp.reconcile_scope_files SELECT id, path, language, kind FROM files;",
+    )?;
+    Ok(())
+}
+
 /// Load full chunk rows (with text + embedding metadata) for a specific set of ids, in the given
-/// order. Used per batch so only the chunks about to be considered are materialized.
+/// order. Used per batch so only the chunks about to be considered are materialized. Joins the
+/// [`snapshot_reconcile_scope_files`] temp table, NOT the live `files` view — see that helper for
+/// the O(chunks × files) scope-view trap this avoids.
 pub(crate) fn current_chunks_by_ids(
     conn: &Connection,
     model_id: &str,
@@ -202,9 +237,10 @@ pub(crate) fn current_chunks_by_ids(
                chunk_embeddings.model_version, chunk_embeddings.embedding_dim,
                chunk_embeddings.input_hash, chunk_embeddings.embedding_text_version,
                chunk_embeddings.next_retry_after_ms,
-               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version
+               chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version,
+               chunks.embedding_policy, chunks.embedding_priority
         FROM chunks
-        JOIN files ON files.id = chunks.file_id
+        JOIN temp.reconcile_scope_files AS files ON files.id = chunks.file_id
         LEFT JOIN chunk_embeddings
           ON chunk_embeddings.chunk_id = chunks.id
          AND chunk_embeddings.model_id = ?1
@@ -283,7 +319,7 @@ pub(crate) fn estimated_reconcile_jobs(
                     scan.dim,
                     scan.max_embedding_chars,
                 ))
-                && policy_for_job(&candidate, scan.max_embedding_chars).eligible;
+                && job_policy(&candidate, scan.max_embedding_chars, scan.stamped_policy).eligible;
             if eligible {
                 count = count.saturating_add(1);
             }
@@ -309,7 +345,7 @@ pub(crate) fn select_reconcile_batch(
     let candidates = current_chunks_by_ids(conn, model_id, ids, decoder)?;
     let mut jobs = Vec::new();
     for candidate in candidates {
-        let policy = policy_for_job(&candidate, scan.max_embedding_chars);
+        let policy = job_policy(&candidate, scan.max_embedding_chars, scan.stamped_policy);
         if !policy.eligible {
             continue;
         }

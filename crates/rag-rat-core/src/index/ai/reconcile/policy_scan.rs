@@ -6,6 +6,7 @@ use super::super::*;
 pub(crate) struct ChunkForPolicy {
     id: i64,
     current_policy: String,
+    current_priority: i64,
     chunk_kind: String,
     symbol_path: Option<String>,
     start_byte: usize,
@@ -135,23 +136,31 @@ pub(crate) fn embedding_policy_skip_summary(
     recompute_policy_skip_summary(conn, max_embedding_chars)
 }
 
+/// TRUE when the #530 stamps certify `chunks.embedding_policy` (+ `embedding_priority`) for this
+/// repo at `max_embedding_chars`: the CURRENT classifier stamped the column (version) AND at the
+/// cap the caller wants — a different cap re-buckets SkipTooLarge/truncation, which the
+/// default-stamped column can't reflect. Shared by the skip-summary fast path and the embed-path
+/// policy source ([`job_policy`](super::super::policy::job_policy)); every miss fails SAFE — the
+/// caller just recomputes from source.
+pub(crate) fn stamped_policy_certified(
+    conn: &Connection,
+    max_embedding_chars: usize,
+) -> anyhow::Result<bool> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let version = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
+    let cap = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
+    Ok(version.as_deref() == Some(EMBEDDING_POLICY_VERSION)
+        && cap.as_deref() == Some(max_embedding_chars.to_string().as_str()))
+}
+
 /// Read the per-policy counts straight from the persisted `chunks.embedding_policy` column, but
-/// ONLY when a full rebuild has stamped it current for this repo (`EMBEDDING_POLICY_VERSION`) at
-/// the requested cap. `None` — stamp absent/stale, or a different cap — tells the caller to
-/// recompute.
+/// ONLY when [`stamped_policy_certified`] holds. `None` — stamp absent/stale, or a different cap —
+/// tells the caller to recompute.
 fn policy_skip_summary_from_column(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
-    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-    let version = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_VERSION_KEY)?;
-    let cap = rag_rat_db::meta::repo_meta(conn, &repo_id, EMBEDDING_POLICY_CAP_KEY)?;
-    // Trust the column ONLY when the CURRENT classifier stamped it (version) AND at the cap the
-    // caller wants: a different cap re-buckets SkipTooLarge/truncation, which the
-    // default-stamped column can't reflect. Both gates fail SAFE — a miss just recomputes.
-    if version.as_deref() != Some(EMBEDDING_POLICY_VERSION)
-        || cap.as_deref() != Some(max_embedding_chars.to_string().as_str())
-    {
+    if !stamped_policy_certified(conn, max_embedding_chars)? {
         return Ok(None);
     }
     // BYTE-IDENTICAL FROM/JOIN to the recompute (scope view + chunk_text presence) so the counted
@@ -227,7 +236,7 @@ fn for_each_recomputed_chunk_policy(
         SELECT files.id, files.path, files.language, files.kind, files.sha256, chunks.id,
                chunks.chunk_kind, chunks.symbol_path, chunks.start_byte, chunks.end_byte,
                chunk_text.blob, chunk_text.raw_len, chunk_text.dict_version, \
-         chunks.embedding_policy
+         chunks.embedding_policy, chunks.embedding_priority
         FROM chunks
         JOIN files ON files.id = chunks.file_id
         JOIN chunk_text ON chunk_text.chunk_id = chunks.id
@@ -279,6 +288,7 @@ fn for_each_recomputed_chunk_policy(
             }
             .resolve(&mut decoder)?,
             current_policy: row.get(13)?,
+            current_priority: row.get(14)?,
         };
         // A structural file (has a grammar, not generated) within the parse cap classifies from its
         // shared tree; anything else streams per-chunk text, bounding memory for huge files.
@@ -422,7 +432,7 @@ pub(crate) fn ensure_embedding_policy_current(conn: &Connection) -> anyhow::Resu
     // leaves it to be reused/dropped, not half-created.
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS embedding_policy_heal(id INTEGER PRIMARY KEY, policy \
-         TEXT NOT NULL);",
+         TEXT NOT NULL, priority INTEGER NOT NULL);",
     )?;
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     // NEVER return with an open transaction: the caller (`maybe_heal_embedding_policy`) swallows
@@ -454,11 +464,17 @@ fn heal_embedding_policy_locked(conn: &Connection, repo_id: &str) -> anyhow::Res
     }
     {
         let mut stage = conn.prepare(
-            "INSERT OR REPLACE INTO temp.embedding_policy_heal(id, policy) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO temp.embedding_policy_heal(id, policy, priority) VALUES (?1, \
+             ?2, ?3)",
         )?;
+        // Stage on EITHER column differing: the stamp certifies policy AND priority (the embed
+        // path's `job_policy` trusts both, #725), and a classifier change can move priority while
+        // the policy name stays the same — healing only policy would re-certify stale priorities.
         for_each_recomputed_chunk_policy(conn, DEFAULT_MAX_EMBEDDING_CHARS, |chunk, decision| {
-            if decision.policy != chunk.current_policy {
-                stage.execute(params![chunk.id, decision.policy])?;
+            if decision.policy != chunk.current_policy
+                || decision.priority != chunk.current_priority
+            {
+                stage.execute(params![chunk.id, decision.policy, decision.priority])?;
             }
             Ok(())
         })?;
@@ -466,6 +482,8 @@ fn heal_embedding_policy_locked(conn: &Connection, repo_id: &str) -> anyhow::Res
     conn.execute(
         "UPDATE main.chunks
          SET embedding_policy = (SELECT policy FROM temp.embedding_policy_heal WHERE id = \
+         main.chunks.id),
+             embedding_priority = (SELECT priority FROM temp.embedding_policy_heal WHERE id = \
          main.chunks.id)
          WHERE id IN (SELECT id FROM temp.embedding_policy_heal)",
         [],
@@ -493,6 +511,7 @@ mod reconstruct_file_text_tests {
         ChunkForPolicy {
             id: 0,
             current_policy: "Embed".to_string(),
+            current_priority: 1,
             chunk_kind: "code".to_string(),
             symbol_path: None,
             start_byte,

@@ -233,6 +233,185 @@ fn incremental_edit_keeps_the_certified_column_fresh() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Shared setup for the embed-path policy-source tests (#725): a rebuild whose fn chunk classifies
+/// Embed, the deterministic hash embedder installed, and every Embed row poisoned to
+/// `SkipLowSignal` in the column. Whether a reconcile then embeds is exactly the question of which
+/// policy source it read: the column (obeys the poison → nothing embedded) or a FromText recompute
+/// (ignores it → the fn chunk is embedded).
+fn poisoned_embed_fixture(root: &std::path::Path) -> IndexDatabase {
+    rust_fixture(root);
+    let mut config = source_config(root.to_path_buf(), Language::Rust);
+    // Select the hash embedder explicitly: a fresh index adopts the CONFIGURED model (#394), and
+    // the default all-MiniLM would leave the reconcile Blocked before it reads any policy.
+    config.llm.embedding.backend = HASH_MODEL_ID.parse().unwrap();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.install_model(HASH_MODEL_ID, None).unwrap();
+    let poisoned = db
+        .storage
+        .connection()
+        .execute(
+            "UPDATE main.chunks SET embedding_policy = 'SkipLowSignal'
+             WHERE embedding_policy = 'Embed'",
+            [],
+        )
+        .unwrap();
+    assert!(poisoned >= 1, "the fixture must stamp at least one Embed chunk to poison");
+    db
+}
+
+#[test]
+fn reconcile_embed_path_reads_the_stamped_policy_column() {
+    // The embed path takes each candidate's policy from the CERTIFIED stamped column instead of
+    // re-deriving it FromText — the per-candidate tree-sitter re-parse that dominated large
+    // reconciles (#725). Under a current stamp at the default cap, the poisoned column must be
+    // OBEYED: zero embeddings written. Only the column read produces that outcome — a recompute
+    // would classify the fn chunk Embed and write it.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    ai::reset_policy_fromtext_calls();
+    let report = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        report.embeddings_written, 0,
+        "a certified-stamp reconcile must serve the poisoned column; an embedding written means \
+         the embed path re-derived policy from text"
+    );
+    assert_eq!(db.current_embedding_count(HASH_MODEL_ID).unwrap(), 0);
+    // Directly: the embed path took the stamped column, never the FromText re-parse — the cost
+    // #725 removes. This is the counter half of the fast-path/fallback disagreement.
+    assert_eq!(
+        ai::policy_fromtext_calls(),
+        0,
+        "a certified-stamp embed path must not re-classify any candidate FromText"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn stale_stamp_reconcile_heals_then_takes_the_fast_path() {
+    // The first reconcile after a classifier/version bump: the stamp is stale, so the self-heal
+    // recomputes + re-certifies the column ONCE up front. The embed loop must then re-derive its
+    // certification from the HEALED stamp and read the column — NOT re-parse every candidate
+    // FromText for the whole run (the regression Codex caught: `stamped_policy` captured before the
+    // heal stayed false). Prove it with the counter: zero FromText calls despite the stale start,
+    // and the stamp ends certified. (The poison is erased by the heal — the fn chunk classifies
+    // Embed from source — so it still embeds; the counter, not the output, is the fast-path proof.)
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    stale_the_stamp(&db);
+    ai::reset_policy_fromtext_calls();
+    let report = db.reconcile(None, Some(8)).unwrap();
+    assert_eq!(
+        ai::policy_fromtext_calls(),
+        0,
+        "after the heal re-certifies the stamp, the embed loop must read the column, not \
+         re-parse: {report:?}"
+    );
+    assert_eq!(
+        policy_version(&db).as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "the stale-stamp reconcile heals and re-certifies"
+    );
+    assert!(report.embeddings_written >= 1, "the healed Embed chunk still embeds: {report:?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_plan_classifies_from_the_stamped_column_like_the_embed_path() {
+    // `reconcile --plan` must preview exactly what `reconcile` will do — so under a certified stamp
+    // it classifies candidates from the stamped column, not FromText (which can legitimately
+    // disagree on a chunk slicing a long comment/string). Poison every Embed chunk to SkipLowSignal
+    // under a current stamp: the plan must report zero eligible work (it read the column) and take
+    // no FromText re-parse, matching the embed path on the same index. A FromText recompute would
+    // classify the fn chunk Embed and count it missing.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    ai::reset_policy_fromtext_calls();
+    let plan = db.reconcile_plan().unwrap();
+    assert_eq!(
+        ai::policy_fromtext_calls(),
+        0,
+        "a certified-stamp plan must read the column, not re-classify FromText"
+    );
+    assert_eq!(
+        plan.embeddings.missing, 0,
+        "the plan reads the poisoned (SkipLowSignal) column, so nothing is eligible — matching \
+         the embed path: {:?}",
+        plan.embeddings
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn self_heal_refreshes_stale_priorities_under_an_unchanged_policy() {
+    // The stamp certifies policy AND priority (the embed path trusts both, #725), and a classifier
+    // change can move priority while the policy name stays the same. A heal that rewrote only
+    // `embedding_policy` would re-certify stale priorities — so the heal must stage on either
+    // column differing and write both back. Poison the fn chunk's priority (policy untouched),
+    // stale the stamp, and let the default-cap reconcile self-heal: the priority must be restored
+    // and the stamp current again.
+    let root = unique_temp_root();
+    rust_fixture(&root);
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+    let poisoned = conn
+        .execute(
+            "UPDATE main.chunks SET embedding_priority = 7 WHERE embedding_policy = 'Embed'",
+            [],
+        )
+        .unwrap();
+    assert!(poisoned >= 1, "the fixture must have an Embed chunk whose priority can be poisoned");
+    stale_the_stamp(&db);
+
+    db.reconcile_with_options_progress(
+        ai::ReconcileOptions { batch_size: Some(8), ..Default::default() },
+        |_| {},
+    )
+    .unwrap();
+
+    let still_poisoned: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks WHERE embedding_priority = 7", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(still_poisoned, 0, "the heal must recompute priorities, not just policy names");
+    assert_eq!(
+        policy_version(&db).as_deref(),
+        Some(ai::EMBEDDING_POLICY_VERSION),
+        "the heal re-certifies after writing BOTH columns"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
+    // A CURRENT stamp at a NON-DEFAULT cap also fails certification (the column is stamped at the
+    // DEFAULT cap, and a different cap re-buckets SkipTooLarge), and the self-heal is skipped at a
+    // non-default cap too — so the embed path genuinely re-derives FromText and ignores the poison.
+    // This is the fallback that must DISAGREE with the certified fast path: the FromText counter is
+    // positive here, zero in `reconcile_embed_path_reads_the_stamped_policy_column`.
+    let root = unique_temp_root();
+    let db = poisoned_embed_fixture(&root);
+    ai::reset_policy_fromtext_calls();
+    let report = db
+        .reconcile_with_options_progress(
+            ai::ReconcileOptions {
+                batch_size: Some(8),
+                max_embedding_chars: ai::DEFAULT_MAX_EMBEDDING_CHARS + 1_000,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+    assert!(
+        report.embeddings_written >= 1,
+        "a non-default-cap reconcile must not trust the DEFAULT-cap column: {report:?}"
+    );
+    assert!(
+        ai::policy_fromtext_calls() > 0,
+        "the uncertified embed path must re-derive policy FromText (the fallback the fast path \
+         avoids)"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn absent_stamp_takes_the_recompute_path() {
     // A never-stamped index (a pre-#530 DB, or one never fully rebuilt with this binary) has NO
