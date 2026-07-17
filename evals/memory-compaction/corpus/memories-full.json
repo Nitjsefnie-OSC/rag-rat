@@ -104,8 +104,8 @@
    {
     "memory_id": "mem_19f291adc8d_cf982d0b4ec4",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/papertrail/store.rs",
-    "path": "crates/rag-rat-core/src/index/papertrail/store.rs",
+    "binding_id": "crates/rag-rat-papertrail/src/store.rs",
+    "path": "crates/rag-rat-papertrail/src/store.rs",
     "anchor_status": "current",
     "created_at_ms": 1783101054093
    }
@@ -180,8 +180,8 @@
    {
     "memory_id": "mem_19f28a1f309_88b0c8ffa006",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783093129993
    }
@@ -213,8 +213,8 @@
    {
     "memory_id": "mem_19f2517def2_fa15187344b1",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783033749234
    }
@@ -268,8 +268,8 @@
    {
     "memory_id": "mem_19f27e2470c_15fcd3092b3d",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783080568588
    }
@@ -299,8 +299,8 @@
    {
     "memory_id": "mem_19f27e1eb74_bc672ed83488",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783080545140
    }
@@ -330,8 +330,8 @@
    {
     "memory_id": "mem_19f24ea3aac_ce66224cf610",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783030758060
    }
@@ -362,8 +362,8 @@
    {
     "memory_id": "mem_19f2433a36c_ba277ec23a00",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783019562522
    }
@@ -422,8 +422,8 @@
    {
     "memory_id": "mem_19f254367c4_d8b756427aa6",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783036602308
    }
@@ -455,8 +455,8 @@
    {
     "memory_id": "mem_19f247e7b63_e1c21cdd16ee",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/schema/migrations.rs",
-    "path": "crates/rag-rat-core/src/index/schema/migrations.rs",
+    "binding_id": "crates/rag-rat-db/src/schema/migrations.rs",
+    "path": "crates/rag-rat-db/src/schema/migrations.rs",
     "anchor_status": "current",
     "created_at_ms": 1783023696739
    }
@@ -515,8 +515,8 @@
    {
     "memory_id": "mem_19f23be3a41_0a35130705b6",
     "binding_kind": "logical_symbol",
-    "binding_id": "crates/rag-rat-core/src/index/mod.rs::file_is_generated",
-    "path": "crates/rag-rat-core/src/index/mod.rs",
+    "binding_id": "crates/rag-rat-base/src/path_class.rs::file_is_generated",
+    "path": "crates/rag-rat-base/src/path_class.rs",
     "start_line": 288,
     "end_line": 290,
     "id": "sym_1729da3bd49725c6",
@@ -550,8 +550,8 @@
    {
     "memory_id": "mem_19f23be0a6c_363b055ea2b3",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/clones/mod.rs",
-    "path": "crates/rag-rat-core/src/index/clones/mod.rs",
+    "binding_id": "crates/rag-rat-clones/src/lib.rs",
+    "path": "crates/rag-rat-clones/src/lib.rs",
     "anchor_status": "current",
     "created_at_ms": 1783011084908
    }
@@ -580,8 +580,8 @@
    {
     "memory_id": "mem_19f23bd6c43_d9018d9f5c93",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/oracle/scip.rs",
-    "path": "crates/rag-rat-core/src/index/oracle/scip.rs",
+    "binding_id": "crates/rag-rat-oracle/src/scip.rs",
+    "path": "crates/rag-rat-oracle/src/scip.rs",
     "anchor_status": "current",
     "created_at_ms": 1783011044419
    }
@@ -640,8 +640,8 @@
    {
     "memory_id": "mem_19f23bd2fe1_b89cb4f95ec7",
     "binding_kind": "path",
-    "binding_id": "crates/rag-rat-core/src/index/clones/refine/split.rs",
-    "path": "crates/rag-rat-core/src/index/clones/refine/split.rs",
+    "binding_id": "crates/rag-rat-clones/src/refine/split.rs",
+    "path": "crates/rag-rat-clones/src/refine/split.rs",
     "anchor_status": "current",
     "created_at_ms": 1783011028961
    }
