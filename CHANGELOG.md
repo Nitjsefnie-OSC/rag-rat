@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-base-v0.19.0...rag-rat-base-v0.20.0) - 2026-07-17
+
+### Other
+
+- *(workspace)* [**breaking**] extract rag-rat-query — the read layer: graph/impact/symbol/tree queries, memory reads + evidence, pagerank (#706 phase 6) ([#719](https://github.com/cq27-dev/rag-rat/pull/719))
+- *(workspace)* [**breaking**] extract the rag-rat-clones crate (#706 phase 4) ([#717](https://github.com/cq27-dev/rag-rat/pull/717))
+- *(workspace)* [**breaking**] extract rag-rat-papertrail — mirror, providers, transport, evidence (#706 phase 2) ([#715](https://github.com/cq27-dev/rag-rat/pull/715))
+- *(workspace)* [**breaking**] extract the rag-rat-db database layer with an explicit MigrationHooks seam (#706 phase 1) ([#714](https://github.com/cq27-dev/rag-rat/pull/714))
+
 ## [0.19.0](https://github.com/cq27-dev/rag-rat/compare/rag-rat-core-v0.18.0...rag-rat-core-v0.19.0) - 2026-07-16
 
 ### Added
