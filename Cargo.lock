@@ -3562,6 +3562,7 @@ dependencies = [
  "rag-rat-base",
  "rag-rat-core",
  "rag-rat-db",
+ "rag-rat-dream",
  "rag-rat-llm",
  "rag-rat-mcp",
  "rag-rat-oracle",
@@ -3645,6 +3646,7 @@ dependencies = [
  "rag-rat-base",
  "rag-rat-clones",
  "rag-rat-db",
+ "rag-rat-dream",
  "rag-rat-llm",
  "rag-rat-oracle",
  "rag-rat-papertrail",
@@ -3696,6 +3698,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rag-rat-dream"
+version = "0.19.0"
+dependencies = [
+ "anyhow",
+ "rag-rat-base",
+ "rag-rat-db",
+ "rag-rat-llm",
+ "rag-rat-query",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "strum",
+ "tempfile",
+ "tracing",
+ "ureq 3.3.0",
+]
+
+[[package]]
 name = "rag-rat-llm"
 version = "0.19.0"
 dependencies = [
@@ -3725,6 +3747,7 @@ dependencies = [
  "rag-rat-base",
  "rag-rat-core",
  "rag-rat-db",
+ "rag-rat-dream",
  "rag-rat-oracle",
  "rag-rat-papertrail",
  "rag-rat-query",

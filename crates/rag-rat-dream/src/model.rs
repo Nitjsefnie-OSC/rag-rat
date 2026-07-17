@@ -66,7 +66,7 @@ struct ErrorDetail {
 
 /// The HTTP verdict model: a blocking `ureq` client against an OpenAI-compatible
 /// `/v1/chat/completions` route (ollama/vLLM/any compatible server). Mirrors the embedder client's
-/// transport posture ([`crate::index::ai::providers::openai`]) — one place to audit, loopback
+/// transport posture ([`rag_rat_llm::providers::openai`]) — one place to audit, loopback
 /// proxy bypass, `http_status_as_error(false)` so the server's JSON error body survives.
 #[derive(Debug)]
 pub struct HttpVerdictModel {
@@ -97,9 +97,10 @@ impl HttpVerdictModel {
             .unwrap_or("http://localhost:11434")
             .trim()
             .trim_end_matches('/');
-        let auth_header = crate::index::ai::resolve_auth_header(cfg.auth_env.as_deref(), |var| {
-            std::env::var(var).ok()
-        })?;
+        let auth_header =
+            rag_rat_llm::cookbook_internals::resolve_auth_header(cfg.auth_env.as_deref(), |var| {
+                std::env::var(var).ok()
+            })?;
         Ok(Self::build(endpoint, cfg.model.trim(), auth_header, cfg.request_timeout_s))
     }
 
@@ -209,8 +210,8 @@ impl VerdictModel for HttpVerdictModel {
 /// box for nothing.
 pub fn provision_verdict_model(
     remote: &RemoteDreamConfig,
-) -> anyhow::Result<(HttpVerdictModel, crate::index::ai::ProvisionedBox)> {
-    use crate::index::ai::CookbookProvisioner;
+) -> anyhow::Result<(HttpVerdictModel, rag_rat_llm::ProvisionedBox)> {
+    use rag_rat_llm::CookbookProvisioner;
 
     let cookbook = remote.cookbook.as_deref().ok_or_else(|| {
         anyhow::anyhow!("provision_verdict_model called on a non-ephemeral `[llm.dream.remote]`")
@@ -232,8 +233,8 @@ pub fn provision_verdict_model(
 /// teardown) before the Rust SIGKILL backstop fires. Chat serving ignores `num_ctx` (an
 /// ollama-embedding knob) and needs only ONE server slot — the verdict/compaction passes call the
 /// model sequentially.
-fn chat_cookbook_input(remote: &RemoteDreamConfig) -> crate::index::ai::CookbookInput {
-    crate::index::ai::CookbookInput {
+fn chat_cookbook_input(remote: &RemoteDreamConfig) -> rag_rat_llm::CookbookInput {
+    rag_rat_llm::CookbookInput {
         model: remote.model.trim().to_string(),
         backend: remote.backend.as_db_str(),
         capability: "chat",
@@ -280,7 +281,7 @@ pub(super) mod mock {
     /// order and counts how many times it was called (so a churn-skip test can assert the model was
     /// NOT re-invoked). When the queue drains it repeats the last response, or errors if it was
     /// never given one.
-    pub(in crate::dream) struct MockVerdictModel {
+    pub(crate) struct MockVerdictModel {
         responses: Mutex<VecDeque<String>>,
         last: Mutex<Option<String>>,
         calls: AtomicUsize,
@@ -288,7 +289,7 @@ pub(super) mod mock {
 
     impl MockVerdictModel {
         /// A mock that returns `responses` in order (then repeats the last one).
-        pub(in crate::dream) fn new<I, S>(responses: I) -> Self
+        pub(crate) fn new<I, S>(responses: I) -> Self
         where
             I: IntoIterator<Item = S>,
             S: Into<String>,
@@ -301,7 +302,7 @@ pub(super) mod mock {
         }
 
         /// How many times `complete` has been called — the churn-skip assertion hook.
-        pub(in crate::dream) fn calls(&self) -> usize {
+        pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
     }

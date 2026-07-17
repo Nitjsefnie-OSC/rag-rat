@@ -53,7 +53,7 @@ pub(crate) use git_context::*;
 /// links every domain the hooks reach into.
 pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
     rag_rat_db::MigrationHooks {
-        rederive_dream_finding_ids: crate::dream::rederive_finding_ids,
+        rederive_dream_finding_ids: rag_rat_dream::rederive_finding_ids,
         backfill_authority_projection: crate::oplog::backfill_authority_projection,
         rebuild_papertrail_fts: rag_rat_papertrail::rebuild_fts,
         realign_logical_symbol_ids: graph_index::realign_logical_symbol_ids,

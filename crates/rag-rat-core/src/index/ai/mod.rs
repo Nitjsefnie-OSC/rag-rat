@@ -19,7 +19,7 @@ pub(crate) use helpers::*;
 pub(crate) use policy::*;
 use rag_rat_base::language::Language;
 use rag_rat_base::time::now_ms;
-pub(crate) use rag_rat_llm::cookbook_internals::{provision_and_build, resolve_auth_header};
+pub(crate) use rag_rat_llm::cookbook_internals::provision_and_build;
 #[cfg(feature = "fastembed")]
 pub(crate) use rag_rat_llm::providers::FastEmbedEmbedder;
 #[cfg(feature = "model2vec")]
@@ -33,9 +33,7 @@ pub(crate) use rag_rat_llm::providers::Model2VecEmbedder;
 // analysis even when a given feature build has no live caller (`MockEmbedder`, the
 // `#[cfg(not(...))]`-only consts). A `pub(crate)` re-export would narrow that and redden `-D
 // warnings`.
-pub(crate) use rag_rat_llm::providers::{
-    CookbookInput, CookbookProvisioner, Embedder, HashEmbedder, OpenAiEmbedder, ProvisionedBox,
-};
+pub(crate) use rag_rat_llm::providers::{Embedder, HashEmbedder, OpenAiEmbedder, ProvisionedBox};
 pub(crate) use reconcile::*;
 pub(crate) use reencode::*;
 use rusqlite::types::Value;

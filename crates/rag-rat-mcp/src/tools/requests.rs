@@ -962,8 +962,8 @@ pub enum McpReviewVerdict {
 }
 
 impl McpReviewVerdict {
-    pub(super) fn core(self) -> rag_rat_core::dream::ReviewVerdict {
-        use rag_rat_core::dream::ReviewVerdict;
+    pub(super) fn core(self) -> rag_rat_dream::ReviewVerdict {
+        use rag_rat_dream::ReviewVerdict;
         match self {
             Self::Accept => ReviewVerdict::Accept,
             Self::Dismiss => ReviewVerdict::Dismiss,

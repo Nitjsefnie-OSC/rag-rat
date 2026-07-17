@@ -1,4 +1,3 @@
-pub mod dream;
 #[cfg(feature = "eval")]
 pub mod eval;
 pub mod fleet;

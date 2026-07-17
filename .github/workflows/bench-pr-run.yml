@@ -15,6 +15,7 @@ on:
       - 'crates/rag-rat-base/**'
       - 'crates/rag-rat-clones/**'
       - 'crates/rag-rat-db/**'
+      - 'crates/rag-rat-dream/**'
       - 'crates/rag-rat-llm/**'
       - 'crates/rag-rat-oracle/**'
       - 'crates/rag-rat-query/**'

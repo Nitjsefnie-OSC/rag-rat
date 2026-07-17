@@ -177,7 +177,7 @@ fn bounded_detail(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dream::tests::mem_db;
+    use crate::tests::mem_db;
 
     fn stamp() -> FailureStamp<'static> {
         FailureStamp {

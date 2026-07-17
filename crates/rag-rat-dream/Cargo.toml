@@ -1,0 +1,30 @@
+[package]
+name = "rag-rat-dream"
+version.workspace = true
+description = "AI memory-maintenance passes for the rag-rat workspace: the deterministic findings worklist, and the model-driven verify/compact passes over repo memories."
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rag-rat-base.workspace = true
+rag-rat-db.workspace = true
+rag-rat-llm.workspace = true
+rag-rat-query.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strum.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,14 +1,15 @@
-//! Dream Mode worklist on `IndexDatabase` (#122): a thin pass-through to `crate::dream`. Computes
+//! Dream Mode worklist on `IndexDatabase` (#122): a thin pass-through to `rag_rat_dream`. Computes
 //! the deterministic memory-maintenance worklist (coverage gaps + stale references), syncs it into
 //! `dream_findings`, and returns the open worklist. Writes ONLY to `dream_findings` — never mutates
 //! a `repo_memories` row.
 
+use rag_rat_dream::{CompactPass, DreamOptions, DreamReport, VerdictPass};
+
 use super::*;
-use crate::dream::{CompactPass, DreamOptions, DreamReport, VerdictPass};
 
 impl IndexDatabase {
     pub fn dream_run(&self, opts: DreamOptions) -> anyhow::Result<DreamReport> {
-        crate::dream::dream_run(self.storage.connection(), opts)
+        rag_rat_dream::dream_run(self.storage.connection(), opts)
     }
 
     /// [`Self::dream_run`] plus the phase-B model verdict pass and the phase-C model compaction
@@ -38,7 +39,7 @@ impl IndexDatabase {
                 preflight.deferred
             );
         }
-        crate::dream::dream_run_with_passes(
+        rag_rat_dream::dream_run_with_passes(
             self.storage.connection(),
             opts,
             verdict_pass,
@@ -49,7 +50,7 @@ impl IndexDatabase {
     /// Whether the model passes have pending work (the zero-work guard for ephemeral
     /// `[llm.dream.remote]`): peek the verify/compact churn-skip queues without touching the model,
     /// considering current model-specific failure annotations, so the CLI skips cold-starting a
-    /// paid GPU box when the queues are already drained. See [`crate::dream::model_work_pending`].
+    /// paid GPU box when the queues are already drained. See [`rag_rat_dream::model_work_pending`].
     pub fn dream_model_work_pending(
         &self,
         opts: DreamOptions,
@@ -62,7 +63,7 @@ impl IndexDatabase {
         // read-only, so heal-and-retry is safe.
         crate::index::retry_once_on_fts_corruption(
             || {
-                crate::dream::model_work_pending(
+                rag_rat_dream::model_work_pending(
                     self.storage.connection(),
                     opts,
                     budget,
@@ -77,20 +78,25 @@ impl IndexDatabase {
 
     /// Render one memory's evidence pack into the exact text the verdict model is shown — the
     /// generator behind the memory-compaction eval's `verify-packs` corpus (#695). See
-    /// [`crate::dream::render_evidence_pack`].
+    /// [`rag_rat_dream::render_evidence_pack`].
     pub fn dream_render_pack(&self, memory_id: &str) -> anyhow::Result<String> {
-        crate::dream::render_evidence_pack(self.storage.connection(), memory_id)
+        rag_rat_dream::render_evidence_pack(self.storage.connection(), memory_id)
     }
 
     /// Apply a human review verdict (accept / dismiss / reset) to a dream finding by id or prefix —
     /// the `rag-rat dream <id> --accept|--dismiss|--reset` surface. Repo-scoped; only a
-    /// non-terminal finding is reviewable. See [`crate::dream::review_dream_finding`].
+    /// non-terminal finding is reviewable. See [`rag_rat_dream::review_dream_finding`].
     pub fn review_dream_finding(
         &self,
         id_or_prefix: &str,
-        verdict: crate::dream::ReviewVerdict,
+        verdict: rag_rat_dream::ReviewVerdict,
         now_ms: i64,
-    ) -> anyhow::Result<crate::dream::ReviewedFinding> {
-        crate::dream::review_dream_finding(self.storage.connection(), id_or_prefix, verdict, now_ms)
+    ) -> anyhow::Result<rag_rat_dream::ReviewedFinding> {
+        rag_rat_dream::review_dream_finding(
+            self.storage.connection(),
+            id_or_prefix,
+            verdict,
+            now_ms,
+        )
     }
 }
