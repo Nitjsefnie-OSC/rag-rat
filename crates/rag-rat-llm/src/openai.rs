@@ -778,8 +778,8 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -787,6 +787,9 @@ mod tests {
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let waits_satisfied = Arc::new(AtomicUsize::new(0));
+        // Count of requests that have FULLY written their response, paired with a condvar so a
+        // parked worker is released by an explicit completion signal rather than by polling.
+        let completions = Arc::new((Mutex::new(0usize), Condvar::new()));
         let counter = Arc::clone(&requests);
         let delays = Arc::new(delays);
         let wait_for_prior_response = Arc::new(wait_for_prior_response);
@@ -802,6 +805,7 @@ mod tests {
                 let delays = Arc::clone(&delays);
                 let wait_for_prior_response = Arc::clone(&wait_for_prior_response);
                 let waits_seen = Arc::clone(&waits_seen);
+                let completions = Arc::clone(&completions);
                 workers.push(thread::spawn(move || {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     raise_max(&max_seen, now);
@@ -812,16 +816,32 @@ mod tests {
                     {
                         thread::sleep(*delay);
                     }
+                    // Deterministic "later request finishes first" ordering: a request whose first
+                    // text index is in `wait_for_prior_response` parks until ANOTHER request has
+                    // fully written its response and signalled completion via the condvar — no
+                    // scheduler timing, no busy-poll. The 30s cap is only a deadlock guard (if the
+                    // client never dispatches a concurrent second request the assertion fails
+                    // rather than hanging CI); on a healthy run the signal arrives in milliseconds,
+                    // so the release never depends on beating a deadline.
                     if let Some(first) = indices.first().copied()
                         && wait_for_prior_response.contains(&first)
                     {
+                        let (lock, cvar) = &*completions;
+                        let mut done = lock.lock().unwrap();
                         let started = std::time::Instant::now();
-                        while counter.load(Ordering::SeqCst) == 0
-                            && started.elapsed() < Duration::from_secs(2)
-                        {
-                            thread::sleep(Duration::from_millis(1));
+                        let deadline = Duration::from_secs(30);
+                        while *done == 0 {
+                            let remaining = deadline.saturating_sub(started.elapsed());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            let (guard, timeout) = cvar.wait_timeout(done, remaining).unwrap();
+                            done = guard;
+                            if timeout.timed_out() {
+                                break;
+                            }
                         }
-                        if counter.load(Ordering::SeqCst) > 0 {
+                        if *done > 0 {
                             waits_seen.fetch_add(1, Ordering::SeqCst);
                         }
                     }
@@ -843,6 +863,13 @@ mod tests {
                     let _ = stream.write_all(response.as_bytes());
                     let _ = stream.flush();
                     counter.fetch_add(1, Ordering::SeqCst);
+                    // Explicit completion signal: release any worker parked in
+                    // `wait_for_prior_response` above, forcing a deterministic completion order.
+                    {
+                        let (lock, cvar) = &*completions;
+                        *lock.lock().unwrap() += 1;
+                        cvar.notify_all();
+                    }
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                 }));
             }
