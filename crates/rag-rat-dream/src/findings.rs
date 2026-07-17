@@ -77,7 +77,7 @@ fn finding_id(scope: &Option<String>, kind: &str, subject: &str, ch: &str) -> St
 /// row's `repo_id` changes, the id it SHOULD have changes with it. Idempotent (an already-derived
 /// id re-derives to itself) and cheap (the worklist is small). Callers guard on the `repo_id`
 /// column existing.
-pub(crate) fn rederive_finding_ids(conn: &Connection) -> rusqlite::Result<()> {
+pub fn rederive_finding_ids(conn: &Connection) -> rusqlite::Result<()> {
     let rows: Vec<(String, String, String, String, String)> = conn
         .prepare("SELECT id, kind, subject, claim_hash, repo_id FROM dream_findings")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
@@ -507,7 +507,7 @@ pub struct ReviewedFinding {
 /// Prefix resolution scans ALL of the active repo's findings (a small set) and matches in Rust — so
 /// a `_`/`%` in the input can't act as a SQL `LIKE` wildcard, AND a prefix that also hits a
 /// terminal row is rejected as ambiguous rather than silently acting on the one reviewable match.
-pub(crate) fn review_dream_finding(
+pub fn review_dream_finding(
     conn: &Connection,
     id_or_prefix: &str,
     verdict: ReviewVerdict,
@@ -1043,7 +1043,7 @@ mod tests {
         let a = Connection::open(&path).unwrap();
         a.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
         a.busy_timeout(std::time::Duration::ZERO).unwrap();
-        rag_rat_db::schema::apply(&a, &crate::index::migration_hooks()).unwrap();
+        rag_rat_db::schema::apply(&a, &rag_rat_db::MigrationHooks::noop()).unwrap();
 
         let b = Connection::open(&path).unwrap();
         b.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -1123,7 +1123,7 @@ mod evidence_dream_tests {
     };
     use rusqlite::Connection;
 
-    use crate::dream::tests::{mem_db, set_repo};
+    use crate::tests::{mem_db, set_repo};
 
     fn content_hash(title: &str, body: &str) -> String {
         note_content_hash(title, body)
@@ -1227,15 +1227,10 @@ mod evidence_dream_tests {
         // pending.
         let c = mem_db();
         set_repo(&c, "r");
-        let opts = crate::dream::DreamOptions {
-            now_ms: 1,
-            limit: 10,
-            verify: true,
-            include_reviewed: false,
-        };
+        let opts =
+            crate::DreamOptions { now_ms: 1, limit: 10, verify: true, include_reviewed: false };
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, true, true, "mock-verdict-model")
-                .unwrap(),
+            !crate::model_work_pending(&c, opts, 10, true, true, "mock-verdict-model").unwrap(),
             "empty repo → no work"
         );
 
@@ -1243,13 +1238,11 @@ mod evidence_dream_tests {
         // but compaction WILL summarize it.
         seed_memory(&c, "m1", "t", "a prose note with no identifiers", "r");
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
-                .unwrap(),
+            !crate::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model").unwrap(),
             "an all-uncitable verify queue is NOT model work — never cold-start a box for it"
         );
         assert!(
-            crate::dream::model_work_pending(&c, opts, 10, false, true, "mock-verdict-model")
-                .unwrap(),
+            crate::model_work_pending(&c, opts, 10, false, true, "mock-verdict-model").unwrap(),
             "the same memory IS compact-pending (compaction has no uncitable short-circuit)"
         );
 
@@ -1263,44 +1256,40 @@ mod evidence_dream_tests {
         .unwrap();
         seed_memory(&c, "m2", "t", "a note about `resolve_marker_token`", "r");
         assert!(
-            crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
-                .unwrap(),
+            crate::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model").unwrap(),
             "a citable never-checked memory is verify-pending"
         );
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 0, true, false, "mock-verdict-model")
-                .unwrap(),
+            !crate::model_work_pending(&c, opts, 0, true, false, "mock-verdict-model").unwrap(),
             "budget zero stops before considering the citable verify entry"
         );
         let inputs = checked_inputs_hash(&c, "m2", &Some("r".to_string())).unwrap();
         let content_hash = content_hash("t", "a note about `resolve_marker_token`");
-        let stamp = crate::dream::failure::FailureStamp {
+        let stamp = crate::failure::FailureStamp {
             memory_id: "m2",
             repo_id: "r",
-            pass: crate::dream::failure::DreamModelPass::Verify,
+            pass: crate::failure::DreamModelPass::Verify,
             content_hash: &content_hash,
             checked_inputs_hash: Some(&inputs),
-            prompt_version: crate::dream::verdict::PROMPT_VERSION,
+            prompt_version: crate::verdict::PROMPT_VERSION,
             model_id: "mock-verdict-model",
         };
-        let failed = crate::dream::failure::DreamModelFailure::new(
-            crate::dream::failure::DreamFailureReason::FabricatedEvidence,
+        let failed = crate::failure::DreamModelFailure::new(
+            crate::failure::DreamFailureReason::FabricatedEvidence,
         );
-        crate::dream::failure::record_failure(&c, crate::dream::failure::RecordFailure {
+        crate::failure::record_failure(&c, crate::failure::RecordFailure {
             stamp,
             failure: &failed,
             now_ms: 2,
         })
         .unwrap();
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model")
-                .unwrap(),
+            !crate::model_work_pending(&c, opts, 10, true, false, "mock-verdict-model").unwrap(),
             "a current deterministic failure is annotated work, not pending model work"
         );
 
         assert!(
-            !crate::dream::model_work_pending(&c, opts, 10, false, false, "mock-verdict-model")
-                .unwrap(),
+            !crate::model_work_pending(&c, opts, 10, false, false, "mock-verdict-model").unwrap(),
             "neither flag → never pending"
         );
     }
@@ -1335,7 +1324,7 @@ mod evidence_dream_tests {
             rusqlite::params![
                 content_hash("t", "a plain note"),
                 inputs,
-                crate::dream::verdict::PROMPT_VERSION
+                crate::verdict::PROMPT_VERSION
             ],
         )
         .unwrap();
@@ -1348,8 +1337,8 @@ mod evidence_dream_tests {
         // Regression (PR #428): a prose-only memory with no identifiers / excerpts yields
         // an uncitable pack; the verdict pass must record a terminal (verdict-less) row so
         // it churn-skips instead of consuming a budget slot forever.
-        use crate::dream::model::mock::MockVerdictModel;
-        use crate::dream::{VerdictPass, verdict};
+        use crate::model::mock::MockVerdictModel;
+        use crate::{VerdictPass, verdict};
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", "just prose, nothing to resolve", "r");
@@ -1400,7 +1389,7 @@ mod evidence_dream_tests {
             rusqlite::params![
                 content_hash("t", "a plain note"),
                 inputs,
-                crate::dream::verdict::PROMPT_VERSION
+                crate::verdict::PROMPT_VERSION
             ],
         )
         .unwrap();
@@ -1441,7 +1430,7 @@ mod evidence_dream_tests {
             rusqlite::params![
                 content_hash("t", "note about src/lib.rs"),
                 inputs,
-                crate::dream::verdict::PROMPT_VERSION
+                crate::verdict::PROMPT_VERSION
             ],
         )
         .unwrap();
@@ -1483,7 +1472,7 @@ mod evidence_dream_tests {
             rusqlite::params![
                 content_hash("original title", "a stable body"),
                 inputs,
-                crate::dream::verdict::PROMPT_VERSION
+                crate::verdict::PROMPT_VERSION
             ],
         )
         .unwrap();

@@ -33,7 +33,7 @@ pub use compact::CompactPass;
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
 pub use findings::{ReviewVerdict, ReviewedFinding};
-pub(crate) use findings::{rederive_finding_ids, review_dream_finding};
+pub use findings::{rederive_finding_ids, review_dream_finding};
 // The phase-B model verdict pass: the out-of-process verdict-model trait + its HTTP client
 // (the CLI builds one from `[llm.dream.remote]`) and the `VerdictPass` handle
 // `dream_run_with_passes` consumes.
@@ -282,7 +282,7 @@ pub fn model_work_pending(
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use rusqlite::Connection;
 
     use super::*;
@@ -291,7 +291,9 @@ pub(super) mod tests {
     /// in this module and its `findings` / `verify` siblings.
     pub(super) fn mem_db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&c, &crate::index::migration_hooks()).unwrap();
+        // Fresh in-memory scratch DB: the documented-sound `MigrationHooks::noop()` case — every
+        // hook-using migration runs over empty tables, so the fixture stays engine-free.
+        rag_rat_db::schema::apply(&c, &rag_rat_db::MigrationHooks::noop()).unwrap();
         c
     }
 

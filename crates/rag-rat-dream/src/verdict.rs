@@ -1153,7 +1153,7 @@ mod tests {
 
     // ── divergence-finding lifecycle (the resolve trap) ──────────────────────────
 
-    fn divergence_subjects(findings: &[crate::dream::WorklistFinding]) -> Vec<String> {
+    fn divergence_subjects(findings: &[crate::WorklistFinding]) -> Vec<String> {
         findings
             .iter()
             .filter(|f| f.kind == "memory_divergence")

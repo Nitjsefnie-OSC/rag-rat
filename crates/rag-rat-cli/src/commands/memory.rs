@@ -42,9 +42,9 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // preserved across future runs (the sync refresh keeps accepted/dismissed).
     if let Some(finding) = &args.finding {
         let verdict = match (args.accept, args.dismiss, args.reset) {
-            (true, false, false) => rag_rat_core::dream::ReviewVerdict::Accept,
-            (false, true, false) => rag_rat_core::dream::ReviewVerdict::Dismiss,
-            (false, false, true) => rag_rat_core::dream::ReviewVerdict::Reset,
+            (true, false, false) => rag_rat_dream::ReviewVerdict::Accept,
+            (false, true, false) => rag_rat_dream::ReviewVerdict::Dismiss,
+            (false, false, true) => rag_rat_dream::ReviewVerdict::Reset,
             _ => anyhow::bail!(
                 "reviewing `{finding}` needs exactly one of --accept / --dismiss / --reset"
             ),
@@ -64,7 +64,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
         anyhow::bail!("--accept / --dismiss / --reset need a <FINDING_ID> to review");
     }
 
-    let opts = rag_rat_core::dream::DreamOptions {
+    let opts = rag_rat_dream::DreamOptions {
         now_ms,
         limit: args.limit.unwrap_or(20) as usize,
         verify: args.verify,
@@ -105,7 +105,7 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
                 args.compact,
                 remote.model.trim(),
             )? {
-                let (m, provisioned) = rag_rat_core::dream::provision_verdict_model(remote)?;
+                let (m, provisioned) = rag_rat_dream::provision_verdict_model(remote)?;
                 _provisioned = Some(provisioned);
                 Some(m)
             } else {
@@ -116,15 +116,15 @@ pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
                 None
             }
         } else {
-            Some(rag_rat_core::dream::HttpVerdictModel::from_config(remote)?)
+            Some(rag_rat_dream::HttpVerdictModel::from_config(remote)?)
         }
     } else {
         None
     };
     let verdict_pass = (args.verify && model.is_some())
-        .then(|| rag_rat_core::dream::VerdictPass { model: model.as_ref().unwrap(), budget });
+        .then(|| rag_rat_dream::VerdictPass { model: model.as_ref().unwrap(), budget });
     let compact_pass = (args.compact && model.is_some())
-        .then(|| rag_rat_core::dream::CompactPass { model: model.as_ref().unwrap(), budget });
+        .then(|| rag_rat_dream::CompactPass { model: model.as_ref().unwrap(), budget });
     let report = db.dream_run_with_passes(opts, verdict_pass, compact_pass)?;
     print_output(&report)
 }

@@ -1315,7 +1315,7 @@ fn resolve_moniker_ignores_a_sibling_repos_moniker_row() {
 /// one repo never resolves or emits a SIBLING repo's worklist rows on a consolidated DB.
 #[test]
 fn dream_run_leaves_a_sibling_repos_findings_untouched() {
-    use crate::dream::{DreamOptions, dream_run};
+    use rag_rat_dream::{DreamOptions, dream_run};
     let conn = a5_scoped_two_repo_conn();
 
     // An OPEN finding owned by each repo.
@@ -1363,7 +1363,7 @@ fn dream_run_leaves_a_sibling_repos_findings_untouched() {
 /// stale_reference finding.
 #[test]
 fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
-    use crate::dream::{DreamOptions, dream_run};
+    use rag_rat_dream::{DreamOptions, dream_run};
     let conn = a5_scoped_two_repo_conn();
 
     // Repo A: a load-bearing symbol (one caller edge) in `src/shared.rs`, with NO memory of its
@@ -1465,7 +1465,7 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
 /// this repo's memory.
 #[test]
 fn verification_queue_never_surfaces_a_sibling_repos_memories() {
-    use crate::dream::verification_queue;
+    use rag_rat_dream::verification_queue;
     let conn = a5_scoped_two_repo_conn();
 
     // An active memory in EACH repo, both anchor-broken (a gone binding) so both are
@@ -1506,7 +1506,7 @@ fn verification_queue_never_surfaces_a_sibling_repos_memories() {
 /// sibling-exclusive symbol resolves to the authoritative NOT FOUND.
 #[test]
 fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
-    use crate::dream::evidence_pack;
+    use rag_rat_dream::evidence_pack;
     let conn = a5_scoped_two_repo_conn();
     let commit = "cafecafecafecafecafecafecafecafecafecafe";
 

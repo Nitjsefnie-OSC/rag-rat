@@ -260,7 +260,7 @@ pub(crate) fn call_tool_with_db(
             // CLI/cron `rag-rat dream --verify|--compact`. `verify: false` also preserves any
             // model-derived findings a prior `--verify` run persisted (dream_run's resolve sweep is
             // kind-scoped), so `memory_divergence` etc. still surface in this worklist.
-            json!(db.dream_run(rag_rat_core::dream::DreamOptions {
+            json!(db.dream_run(rag_rat_dream::DreamOptions {
                 now_ms: now_ms(),
                 limit: args.limit as usize,
                 verify: false,

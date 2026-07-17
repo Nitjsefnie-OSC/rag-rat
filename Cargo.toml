@@ -3,6 +3,7 @@ members = [
   "crates/rag-rat-base",
   "crates/rag-rat-clones",
   "crates/rag-rat-db",
+  "crates/rag-rat-dream",
   "crates/rag-rat-llm",
   "crates/rag-rat-oracle",
   "crates/rag-rat-papertrail",
@@ -38,6 +39,7 @@ categories = ["command-line-utilities", "development-tools"]
 rag-rat-base = { version = "0.19.0", path = "crates/rag-rat-base", default-features = false }
 rag-rat-clones = { version = "0.19.0", path = "crates/rag-rat-clones", default-features = false }
 rag-rat-db = { version = "0.19.0", path = "crates/rag-rat-db", default-features = false }
+rag-rat-dream = { version = "0.19.0", path = "crates/rag-rat-dream", default-features = false }
 rag-rat-llm = { version = "0.19.0", path = "crates/rag-rat-llm", default-features = false }
 rag-rat-oracle = { version = "0.19.0", path = "crates/rag-rat-oracle", default-features = false }
 rag-rat-papertrail = { version = "0.19.0", path = "crates/rag-rat-papertrail", default-features = false }

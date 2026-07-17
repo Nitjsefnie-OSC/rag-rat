@@ -249,8 +249,12 @@ fn heal_refuses_while_staged_chunk_fts_rows_are_not_rederivable() {
 
     // The plain dream worklist ranks nothing and must stay write-free and error-free under the
     // exact same window (byte-identical contract): no probe, no heal, corruption untouched.
-    let worklist_opts =
-        crate::dream::DreamOptions { now_ms: 1, limit: 10, verify: false, include_reviewed: false };
+    let worklist_opts = rag_rat_dream::DreamOptions {
+        now_ms: 1,
+        limit: 10,
+        verify: false,
+        include_reviewed: false,
+    };
     db.dream_run_with_passes(worklist_opts, None, None)
         .expect("the deterministic worklist never touches ranked FTS");
     let docsize_rows: i64 = db
