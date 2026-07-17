@@ -74,7 +74,7 @@ reports the size as a **split** (#78), because the two halves are bought separat
 | Half | What it is | BMF measure |
 |---|---|---|
 | **Structure** (the headline) | files + symbols + graph + chunks + FTS + git history. `model = "none"` — zero vectors. What a base install actually builds. | `db_size` |
-| **+ Vectors** | every chunk embedded, on top of the same index. Opt-in second pass. | `db_size_with_vectors`, `db_size_vectors_delta` |
+| **+ Vectors** | every chunk the embedding policy admits, embedded on top of the same index. Opt-in second pass. | `db_size_with_vectors`, `db_size_vectors_delta` |
 
 The headline pass runs `model = "none"`, which is the honest config for this corpus: nobody does
 vector recall over the Linux kernel with a hash embedder, so those baseline vectors would be

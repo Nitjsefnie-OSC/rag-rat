@@ -144,11 +144,13 @@ with nine measures:
 - `db_size` — on-disk index size in bytes, post-WAL-checkpoint. The **structure-only** half of the
   size split (#78): no vectors.
 
-Setting `RAG_RAT_KERNEL_VECTORS=1` runs a second pass that installs the hash embedder and reconciles
-every chunk, adding two more measures — `db_size_with_vectors` and `db_size_vectors_delta` (the
-marginal bytes the embedding tier costs). Off by default: at kernel scale it embeds ~1.6M chunks, and
-hash-embedder vectors over the kernel are plumbing-validation, not retrieval value. When the pass
-doesn't run, both measures are **omitted** rather than reported as zero. See
+Setting `RAG_RAT_KERNEL_VECTORS=1` runs a second pass that installs the hash embedder and embeds
+every chunk the embedding policy admits (not every chunk yields a vector — the policy skips e.g.
+generated and low-signal chunks), adding two more measures — `db_size_with_vectors` and
+`db_size_vectors_delta` (the marginal bytes the embedding tier costs). Off by default: at kernel
+scale it sweeps ~1.6M chunks, and hash-embedder vectors over the kernel are plumbing-validation, not
+retrieval value. When the pass doesn't run, both measures are **omitted** rather than reported as
+zero. See
 [`benchmarks.md`](./benchmarks.md#db-size-structure-vs-vectors).
 
 It's a **single cold rebuild**, not a criterion loop: the whole kernel is ~63k C/H files and takes

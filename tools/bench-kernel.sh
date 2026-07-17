@@ -27,8 +27,8 @@
 #                            wave's prepared form is dropped) — the memory/speed knob. Read by the
 #                            binary; passed through this script's environment. (binary default: 2000)
 #   RAG_RAT_KERNEL_VECTORS   set to 1 to run the second, +vectors pass (default: 0 = headline only):
-#                            installs the hash embedder and reconciles every chunk, so the run also
-#                            reports db_size_with_vectors / db_size_vectors_delta
+#                            installs the hash embedder and embeds every policy-admitted chunk, so
+#                            the run also reports db_size_with_vectors / db_size_vectors_delta
 #   BMF_OUT                  output BMF JSON path           (default: kernel_bmf.json)
 #   TAXONOMY_CSV             unresolved-edge-by-kind CSV    (default: kernel_unresolved_by_kind.csv)
 #   KERNEL_WORK              working dir                    (default: a fresh mktemp dir)
@@ -64,7 +64,25 @@ git -C "$WORK/linux" -c protocol.version=2 fetch -q --depth 1 origin "$KERNEL_SH
 git -C "$WORK/linux" checkout -q "$KERNEL_SHA"
 
 # Render a C-language config over the requested subtree(s). `c = [...]` maps to **/*.c + **/*.h.
-#
+# Both passes render their config through this one helper — identical [index] + [target_bindings],
+# differing ONLY in the embedding selector — so the two configs cannot drift apart in any other
+# dimension.
+subdirs_toml="$(printf '"%s", ' $RAG_RAT_KERNEL_SUBDIRS)"
+write_config() {
+  local path="$1" model="$2"
+  cat > "$path" <<EOF
+[index]
+root = "$WORK/linux"
+database = "$WORK/kernel-index.sqlite"
+
+[llm.embedding]
+model = "$model"
+
+[target_bindings]
+c = [${subdirs_toml%, }]
+EOF
+}
+
 # `model = "none"` is the HONEST headline config (#78), stated explicitly rather than left to the
 # default: nobody runs vector recall over the kernel with a hash embedder, so the baseline vectors
 # would be plumbing-validation, not retrieval value. It also pins what the headline measures — the
@@ -72,18 +90,7 @@ git -C "$WORK/linux" checkout -q "$KERNEL_SHA"
 # `--no-default-features` build can even load. `index --full` computes no embeddings either way
 # (the reconcile is a separate, explicit pass and refuses without an installed model), so this
 # names the run's real semantics instead of relying on that.
-subdirs_toml="$(printf '"%s", ' $RAG_RAT_KERNEL_SUBDIRS)"
-cat > "$WORK/rag-rat.toml" <<EOF
-[index]
-root = "$WORK/linux"
-database = "$WORK/kernel-index.sqlite"
-
-[llm.embedding]
-model = "none"
-
-[target_bindings]
-c = [${subdirs_toml%, }]
-EOF
+write_config "$WORK/rag-rat.toml" "none"
 
 # Checkpoint the WAL into the main file, then print the DB's durable size in bytes. Called once per
 # size measurement (structure-only, then again after the +vectors pass), so each number is the real
@@ -155,7 +162,7 @@ structure_db_size="$(db_size_bytes "$WORK/kernel-index.sqlite")"
 
 # PASS 2 (opt-in) — add vectors on top of the SAME index and re-measure, so the reported delta is
 # the marginal cost of the embedding tier over the structure this run already built, not two
-# independent indexes differenced. Off by default: at kernel scale it embeds ~1.6M chunks, and the
+# independent indexes differenced. Off by default: at kernel scale it sweeps ~1.6M chunks, and the
 # hash embedder's vectors are plumbing-validation rather than retrieval value — the point is to
 # price the tier, not to ship a recall claim. `models install` is required because `reconcile`
 # refuses to embed under a model that was never explicitly installed.
@@ -164,18 +171,8 @@ if [ "$RAG_RAT_KERNEL_VECTORS" = "1" ]; then
   # The same index + config, with the embeddings-off selector swapped for the hash embedder. The
   # selector must be a model this `--no-default-features` build can actually construct, so it is
   # `embedding-hash` (the dependency-free tier) and not a transformer that needs a download.
-  cat > "$WORK/rag-rat-vectors.toml" <<EOF
-[index]
-root = "$WORK/linux"
-database = "$WORK/kernel-index.sqlite"
-
-[llm.embedding]
-model = "embedding-hash"
-
-[target_bindings]
-c = [${subdirs_toml%, }]
-EOF
-  echo "bench-kernel: +vectors pass — installing the hash embedder and reconciling every chunk…" >&2
+  write_config "$WORK/rag-rat-vectors.toml" "embedding-hash"
+  echo "bench-kernel: +vectors pass — installing the hash embedder and reconciling chunk embeddings…" >&2
   "$RAG_RAT_BIN" --config "$WORK/rag-rat-vectors.toml" models install embedding-hash >/dev/null
   "$RAG_RAT_BIN" --config "$WORK/rag-rat-vectors.toml" reconcile --until-clean >/dev/null
   vectors_db_size="$(db_size_bytes "$WORK/kernel-index.sqlite")"
@@ -238,7 +235,7 @@ bmf = {
     }
 }
 if vectors_db_size is not None:
-    # The +Y half of the split: the same index with every chunk embedded, and the marginal cost of
+    # The +Y half of the split: the same index with embeddings reconciled, and the marginal cost of
     # the vector tier on top of the structure above.
     bmf[f"linux-kernel-{tag}/full-index"]["db_size_with_vectors"] = {"value": vectors_db_size}
     bmf[f"linux-kernel-{tag}/full-index"]["db_size_vectors_delta"] = {
