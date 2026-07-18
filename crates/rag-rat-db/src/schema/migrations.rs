@@ -902,6 +902,15 @@ pub(crate) fn apply_contentless_chunk_fts(conn: &Connection) -> rusqlite::Result
     Ok(())
 }
 
+/// V074: re-install the `edges` compatibility view so the V068 suppressed-edge exclusion is the
+/// scalar compare `ensure_edges_view` now writes, not the original per-row `NOT IN (SELECT ...)`
+/// probe (the query_warm regression). A DB already at the schema tip opens as `Compatible` and
+/// never re-runs the view bootstrap, so without this ladder step only freshly migrated indexes
+/// would pick up the cheap form.
+pub fn apply_edges_view_scalar_suppression(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_edges_view(conn)
+}
+
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     let legacy_table: Option<String> = conn
         .query_row(
@@ -995,8 +1004,15 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
         WHERE d.edge_kind_id NOT IN (
             SELECT id FROM name_strings WHERE value IN ('dispatch_construct', 'dispatch_handle')
         )
-        AND d.resolution_id NOT IN (
-            SELECT id FROM name_strings WHERE value = 'suppressed'
+        -- Suppressed resolver candidates (retained for inspection, never real edges) are hidden
+        -- with a SCALAR compare, not `NOT IN (SELECT ...)`: the membership form probes an
+        -- ephemeral list PER VIEW ROW (~19M instructions per warm query on the bench corpus —
+        -- the query_warm regression), while an uncorrelated scalar subquery is evaluated once
+        -- per statement and the per-row cost is one integer compare. `resolution_id` is NOT
+        -- NULL and ids are positive, so `<> -1` (the never-interned sentinel) keeps every row —
+        -- exactly `NOT IN (empty)`.
+        AND d.resolution_id <> COALESCE(
+            (SELECT id FROM name_strings WHERE value = 'suppressed'), -1
         );
 
         -- Interning per column: `INSERT OR IGNORE` + `value NOT NULL` means a NULL string is
@@ -1287,6 +1303,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_071_ID => Some(71),
             MIGRATION_072_ID => Some(72),
             MIGRATION_073_ID => Some(73),
+            MIGRATION_074_ID => Some(74),
             _ => None,
         })
         .max()
@@ -1369,6 +1386,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_071_ID
             | MIGRATION_072_ID
             | MIGRATION_073_ID
+            | MIGRATION_074_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1448,6 +1466,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_071_ID => migration.checksum != MIGRATION_071_CHECKSUM,
         MIGRATION_072_ID => migration.checksum != MIGRATION_072_CHECKSUM,
         MIGRATION_073_ID => migration.checksum != MIGRATION_073_CHECKSUM,
+        MIGRATION_074_ID => migration.checksum != MIGRATION_074_CHECKSUM,
         _ => false,
     }
 }
