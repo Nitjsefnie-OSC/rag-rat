@@ -26,8 +26,8 @@ use rag_rat_base::config::Config;
 use rag_rat_base::language::Language;
 use rag_rat_base::locks;
 use rag_rat_core::index::{CloneCheckInput, IndexDatabase, TextCloneMatch};
-use rag_rat_core::query::grep_augment;
 use rag_rat_core::query::orientation::Orientation;
+use rag_rat_core::query::{grep_augment, read_augment};
 use rag_rat_db::storage::IndexConnection;
 use serde::Deserialize;
 
@@ -392,11 +392,14 @@ fn version_line(status: &rag_rat_core::version_check::VersionStatus) -> Option<S
     }
 }
 
-/// PreToolUse path: the write-time clone check (#287) on the edit tools, grep augmentation
-/// otherwise.
+/// PreToolUse path: the write-time clone check (#287) on the edit tools, read augmentation on
+/// `Read` (#756), grep augmentation on a code search otherwise.
 fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
     if matches!(input.tool_name.as_str(), "Write" | "Edit" | "MultiEdit" | "apply_patch") {
         return clone_check(input);
+    }
+    if input.tool_name == "Read" {
+        return read_augment_hook(input);
     }
     let Some(search) = extract_search(input) else { return Ok(()) };
     let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
@@ -407,20 +410,96 @@ fn pretooluse(input: &HookInput) -> anyhow::Result<()> {
     let context = ask_listener(&config, &input.session_id, &input.cwd, &search)
         .unwrap_or_else(|| fallback_compose(&config, &input.cwd, &search));
     if let Some(context) = context {
-        // PreToolUse contract: additionalContext only — no `permissionDecision` (Codex rejects the
-        // "allow" value, and we only inject context, never gate the tool). Plain stdout is
-        // debug-only.
-        println!(
-            "{}",
-            serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": context,
-                }
-            })
-        );
+        print_additional_context(&context);
     }
     Ok(())
+}
+
+/// Read-augmentation path (#756): when the agent opens a file, inject the repo memories bound to it
+/// (+ its directory) and the load-bearing symbols defined in it. Silent no-op unless the file is a
+/// tracked, root-relative path with something to say. Prefers the warm listener (per-session
+/// dedup); falls back to a direct read-only compose.
+fn read_augment_hook(input: &HookInput) -> anyhow::Result<()> {
+    let Some(config) = find_config(Path::new(&input.cwd)) else { return Ok(()) };
+    let Some(file_path) = input.tool_input.get("file_path").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let indexed_root = session_indexed_root(&config, &input.cwd);
+    let Some(rel_path) = worktree_rel_path(file_path, &indexed_root) else { return Ok(()) };
+    let context = ask_listener_read(&config, &input.session_id, &input.cwd, &rel_path)
+        .unwrap_or_else(|| fallback_compose_read(&config, &input.cwd, &rel_path));
+    if let Some(context) = context {
+        print_additional_context(&context);
+    }
+    Ok(())
+}
+
+/// The absolute directory that indexed `files.path` are relative to, IN THE SESSION'S checkout.
+/// `config.root` is main-anchored (`Config::load`, #219) and already folds in the config's position
+/// under the git root plus `[index] root`.
+///
+/// - In the MAIN worktree (or when no main resolves) `config.root` already IS the session's indexed
+///   root — return it, so `[index] root` and a git-root-nested config are both honored as-is.
+/// - In a LINKED worktree, rebase `config.root` from the MAIN git-worktree root onto the SESSION
+///   git-worktree root. BOTH anchors are git WORKDIR roots (git topology, NOT `rag-rat.toml`
+///   directories), so the whole config-relative suffix — a nested config dir AND `[index] root` —
+///   is preserved exactly once, and a branch-only-config linked worktree (whose main has no config)
+///   still resolves (#756 review).
+fn session_indexed_root(config: &Config, cwd: &str) -> PathBuf {
+    let cwd = Path::new(cwd);
+    match rag_rat_base::config::linked_worktree_main_root(cwd) {
+        Some(main_git_root) => match rag_rat_base::config::worktree_root(cwd) {
+            Some(session_git_root) => rebase_root(&config.root, &main_git_root, &session_git_root),
+            None => config.root.clone(),
+        },
+        None => config.root.clone(),
+    }
+}
+
+/// Rebase `config_root` from `main_top` onto `session_top`, preserving the whole suffix below
+/// `main_top` (a git-root-nested config dir AND `[index] root`). Pure, so the linked-worktree ×
+/// nested-config × subdir-root matrix is unit-tested without a filesystem. Returns `config_root`
+/// unchanged when it isn't under `main_top` (an unexpected topology — never guess a wrong prefix).
+fn rebase_root(config_root: &Path, main_top: &Path, session_top: &Path) -> PathBuf {
+    match config_root.strip_prefix(main_top) {
+        Ok(subdir) => session_top.join(subdir),
+        Err(_) => config_root.to_path_buf(),
+    }
+}
+
+/// The worktree-root-relative, SLASH-separated path for `file_path`, or `None` when it's OUTSIDE
+/// `worktree_root` (nothing indexed to augment it with). Indexed bindings and symbols are keyed by
+/// a forward-slash root-relative path on every OS, so join the stripped components with `/` rather
+/// than `to_string_lossy` (which would leave Windows backslashes that never match) (#756 review).
+fn worktree_rel_path(file_path: &str, worktree_root: &Path) -> Option<String> {
+    let file = Path::new(file_path);
+    // `worktree_root` comes back canonicalized from discovery while the hook's `file_path` is raw,
+    // so canonicalize BOTH (when they exist) to survive a symlinked/`..`-laden checkout path;
+    // fall back to a raw strip when either can't be resolved (keeps this unit-testable with
+    // synthetic paths).
+    let file_c = file.canonicalize();
+    let root_c = worktree_root.canonicalize();
+    let (f, r): (&Path, &Path) = match (file_c.as_deref(), root_c.as_deref()) {
+        (Ok(f), Ok(r)) => (f, r),
+        _ => (file, worktree_root),
+    };
+    let rel = f.strip_prefix(r).ok()?;
+    Some(rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
+}
+
+/// Emit an `additionalContext` block for a PreToolUse hook. PreToolUse contract: additionalContext
+/// only — no `permissionDecision` (Codex rejects the "allow" value, and we only inject context,
+/// never gate the tool). Plain stdout is debug-only.
+fn print_additional_context(context: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": context,
+            }
+        })
+    );
 }
 
 /// PostToolUse path (#661): after an edit tool completes, trigger a scoped reindex of the edited
@@ -894,15 +973,6 @@ fn ask_listener(
 ) -> Option<Option<String>> {
     #[cfg(unix)]
     {
-        use std::io::{BufRead, BufReader, Write as _};
-        use std::os::unix::net::UnixStream;
-        let socket = socket_path(config);
-        // SOCKET_BUDGET covers both read and write. Unix-domain connect() completes into
-        // the listener's backlog immediately (no network round-trip), so no separate connect
-        // timeout is needed.
-        let stream = UnixStream::connect(&socket).ok()?;
-        stream.set_read_timeout(Some(SOCKET_BUDGET)).ok()?;
-        stream.set_write_timeout(Some(SOCKET_BUDGET)).ok()?;
         // `cwd` lets the listener scope the augmentation to the session's worktree overlay (#219);
         // an older listener without the field just ignores it (lenient deserialize) → base scope.
         let request = serde_json::json!({
@@ -911,21 +981,81 @@ fn ask_listener(
             "pattern": search.pattern, "search_path": search.search_path,
             "source": search.source,
         });
-        let mut writer = stream.try_clone().ok()?;
-        writeln!(writer, "{request}").ok()?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).ok()?;
-        let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
-        if reply.get("v")?.as_u64()? != 1 {
-            return None;
-        }
-        Some(reply.get("context")?.as_str().map(str::to_string))
+        // grep_augment predates the `kind` echo, so any v1 reply is authoritative — trust it and
+        // don't consult the handled-kind marker (older listeners never send it).
+        send_to_listener(config, &request).map(|reply| reply.context)
     }
     #[cfg(not(unix))]
     {
         let _ = (config, session_id, cwd, search);
         None
     }
+}
+
+/// Read-augmentation counterpart of [`ask_listener`] (#756): ask the warm listener for the digest
+/// of a file being opened, so the per-session dedup applies. `path` is repo-root-relative.
+fn ask_listener_read(
+    config: &Config,
+    session_id: &str,
+    cwd: &str,
+    path: &str,
+) -> Option<Option<String>> {
+    #[cfg(unix)]
+    {
+        let request = serde_json::json!({
+            "v": 1, "kind": "read_augment", "session_id": session_id,
+            "cwd": cwd, "path": path,
+        });
+        // Treat the reply as authoritative ONLY when the listener CONFIRMS it handled read_augment
+        // (echoes the kind). An older listener that predates this feature returns a v1 null-context
+        // reply with no handled kind — return outer `None` so the caller runs the direct fallback
+        // instead of silently disabling read augmentation until the server restarts (#756 review).
+        match send_to_listener(config, &request) {
+            Some(reply) if reply.handled_kind.as_deref() == Some("read_augment") =>
+                Some(reply.context),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (config, session_id, cwd, path);
+        None
+    }
+}
+
+/// A parsed listener reply: the injectable `context` (None ⇒ nothing new) and the request `kind`
+/// the listener reported handling (None ⇒ an older listener that didn't understand the request).
+#[cfg(unix)]
+struct ListenerReply {
+    context: Option<String>,
+    handled_kind: Option<String>,
+}
+
+/// One request/response round-trip to the warm listener socket. `None` ⇒ the listener didn't answer
+/// (no socket, timeout, protocol skew) so the caller falls back; `Some(reply)` carries the context
+/// plus the handled-kind marker.
+#[cfg(unix)]
+fn send_to_listener(config: &Config, request: &serde_json::Value) -> Option<ListenerReply> {
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::os::unix::net::UnixStream;
+    let socket = socket_path(config);
+    // SOCKET_BUDGET covers both read and write. Unix-domain connect() completes into the listener's
+    // backlog immediately (no network round-trip), so no separate connect timeout is needed.
+    let stream = UnixStream::connect(&socket).ok()?;
+    stream.set_read_timeout(Some(SOCKET_BUDGET)).ok()?;
+    stream.set_write_timeout(Some(SOCKET_BUDGET)).ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    writeln!(writer, "{request}").ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
+    if reply.get("v")?.as_u64()? != 1 {
+        return None;
+    }
+    Some(ListenerReply {
+        context: reply.get("context").and_then(|c| c.as_str()).map(str::to_string),
+        handled_kind: reply.get("kind").and_then(|k| k.as_str()).map(str::to_string),
+    })
 }
 
 /// Single source of truth via `locks::hook_socket_path_for`; same computation as the MCP
@@ -938,13 +1068,45 @@ fn socket_path(config: &Config) -> PathBuf {
 
 /// Stateless direct read (no dedupe — spec: fallback path). Any error ⇒ silence.
 fn fallback_compose(config: &Config, cwd: &str, search: &Search) -> Option<String> {
+    let conn = scoped_read_conn(config, cwd)?;
+    grep_augment::compose(
+        conn.connection(),
+        &search.pattern,
+        search.search_path.as_deref(),
+        &grep_augment::DedupeFilter::default(),
+        config.memory.surface,
+    )
+    .ok()
+    .flatten()
+    .map(|out| out.context)
+}
+
+/// Read-augmentation fallback (#756): the stateless direct compose for a file being opened, used
+/// when the warm listener didn't answer. No session dedup on this path (spec: fallback is
+/// stateless). `rel_path` is repo-root-relative. Any error ⇒ silence.
+fn fallback_compose_read(config: &Config, cwd: &str, rel_path: &str) -> Option<String> {
+    let conn = scoped_read_conn(config, cwd)?;
+    read_augment::compose(
+        conn.connection(),
+        rel_path,
+        &grep_augment::DedupeFilter::default(),
+        config.memory.surface,
+    )
+    .ok()
+    .flatten()
+    .map(|out| out.context)
+}
+
+/// Open a read-only connection scoped to the session's worktree overlay, ready for a compose call.
+/// Shared by the grep- and read-augment fallbacks. `compose` queries the `files` view, so without
+/// the scope install it would read raw (unscoped) rows. `config.root` is the anchored main
+/// worktree; `cwd` is the session dir (a linked worktree → its overlay, else base) (#219). The repo
+/// dimension is resolved from this config (identity + override) so the scope binds the config's
+/// repo, not the config-blind sole repo (a sibling in a consolidated DB); an unprovable repo →
+/// empty scope, never a sibling's rows. `None` on any not-ready condition, so the caller stays
+/// silent.
+fn scoped_read_conn(config: &Config, cwd: &str) -> Option<IndexConnection> {
     let conn = IndexConnection::open_read_only(&config.database).ok()?;
-    // Scope to the session's worktree overlay before composing — `compose` queries the `files`
-    // view, so without this it would read raw (unscoped) rows. config.root is the anchored main
-    // worktree; cwd is the session dir (a linked worktree → its overlay, else base) (#219). Resolve
-    // the repo dimension from this config (identity + override) so the scope binds the config's
-    // repo, not the config-blind sole repo (a sibling in a consolidated DB); an unprovable repo →
-    // empty scope, never a sibling's rows.
     let repo_id = rag_rat_core::index::resolve_scope_repo_id(
         conn.connection(),
         &config.root,
@@ -959,16 +1121,7 @@ fn fallback_compose(config: &Config, cwd: &str, search: &Search) -> Option<Strin
         Path::new(cwd),
     )
     .ok()?;
-    grep_augment::compose(
-        conn.connection(),
-        &search.pattern,
-        search.search_path.as_deref(),
-        &grep_augment::DedupeFilter::default(),
-        config.memory.surface,
-    )
-    .ok()
-    .flatten()
-    .map(|out| out.context)
+    Some(conn)
 }
 
 #[cfg(test)]
