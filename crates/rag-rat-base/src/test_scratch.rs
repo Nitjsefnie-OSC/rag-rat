@@ -48,7 +48,7 @@
 //! (`rag-rat-core`, `rag-rat-cli`, …) consume this helper. It is not part of the semver-stable API
 //! surface. Matches the existing `rag_rat_oracle::test_support` convention.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -274,9 +274,30 @@ fn sweep_stale(root: &Path) {
     }
 }
 
+/// Refuse a caller-supplied scratch `tag` that is not exactly one normal path component (#732
+/// review, skakri).
+///
+/// [`scratch_dir`] embeds the tag in the scratch dir name it joins onto the namespace root and
+/// then `remove_dir_all`s — a tag carrying a separator, `.`/`..`, a root, or a Windows prefix
+/// would let that join escape the dedicated namespace and delete outside it. Requiring a single
+/// [`Component::Normal`] and nothing else rejects separators, absolute paths, `..`, `.`, the
+/// empty string, and Windows prefixes under both OS path grammars, so no `cfg` split is needed.
+/// Panic-loud, matching the module's other security checks ([`ensure_secure_root`]).
+fn validate_tag(tag: &str) {
+    let mut components = Path::new(tag).components();
+    assert!(
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none(),
+        "scratch tag must be a single path component: {tag:?}",
+    );
+}
+
 /// A unique scratch directory PATH under [`scratch_root`], keyed by `tag`, the PID, and a
 /// process-wide counter. The path is NOT created (callers create it, matching the fixtures this
 /// replaces); any pre-existing dir at the exact path is removed first.
+///
+/// `tag` must be exactly one normal path component — no separators, no `.`/`..`, not absolute,
+/// not empty — and anything else PANICS before any path is built or deleted, so a hostile tag can
+/// never steer the join/`remove_dir_all` pair outside the scratch namespace (#732 review).
 ///
 /// On the first call per process this also sweeps stale sibling scratch dirs out of the root (see
 /// module docs) — the self-healing backstop for `Drop` cleanup that a `kill -9` skips.
@@ -285,6 +306,8 @@ fn sweep_stale(root: &Path) {
 /// namespace an attacker pre-planted as a symlink (or that another user owns) panics the suite
 /// rather than being swept.
 pub fn scratch_dir(tag: &str) -> PathBuf {
+    validate_tag(tag);
+
     let root = scratch_root();
     ensure_secure_root(&root);
     SWEEP.call_once(|| sweep_stale(&root));
@@ -430,5 +453,95 @@ mod tests {
             result.is_err(),
             "ensure_secure_root must panic on a foreign-owned namespace {namespace:?}",
         );
+    }
+
+    /// Assert `scratch_dir` refuses `tag` by panicking with the single-component message —
+    /// `catch_unwind`, the module's expected-panic pattern. Checking the payload proves the panic
+    /// is the tag validation, not an unrelated filesystem failure.
+    fn assert_tag_refused(tag: &str) {
+        let result = std::panic::catch_unwind(|| scratch_dir(tag));
+        let Err(payload) = result else {
+            panic!("scratch_dir must refuse the non-single-component tag {tag:?}, but it returned");
+        };
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&'static str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        assert!(
+            msg.contains("scratch tag must be a single path component"),
+            "unexpected panic message for tag {tag:?}: {msg}",
+        );
+    }
+
+    /// A tag carrying a path separator must be refused (#732 review, skakri): joined onto the
+    /// namespace root it would nest the scratch dir below an attacker-chosen subdirectory, and the
+    /// `remove_dir_all` in `scratch_dir` would then delete outside the dedicated namespace.
+    #[test]
+    fn refuses_tag_with_separator() {
+        assert_tag_refused("nested/evil");
+    }
+
+    /// An absolute-path tag must be refused: `Path::join` with an absolute path REPLACES the
+    /// namespace root, so the scratch dir — and its deletion — would land anywhere on disk.
+    #[test]
+    fn refuses_absolute_tag() {
+        assert_tag_refused("/tmp/evil");
+    }
+
+    /// A `..` tag must be refused: it resolves the join to the namespace's PARENT (the shared
+    /// system temp), so `remove_dir_all` would aim at a sibling of the namespace.
+    #[test]
+    fn refuses_parent_dir_tag() {
+        assert_tag_refused("..");
+    }
+
+    /// An empty tag must be refused: it is zero path components, not one.
+    #[test]
+    fn refuses_empty_tag() {
+        assert_tag_refused("");
+    }
+
+    /// A normal single-component tag keeps its exact pre-validation behavior: a fresh path
+    /// directly under the namespace root, named `<tag>-<pid>-<seq>`.
+    #[test]
+    fn accepts_normal_single_component_tag() {
+        let dir = scratch_dir("normal-tag");
+        assert_eq!(dir.parent(), Some(scratch_root().as_path()));
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        assert!(name.starts_with("normal-tag-"), "unexpected scratch name {name:?}");
+    }
+
+    /// The exact #732-review attack: a `..` tag aims the join+delete at a victim OUTSIDE the
+    /// namespace. The victim is pre-created at the precise path the un-validated code would
+    /// delete — predicted from this process's PID and the next SEQ value (nextest runs each test
+    /// in its own process, so this test owns the counter) — so dropping the validation fails this
+    /// test by losing the victim, not just by returning. The call must REFUSE and the victim must
+    /// SURVIVE. Mirror of `refuses_symlinked_namespace_and_spares_victim`.
+    #[test]
+    fn refuses_escaping_tag_and_spares_victim() {
+        // Predict the exact name `scratch_dir` will build for the malicious call below:
+        // `{tag}-{pid}-{seq}`. The join resolves `root/../<predicted>` to a sibling of the
+        // namespace in the shared temp — plant the victim there so the attack has a real target.
+        let tag = "../victim-escape";
+        let predicted =
+            format!("victim-escape-{}-{}", std::process::id(), SEQ.load(Ordering::Relaxed));
+        let victim = std::env::temp_dir().join(predicted);
+        let victim_precious = victim.join("precious-data");
+        std::fs::create_dir_all(&victim_precious).unwrap();
+
+        let result = std::panic::catch_unwind(|| scratch_dir(tag));
+
+        assert!(
+            victim_precious.exists(),
+            "the escaping tag deleted the victim dir {victim:?} outside the scratch namespace",
+        );
+        assert!(
+            result.is_err(),
+            "scratch_dir must refuse the escaping tag {tag:?}, but it returned"
+        );
+
+        // The victim lives outside the swept namespace, so clean it up explicitly.
+        let _ = std::fs::remove_dir_all(&victim);
     }
 }
