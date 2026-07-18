@@ -51,7 +51,14 @@ jobs:
 
       - uses: bencherdev/bencher@main
 
-      # Instruction counts (iai-callgrind) — deterministic, tight percentage threshold.
+      # Instruction counts (iai-callgrind) — TRACKING ONLY, no `--err`. iai is *mostly*
+      # deterministic, but the search path iterates `HashMap`s seeded by `RandomState`, so
+      # instruction counts jitter a few percent run-to-run; a 2% `--err` gate (cloned from main's
+      # threshold via --start-point-clone-thresholds) red-failed PRs on noise that main's own
+      # bench.yml deliberately stopped gating for the same reason (see its "Track instruction
+      # counts" comment). Track + alert in Bencher instead of hard-failing the PR check — same
+      # "headline signal, not a gate" stance as bench.yml. See #648. Re-arm `--err` once the
+      # start-point baseline is current and the query benches are deterministically seeded.
       - name: Track instruction counts (iai-callgrind)
         run: |
           bencher run \
@@ -64,7 +71,6 @@ jobs:
             --adapter rust_iai_callgrind \
             --github-actions '${{ secrets.GITHUB_TOKEN }}' \
             --ci-number "$PR_NUMBER" \
-            --err \
             --file benchmark_results_iai.txt
 
       # Wall-clock index time (criterion) — noisier, statistical threshold lives on the main branch.
