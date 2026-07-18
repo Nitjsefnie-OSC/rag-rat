@@ -511,7 +511,7 @@ mod freshness_version_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use rag_rat_base::config::RemoteEmbeddingConfig;
     use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, spec};
@@ -657,13 +657,13 @@ mod freshness_version_tests {
     }
 
     fn read_request_body(stream: &mut TcpStream) -> String {
-        // The listener is non-blocking (poll-accept), and on macOS/BSD an accepted socket INHERITS
-        // the listener's `O_NONBLOCK` (Linux/Windows do not). On a non-blocking socket `read`
-        // returns `WouldBlock` the instant no bytes are buffered — which the body loop
-        // below treats as `Err → break`, TRUNCATING a request whose body spans multiple TCP
-        // segments (the 1005-item batch). Force the accepted stream back to blocking so
-        // `set_read_timeout` (SO_RCVTIMEO) governs the reads and a large body is drained in
-        // full.
+        // Force the accepted stream to blocking so `set_read_timeout` (SO_RCVTIMEO) governs the
+        // reads: on macOS/BSD an accepted socket INHERITS a non-blocking listener's `O_NONBLOCK`
+        // (Linux/Windows do not inherit), and on a non-blocking socket `read` returns
+        // `WouldBlock` the instant no bytes are buffered — which the body loop below treats as
+        // `Err → break`, TRUNCATING a request whose body spans multiple TCP segments (the
+        // 1005-item batch). The stubs' listeners have been blocking since #697; the reset stays
+        // as a guard.
         stream.set_nonblocking(false).ok();
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         let mut raw = Vec::new();
@@ -711,54 +711,44 @@ mod freshness_version_tests {
         delay: Duration,
     ) -> (String, thread::JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::clone(&max_in_flight);
         let handle = thread::spawn(move || {
             let mut workers = Vec::new();
-            let mut accepted = 0usize;
-            let started = Instant::now();
-            let mut last_accept = started;
-            while accepted < max_conns
-                && started.elapsed() < Duration::from_secs(5)
-                && (accepted == 0 || last_accept.elapsed() < Duration::from_millis(500))
-            {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        accepted += 1;
-                        last_accept = Instant::now();
-                        let in_flight = Arc::clone(&in_flight);
-                        let max_seen = Arc::clone(&max_seen);
-                        workers.push(thread::spawn(move || {
-                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                            raise_max(&max_seen, now);
-                            let body = read_request_body(&mut stream);
-                            thread::sleep(delay);
-                            let inputs = body.matches("path: ").count().max(1);
-                            let vector = vec!["0.1"; dim].join(",");
-                            let rows = (0..inputs)
-                                .map(|i| format!("{{\"embedding\":[{vector}],\"index\":{i}}}"))
-                                .collect::<Vec<_>>()
-                                .join(",");
-                            let response_body = format!("{{\"data\":[{rows}]}}");
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: \
-                                 application/json\r\nContent-Length: {}\r\nConnection: \
-                                 close\r\n\r\n{response_body}",
-                                response_body.len()
-                            );
-                            let _ = stream.write_all(response.as_bytes());
-                            let _ = stream.flush();
-                            in_flight.fetch_sub(1, Ordering::SeqCst);
-                        }));
-                    },
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    },
-                    Err(_) => break,
-                }
+            // Accept EXACTLY `max_conns` connections on a blocking listener — the stub's lifetime
+            // is bounded by the test's request count (an event), not by the wall clock. The
+            // previous loop polled a non-blocking listener under a 5s overall / 500ms idle cap:
+            // under host load the reconcile's pre-request work delayed its connect past those
+            // caps, the listener dropped, and every chunk failed (#697). A loaded box can only
+            // make this loop WAIT longer, never exit early. `handle.join()` in the test therefore
+            // guarantees every accepted request has fully drained before the assertions run.
+            for _ in 0..max_conns {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let in_flight = Arc::clone(&in_flight);
+                let max_seen = Arc::clone(&max_seen);
+                workers.push(thread::spawn(move || {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    raise_max(&max_seen, now);
+                    let body = read_request_body(&mut stream);
+                    thread::sleep(delay);
+                    let inputs = body.matches("path: ").count().max(1);
+                    let vector = vec!["0.1"; dim].join(",");
+                    let rows = (0..inputs)
+                        .map(|i| format!("{{\"embedding\":[{vector}],\"index\":{i}}}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let response_body = format!("{{\"data\":[{rows}]}}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                         {}\r\nConnection: close\r\n\r\n{response_body}",
+                        response_body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }));
             }
             for worker in workers {
                 let _ = worker.join();
@@ -773,55 +763,42 @@ mod freshness_version_tests {
         fail_marker: &'static str,
     ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = thread::spawn(move || {
             let mut workers = Vec::new();
-            let mut accepted = 0usize;
-            let started = Instant::now();
-            let mut last_accept = started;
-            while accepted < max_conns
-                && started.elapsed() < Duration::from_secs(5)
-                && (accepted == 0 || last_accept.elapsed() < Duration::from_millis(500))
-            {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        accepted += 1;
-                        last_accept = Instant::now();
-                        workers.push(thread::spawn(move || {
-                            let body = read_request_body(&mut stream);
-                            let response = if body.contains(fail_marker) {
-                                let response_body = "{\"error\":\"transient\"}";
-                                format!(
-                                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: \
-                                     application/json\r\nContent-Length: {}\r\nConnection: \
-                                     close\r\n\r\n{response_body}",
-                                    response_body.len()
-                                )
-                            } else {
-                                let inputs = body.matches("path: ").count().max(1);
-                                let vector = vec!["0.1"; dim].join(",");
-                                let rows = (0..inputs)
-                                    .map(|i| format!("{{\"embedding\":[{vector}],\"index\":{i}}}"))
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                                let response_body = format!("{{\"data\":[{rows}]}}");
-                                format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: \
-                                     application/json\r\nContent-Length: {}\r\nConnection: \
-                                     close\r\n\r\n{response_body}",
-                                    response_body.len()
-                                )
-                            };
-                            let _ = stream.write_all(response.as_bytes());
-                            let _ = stream.flush();
-                        }));
-                    },
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    },
-                    Err(_) => break,
-                }
+            // Same event-bounded accept as `spawn_reconcile_embed_stub` (#697): block until each
+            // of the `max_conns` expected connections arrives; no wall-clock caps that a loaded
+            // host can beat. The retries the scoped-retry path makes are SEQUENTIAL, so the old
+            // 500ms idle cap could fire between one request and its follow-up.
+            for _ in 0..max_conns {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                workers.push(thread::spawn(move || {
+                    let body = read_request_body(&mut stream);
+                    let response = if body.contains(fail_marker) {
+                        let response_body = "{\"error\":\"transient\"}";
+                        format!(
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: \
+                             application/json\r\nContent-Length: {}\r\nConnection: \
+                             close\r\n\r\n{response_body}",
+                            response_body.len()
+                        )
+                    } else {
+                        let inputs = body.matches("path: ").count().max(1);
+                        let vector = vec!["0.1"; dim].join(",");
+                        let rows = (0..inputs)
+                            .map(|i| format!("{{\"embedding\":[{vector}],\"index\":{i}}}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let response_body = format!("{{\"data\":[{rows}]}}");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n{response_body}",
+                            response_body.len()
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }));
             }
             for worker in workers {
                 let _ = worker.join();
