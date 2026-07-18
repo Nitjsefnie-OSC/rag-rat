@@ -16,13 +16,29 @@
 //!
 //! So this module fixes the leak the other way the issue proposed — a self-healing sweep:
 //!   1. all scratch lives under ONE dedicated, namespaced sub-root of the system temp
-//!      ([`SCRATCH_NAMESPACE`]), so a stranded dir is trivially found and the sweep below can never
-//!      touch anything but this helper's own dirs;
+//!      ([`scratch_root`], `<temp>/rag-rat-test-scratch-<euid>`), so a stranded dir is trivially
+//!      found and the sweep below can never touch anything but this helper's own dirs;
 //!   2. the FIRST scratch request in each process sweeps sibling scratch dirs older than
 //!      [`SWEEP_MAX_AGE`] out of that root — self-healing after a `kill -9`, no external cron.
 //!
 //! `Drop`-based cleanup stays the fast path; the age-bounded sweep is only the backstop for the
 //! cases where `Drop` never runs.
+//!
+//! # Security: the namespace is per-user and its identity is verified before any sweep
+//!
+//! The system temp is world-writable and shared between local users. A namespace at a *fixed*,
+//! predictable path (`<temp>/rag-rat-test-scratch`) is attackable: before our process starts,
+//! another local user can pre-create that path as a **symlink to any directory the test-running
+//! user can write**. `create_dir_all` accepts the symlink (its target already exists as a dir), and
+//! the startup sweep then traverses the *target*, deleting its subdirectories older than
+//! [`SWEEP_MAX_AGE`] — attacker-directed deletion of arbitrary directories (#726 review, skakri).
+//!
+//! Two defences, both below:
+//!   * **per-euid namespace** — the root carries the effective uid (`…-<euid>`), so two users
+//!     sharing the temp get structurally distinct roots and a name collision is impossible;
+//!   * **verify before sweep** — [`ensure_secure_root`] re-inspects the created namespace with
+//!     symlink-aware metadata and panics unless it is a real directory (not a symlink) owned by our
+//!     euid, with mode `0700`. A poisoned namespace fails the suite loudly; it is never swept.
 //!
 //! Not `#[cfg(test)]`: that gate does not propagate across crates, and fixtures in sibling crates
 //! (`rag-rat-core`, `rag-rat-cli`, …) consume this helper. It is not part of the semver-stable API
@@ -33,10 +49,12 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-/// The single dedicated sub-directory of the system temp under which ALL test scratch lives. A
-/// dedicated namespace keeps the sweep's blast radius to this helper's own dirs (never the shared
-/// temp root) and makes any manual cleanup a one-liner: `rm -rf $TMPDIR/rag-rat-test-scratch`.
-pub const SCRATCH_NAMESPACE: &str = "rag-rat-test-scratch";
+/// Prefix of the dedicated system-temp sub-directory under which ALL test scratch lives. The real
+/// namespace appends this process's effective uid ([`scratch_root`] →
+/// `rag-rat-test-scratch-<euid>`) so users sharing the temp never collide. A dedicated namespace
+/// keeps the sweep's blast radius to this helper's own dirs (never the shared temp root) and makes
+/// manual cleanup a one-liner: `rm -rf $TMPDIR/rag-rat-test-scratch-$(id -u)`.
+pub const SCRATCH_NAMESPACE_PREFIX: &str = "rag-rat-test-scratch";
 
 /// Sweep scratch dirs older than this on first use per process. Two hours is far longer than any
 /// single test or `nextest` run (CI caps a wedged test at 60s), so the threshold can never delete a
@@ -50,12 +68,96 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Guards the once-per-process startup sweep.
 static SWEEP: Once = Once::new();
 
-/// The scratch root shared by every test in every crate: `<system temp>/rag-rat-test-scratch`.
+/// The scratch root shared by every test in every crate: `<system
+/// temp>/rag-rat-test-scratch-<euid>`.
 ///
-/// The system temp (not `target/tmp`) so `git init` fixtures have no ancestor `.git`; a dedicated
-/// namespace so the sweep can only ever remove this helper's own dirs.
+/// The system temp (not `target/tmp`) so `git init` fixtures have no ancestor `.git`; a dedicated,
+/// per-euid namespace so the sweep can only ever remove this helper's own dirs and two users
+/// sharing the temp can never collide.
 pub fn scratch_root() -> PathBuf {
-    std::env::temp_dir().join(SCRATCH_NAMESPACE)
+    std::env::temp_dir().join(format!("{SCRATCH_NAMESPACE_PREFIX}-{}", current_euid()))
+}
+
+/// This process's effective user id, used to make the scratch namespace per-user and to verify
+/// namespace ownership before sweeping.
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, has no preconditions, and per POSIX always succeeds.
+    // On Linux `uid_t` is `u32` (matching `MetadataExt::uid()`); this binding pins that, so a
+    // platform with a differently-sized `uid_t` fails to compile here rather than truncating.
+    unsafe { libc::geteuid() }
+}
+
+/// Securely create the scratch namespace `root` and verify it is a real directory this process
+/// owns, panicking loudly otherwise. Run before every sweep so a poisoned namespace can never be
+/// swept.
+///
+/// # The attack (#726 review, skakri)
+///
+/// On a shared system temp, another local user can pre-create the namespace path as a **symlink to
+/// any directory the test-running user can write**. A plain `create_dir_all` accepts that symlink
+/// (its target already exists as a dir), after which the startup sweep traverses the *target* and
+/// removes its subdirectories older than [`SWEEP_MAX_AGE`] — arbitrary-directory deletion driven by
+/// an attacker's symlink.
+///
+/// # The defence
+///
+/// Create the namespace with mode `0700`, then re-inspect it with **symlink-aware**
+/// [`std::fs::symlink_metadata`] (which does NOT follow links) and require that it is (1) not a
+/// symlink, (2) a directory, and (3) owned by this process's effective uid. Any deviation is a
+/// poisoned namespace: panic and fail the suite rather than sweep a directory we do not own.
+///
+/// # TOCTOU boundary (stated honestly)
+///
+/// This verification defeats the *pre-created* symlink — a link planted before we look is caught by
+/// `symlink_metadata`, because we inspect the very path we created and are about to sweep. It does
+/// NOT close a racing swap performed by an attacker *between* this check and the sweep: closing
+/// that window would require dirfd-relative operations (an `O_NOFOLLOW`/`O_DIRECTORY` `openat` plus
+/// `fstatat`/`unlinkat` pinned to the verified inode) so every later op targets the same inode.
+/// That is out of scope for test scratch: the per-euid namespace already makes a collision
+/// structurally irrelevant, and a same-user attacker racing our parent temp gains no privilege. The
+/// realistic, cheap attack — plant a symlink and wait — is fully closed.
+fn ensure_secure_root(root: &Path) {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    // Create only the namespace (its parent temp already exists) with 0700 from birth, so a freshly
+    // created namespace is never group/other-accessible even for an instant.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    if let Err(err) = builder.create(root) {
+        panic!("test scratch: failed to create namespace {root:?}: {err}");
+    }
+
+    // Re-inspect with symlink-aware metadata: a pre-planted symlink is caught HERE, before any
+    // sweep can traverse (and delete inside) its target.
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(err) => panic!("test scratch: cannot stat namespace {root:?}: {err}"),
+    };
+    let file_type = meta.file_type();
+    assert!(
+        !file_type.is_symlink(),
+        "test scratch: namespace {root:?} is a symlink — refusing to sweep its target (possible \
+         tmp symlink-planting attack; see test_scratch.rs)",
+    );
+    assert!(
+        file_type.is_dir(),
+        "test scratch: namespace {root:?} exists but is not a directory (found {file_type:?})",
+    );
+    let owner = meta.uid();
+    let euid = current_euid();
+    assert_eq!(
+        owner, euid,
+        "test scratch: namespace {root:?} is owned by uid {owner}, not this process's euid {euid} \
+         — refusing to sweep a directory this user does not own",
+    );
+
+    // Defence in depth: a namespace left by an older build may have looser permissions. Tighten to
+    // 0700 (failing loudly if we cannot) so group/other can never plant siblings inside it.
+    if meta.mode() & 0o777 != 0o700
+        && let Err(err) = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+    {
+        panic!("test scratch: cannot set 0700 on namespace {root:?}: {err}");
+    }
 }
 
 /// Delete scratch dirs directly under `root` whose mtime is older than [`SWEEP_MAX_AGE`].
@@ -69,8 +171,11 @@ fn sweep_stale(root: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(metadata) = entry.metadata() else { continue };
-        if !metadata.is_dir() {
+        // Defence in depth: never follow a symlink. Even inside our own verified namespace, treat a
+        // symlink entry as hostile — `symlink_metadata` does NOT follow, so a link planted here can
+        // never redirect `remove_dir_all` at an unrelated target. Only real directories are swept.
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else { continue };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
         let old_enough = metadata
@@ -91,9 +196,13 @@ fn sweep_stale(root: &Path) {
 ///
 /// On the first call per process this also sweeps stale sibling scratch dirs out of the root (see
 /// module docs) — the self-healing backstop for `Drop` cleanup that a `kill -9` skips.
+///
+/// The root is created and its identity verified via [`ensure_secure_root`] before any sweep, so a
+/// namespace an attacker pre-planted as a symlink (or that another user owns) panics the suite
+/// rather than being swept.
 pub fn scratch_dir(tag: &str) -> PathBuf {
     let root = scratch_root();
-    let _ = std::fs::create_dir_all(&root);
+    ensure_secure_root(&root);
     SWEEP.call_once(|| sweep_stale(&root));
 
     let name = format!("{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
@@ -110,17 +219,22 @@ mod tests {
 
     use super::*;
 
-    /// New scratch dirs must land inside the ONE dedicated namespace sub-root of the system temp —
-    /// never scattered directly across the shared temp root (which is what let 16k dirs accumulate,
-    /// and what would make the sweep unsafe). Bites if creation is pointed back at the bare temp
-    /// dir.
+    /// New scratch dirs must land inside the ONE dedicated, PER-EUID namespace sub-root of the
+    /// system temp — never scattered directly across the shared temp root (which is what let 16k
+    /// dirs accumulate, and what would make the sweep unsafe). The per-euid suffix is what stops
+    /// two users sharing the temp from colliding on a fixed, attackable path. Bites if creation
+    /// is pointed back at the bare temp dir OR if the namespace is reverted to the un-suffixed
+    /// shared name.
     #[test]
     fn scratch_dirs_live_under_the_dedicated_namespace() {
         let root = scratch_root();
+        // The namespace name carries this process's euid — a shared/un-suffixed name is attackable
+        // on a multi-user temp, so pin the exact per-euid form.
+        let expected = format!("{SCRATCH_NAMESPACE_PREFIX}-{}", current_euid());
         assert_eq!(
             root.file_name(),
-            Some(OsStr::new(SCRATCH_NAMESPACE)),
-            "scratch root should be the dedicated namespace, got {root:?}",
+            Some(OsStr::new(&expected)),
+            "scratch root should be the dedicated per-euid namespace {expected:?}, got {root:?}",
         );
         // The namespace is a CHILD of the system temp, not the bare temp root itself (a bare-root
         // sweep could delete unrelated files).
@@ -154,5 +268,80 @@ mod tests {
 
         assert!(!stale.exists(), "sweep should have removed the stale (aged) dir {stale:?}");
         assert!(fresh.exists(), "sweep must NOT remove the fresh dir {fresh:?}");
+    }
+
+    /// A namespace an attacker pre-planted as a **symlink to a victim directory** must be REFUSED
+    /// (panic), and the victim's aged contents must SURVIVE — never swept. This is the exact #726
+    /// attack: without the `symlink_metadata` verification, `create_dir_all` accepts the symlink
+    /// and the sweep traverses the target, deleting its aged subdirs. Bites if that
+    /// verification is removed (no panic AND the victim's aged dir gets swept).
+    #[test]
+    fn refuses_symlinked_namespace_and_spares_victim() {
+        use std::os::unix::fs::symlink;
+
+        let parent = scratch_dir("symlink-attack-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+
+        // The victim: a directory (owned by us) containing an aged subdir a naive sweep would nuke.
+        let victim = parent.join("victim");
+        let victim_aged = victim.join("precious-aged-data");
+        std::fs::create_dir_all(&victim_aged).unwrap();
+        let aged = SystemTime::now() - (SWEEP_MAX_AGE + Duration::from_secs(3600));
+        set_file_mtime(&victim_aged, FileTime::from_system_time(aged)).unwrap();
+
+        // The attacker pre-creates the namespace path as a symlink to the victim.
+        let planted = parent.join("planted-namespace");
+        symlink(&victim, &planted).unwrap();
+
+        // Drive the real startup sequence (create+verify, then sweep) against the planted path. The
+        // verification must panic before the sweep can touch the target.
+        let planted_for_closure = planted.clone();
+        let result = std::panic::catch_unwind(move || {
+            ensure_secure_root(&planted_for_closure);
+            sweep_stale(&planted_for_closure);
+        });
+
+        assert!(
+            result.is_err(),
+            "ensure_secure_root must panic on a symlinked namespace {planted:?}, but it returned",
+        );
+        assert!(
+            victim_aged.exists(),
+            "the symlink-planting attack deleted the victim's aged dir {victim_aged:?}",
+        );
+    }
+
+    /// A namespace that is a real directory but owned by ANOTHER user must be refused — a same-user
+    /// attacker cannot forge ownership, but a directory we do not own is exactly what we must never
+    /// sweep. Creating a foreign-owned dir needs root (to `chown`), so this is a no-op when not run
+    /// as root. Bites if the euid-ownership check is dropped.
+    #[test]
+    fn refuses_foreign_owned_namespace() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // `chown` to another uid requires privilege; only root can set this up. Skip otherwise
+        // (CI here runs as root, where the check is exercised for real).
+        if current_euid() != 0 {
+            eprintln!("skipping foreign-owner test: not root (euid={})", current_euid());
+            return;
+        }
+
+        let parent = scratch_dir("foreign-owner-parent");
+        let namespace = parent.join("foreign-namespace");
+        std::fs::create_dir_all(&namespace).unwrap();
+
+        // Hand the namespace to `nobody` (65534) so it is a real dir we no longer own.
+        let c_path = std::ffi::CString::new(namespace.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path for the duration of the call.
+        let rc = unsafe { libc::chown(c_path.as_ptr(), 65534, 65534) };
+        assert_eq!(rc, 0, "chown to nobody failed: {}", std::io::Error::last_os_error());
+
+        let namespace_for_closure = namespace.clone();
+        let result = std::panic::catch_unwind(move || ensure_secure_root(&namespace_for_closure));
+
+        assert!(
+            result.is_err(),
+            "ensure_secure_root must panic on a foreign-owned namespace {namespace:?}",
+        );
     }
 }
