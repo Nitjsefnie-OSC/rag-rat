@@ -23,6 +23,12 @@
  *   - vLLM      `vllm/vllm-openai:latest`      entrypoint `vllm serve`
  *               → `<hf> --runner pooling --host 0.0.0.0 --port 8000`; auto-downloads on boot; serves
  *               `/v1/embeddings`; port 8000; GPU-REQUIRED (no official CPU image).
+ *
+ * #689: all three images below are pinned `tag@digest` rather than tracking `:latest` — an unpinned
+ * `:latest` lets an upstream image bump change engine behavior under us with no change on our side
+ * (the original vLLM regression this issue reports). Each pin is the digest `:latest` resolved to on
+ * 2026-07-18 (via the Docker Hub registry API — see the PR/commit for the exact `curl` evidence);
+ * bump deliberately by re-resolving and updating the pin, never by reverting to `:latest`.
  */
 
 import type { Backend, Capability, CookbookInput } from "../src/contract.js";
@@ -139,7 +145,8 @@ const OLLAMA_SPEC: BackendServerSpec = {
   capabilities: ["embed", "chat"],
   requiresGpu: false,
   modelLoad: "ollama-pull",
-  image: () => "ollama/ollama:latest",
+  // #689: pinned to ollama 0.32.1 (resolved from `:latest` 2026-07-18) — bump deliberately.
+  image: () => "ollama/ollama:0.32.1@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0",
   // `serve` boots an empty server regardless of capability; the model (embed or chat) is pulled after.
   entrypointArgs: () => ["serve"],
   servePath: (capability) => (capability === "chat" ? "/v1/chat/completions" : "/v1/embeddings"),
@@ -165,7 +172,16 @@ const INFINITY_SPEC: BackendServerSpec = {
   requiresGpu: false,
   modelLoad: "in-launch",
   // CPU image unless a GPU was explicitly requested (infinity is CPU-capable; the CPU tag is slimmer).
-  image: (input) => (input.gpu != null ? "michaelf34/infinity:latest" : "michaelf34/infinity:latest-cpu"),
+  // #689: pinned (resolved from `:latest`/`:latest-cpu` 2026-07-18) — bump deliberately.
+  //   - GPU variant resolves to infinity 0.0.77.
+  //   - CPU variant: `latest-cpu`'s current digest does NOT match any published semver tag (incl.
+  //     `0.0.77-cpu`) as of 2026-07-18 — upstream's `latest-cpu` appears stale/out of step with
+  //     `latest`. Pinning the digest anyway (freezes exactly what `latest-cpu` serves today); the
+  //     tag name is kept as the human-readable label since no matching version could be verified.
+  image: (input) =>
+    input.gpu != null
+      ? "michaelf34/infinity:0.0.77@sha256:11e8b3921b9f1a58965afaad4a844c435c9807cbc82c51e47cb147b7d977fc88"
+      : "michaelf34/infinity:latest-cpu@sha256:161ef2dd48ba050ad29a413d671270502acb4ad67759d695eb0d325c033a935d",
   // `infinity_emb` is the entrypoint; `v2` is the subcommand. `--model-id` is the HF id. infinity
   // binds 0.0.0.0 by default, so no host flag is needed. server_concurrency is intentionally NOT
   // mapped: infinity's async engine batches dynamically, so there's no concurrent-request knob —
@@ -193,7 +209,10 @@ const VLLM_SPEC: BackendServerSpec = {
   // vLLM's published image (`vllm/vllm-openai`) is CUDA-only — a provider must attach a GPU.
   requiresGpu: true,
   modelLoad: "in-launch",
-  image: () => "vllm/vllm-openai:latest",
+  // #689: pinned to vLLM v0.25.1 (resolved from `:latest` 2026-07-18) — bump deliberately. This is
+  // the exact issue's motivating case: an unpinned `:latest` let an upstream vLLM regression change
+  // engine behavior under every ephemeral chat/embed box with no change on our side.
+  image: () => "vllm/vllm-openai:v0.25.1@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089",
   // Entrypoint is `vllm serve`, so the model id is the first positional. vLLM binds loopback unless
   // `--host 0.0.0.0` is passed — the classic "up but unreachable" trap. The RUNNER is capability-
   // dependent: `--runner pooling` puts vLLM in embedding mode (current flag; the old `--task embed`

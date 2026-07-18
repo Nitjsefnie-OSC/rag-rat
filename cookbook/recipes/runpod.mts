@@ -132,6 +132,11 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
   // the model's HF context).
   const dockerArgs = (await spec.entrypointArgs(input)).join(" ");
 
+  // #689: name the resolved image in the event stream so an image-related boot failure is
+  // attributable from the log view instead of surfacing as an opaque deploy/readiness error.
+  const resolvedImage = spec.image(input);
+  log("info", `using ${spec.backend} image: ${resolvedImage}`);
+
   // Deploy the pod. The backend spec supplies the image, the dockerArgs (entrypoint args joined),
   // and the container env; `ports "<port>/http"` exposes the proxy. No persistent volume (ephemeral).
   //
@@ -151,7 +156,7 @@ async function provision(ctx: ProvisionContext<PodHandle>): Promise<Provisioned<
           gpuCount: 1,
           gpuTypeId,
           name: podName,
-          imageName: spec.image(input),
+          imageName: resolvedImage,
           dockerArgs,
           ports: `${port}/http`,
           containerDiskInGb: CONTAINER_DISK_GB,
