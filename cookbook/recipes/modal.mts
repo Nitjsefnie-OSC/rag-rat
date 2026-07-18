@@ -133,7 +133,11 @@ async function provision(ctx: ProvisionContext<Sandbox>): Promise<Provisioned<Sa
     modal.apps.fromName(APP_NAME, { createIfMissing: true }),
   );
 
-  const image = modal.images.fromRegistry(spec.image(input));
+  // #689: name the resolved image in the event stream so an image-related boot failure is
+  // attributable from the log view instead of surfacing as an opaque `SandboxWaitUntilReady` error.
+  const resolvedImage = spec.image(input);
+  log("info", `using ${spec.backend} image: ${resolvedImage}`);
+  const image = modal.images.fromRegistry(resolvedImage);
 
   // CREATE-TIMEOUT ORPHAN (#330-1, the Modal analog of RunPod's N3 deploy-orphan sweep): the create
   // is `withBudget`-bounded, but Modal can REACH the backend and CREATE the sandbox and then have the

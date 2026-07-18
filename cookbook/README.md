@@ -32,11 +32,15 @@ All three backends speak the **OpenAI-compatible embeddings API** (`POST <embedP
 input:[…], encoding_format:"float"}` → `{data:[{embedding,index}]}`), so the embed call and the
 readiness probe are backend-independent. Only the **route** differs:
 
-| Backend | Image | Port | Embeddings route | GPU | Model load |
+| Backend | Image (pinned, `#689`) | Port | Embeddings route | GPU | Model load |
 |---|---|---|---|---|---|
-| `ollama` | `ollama/ollama:latest` | 11434 | `/v1/embeddings` | optional | `ollama pull` after boot |
-| `infinity` | `michaelf34/infinity:latest[-cpu]` | 7997 | `/embeddings` | optional | auto-download on boot |
-| `vllm` | `vllm/vllm-openai:latest` | 8000 | `/v1/embeddings` | **required** | auto-download on boot |
+| `ollama` | `ollama/ollama:0.32.1@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0` | 11434 | `/v1/embeddings` | optional | `ollama pull` after boot |
+| `infinity` | `michaelf34/infinity:0.0.77@sha256:11e8b3921b9f1a58965afaad4a844c435c9807cbc82c51e47cb147b7d977fc88` (GPU) / `michaelf34/infinity:latest-cpu@sha256:161ef2dd48ba050ad29a413d671270502acb4ad67759d695eb0d325c033a935d` (CPU) | 7997 | `/embeddings` | optional | auto-download on boot |
+| `vllm` | `vllm/vllm-openai:v0.25.1@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089` | 8000 | `/v1/embeddings` | **required** | auto-download on boot |
+
+Images are pinned `tag@digest` (see `recipes/backends.mts`) — an unpinned `:latest` let upstream image
+bumps change server behavior with no change on our side; bump the pin deliberately, never revert to
+`:latest`.
 
 `model` is backend-specific: an **ollama model name** (`all-minilm`) for ollama, a **HuggingFace
 model id** (`sentence-transformers/all-MiniLM-L6-v2`) for infinity/vLLM (which download it from HF on
