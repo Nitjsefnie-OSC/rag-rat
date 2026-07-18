@@ -1,5 +1,4 @@
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rag_rat_base::config::ResolvedTarget;
 // The embedding-model constants moved from `index::ai` to the crate-root registry (#112).
@@ -9,11 +8,8 @@ use rag_rat_base::embedding_models::{
     FASTEMBED_DISPLAY_MODEL, FASTEMBED_EMBEDDING_DIM, FASTEMBED_MODEL_ID, HASH_EMBEDDING_DIM,
     HASH_MODEL_ID,
 };
-use rag_rat_base::time::now_ms;
 
 use super::*;
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A recognizable bogus row that only a git-history full replacement would remove. Surviving the
 /// next incremental pass means the reload was skipped or appended; gone means the full path ran. It
@@ -162,10 +158,9 @@ fn hot_module_text(revision: usize) -> String {
 }
 
 fn unique_temp_root() -> PathBuf {
-    let mut root = std::env::temp_dir();
-    let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    root.push(format!("rag-rat-schema-test-{}-{}-{suffix}", std::process::id(), now_ms()));
-    root
+    // Shared, self-healing scratch root with a startup sweep, so a panicking/killed test can't
+    // strand this dir in the system temp (#726). See `rag_rat_base::test_scratch`.
+    rag_rat_base::test_scratch::scratch_dir("rag-rat-schema-test")
 }
 
 fn fixture_temp_root(fixture: &str) -> PathBuf {

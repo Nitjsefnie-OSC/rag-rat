@@ -254,7 +254,6 @@ pub(crate) fn live_worktree_contexts(root: &Path) -> (Vec<String>, Vec<String>) 
 #[cfg(test)]
 mod worktree_scope_tests {
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
@@ -272,12 +271,9 @@ mod worktree_scope_tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("ragrat-wtscope-{}-{tag}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        // Shared, self-healing scratch root with a startup sweep, so a panicking/killed test can't
+        // strand this dir in the system temp (#726). See `rag_rat_base::test_scratch`.
+        rag_rat_base::test_scratch::scratch_dir(&format!("ragrat-wtscope-{tag}"))
     }
 
     fn init_repo(tag: &str) -> PathBuf {

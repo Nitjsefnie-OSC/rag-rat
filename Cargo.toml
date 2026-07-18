@@ -73,6 +73,9 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 # links, so it adds NO second sha2/digest stack — `Hkdf::<sha2::Sha256>` reuses the existing hash.
 hkdf = "0.13"
 fastembed = { version = "5.17.2", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+# Cross-platform mtime setter, used only by `test_scratch`'s sweep test to age a fixture dir past
+# the sweep threshold (already in the tree transitively; a dev-dependency, not shipped).
+filetime = "0.2"
 # `join_all` drives the per-binding mirror jobs concurrently on the papertrail
 # current-thread runtime (reqwest already pulls futures-util transitively).
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }

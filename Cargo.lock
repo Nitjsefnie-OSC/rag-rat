@@ -3587,6 +3587,7 @@ name = "rag-rat-base"
 version = "0.19.0"
 dependencies = [
  "anyhow",
+ "filetime",
  "gix",
  "libc",
  "minicbor",
