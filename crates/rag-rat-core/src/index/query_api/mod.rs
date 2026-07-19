@@ -36,7 +36,10 @@ pub use clones::{
 };
 #[cfg(test)]
 pub(crate) use clones::{MAX_MEMBERS, MEMBER_VALUE_CAP};
-pub use db_file_health::{DatabaseFileHealth, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport};
+pub use db_file_health::{
+    DatabaseFileHealth, FreelistReclaim, FreelistReclaimReport, WAL_CHECKPOINT_MIN_BYTES,
+    WalCheckpointReport, reclaim_freelist_at,
+};
 pub use gc::GcReport;
 pub use global_status::{
     GlobalFtsStatus, GlobalStatus, MemoryCounts, MemoryKindCounts, PapertrailCursor, RepoContent,
@@ -518,7 +521,9 @@ impl IndexDatabase {
             Ok(text) => text,
             Err(_) => {
                 let path = chunk.path.clone();
-                self.mark_file_deleted(Path::new(&path))?;
+                // #767 review: the gated variant — a stale-scope read path must not stamp a
+                // `kind='deleted'` row for a repo `rag-rat rm` already purged.
+                self.mark_file_deleted_if_not_removed(Path::new(&path))?;
                 self.sync_fts()?;
                 anyhow::bail!(IndexError::Gone { chunk_id });
             },
@@ -582,6 +587,16 @@ impl IndexDatabase {
         let Some(root) = self.storage.source_root() else {
             anyhow::bail!("heal_index requires source_root metadata; run `rag-rat index` first");
         };
+        // #767 review: fail closed when the active repo was `rag-rat rm`-removed after this
+        // connection resolved its scope (a stale MCP `heal_index` writer). This is the PREFLIGHT
+        // that stops the batch before any per-file work; the AUTHORITATIVE checks live at each
+        // per-file write boundary — `heal_file` and `mark_file_deleted_if_not_removed` re-check
+        // the tombstone inside their IMMEDIATE mutation transactions, which serialize with rm's
+        // purge on the SQLite write lock (the heal path deliberately stays flock-free so it can
+        // run alongside a mid-flight rebuild).
+        let conn = self.storage.connection();
+        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         let indexed_files = self.indexed_files()?;
         let max_repairs = limit.map(usize::try_from).transpose()?.unwrap_or(usize::MAX);
         let mut report = HealIndexReport {
@@ -607,7 +622,7 @@ impl IndexDatabase {
                         Some("limit reached; rerun heal_index to continue".to_string());
                     break;
                 }
-                self.mark_file_deleted(path)?;
+                self.mark_file_deleted_if_not_removed(path)?;
                 report.removed_files += 1;
                 continue;
             };

@@ -140,6 +140,21 @@ pub struct ImportSummary {
 /// `Config::load` already made — so the refusal and the `database` resolution can never disagree (a
 /// linked worktree's branch-local toml is not authoritative for either).
 pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
+    run_inner(config, None)
+}
+
+/// CLI consolidation with the EXACT config path that produced `config`. Unlike [`run`] (the
+/// programmatic/test seam, whose callers may construct a Config without a file), this rechecks the
+/// file after acquiring the source-side repo locks so a concurrent `rag-rat rm` that deleted it
+/// wins cleanly rather than letting consolidation continue from stale in-memory configuration.
+pub fn run_with_config_path(
+    config: &Config,
+    config_path: &Path,
+) -> anyhow::Result<ConsolidateOutcome> {
+    run_inner(config, Some(config_path))
+}
+
+fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<ConsolidateOutcome> {
     let target = data_dir::global_database_path().context(
         "cannot resolve the global database path: no data directory is available (set \
          RAG_RAT_DATA_DIR, XDG_DATA_HOME, or HOME)",
@@ -233,6 +248,22 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
         _source_locks.push(acquire_consolidate_lock(&source, id, "legacy")?);
     }
 
+    // #767 review: `rm` holds this same source-side repo lock while deleting the governing config.
+    // If consolidate loaded Config first and then waited here, it would otherwise resume from that
+    // stale clone, clear/register in the global DB, and import the now-empty legacy source AFTER rm
+    // reported success. Recheck the exact path the CLI loaded only after all source locks are held;
+    // if rm won, abort before migrating/clearing/registering anything. The lock keeps it present
+    // for the rest of this run once observed.
+    if let Some(config_path) = config_path
+        && !config_path.is_file()
+    {
+        anyhow::bail!(
+            "the governing config ({}) was removed while consolidate waited for the repo write \
+             lock — a concurrent `rag-rat rm` won; aborting without re-registering the repo",
+            config_path.display()
+        );
+    }
+
     // Bring the global DB to current schema (creating it under the shared schema lock), then open
     // a fresh connection to register this repo and copy rows into it. SCHEMA-ONLY, never the
     // healing `migrate`: this connection is config-less and the SUBJECT repo is not registered
@@ -244,6 +275,11 @@ pub fn run(config: &Config) -> anyhow::Result<ConsolidateOutcome> {
         .with_context(|| format!("migrating the global database {}", target.display()))?;
     let target_storage = IndexConnection::open(&target)?;
     let target_conn = target_storage.connection();
+
+    // #767: consolidate is a DELIBERATE re-add, like `init` — lift any `rag-rat rm` removal
+    // tombstone for this repo first, or `register_repo` below would refuse the import with a "run
+    // init" remedy that does not fit consolidate. Under the target lock already held.
+    schema::clear_repo_removed(target_conn, &identity.repo_id)?;
 
     // Register (or adopt/extend) this repo in the global DB. The returned id is what every imported
     // row is stamped with — the legacy DB's own `repo_id` (placeholder or otherwise) is discarded.

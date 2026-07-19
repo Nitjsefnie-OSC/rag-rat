@@ -23,3 +23,9 @@ pub(crate) use authoring::backfill_memory_oplog;
 // `index::consolidate` names this through this re-export (Task 5 of #541).
 pub(crate) use authoring::reconcile_owner_stream_for_repo;
 pub(crate) use edges::{add_edge, remove_edge};
+
+// The `rag-rat rm` removal-tombstone guard (#767 review) the memory mutations call inside
+// their write transactions, immediately before the INSERT — defined beside the removal
+// orchestration in `index::remove` (the dream + heal writers gate on it too), re-exported here
+// so the `super::` call sites read unchanged.
+pub(crate) use crate::index::remove::assert_repo_not_removed;

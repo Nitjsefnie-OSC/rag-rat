@@ -181,6 +181,66 @@ pub fn register_repo(
     register_repo_inner(conn, identity, root, now_ms, true, hooks)
 }
 
+/// The `index_meta` key that TOMBSTONES a repo removed via `rag-rat rm` (#767). GLOBAL scope on
+/// purpose: the removal purge deletes every repo-scoped row, so a marker meant to OUTLIVE the
+/// removal must live outside that sweep — `index_meta` carries no `repo_id` column and is never
+/// swept.
+fn removed_repo_key(repo_id: &str) -> String {
+    format!("removed_repo:{repo_id}")
+}
+
+fn repo_removal_generation_key(repo_id: &str) -> String {
+    format!("removed_repo_generation:{repo_id}")
+}
+
+/// Monotonic count of completed `rag-rat rm` purges for `repo_id`. Unlike the active removal
+/// tombstone, this is NEVER cleared by `init`: a removal plan captures it before confirmation and
+/// rechecks it under the repo write lock, so an intervening remove → deliberate re-init cycle makes
+/// the stale plan fail closed instead of deleting the newly re-added repo. Missing means generation
+/// zero for stores created before #767.
+pub fn repo_removal_generation(conn: &Connection, repo_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM index_meta WHERE key = ?1), 0)",
+        [repo_removal_generation_key(repo_id)],
+        |row| row.get(0),
+    )
+}
+
+/// Tombstone `repo_id` as removed-via-`rm` at `removed_at_ms`. Written INSIDE the purge transaction
+/// so it commits atomically with the deletion; [`register_repo`] then refuses to re-register the id
+/// until [`clear_repo_removed`] (via `rag-rat init`) lifts it — the durable guard against a writer
+/// that queued behind the removal lock with a STALE in-memory config silently repopulating the repo
+/// after the purge (a lock alone cannot stop a process that already cloned its `Config`).
+pub fn mark_repo_removed(
+    conn: &Connection,
+    repo_id: &str,
+    removed_at_ms: i64,
+) -> anyhow::Result<()> {
+    crate::meta::set_meta(conn, &removed_repo_key(repo_id), &removed_at_ms.to_string())?;
+    conn.execute(
+        "INSERT INTO index_meta(key, value) VALUES (?1, '1') ON CONFLICT(key) DO UPDATE SET value \
+         = CAST(CAST(index_meta.value AS INTEGER) + 1 AS TEXT)",
+        [repo_removal_generation_key(repo_id)],
+    )?;
+    Ok(())
+}
+
+/// Whether `repo_id` is tombstoned as removed-via-`rm`. A direct `index_meta` read (rusqlite-typed
+/// so [`register_repo_inner`] can gate on it without an error-type conversion).
+pub fn is_repo_removed(conn: &Connection, repo_id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM index_meta WHERE key = ?1)",
+        [removed_repo_key(repo_id).as_str()],
+        |row| row.get(0),
+    )
+}
+
+/// Lift the removed-via-`rm` tombstone for `repo_id` — `rag-rat init`'s deliberate re-add, the ONE
+/// path allowed to bring a removed repo back. Idempotent (clearing an absent tombstone is a no-op).
+pub fn clear_repo_removed(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
+    crate::meta::delete_meta(conn, &removed_repo_key(repo_id))
+}
+
 /// Register/adopt `identity` WITHOUT recording the working-tree `root` in `repo_roots` — the
 /// read-only open path (`open_config`: doctor / MCP / query, #427). A recorded root is the "this
 /// checkout was INDEXED here" signal `is_root_already_indexed` / `same_identity_join_note` key on,
@@ -222,6 +282,22 @@ fn register_repo_inner(
             "refusing to register the reserved or empty repo_id {:?}: `{LEGACY_REPO_ID}` is the \
              pre-adoption placeholder and an empty id cannot scope rows",
             identity.repo_id
+        )));
+    }
+
+    // #767: refuse to (re-)register a repo tombstoned by `rag-rat rm`, on BOTH the indexing
+    // (`record_root`) AND the read-only adoption paths. A writer that queued behind the removal
+    // lock resumes with a stale in-memory config and would otherwise repopulate the just-purged
+    // repo — and a read-only open is NOT harmless when it is write-capable: a manual
+    // `papertrail sync` registers read-only, then commits `papertrail_*` rows. A
+    // genuinely-removed repo has no surviving config to reach here (rm deletes it); `rag-rat
+    // init` / `consolidate` clear the tombstone for a deliberate re-add. This is the cheap
+    // PRE-FILTER; the AUTHORITATIVE check re-runs inside the adoption transaction below (this
+    // read races rm's tombstone commit — the in-transaction one cannot).
+    if is_repo_removed(conn, trimmed_id)? {
+        return Err(registry_refusal(format!(
+            "repo {trimmed_id} was removed with `rag-rat rm` — run `rag-rat init` in the repo to \
+             re-add it"
         )));
     }
 
@@ -384,6 +460,20 @@ fn register_repo_inner(
     // serializes registrations against each other; IMMEDIATE covers contention with NON-registry
     // writers (an index pass on a sibling repo).
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    // #767 review: re-check the removal tombstone INSIDE the adoption transaction. The pre-filter
+    // above reads the tombstone BEFORE the registry lock and any transaction, and `rm` takes
+    // neither — so without this re-check a stale (preloaded-config) registration could pass the
+    // pre-filter, have rm purge + tombstone in the gap, and then INSERT the `repos` row after rm
+    // reported success. This transaction and rm's purge are both IMMEDIATE, so they serialize on
+    // the SQLite write lock and the tombstone state read here is stable for the whole adoption:
+    // set → rm committed first, refuse; unset → rm's purge waits for this commit and removes the
+    // just-registered repo itself.
+    if is_repo_removed(&tx, trimmed_id)? {
+        return Err(registry_refusal(format!(
+            "repo {trimmed_id} was removed with `rag-rat rm` — run `rag-rat init` in the repo to \
+             re-add it"
+        )));
+    }
     let placeholder_present = tx
         .query_row("SELECT 1 FROM repos WHERE repo_id = ?1", [LEGACY_REPO_ID], |_| Ok(()))
         .optional()?
