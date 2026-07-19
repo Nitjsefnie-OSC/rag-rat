@@ -44,8 +44,8 @@ sequenceDiagram
   symbols.
 - **History as evidence.** Git history, lazy chunk blame, and cached GitHub issue/PR/review
   rationale, all queryable.
-- **Rides your existing grep.** A [PreToolUse hook](docs/grep-augmentation.md) injects the memories
-  and symbols behind whatever you just searched for.
+- **Rides your existing grep.** A [grep-augmentation hook](docs/grep-augmentation.md) injects the
+  memories and symbols behind whatever you just searched for.
 - **Flags clones as you write them.** A PreToolUse hook on Write/Edit/MultiEdit fingerprints the
   functions you're writing and warns when they're exact or near-duplicates of code already in the
   repo — so an agent reuses instead of re-implementing. Read-only, and a silent no-op when the index
@@ -53,8 +53,9 @@ sequenceDiagram
 
 ## Quickstart
 
-For Claude Code and Codex, install the plugin. It registers the MCP server, adds the skills and
-hooks, and installs a version-matched `rag-rat` binary on first run:
+For Claude Code, Codex, and opencode, install the plugin. It registers the MCP server, adds the
+hooks, and installs a version-matched `rag-rat` binary on first run (the Claude Code and Codex
+bundles also add the skills; on opencode add them with `npx @rag-rat/skills`):
 
 ```bash
 # Claude Code
@@ -64,9 +65,13 @@ claude plugin install rag-rat@rag-rat
 # Codex
 codex plugin marketplace add cq27-dev/rag-rat
 codex plugin add rag-rat@rag-rat
+
+# opencode (add -g for a global install)
+opencode plugin @rag-rat/plugin-opencode
 ```
 
-After installing, approve the plugin so its tools and hooks run:
+After installing, approve the plugin so its tools and hooks run (opencode loads plugins without an
+approval step — nothing to do there):
 
 - **Claude Code** asks before each rag-rat MCP tool the first time it runs — choose "Yes, don't ask
   again," or pre-allow them in `~/.claude/settings.json` with

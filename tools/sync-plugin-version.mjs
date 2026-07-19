@@ -38,6 +38,7 @@ const VERSION_FILES = [
   ".claude-plugin/marketplace.json",
   "plugin/.claude-plugin/plugin.json",
   "plugin/.codex-plugin/plugin.json",
+  "plugin/opencode/package.json",
 ];
 const versionRe = /("version"\s*:\s*)"[^"]*"/;
 for (const file of VERSION_FILES) {
@@ -58,6 +59,7 @@ for (const file of VERSION_FILES) {
 const PIN_FILES = [
   "plugin/.claude-plugin/plugin.json",
   "plugin/.mcp.json",
+  "plugin/opencode/rag-rat.ts",
   ".agents/skills/init-rag-rat/SKILL.md",
   "plugin/skills/init-rag-rat/SKILL.md",
 ];
