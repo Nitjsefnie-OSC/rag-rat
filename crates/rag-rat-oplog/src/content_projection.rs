@@ -24,7 +24,11 @@
 use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::account::{content_projected_tables_exist, decode_content_signed};
+use super::account::{
+    KeyId, content_projected_tables_exist, decode_content_signed, historical_content_keyring,
+    open_sealed_payload, stream_owner_account,
+};
+use super::identity::load_local_device;
 use super::op::{self, DecodedOp, Entry, OpMeta};
 use super::project;
 use super::project::ProjectedState;
@@ -37,7 +41,7 @@ use super::stream::StreamId;
 /// the open/migrate seam and re-folds every stream before stamping — never trusted incrementally;
 /// a NEWER stamp blocks this binary from reprojecting at all (see
 /// [`assert_content_projector_not_newer`]).
-const CONTENT_PROJECTOR_VERSION: i64 = 1;
+const CONTENT_PROJECTOR_VERSION: i64 = 2;
 
 /// The `oplog_meta` key holding the `/3` projector version the content projection was last folded
 /// by. DISTINCT from the `/1` `projector_version` (they evolve independently and share one meta
@@ -243,27 +247,73 @@ fn write_projection(
 /// the body. An `Unknown` op is retained in the log but skipped here (mirrors
 /// [`crate::store`]'s `load_known_entries`), so a forward-version op never breaks the fold.
 fn load_accepted_entries(tx: &Transaction<'_>, stream_id: StreamId) -> anyhow::Result<Vec<Entry>> {
+    // Key wraps live in the immutable stream OWNER's secrets log. A granted writer's account is
+    // only the content author and may have no copy of those wraps.
+    let owner_account = stream_owner_account(tx, stream_id)?;
+    // Projection reads never mint or backfill a local identity. A keyless peer still retains and
+    // accepts suite-1 entries; it simply cannot project them locally yet.
+    let device = load_local_device(tx)?;
+    let keyring = match (owner_account, device.as_ref()) {
+        (Some(owner), Some(device)) =>
+            Some(historical_content_keyring(tx, owner, stream_id, device)?),
+        _ => None,
+    };
     let mut stmt = tx.prepare(
-        "SELECT signed_bytes FROM content_entries
+        "SELECT entry_hash, stream_id, signed_bytes FROM content_entries
          WHERE stream_id = ?1 AND accepted = 1
          ORDER BY entry_hash", /* deterministic load order (the projector sorts internally
                                 * regardless) */
     )?;
-    let rows =
-        stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
+    let rows = stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+    })?;
     let mut entries = Vec::new();
     for row in rows {
-        let signed_bytes = row?;
+        let (stored_entry_hash, stored_stream_id, signed_bytes) = row?;
+        let stored_entry_hash: [u8; 32] = stored_entry_hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored accepted /3 entry_hash is not 32 bytes"))?;
+        let stored_stream_id: [u8; 32] = stored_stream_id
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored accepted /3 stream_id is not 32 bytes"))?;
         // The signed ENVELOPE decoded at ingest to become a candidate, so a failure here is
         // corruption at rest — surface it loudly.
         let signed = decode_content_signed(&signed_bytes)
             .context("stored accepted /3 entry failed to decode")?;
-        // The BODY is an opaque bstr the acceptance layer never decodes (§8, body-agnostic), so an
-        // authorized+accepted entry can carry a malformed or wrong-domain payload (a foreign entry
-        // that `content_ingest` accepted without a body check). Skip an undecodable/unknown body
-        // like the `/1` fold skips a non-projectable op — never `bail!`, which would crash every
-        // later local author on this stream over one bad row.
-        let Ok(decoded) = op::decode(&signed.payload) else {
+        anyhow::ensure!(
+            signed.entry_hash == stored_entry_hash,
+            "stored accepted /3 signed envelope does not match its entry_hash row"
+        );
+        anyhow::ensure!(
+            signed.header.stream_id.to_bytes() == stored_stream_id
+                && signed.header.stream_id == stream_id,
+            "stored accepted /3 signed envelope does not match its stream_id row"
+        );
+        // Payload/key failures are LOCAL projection failures, not acceptance failures. Unknown
+        // suites, absent exact keys, malformed sealed payloads, tag failures, and undecodable
+        // plaintext all remain retained+accepted and skip only this entry.
+        let plaintext;
+        let op_bytes = match signed.header.crypto_suite {
+            0 => signed.payload.as_slice(),
+            1 => {
+                let Some(key_id) = signed.header.key_id else {
+                    continue;
+                };
+                let Some(key) =
+                    keyring.as_ref().and_then(|keyring| keyring.get(KeyId::from_bytes(key_id)))
+                else {
+                    continue;
+                };
+                let Ok(opened) = open_sealed_payload(key, &signed.payload, &signed.header_bytes)
+                else {
+                    continue;
+                };
+                plaintext = opened;
+                plaintext.as_slice()
+            },
+            _ => continue,
+        };
+        let Ok(decoded) = op::decode(op_bytes) else {
             continue;
         };
         match decoded {

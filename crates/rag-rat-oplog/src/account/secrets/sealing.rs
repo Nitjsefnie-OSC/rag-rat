@@ -13,6 +13,7 @@
 //! device-independent. A local mismatch / unwrap failure is therefore LOCAL evidence only, written
 //! to `sync_security_events` and nothing else.
 
+use anyhow::Context;
 use rusqlite::{Connection, params};
 
 use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
@@ -53,10 +54,39 @@ pub enum SealingKeyOutcome {
     FailedClosed,
 }
 
+/// Every historical content key this device can recover for one stream, indexed by the exact
+/// signed `key_id`. Keys remain process-local, are never persisted, and zeroize on drop through
+/// [`ContentKey`].
+pub struct ContentKeyring(Vec<(KeyId, ContentKey)>);
+
+impl ContentKeyring {
+    /// Resolve exactly `key_id`; never substitute another key from the same epoch.
+    pub fn get(&self, key_id: KeyId) -> Option<&ContentKey> {
+        self.0.iter().find(|(candidate, _)| *candidate == key_id).map(|(_, key)| key)
+    }
+}
+
+enum KeyRecovery {
+    Ready(ContentKey),
+    NotRecipient,
+    Failed(Vec<WrapRecoveryFailure>),
+}
+
+struct WrapRecoveryFailure {
+    entry_hash: [u8; 32],
+    observed_key_id: Option<KeyId>,
+}
+
 /// One EFFECTIVE accepted `StreamKeyWrap` op for a stream, decoded from its stored bytes.
 struct AcceptedStreamWrap {
     entry_hash: [u8; 32],
     wrap: StreamKeyWrap,
+}
+
+#[derive(Clone, Copy)]
+enum AcceptedWrapDecodeMode {
+    Tolerant,
+    StrictEvidence,
 }
 
 /// The stream's current sealing selection, derived on read from the accepted wrap set — no cached
@@ -69,6 +99,24 @@ pub fn select_current_sealing_wrap(
     stream_id: StreamId,
 ) -> anyhow::Result<Option<SelectedWrap>> {
     Ok(select_from_wraps(&list_accepted_stream_key_wraps(conn, account_id, stream_id)?))
+}
+
+/// Whether an accepted `StreamKeyWrap` exists for `stream_id`. Unlike local key recovery, this is
+/// downgrade evidence: corruption of any accepted secrets row must fail closed rather than make a
+/// previously keyed stream appear eligible for plaintext. Presence does not require a local
+/// recipient wrap or a successful unwrap.
+pub(in crate::account) fn accepted_stream_key_wrap_exists_strict(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+) -> anyhow::Result<bool> {
+    Ok(!list_accepted_stream_key_wraps_with_mode(
+        conn,
+        account_id,
+        stream_id,
+        AcceptedWrapDecodeMode::StrictEvidence,
+    )?
+    .is_empty())
 }
 
 /// Whether `stream_id`'s content key must be ROTATED (sync phase C4.4, #607): TRUE iff some
@@ -148,75 +196,111 @@ pub fn current_sealing_key(
         return Ok(SealingKeyOutcome::NoCurrentKey);
     };
 
-    // Every wrap naming THIS device at the selected (epoch, key_id) — across fan-out sibling ops.
-    // Keying on the selected key_id (not the epoch alone) is load-bearing: two accepted wraps can
-    // share an epoch with DIFFERENT key_ids (concurrent owner mints), and trying the other key_id's
-    // wrap would either diverge or raise a spurious mismatch on an honest state.
-    let my_fingerprint = device.fingerprint();
-    let my_wraps: Vec<_> = wraps
-        .iter()
-        .filter(|w| {
-            w.wrap.key_epoch == selected.key_epoch
-                && KeyId::from_bytes(w.wrap.key_id) == selected.key_id
-        })
-        .filter_map(|w| {
-            w.wrap
-                .wraps
-                .iter()
-                .find(|entry| entry.recipient_fp == my_fingerprint)
-                .map(|entry| (w.entry_hash, &entry.sealed))
-        })
-        .collect();
-    if my_wraps.is_empty() {
-        return Ok(SealingKeyOutcome::NotRecipient);
-    }
-
-    // The AAD binds the exact sealing context byte-for-byte; the recipient_pub is this device's own
-    // roster x25519 bytes (wrap-to-self at mint sealed to exactly these).
-    let ctx = WrapContext {
-        account_id: account_id.to_bytes(),
-        stream_id: stream_id.to_bytes(),
-        key_epoch: selected.key_epoch,
-        recipient_pub: device.x25519_public().to_bytes(),
-    };
-    for (entry_hash, sealed) in my_wraps {
-        // An unwrap failure is fail-closed evidence, NOT `?`-propagated: `Err` is reserved for
-        // infra/DB failures, and propagating would record no evidence and return `Err` in violation
-        // of the `Ok(SealingKeyOutcome)` fail-closed contract.
-        let recovered = match keywrap::unwrap_content_key(sealed, device.x25519_secret(), &ctx) {
-            Ok(key) => key,
-            Err(_) => {
+    match recover_key(&wraps, account_id, stream_id, selected.key_epoch, selected.key_id, device) {
+        KeyRecovery::Ready(key) => Ok(SealingKeyOutcome::Ready(key)),
+        KeyRecovery::NotRecipient => Ok(SealingKeyOutcome::NotRecipient),
+        KeyRecovery::Failed(failures) => {
+            for failure in failures {
                 security_event::record_sync_security_event(conn, &SyncSecurityEvent {
-                    kind: SyncSecurityEventKind::WrapUnwrapFailed,
+                    kind: if failure.observed_key_id.is_some() {
+                        SyncSecurityEventKind::WrapKeyIdMismatch
+                    } else {
+                        SyncSecurityEventKind::WrapUnwrapFailed
+                    },
                     account_id,
                     stream_id,
                     key_epoch: selected.key_epoch,
-                    entry_hash,
+                    entry_hash: failure.entry_hash,
                     expected_key_id: Some(selected.key_id),
-                    observed_key_id: None,
+                    observed_key_id: failure.observed_key_id,
                     observed_at_ms: now_ms,
                 })?;
-                continue;
-            },
-        };
-        let observed = recovered.key_id();
-        if observed == selected.key_id {
-            return Ok(SealingKeyOutcome::Ready(recovered));
-        }
-        // The residual the cross-check exists for: a wrong key inside a validly-signed accepted op
-        // (impl bug / a compromised-owner substitution the authority gate can't catch).
-        security_event::record_sync_security_event(conn, &SyncSecurityEvent {
-            kind: SyncSecurityEventKind::WrapKeyIdMismatch,
-            account_id,
-            stream_id,
-            key_epoch: selected.key_epoch,
-            entry_hash,
-            expected_key_id: Some(selected.key_id),
-            observed_key_id: Some(observed),
-            observed_at_ms: now_ms,
-        })?;
+            }
+            Ok(SealingKeyOutcome::FailedClosed)
+        },
     }
-    Ok(SealingKeyOutcome::FailedClosed)
+}
+
+/// Recover every accepted historical stream key addressed to `device`. Each distinct
+/// `(key_epoch, key_id)` reconstructs its own wrap context, while all same-pair fan-out siblings
+/// are unioned before recovery. Different key IDs at one epoch are never mixed. Unopenable,
+/// mismatched, and other-recipient groups are omitted; their accepted log entries remain untouched.
+pub fn historical_content_keyring(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+    device: &LocalDevice,
+) -> anyhow::Result<ContentKeyring> {
+    let wraps = list_accepted_stream_key_wraps(conn, account_id, stream_id)?;
+    let mut groups = Vec::new();
+    for accepted in &wraps {
+        let group = (accepted.wrap.key_epoch, KeyId::from_bytes(accepted.wrap.key_id));
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    let mut keys = Vec::new();
+    for (key_epoch, key_id) in groups {
+        if keys.iter().any(|(recovered_id, _)| *recovered_id == key_id) {
+            continue;
+        }
+        if let KeyRecovery::Ready(key) =
+            recover_key(&wraps, account_id, stream_id, key_epoch, key_id, device)
+        {
+            keys.push((key_id, key));
+        }
+    }
+    Ok(ContentKeyring(keys))
+}
+
+/// Shared cryptographic recovery for current sealing and historical projection reads.
+fn recover_key(
+    wraps: &[AcceptedStreamWrap],
+    account_id: AccountId,
+    stream_id: StreamId,
+    key_epoch: u64,
+    key_id: KeyId,
+    device: &LocalDevice,
+) -> KeyRecovery {
+    let my_fingerprint = device.fingerprint();
+    let my_wraps: Vec<_> = wraps
+        .iter()
+        .filter(|accepted| {
+            accepted.wrap.key_epoch == key_epoch
+                && KeyId::from_bytes(accepted.wrap.key_id) == key_id
+        })
+        .flat_map(|accepted| {
+            accepted
+                .wrap
+                .wraps
+                .iter()
+                .filter(move |entry| entry.recipient_fp == my_fingerprint)
+                .map(move |entry| (accepted.entry_hash, &entry.sealed))
+        })
+        .collect();
+    if my_wraps.is_empty() {
+        return KeyRecovery::NotRecipient;
+    }
+    let ctx = WrapContext {
+        account_id: account_id.to_bytes(),
+        stream_id: stream_id.to_bytes(),
+        key_epoch,
+        recipient_pub: device.x25519_public().to_bytes(),
+    };
+    let mut failures = Vec::new();
+    for (entry_hash, sealed) in my_wraps {
+        let Ok(recovered) = keywrap::unwrap_content_key(sealed, device.x25519_secret(), &ctx)
+        else {
+            failures.push(WrapRecoveryFailure { entry_hash, observed_key_id: None });
+            continue;
+        };
+        let observed_key_id = recovered.key_id();
+        if observed_key_id == key_id {
+            return KeyRecovery::Ready(recovered);
+        }
+        failures.push(WrapRecoveryFailure { entry_hash, observed_key_id: Some(observed_key_id) });
+    }
+    KeyRecovery::Failed(failures)
 }
 
 /// The current sealing selection over an accepted-wrap set: MAX `key_epoch`, tiebreak MIN
@@ -243,12 +327,26 @@ fn select_from_wraps(wraps: &[AcceptedStreamWrap]) -> Option<SelectedWrap> {
 /// naming `stream_id`, decoding each from the stored, already-signature-verified bytes. `accepted =
 /// 1` IS the effective marker (the C4.2b evaluator set it); B-2 slot-eligibility guarantees an
 /// accepted log-1 row decodes as a Known `StreamKeyWrap`, so an undecodable/unknown accepted row is
-/// corruption — skipped (fail-safe: it just can't contribute a key) rather than aborting the read,
-/// mirroring `storage::load_secrets_headers`.
+/// corruption. Local key selection/recovery skips such rows (fail-safe: they cannot contribute a
+/// key), while downgrade evidence uses strict mode and fails closed.
 fn list_accepted_stream_key_wraps(
     conn: &Connection,
     account_id: AccountId,
     stream_id: StreamId,
+) -> anyhow::Result<Vec<AcceptedStreamWrap>> {
+    list_accepted_stream_key_wraps_with_mode(
+        conn,
+        account_id,
+        stream_id,
+        AcceptedWrapDecodeMode::Tolerant,
+    )
+}
+
+fn list_accepted_stream_key_wraps_with_mode(
+    conn: &Connection,
+    account_id: AccountId,
+    stream_id: StreamId,
+    mode: AcceptedWrapDecodeMode,
 ) -> anyhow::Result<Vec<AcceptedStreamWrap>> {
     let mut stmt = conn.prepare(
         "SELECT entry_hash, signed_bytes FROM account_entries
@@ -263,20 +361,43 @@ fn list_accepted_stream_key_wraps(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::new();
     for (entry_hash, signed_bytes) in rows {
-        let Ok(entry_hash) = <[u8; 32]>::try_from(entry_hash.as_slice()) else {
-            continue;
+        let entry_hash = match <[u8; 32]>::try_from(entry_hash.as_slice()) {
+            Ok(entry_hash) => entry_hash,
+            Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
+            Err(_) => anyhow::bail!(
+                "stored accepted secrets entry_hash is not 32 bytes while checking sealed-ratchet \
+                 wrap evidence"
+            ),
         };
-        let Ok(signed) = envelope::decode_account_signed(&signed_bytes) else {
-            continue;
+        let signed = match envelope::decode_account_signed(&signed_bytes) {
+            Ok(signed) => signed,
+            Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
+            Err(err) =>
+                return Err(err).context(
+                    "stored accepted secrets envelope failed to decode while checking \
+                     sealed-ratchet wrap evidence",
+                ),
         };
         if signed.entry_hash != entry_hash {
-            continue;
+            if matches!(mode, AcceptedWrapDecodeMode::Tolerant) {
+                continue;
+            }
+            anyhow::bail!(
+                "stored accepted secrets envelope does not match its entry_hash row while \
+                 checking sealed-ratchet wrap evidence"
+            );
         }
         match ops::decode(signed.header.entry_type, &signed.payload) {
             Ok(DecodedSecretsOp::Known(wrap)) if wrap.stream_id == stream_id => {
                 out.push(AcceptedStreamWrap { entry_hash, wrap });
             },
-            _ => continue,
+            Ok(_) => {},
+            Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
+            Err(err) =>
+                return Err(err).context(
+                    "stored accepted secrets payload failed to decode while checking \
+                     sealed-ratchet wrap evidence",
+                ),
         }
     }
     Ok(out)
@@ -291,8 +412,8 @@ mod tests {
         DecodedSecretsOp, StreamKeyWrap, WrapEntry, decode, entry_type as secrets_entry_type,
     };
     use super::{
-        SealingKeyOutcome, SelectedWrap, current_sealing_key, select_current_sealing_wrap,
-        stream_key_rotation_needed,
+        SealingKeyOutcome, SelectedWrap, current_sealing_key, historical_content_keyring,
+        select_current_sealing_wrap, stream_key_rotation_needed,
     };
     use crate::account::cut::Cut;
     use crate::account::envelope::{AccountEntryHeader, sign_account_entry};
@@ -623,6 +744,91 @@ mod tests {
         assert_eq!(recovered.as_slice(), key.as_slice(), "the recovered key is the sealed key");
         assert_eq!(recovered.key_id(), key.key_id());
         assert_eq!(security_event_count(&conn), 0);
+    }
+
+    #[test]
+    fn historical_keyring_recovers_all_exact_keys_and_unions_fanout_siblings() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        let device = local_device(&conn, NOW).unwrap();
+        let other = Dev::new(9);
+        let other_x = DeviceX25519Public::from_bytes(&other.x).unwrap();
+        let local_x = device.x25519_public();
+
+        let prior = ContentKey::from_seed(&[0x20; 32]);
+        let fanned = ContentKey::from_seed(&[0x21; 32]);
+        let same_epoch_other_key = ContentKey::from_seed(&[0x22; 32]);
+        let other_device_only = ContentKey::from_seed(&[0x23; 32]);
+        let mismatched_plaintext = ContentKey::from_seed(&[0x24; 32]);
+        let claimed_id = ContentKey::from_seed(&[0x25; 32]).key_id();
+
+        let ops = [
+            honest_wrap(account, stream_id, device.fingerprint(), &local_x, &prior, 0),
+            // First fan-out sibling does not name this device.
+            honest_wrap(account, stream_id, other.fp, &other_x, &fanned, 1),
+            // A later sibling for the same (epoch, key_id) does.
+            honest_wrap(account, stream_id, device.fingerprint(), &local_x, &fanned, 1),
+            // A distinct key at the same epoch must remain independently addressable.
+            honest_wrap(
+                account,
+                stream_id,
+                device.fingerprint(),
+                &local_x,
+                &same_epoch_other_key,
+                1,
+            ),
+            honest_wrap(account, stream_id, other.fp, &other_x, &other_device_only, 2),
+            build_wrap(
+                account,
+                stream_id,
+                device.fingerprint(),
+                &local_x,
+                &mismatched_plaintext,
+                3,
+                claimed_id.to_bytes(),
+            ),
+        ];
+        let mut prev = None;
+        for (seq, op) in ops.iter().enumerate() {
+            let (bytes, hash) =
+                wrap_entry(account, &founder, seq as u64, prev, Some(genesis_hash), op);
+            ingest(&conn, &bytes);
+            prev = Some(hash);
+        }
+
+        let keyring = historical_content_keyring(&conn, account, stream_id, &device).unwrap();
+        assert_eq!(keyring.get(prior.key_id()).unwrap().as_slice(), prior.as_slice());
+        assert_eq!(keyring.get(fanned.key_id()).unwrap().as_slice(), fanned.as_slice());
+        assert_eq!(
+            keyring.get(same_epoch_other_key.key_id()).unwrap().as_slice(),
+            same_epoch_other_key.as_slice(),
+        );
+        assert!(
+            keyring.get(other_device_only.key_id()).is_none(),
+            "another device's wrap is not a key"
+        );
+        assert!(keyring.get(claimed_id).is_none(), "unwrap/key-id mismatch fails closed");
+        assert_eq!(security_event_count(&conn), 0, "projection recovery does not mutate evidence");
+    }
+
+    #[test]
+    fn historical_keyring_tolerates_a_corrupt_accepted_wrap() {
+        let conn = db();
+        let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+        let device = local_device(&conn, NOW).unwrap();
+        let key = ContentKey::from_seed(&[0x20; 32]);
+        let wrap =
+            honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
+        let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        ingest(&conn, &bytes);
+        conn.execute("UPDATE account_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [
+            entry_hash.as_slice(),
+        ])
+        .unwrap();
+
+        let keyring = historical_content_keyring(&conn, account, stream_id, &device)
+            .expect("projection key recovery remains tolerant of an unusable local wrap");
+        assert!(keyring.get(key.key_id()).is_none(), "a corrupt wrap recovers no key");
     }
 
     // ── The adoption cross-check ──
