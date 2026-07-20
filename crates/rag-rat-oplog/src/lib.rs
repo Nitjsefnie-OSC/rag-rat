@@ -91,19 +91,21 @@ mod stream;
 // root, or they would leak the `pub(crate)` `DeviceSecret` past its visibility).
 pub use account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
-    CapacityScope, ContentKey, ContentKeyring, DeviceCut, DeviceRole, GrantAuthority,
-    GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId, OwnerAuthority,
-    OwnerChainAuthority, PreparedContentAuthoring, RosterContentAuthority, RotationOutcome,
-    SealPolicy, SealingKeyOutcome, SelectedWrap, account_ingest, auth_len_freshness,
-    author_content_batch, author_content_batch_in_tx, author_prepared_content_batch_in_tx,
-    backfill_authority_projection, content_op_is_authorable, content_op_is_sealed_authorable,
-    content_stream_has_sealed_ratchet, content_stream_is_empty, current_sealing_key,
-    decode_content_signed, ensure_owned_stream_v2_in_tx, ensure_stream_key_current_in_tx,
-    established_owned_stream_v2, grant_effective_for_device, historical_content_keyring,
-    local_account, mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id,
-    owner_control_authority, owner_secrets_authority, prepare_content_authoring,
-    roster_content_authority, rotate_stream_key_in_tx, select_current_sealing_wrap,
-    stream_key_rotation_needed, stream_owner_effective,
+    CapacityScope, CatchUpReport, ContentKey, ContentKeyring, DeviceCut, DeviceRole,
+    GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, IngestOutcome, KeyId,
+    LiveKeyEpoch, LiveKeyTargets, OwnerAuthority, OwnerChainAuthority, PreparedContentAuthoring,
+    RosterContentAuthority, RotationOutcome, SealPolicy, SealingKeyOutcome, SelectedWrap,
+    account_ingest, auth_len_freshness, author_content_batch, author_content_batch_in_tx,
+    author_prepared_content_batch_in_tx, backfill_authority_projection,
+    catch_up_stream_keys_for_device_in_tx, content_op_is_authorable,
+    content_op_is_sealed_authorable, content_stream_has_sealed_ratchet, content_stream_is_empty,
+    current_sealing_key, decode_content_signed, ensure_owned_stream_v2_in_tx,
+    ensure_stream_key_current_in_tx, established_owned_stream_v2, grant_effective_for_device,
+    historical_content_keyring, live_stream_key_targets_for_device, local_account,
+    mint_and_author_stream_key_wrap_in_tx, owned_stream_v2_id, owner_control_authority,
+    owner_secrets_authority, prepare_content_authoring, roster_content_authority,
+    rotate_stream_key_in_tx, select_current_sealing_wrap, stream_key_rotation_needed,
+    stream_owner_effective,
 };
 // The `/3` content projection's store-global upgrade re-fold (#688): wired into the index
 // open/migrate seam by rag-rat-core, so a stale store is rebuilt (every stream, then the one
@@ -114,7 +116,10 @@ pub use content_projection::rebuild_all_content_projections_if_stale;
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
 pub use identity::{LocalDevice, load_local_device, local_device};
-pub use op::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus};
+pub use op::{
+    DeviceFingerprint, EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus,
+    ParseDeviceFingerprintError,
+};
 // The `/1` shadow-projection read seams (`ProjectedState` / `load_projection`) and the
 // standalone (own-txn) `/1` authoring wrappers (`author_batch` / `author_op`) — test-only
 // scaffolding for the retained `/1` store. The live memory path now authors owner-bound `/3`

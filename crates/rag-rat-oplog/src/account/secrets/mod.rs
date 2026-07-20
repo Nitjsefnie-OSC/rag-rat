@@ -22,7 +22,8 @@ mod storage;
 // re-exported up through `account` and the crate root for the seal path (C5) to reach (`pub` here
 // so `account::mod` can re-export it — the private `mod secrets` keeps it crate-scoped regardless).
 pub use author::{
-    RotationOutcome, ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
+    CatchUpReport, RotationOutcome, catch_up_stream_keys_for_device_in_tx,
+    ensure_stream_key_current_in_tx, mint_and_author_stream_key_wrap_in_tx,
     rotate_stream_key_in_tx,
 };
 // The ingest-time structural validation twin (mirrors the control-plaintext arm) and the
@@ -34,7 +35,8 @@ pub(in crate::account) use sealing::accepted_stream_key_wrap_exists_strict;
 // the CLI "what key is current" surface. Nothing calls them in C4.3b (machinery ships one
 // slice ahead of its consumer).
 pub use sealing::{
-    ContentKeyring, SealingKeyOutcome, SelectedWrap, current_sealing_key,
-    historical_content_keyring, select_current_sealing_wrap, stream_key_rotation_needed,
+    ContentKeyring, LiveKeyEpoch, LiveKeyTargets, SealingKeyOutcome, SelectedWrap,
+    current_sealing_key, historical_content_keyring, live_stream_key_targets_for_device,
+    select_current_sealing_wrap, stream_key_rotation_needed,
 };
 pub(in crate::account) use storage::refold_secrets_log;
