@@ -20,7 +20,9 @@ use super::units::BudgetPlan;
 
 /// Bumped when the prompt text or schema changes in a way that should re-distill existing records.
 /// The drain folds this into the regeneration hash so a prompt edit re-runs the model. Start at 1.
-pub(crate) const PROMPT_VERSION: u32 = 2;
+/// 2 → 3 (#800): every coalesced partner renders (was: only the first), and the diff/xref blocks
+/// are now hydrated from extraction snapshots.
+pub(crate) const PROMPT_VERSION: u32 = 3;
 
 // Output bounds are shared contract constants so the later strict/fallback parser can enforce the
 // same limits as guided decoding rather than trusting the backend alone.
@@ -30,6 +32,12 @@ pub(crate) const MAX_CAUSE_CLASS_CHARS: usize = 100;
 pub(crate) const MAX_REJECTED_ALTERNATIVES: usize = 20;
 pub(crate) const MAX_ALTERNATIVE_CHARS: usize = 500;
 pub(crate) const MAX_ANCHOR_INDICES: usize = 40;
+
+/// Max chars of a cross-referenced item's title and opening the prompt renders. The extraction
+/// snapshot caps the STORED (and hashed) text to this same width, so a referenced item's edit
+/// beyond what the model can see never regenerates the record — the length-dimension partner of
+/// the `max_xrefs` count invariant (see `xref_snapshot_cap_matches_the_prompt_xref_budget`).
+pub(crate) const XREF_TEXT_RENDER_CHARS: usize = 200;
 
 /// The system instructions (role + plain-prose + cite-by-unit rules). Authored as markdown in
 /// `prompts/system.md` and embedded at build time (the dream passes use the same pattern) so prompt
@@ -91,10 +99,13 @@ pub(crate) struct PartnerThread {
     pub units: Vec<PromptUnit>,
 }
 
-/// A cross-referenced item: its title plus the opening of its body, for context only.
+/// A cross-referenced item: its kind, key, the outbound ref's kind (`reference`/`fixes`/`reverts`
+/// — load-bearing for `outcome.status`), title, and the opening of its body. Context only.
 #[derive(Debug, Clone)]
 pub(crate) struct Xref {
+    pub kind: String,
     pub key: String,
+    pub ref_kind: String,
     pub title: String,
     pub opening: String,
 }
@@ -139,7 +150,9 @@ pub(crate) struct PromptInput {
     pub title: String,
     pub opened: String,
     pub units: Vec<PromptUnit>,
-    pub partner: Option<PartnerThread>,
+    /// Every coalesced partner thread, in the extraction's durable partner order. Each renders as
+    /// CONTEXT that may inform the decision/outcome, but none of their units may be cited.
+    pub partners: Vec<PartnerThread>,
     pub xrefs: Vec<Xref>,
     pub fix_commits: Vec<FixCommit>,
     pub symbols: Vec<SymbolContext>,
@@ -598,20 +611,35 @@ pub(crate) fn render_context(input: &PromptInput, budget: &PromptBudget) -> Stri
     out.push_str("THREAD UNITS (cite these numbers as evidence):\n");
     render_units(&mut out, &input.units, budget.units);
 
-    if let Some(partner) = &input.partner {
-        render_partner(&mut out, partner, budget.partner);
+    // Every coalesced partner, charged against ONE shared partner budget in durable order: the
+    // block stays hard-capped no matter how many threads coalesced.
+    if !input.partners.is_empty() {
+        let mut remaining = budget.partner;
+        for partner in &input.partners {
+            if remaining == 0 {
+                break;
+            }
+            let before = out.len();
+            render_partner(&mut out, partner, remaining);
+            remaining -= out.len() - before;
+        }
     }
     if !input.xrefs.is_empty() && budget.max_xrefs > 0 {
         out.push_str("\nREFERENCED ITEMS:\n");
         for x in input.xrefs.iter().take(budget.max_xrefs) {
             out.push_str(&format!(
-                "  #{}: {}",
+                "  [{}] #{} ({}): {}",
+                bounded_untrusted(&x.kind, 50),
                 bounded_untrusted(&x.key, 100),
-                neutralize(&truncate_chars(x.title.trim(), 200))
+                bounded_untrusted(&x.ref_kind, 50),
+                neutralize(&truncate_chars(x.title.trim(), XREF_TEXT_RENDER_CHARS))
             ));
             let opening = x.opening.trim();
             if !opening.is_empty() {
-                out.push_str(&format!(" — {}", neutralize(&truncate_chars(opening, 200))));
+                out.push_str(&format!(
+                    " — {}",
+                    neutralize(&truncate_chars(opening, XREF_TEXT_RENDER_CHARS))
+                ));
             }
             out.push('\n');
         }
@@ -988,7 +1016,9 @@ fn bounded_untrusted(s: &str, max_chars: usize) -> String {
 }
 
 /// Truncate to at most `max` chars (not bytes) on a char boundary — for human-facing snippets.
-fn truncate_chars(s: &str, max: usize) -> String {
+/// Idempotent: re-truncating an already-truncated value returns the same string, so the extraction
+/// snapshot can store `truncate_chars(text, N)` and the render re-apply it without drift.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
         None => s.to_string(),
@@ -1031,7 +1061,7 @@ mod tests {
                 unit("issue #5", "The widget crashes every time the page loads."),
                 unit("comment c1", "Looks like a null deref in the render path."),
             ],
-            partner: None,
+            partners: vec![],
             xrefs: vec![],
             fix_commits: vec![],
             symbols: vec![],
@@ -1059,7 +1089,7 @@ mod tests {
         // Starts at 1; the drain folds it into the record's regeneration hash so a prompt edit
         // re-distills. Bump it (and this expectation) whenever `system.md`/`rules.md`/the schema
         // change in a way that should invalidate existing model output.
-        assert_eq!(super::PROMPT_VERSION, 2);
+        assert_eq!(super::PROMPT_VERSION, 3);
     }
 
     #[test]
@@ -1152,7 +1182,7 @@ mod tests {
         // grounded in the numbered primary units (honest null/[] when only the partner
         // establishes it), or the drain cannot materialize evidence for a partner-derived claim.
         assert!(
-            super::RULES.contains("if only the partner thread establishes something"),
+            super::RULES.contains("if only a partner thread establishes something"),
             "rules ground claims in citeable primary units"
         );
     }
@@ -1672,7 +1702,9 @@ mod tests {
         let mut input = base_input();
         input.xrefs = (0..100)
             .map(|i| Xref {
+                kind: "issue".to_string(),
                 key: format!("{i}"),
+                ref_kind: "reference".to_string(),
                 title: format!("XREF{i}"),
                 opening: String::new(),
             })
@@ -1771,12 +1803,12 @@ mod tests {
     #[test]
     fn partner_heading_is_charged_to_the_partner_budget() {
         let mut input = base_input();
-        input.partner = Some(PartnerThread {
+        input.partners = vec![PartnerThread {
             kind: "issue".to_string(),
             key: "5".to_string(),
             title: "The widget crashes on load".to_string(),
             units: vec![unit("issue #5", "Original report text.")],
-        });
+        }];
         // A zero partner budget renders no partner block at all.
         let zero = PromptBudget { partner: 0, ..PromptBudget::default() };
         assert!(
@@ -1800,14 +1832,16 @@ mod tests {
         let mut input = base_input();
         input.merged = true;
         input.kind = "change_request".to_string();
-        input.partner = Some(PartnerThread {
+        input.partners = vec![PartnerThread {
             kind: "issue".to_string(),
             key: "5".to_string(),
             title: "The widget crashes on load".to_string(),
             units: vec![unit("issue #5", "Original report text.")],
-        });
+        }];
         input.xrefs = vec![Xref {
+            kind: "issue".to_string(),
             key: "9".to_string(),
+            ref_kind: "reference".to_string(),
             title: "Related refactor".to_string(),
             opening: "We reworked the render path.".to_string(),
         }];
@@ -1826,7 +1860,11 @@ mod tests {
         assert!(prompt.contains("(merged)"), "merged PR header");
         assert!(prompt.contains("PARTNER THREAD (#5, issue, do NOT cite its units)"), "{prompt}");
         assert!(prompt.contains("REFERENCED ITEMS:"));
-        assert!(prompt.contains("#9: Related refactor — We reworked the render path."));
+        assert!(
+            prompt.contains(
+                "[issue] #9 (reference): Related refactor — We reworked the render path."
+            )
+        );
         assert!(prompt.contains("FIX COMMITS:") && prompt.contains("deadbeefcafe"), "short sha");
         assert!(prompt.contains("guard the null render path"), "full commit message body");
         assert!(prompt.contains("render_widget  (function, src/widget.rs)"), "symbol grounding");
