@@ -46,8 +46,10 @@ pub use authoring::{
 pub use bootstrap::local_account;
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
-    ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, SignedContentEntry,
-    VerifiedContentEntry, content_ingest, decode_content_signed, settle_pending_content_refolds,
+    ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,
+    ContentSettleReport, ContentStreamSettleFailure, SignedContentEntry, VerifiedContentEntry,
+    content_ingest, content_stream_has_pending_refold, decode_content_signed,
+    settle_pending_content_refold_for_stream_in_tx, settle_pending_content_refolds,
     sign_content_entry, verify_content_signed,
 };
 // The C5a sealed-authoring surface (#608): the envelope-layer seal

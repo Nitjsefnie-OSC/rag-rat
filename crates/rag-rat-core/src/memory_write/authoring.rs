@@ -344,10 +344,32 @@ impl ReconcileWork {
     }
 }
 
+/// The pending-fold barrier (#698): memory completeness may not be read while the owner stream
+/// owes a deferred content refold, because the accepted-`/3` projection is stale until settle.
+///
+/// The debt is settled INSIDE the caller's own IMMEDIATE transaction, immediately before the
+/// authoritative re-read, and never on an autocommit connection beforehand. A foreign `/3`
+/// candidate may target the LOCAL owner stream, so a remote peer can re-enqueue debt on the
+/// largest stream in the store at will; draining it ahead of the transaction meant an unbudgeted
+/// refold of the whole local memory history on the interactive write path, and a trip observed
+/// inside an already-open transaction could only hard-error (#798 adversarial findings 2 and 5).
+/// Settling in-transaction bounds the cost to ONE fold per local write — work the write's own
+/// authoring performs anyway — and lets a mid-write enqueue self-heal. A fold failure propagates
+/// and rolls the write back, so the barrier stays fail-closed.
+fn settle_owner_stream_in_tx(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<()> {
+    rag_rat_oplog::settle_pending_content_refold_for_stream_in_tx(tx, stream)
+        .context("settling the owner stream's pending content refold before reading completeness")
+}
+
 /// Read the repo's unauthored nodes + edges and partition out the un-authorable (#680): the fast
 /// path calls it to decide whether real work remains, the slow path to build the batch from the
 /// AUTHORABLE half. Scope-independent like its two readers, so it runs on either an autocommit
 /// `Connection` (fast path) or the reconcile `Transaction` (slow path, via deref).
+///
+/// Callers inside a transaction MUST call [`settle_owner_stream_in_tx`] first: this reads the
+/// accepted-`/3` projection, which is stale while the stream owes a deferred refold. The
+/// autocommit fast path cannot settle, so it treats outstanding debt as "work may exist" rather
+/// than trusting an empty read (see `sync_owner_stream`).
 fn read_reconcile_work(
     conn: &Connection,
     repo_id: &str,
@@ -404,22 +426,38 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     rag_rat_oplog::local_account(conn, now_ms)?;
     let stream = ensure_owner_stream(conn, repo_id, now_ms)?;
     let policy = stream_seal_policy(conn, repo_id, stream)?;
-    let work = read_reconcile_work(conn, repo_id, stream, policy)?;
-    if !work.has_authorable_work() {
-        work.warn_quarantined(repo_id);
-        return Ok(());
-    }
-    let ops = build_reconcile_ops(
-        &work.authorable_nodes,
-        &work.live_edges,
-        repo_id,
-        rag_rat_oplog::content_stream_is_empty(conn, stream)?,
-    )?;
-    let prepared = prepare_owner_authoring(conn, repo_id, stream, policy, &ops, now_ms)?
-        .context("reconcile work unexpectedly prepared as an empty batch")?;
+    // While the owner stream owes a deferred refold, the accepted-`/3` projection is stale and the
+    // completeness readers refuse to run at all (they are the fail-closed barrier) — so the
+    // autocommit fast path is SKIPPED entirely rather than consulted and disbelieved. The
+    // transaction below settles the debt first and then reads authoritatively. Preparation does not
+    // depend on the op set (only the authorability pre-check does, and the in-transaction read
+    // quarantines un-authorable rows by construction), so a sentinel drives it exactly as the
+    // sealed-enable path does. A false positive costs one otherwise-idle transaction: authoring an
+    // empty batch is already skipped below.
+    let prepared = if rag_rat_oplog::content_stream_has_pending_refold(conn, stream)? {
+        let sentinel =
+            MemoryOp::EdgeRemove { edge_key: EdgeKey::from("pending-refold-settle-preparation") };
+        prepare_owner_authoring(conn, repo_id, stream, policy, &[sentinel], now_ms)?
+    } else {
+        let work = read_reconcile_work(conn, repo_id, stream, policy)?;
+        if !work.has_authorable_work() {
+            work.warn_quarantined(repo_id);
+            return Ok(());
+        }
+        let ops = build_reconcile_ops(
+            &work.authorable_nodes,
+            &work.live_edges,
+            repo_id,
+            rag_rat_oplog::content_stream_is_empty(conn, stream)?,
+        )?;
+        prepare_owner_authoring(conn, repo_id, stream, policy, &ops, now_ms)?
+    };
 
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Settle the owner stream's deferred refold debt HERE, inside the write's own transaction and
+    // before the authoritative re-read, so completeness is read against a current projection.
+    settle_owner_stream_in_tx(&tx, stream)?;
     anyhow::ensure!(
         stream_seal_policy(&tx, repo_id, stream)? == policy,
         "memory stream seal policy changed while preparing reconcile; retry"
@@ -443,6 +481,8 @@ fn sync_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow::R
     // needed ownership established (done above), and authoring an empty batch would still refold +
     // reproject for no change.
     if !ops.is_empty() {
+        let prepared =
+            prepared.as_ref().context("reconcile work unexpectedly prepared as an empty batch")?;
         // Every op here is authorable — `read_reconcile_work` already quarantined any oversized row
         // (#680), so the `/3` author's §18a size check cannot fire on this batch. `with_context`
         // still names the repo so any OTHER authoring failure (a stale `auth_len`, a contested
@@ -564,6 +604,9 @@ pub(crate) fn enable_sealed_authoring(conn: &Connection, now_ms: i64) -> anyhow:
         "sealed enable key preparation did not arm the stream ratchet"
     );
     rag_rat_db::meta::set_repo_meta(&tx, &repo_id, STREAM_SEAL_POLICY_META_KEY, "sealed")?;
+    // Same barrier discipline as the reconcile path: settle inside this transaction so the sealed
+    // re-authoring below reads completeness against a current accepted-`/3` projection.
+    settle_owner_stream_in_tx(&tx, stream)?;
     let work = read_reconcile_work(&tx, &repo_id, stream, StreamSealPolicy::Sealed)?;
     work.warn_quarantined(&repo_id);
     let ops = build_reconcile_ops(
@@ -872,16 +915,20 @@ fn content_of(memory: &RepoMemory) -> NodeContent {
 /// subsystem's own tag reader (the op encoder sorts + dedupes anyway).
 ///
 /// This trusts `content_projected_nodes` to mirror the `accepted` flag exactly. Every writer of
-/// `accepted` refreshes the projection in the same txn: the local authoring seam reprojects, the
-/// account refold (`refold_streams_for_account`) reprojects each stream it folds (guarded on the
-/// V070 tables existing — #683), and the deferred-refold settle reprojects before clearing its
-/// mark. A future acceptance writer must uphold the same coupling or this anti-join
-/// re-authors/skips rows.
+/// `accepted` refreshes the projection in the same txn: local authoring reprojects, trusted/local
+/// account folds finalize each affected stream immediately, and deferred remote content/account
+/// work reprojects at settle before clearing its mark. A future acceptance writer must uphold the
+/// same coupling or this anti-join re-authors/skips rows.
 fn read_unauthored_memory_rows(
     conn: &Connection,
     repo_id: &str,
     stream: StreamId,
 ) -> anyhow::Result<Vec<MemoryRow>> {
+    anyhow::ensure!(
+        !rag_rat_oplog::content_stream_has_pending_refold(conn, stream)?,
+        "owner stream has a pending content refold; settle pending content refolds before reading \
+         memory completeness"
+    );
     let mut stmt = conn.prepare(
         "SELECT m.id, m.kind, m.title, m.body, m.confidence, m.status, m.source, m.payload_json
          FROM repo_memories m
@@ -1018,6 +1065,13 @@ mod tests {
             params![key, REPO, source, relation, target],
         )
         .unwrap();
+    }
+
+    fn queue_pending_refold(conn: &Connection, stream: StreamId) {
+        conn.execute("INSERT INTO content_streams_pending_refold(stream_id) VALUES (?1)", [stream
+            .to_bytes()
+            .as_slice()])
+            .unwrap();
     }
 
     /// Author a BARE `/3` NodeStatus for a node with NO `NodeCreate` — the `/3` analog of the INERT
@@ -1291,6 +1345,118 @@ mod tests {
         let before = entry_count(&conn);
         backfill_memory_oplog(&conn, 9_000).unwrap();
         assert_eq!(entry_count(&conn), before, "no ghost → no new /3 entry");
+    }
+
+    /// Abort the queue-clear DELETE for `stream`, poisoning its settle so an inline barrier settle
+    /// cannot clear the mark — the row's refold debt is retained and the barrier stays tripped.
+    fn poison_owner_stream_settle(conn: &Connection, stream: StreamId) {
+        let hex: String = stream.to_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER poison_owner_queue_clear
+             BEFORE DELETE ON content_streams_pending_refold
+             WHEN OLD.stream_id = X'{hex}'
+             BEGIN SELECT RAISE(ABORT, 'injected queue-clear failure'); END;"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn pending_owner_refold_inline_settles_on_the_mutation_path() {
+        // #798 finding 5: a tripped barrier on the AUTOCOMMIT mutation path no longer hard-fails —
+        // it attempts ONE inline, targeted settle of the owner stream and, when that clears the
+        // debt, PROCEEDS. A remote ingest enqueuing owner-stream debt must not wedge every local
+        // mutation behind a settle no local caller schedules.
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        insert_memory(&conn, "mem_ghost", "active", 500);
+        queue_pending_refold(&conn, stream);
+
+        // The reconcile trips the barrier, inline-settles the settle-able owner stream, and then
+        // authors the ghost — no manual settle needed.
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert!(is_projected(&conn, "mem_ghost"), "the inline-settled reconcile authors the ghost");
+        assert!(
+            !rag_rat_oplog::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "the inline settle cleared the owner stream's refold debt",
+        );
+
+        // A subsequent mutation on the same clean stream also succeeds and authors no duplicates.
+        create_concept(&conn, "after inline settle").unwrap();
+        let entries_after = entry_count(&conn);
+        backfill_memory_oplog(&conn, 10_000).unwrap();
+        assert_eq!(entry_count(&conn), entries_after, "the retry authors no duplicates");
+    }
+
+    #[test]
+    fn a_still_pending_owner_refold_errors_after_a_failed_in_tx_settle() {
+        // #798 finding 5: the barrier self-heals only when the in-transaction settle actually
+        // clears the debt. A stream whose settle keeps failing (poisoned) rolls the whole write
+        // back, so the barrier stays FAIL-CLOSED rather than reading a stale accepted-/3
+        // projection — the debt survives and nothing is authored.
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        insert_memory(&conn, "mem_ghost", "active", 500);
+        queue_pending_refold(&conn, stream);
+        poison_owner_stream_settle(&conn, stream);
+        let entries_before = entry_count(&conn);
+
+        // The failure now surfaces from the settle itself (it is attempted inside the write's own
+        // transaction) rather than from a barrier that refused to try.
+        let reconcile_err = format!("{:#}", backfill_memory_oplog(&conn, 9_000).unwrap_err());
+        assert!(
+            reconcile_err.contains("pending content refold"),
+            "the rolled-back write names the unsettled owner stream: {reconcile_err}",
+        );
+        let mutation_err = format!("{:#}", create_concept(&conn, "blocked mutation").unwrap_err());
+        assert!(
+            mutation_err.contains("pending content refold"),
+            "a live mutation fails closed the same way: {mutation_err}",
+        );
+        assert_eq!(entry_count(&conn), entries_before, "the still-tripped barrier authors nothing");
+        assert!(
+            rag_rat_oplog::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "the poisoned settle retained the refold debt",
+        );
+        assert!(
+            !is_projected(&conn, "mem_ghost"),
+            "the ghost is not authored while the barrier trips",
+        );
+    }
+
+    #[test]
+    fn pending_owner_refold_inline_settles_on_the_edge_reconcile_path() {
+        // #798 finding 5, edge path: the same inline settle unblocks a ghost EDGE reconcile.
+        let conn = scoped_conn();
+        let a = create_concept(&conn, "a").unwrap().memory.memory_id;
+        let b = create_concept(&conn, "b").unwrap().memory.memory_id;
+        insert_raw_node_edge(&conn, &a, "relates_to", &b);
+        let stream = rag_rat_oplog::owned_stream_v2_id(&conn, REPO).unwrap().unwrap();
+        queue_pending_refold(&conn, stream);
+
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert_eq!(projected_edge_count(&conn), 1, "the inline-settled reconcile authors the edge");
+        assert!(
+            !rag_rat_oplog::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "the inline settle cleared the owner stream's refold debt",
+        );
+        let entries_after = entry_count(&conn);
+        backfill_memory_oplog(&conn, 11_000).unwrap();
+        assert_eq!(entry_count(&conn), entries_after, "the retry authors no duplicate edge");
+    }
+
+    #[test]
+    fn pending_unrelated_stream_does_not_block_owner_reconcile() {
+        let conn = scoped_conn();
+        create_concept(&conn, "seed").unwrap();
+        insert_memory(&conn, "mem_ghost", "active", 500);
+        let unrelated = StreamId::from_bytes([0x51; 32]);
+        queue_pending_refold(&conn, unrelated);
+
+        backfill_memory_oplog(&conn, 9_000).unwrap();
+        assert!(is_projected(&conn, "mem_ghost"));
+        assert!(rag_rat_oplog::content_stream_has_pending_refold(&conn, unrelated).unwrap());
     }
 
     #[test]

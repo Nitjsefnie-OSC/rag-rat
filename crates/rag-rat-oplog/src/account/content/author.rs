@@ -1446,7 +1446,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        account_storage::refold_in_tx(&tx, account).unwrap();
+        account_storage::refold_in_tx(&tx, account, NOW).unwrap();
         tx.commit().unwrap();
         verified.entry_hash
     }
@@ -1499,7 +1499,7 @@ mod tests {
             entry_hash: signed.entry_hash,
         };
         account_storage::insert_candidate(&tx, &verified, &signed.signed_bytes, NOW).unwrap();
-        account_storage::refold_in_tx(&tx, account).unwrap();
+        account_storage::refold_in_tx(&tx, account, NOW).unwrap();
         tx.commit().unwrap();
         verified.entry_hash
     }
@@ -1971,7 +1971,11 @@ mod tests {
 
         // Ingest the sealed content entry and settle its deferred acceptance fold.
         content_storage::content_ingest(&peer, &sealed_bytes, NOW).expect("ingest sealed entry");
-        content_storage::settle_pending_content_refolds(&peer).expect("settle the refold");
+        content_storage::settle_pending_content_refolds(
+            &peer,
+            &content_storage::ContentRefoldBudget::unbounded(),
+        )
+        .expect("settle the refold");
 
         let (status, accepted): (String, i64) = peer
             .query_row(
