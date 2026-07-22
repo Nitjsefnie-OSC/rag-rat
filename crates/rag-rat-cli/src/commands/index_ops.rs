@@ -669,7 +669,7 @@ fn run_maintenance_pass(
     );
     // #573: give the git-hook write path a WAL-checkpoint owner. On a hooks/MCP-only machine (no
     // long-lived foreground watcher) nothing else truncates the shared global `-wal`, so it grows
-    // unbounded. Size-gated by the same threshold the watcher's quiet-pass checkpoint uses
+    // unbounded. Size-gated by the same threshold the watcher's pass-terminal checkpoint uses
     // (`WAL_CHECKPOINT_MIN_BYTES`); best-effort — a busy/failed checkpoint just rides the next pass
     // and never fails maintenance. Runs under the write lock this pass already holds.
     let wal_checkpoint = db

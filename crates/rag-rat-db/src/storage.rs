@@ -45,11 +45,31 @@ pub fn is_busy(err: &anyhow::Error) -> bool {
     })
 }
 
+/// The WAL fold trigger shared by every deliberate checkpoint site: attempt
+/// `wal_checkpoint(TRUNCATE)` only once the sidecar exceeds this. With passive autocheckpoint
+/// disabled on write connections (#818), the WAL accumulates a write burst's volume until a
+/// deliberate fold; below this size the fold is not worth the truncate's reader-wait, and the
+/// probe is a single `stat` — cheap enough for every watcher pass and every connection close.
+pub const WAL_CHECKPOINT_MIN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Size of the `-wal` sidecar, 0 when absent. SQLite derives the sidecar name by appending
+/// `-wal` to the database path byte-for-byte, so build it the same way (no extension juggling).
+pub fn wal_bytes(database: &Path) -> u64 {
+    let mut sidecar = database.as_os_str().to_os_string();
+    sidecar.push("-wal");
+    fs::metadata(PathBuf::from(sidecar)).map(|meta| meta.len()).unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub struct IndexConnection {
     conn: Connection,
     database_path: PathBuf,
     source_root: Option<PathBuf>,
+    /// True only for [`open`](Self::open) — the constructor whose `setup()` pins
+    /// `wal_autocheckpoint = 0` (#818). The connection class that disables the passive
+    /// autocheckpoint is the class that owes a size-gated fold when it closes; read-only opens
+    /// cannot checkpoint, and the watcher event loop's nowait open must never do write-back IO.
+    fold_wal_on_close: bool,
 }
 
 impl IndexConnection {
@@ -58,7 +78,12 @@ impl IndexConnection {
             fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        let storage = Self { conn, database_path: path.to_path_buf(), source_root: None };
+        let storage = Self {
+            conn,
+            database_path: path.to_path_buf(),
+            source_root: None,
+            fold_wal_on_close: true,
+        };
         storage.setup()?;
         Ok(storage)
     }
@@ -91,7 +116,12 @@ impl IndexConnection {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(busy_timeout)?;
-        Ok(Self { conn, database_path: path.to_path_buf(), source_root: None })
+        Ok(Self {
+            conn,
+            database_path: path.to_path_buf(),
+            source_root: None,
+            fold_wal_on_close: false,
+        })
     }
 
     /// Read-WRITE open that neither CREATES the database nor WAITS on a busy lock — for the
@@ -116,7 +146,14 @@ impl IndexConnection {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(std::time::Duration::ZERO)?;
-        Ok(Self { conn, database_path: path.to_path_buf(), source_root: None })
+        // No drop-time fold: this open serves the watcher EVENT LOOP, which must never block or
+        // do write-back IO — an oversized sidecar is the pass worker's problem, not this one's.
+        Ok(Self {
+            conn,
+            database_path: path.to_path_buf(),
+            source_root: None,
+            fold_wal_on_close: false,
+        })
     }
 
     pub fn database_path(&self) -> &Path {
@@ -155,10 +192,32 @@ impl IndexConnection {
         // pragma itself briefly needs the lock and would otherwise fail fast under a concurrent
         // writer (#220). It makes a connection wait out a writer (the watcher mid-pass, a lazy
         // heal) instead of failing with SQLITE_BUSY — WAL allows one writer at a time.
+        //
+        // The write-path memory knobs (#815) also live here, at open — BEFORE any temp object
+        // exists on the connection: SQLite silently DROPS every existing temp table/view when
+        // `temp_store` changes, and the scope view installs a temp overlay right after open, so
+        // this batch is the only safe point to set it. Against the ~2 MiB default page cache,
+        // sorts and temp b-trees spilled to disk as external merges (measured on a live watcher:
+        // ~2.0 GB written to /var/tmp temp files in 27 min, 743 MB of it funneled through one
+        // ~25 MB temp b-tree); an in-memory temp store plus a 64 MiB page cache (negative
+        // `cache_size` is KiB) absorbs those working sets. Per-connection and a cap, not a
+        // preallocation; bulk rebuilds raise the cache further on their own connection.
+        //
+        // `wal_autocheckpoint = 0` (#818): the default passive autocheckpoint (~4 MiB) fires
+        // dozens of times inside one write burst, thrashing pages back into the main file while
+        // the WAL never shrinks (measured alongside the above: 947 MB WAL writes, 199 MB main-db
+        // write-back in 27 min). WAL folding belongs to the DELIBERATE fold sites instead: this
+        // connection's own close-time fold (the `Drop` impl below — every exit path of every
+        // one-shot writer), the watcher's pass-terminal checkpoint (the mid-lifetime cadence for
+        // the long-lived holder), and the git-hook maintenance pass. Disabling the mid-burst
+        // autocheckpoint is safe only because those sites exist. `synchronous` stays NORMAL.
         self.conn.execute_batch(
             "
             PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -65536;
+            PRAGMA wal_autocheckpoint = 0;
             ",
         )?;
         // The delete→WAL transition needs an EXCLUSIVE lock, and SQLite deliberately does NOT run
@@ -203,6 +262,30 @@ impl IndexConnection {
     }
 }
 
+/// Close-time WAL fold (#818): `setup()` pins `wal_autocheckpoint = 0`, so a write connection that
+/// closes without a deliberate checkpoint would strand its write burst in the shared `-wal` — and
+/// SQLite's own close-time checkpoint only runs for the LAST connection to the file, which a
+/// long-lived MCP server or watcher routinely prevents. Owning the fold here makes the invariant
+/// structural: EVERY exit path of every one-shot writer (each `index` branch including the
+/// `--worktree` early return, `reconcile`, the memory/oracle/papertrail commands, error exits,
+/// MCP per-call connections) folds because the connection that wrote is the connection that folds.
+/// Size-gated by [`WAL_CHECKPOINT_MIN_BYTES`] (a bare stat below it) and best-effort: a busy or
+/// failed truncate rides the next writer's fold. Long-lived holders still need a cadence owner
+/// mid-lifetime — the watcher folds at every pass terminal. Skipped while panicking so failing
+/// tests and crashes exit fast.
+impl Drop for IndexConnection {
+    fn drop(&mut self) {
+        if !self.fold_wal_on_close || std::thread::panicking() {
+            return;
+        }
+        if wal_bytes(&self.database_path) < WAL_CHECKPOINT_MIN_BYTES {
+            return;
+        }
+        let _ =
+            self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +305,104 @@ mod tests {
         assert_eq!(n, 0);
         let err = ro.connection().execute("INSERT INTO index_meta(key, value) VALUES('x','y')", []);
         assert!(err.is_err(), "read-only connection must reject writes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn setup_pins_the_write_path_pragmas() {
+        let dir = std::env::temp_dir().join(format!(
+            "ragrat-setup-pragmas-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let rw = IndexConnection::open(&db).unwrap();
+        let pragma = |name: &str| -> i64 {
+            rw.connection().query_row(&format!("PRAGMA {name}"), [], |row| row.get(0)).unwrap()
+        };
+
+        // #815: temp b-trees/tables must stay in memory (2 = MEMORY), never spill to /var/tmp
+        // external-merge files, and the page cache is a bounded 64 MiB (negative form = KiB).
+        assert_eq!(pragma("temp_store"), 2, "temp_store must be MEMORY");
+        assert_eq!(pragma("cache_size"), -65536, "page cache must be a bounded 64 MiB");
+        // #818: no mid-burst passive autocheckpoints — the deliberate checkpoint sites (the
+        // watcher pass terminal, the maintenance pass, last-close) own WAL folding.
+        assert_eq!(pragma("wal_autocheckpoint"), 0, "passive autocheckpoint must be off");
+        // The durability pairing those knobs rely on: WAL journaling with synchronous = NORMAL
+        // (never OFF — the shared-database global constraint).
+        let mode: String =
+            rw.connection().query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(pragma("synchronous"), 1, "synchronous must stay NORMAL");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Grow the `-wal` past the fold threshold with zeroblob pages (cheap to generate).
+    fn grow_wal_past_threshold(db: &Path) {
+        let writer = Connection::open(db).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS wal_fill(x BLOB);
+                 INSERT INTO wal_fill VALUES (zeroblob(4194304)), (zeroblob(4194304)),
+                     (zeroblob(4194304)), (zeroblob(4194304)), (zeroblob(4194304));",
+            )
+            .unwrap();
+        assert!(
+            wal_bytes(db) >= WAL_CHECKPOINT_MIN_BYTES,
+            "fixture must push the sidecar past the fold threshold"
+        );
+    }
+
+    #[test]
+    fn dropping_a_write_connection_folds_an_oversized_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ragrat-drop-fold-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let rw = IndexConnection::open(&db).unwrap();
+        // A second live connection defeats SQLite's last-connection-close checkpoint — the drop
+        // fold must be what truncates, not the close fallback (which a resident MCP server or
+        // watcher suppresses in production).
+        let holder = Connection::open(&db).unwrap();
+        grow_wal_past_threshold(&db);
+
+        drop(rw);
+        assert_eq!(
+            wal_bytes(&db),
+            0,
+            "dropping the write connection must fold the oversized WAL (#818)"
+        );
+        drop(holder);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropping_the_nowait_connection_never_folds() {
+        let dir = std::env::temp_dir().join(format!(
+            "ragrat-drop-nowait-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("index.db");
+        let holder = IndexConnection::open(&db).unwrap();
+        grow_wal_past_threshold(&db);
+        let before = wal_bytes(&db);
+
+        // The event-loop's fail-fast open must never do write-back IO, not even at drop.
+        let nowait = IndexConnection::open_read_write_no_create_nowait(&db).unwrap();
+        drop(nowait);
+        assert_eq!(
+            wal_bytes(&db),
+            before,
+            "the nowait event-loop connection must leave WAL folding to the pass worker"
+        );
+        drop(holder);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1,26 +1,27 @@
 //! Physical health of the shared database file (#482): WAL checkpointing and size/freelist
 //! reporting on `IndexDatabase`. The global store is written by every repo's watcher, hooks, and
 //! MCP servers, but nothing owned its file hygiene: passive autocheckpoint never truncates the
-//! `-wal` (it keeps its high-water mark forever) and freed pages stay in the freelist. The
-//! checkpoint here is threshold-gated (a bare `stat` of the sidecar) so quiet watcher passes can
-//! attempt it for free; `database_file_health` feeds the `doctor` report.
+//! `-wal` (it keeps its high-water mark forever) and freed pages stay in the freelist — which is
+//! why write connections disable it outright (`wal_autocheckpoint = 0`, #818) and route all WAL
+//! folding through the deliberate checkpoint here. It is threshold-gated (a bare `stat` of the
+//! sidecar) so every watcher pass can attempt it for free; `database_file_health` feeds the
+//! `doctor` report.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+// The fold threshold and the sidecar stat live with the connection (`rag_rat_db::storage`),
+// which owns the close-time fold (#818); re-exported here so the query layer's
+// checkpoint/report surface keeps its one canonical path.
+pub use rag_rat_db::storage::WAL_CHECKPOINT_MIN_BYTES;
+pub(crate) use rag_rat_db::storage::wal_bytes;
 use rusqlite::Connection;
 use serde::Serialize;
 
 use super::*;
 
-/// The pass-tail checkpoint trigger: attempt `wal_checkpoint(TRUNCATE)` only once the sidecar
-/// exceeds this. A healthy autocheckpointing WAL stays around 4 MiB (1000 default-size pages), so
-/// anything past this is accumulated high-water from a heavy write phase. Below it, the probe is a
-/// single `stat` — cheap enough for every quiet watcher pass.
-pub const WAL_CHECKPOINT_MIN_BYTES: u64 = 16 * 1024 * 1024;
-
 /// Doctor warning threshold for the `-wal` sidecar: past this, checkpoints are being starved
-/// (long-lived readers) or no quiet pass ever runs — worth surfacing rather than silently holding
-/// disk.
+/// (long-lived readers) or no pass-terminal / maintenance checkpoint ever runs — worth surfacing
+/// rather than silently holding disk.
 const WAL_WARN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Doctor warning threshold for dead space: freelist pages as a fraction of the whole file.
@@ -38,7 +39,7 @@ pub struct WalCheckpointReport {
     /// False when the sidecar was under the threshold and nothing ran.
     pub attempted: bool,
     /// True when the checkpoint fully completed and truncated the sidecar (`busy = 0`). False
-    /// under concurrent readers/writers that kept frames pinned — the next quiet pass retries.
+    /// under concurrent readers/writers that kept frames pinned — the next pass retries.
     pub truncated: bool,
 }
 
@@ -82,8 +83,8 @@ pub struct DatabaseFileHealth {
 impl IndexDatabase {
     /// Truncate the WAL sidecar when it has outgrown `min_bytes`; below that, a bare `stat` and
     /// return. Best-effort: `wal_checkpoint(TRUNCATE)` waits for concurrent readers only within
-    /// `busy_timeout`, then reports `truncated: false` rather than erroring, and the next quiet
-    /// pass retries. Callers must NOT compensate for a busy report by weakening durability —
+    /// `busy_timeout`, then reports `truncated: false` rather than erroring, and the next pass
+    /// retries. Callers must NOT compensate for a busy report by weakening durability —
     /// `synchronous` stays NORMAL on the shared database (the A6 global constraint, #401).
     pub fn checkpoint_wal_if_oversized(
         &self,
@@ -194,8 +195,8 @@ fn compute_database_file_health(
             let mut parts = Vec::new();
             if wal {
                 parts.push(
-                    "the -wal sidecar is oversized — a quiet watcher pass truncates it, or \
-                     long-lived readers are starving checkpoints",
+                    "the -wal sidecar is oversized — a watcher pass truncates it at the terminal, \
+                     or long-lived readers are starving checkpoints",
                 );
             }
             if freelist {
@@ -321,14 +322,6 @@ fn freelist_snapshot(
         conn.connection().query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
     let main_bytes = std::fs::metadata(database).map(|meta| meta.len()).unwrap_or(0);
     Ok((main_bytes, freelist_pages))
-}
-
-/// Size of the `-wal` sidecar, 0 when absent. SQLite derives the sidecar name by appending
-/// `-wal` to the database path byte-for-byte, so build it the same way (no extension juggling).
-fn wal_bytes(database: &Path) -> u64 {
-    let mut sidecar = database.as_os_str().to_os_string();
-    sidecar.push("-wal");
-    std::fs::metadata(PathBuf::from(sidecar)).map(|meta| meta.len()).unwrap_or(0)
 }
 
 #[cfg(test)]
