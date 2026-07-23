@@ -8,8 +8,16 @@ name: bench-release
 # See docs/bencher.md and tools/bench-kernel.sh.
 
 on:
-  release:
-    types: [published]
+  # Ride the release tag push, NOT `release: published`. Since v0.16.0 the GitHub release is created by
+  # cargo-dist with GITHUB_TOKEN, and GitHub suppresses downstream workflow runs for GITHUB_TOKEN-created
+  # release events (recursive-workflow prevention), so `release: published` fired into a void and this
+  # bench silently skipped v0.16.0–v0.19.0 (#712). release-plz pushes the vX.Y.Z tag with a PAT, which
+  # DOES fire tag-push workflows — the same pattern release-android.yml / release-npm.yml already use.
+  # This job only needs the source at the tag (it checks out and indexes the kernel; it downloads no
+  # release assets), so it needs no wait-for-release poll.
+  push:
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
     inputs:
       kernel_subdirs:

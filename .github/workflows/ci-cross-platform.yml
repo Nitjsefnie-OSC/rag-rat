@@ -2,10 +2,12 @@ name: CI (cross-platform)
 
 # macOS + Windows coverage for the test/clippy/build-full legs. These platforms are NOT exercised on
 # every PR/push (that would multiply CI minutes for the rare platform regression); the per-PR + main
-# matrix in ci.yml stays Linux-only. Instead this runs only when a release is published — the same
-# `release: published` trigger oracle.yml and bench-release.yml already key off (release-plz cuts the
-# GitHub release, authored with RELEASE_PLZ_TOKEN so downstream workflows fire, once the Release PR's
-# version commit lands on main). workflow_dispatch is kept so the matrix can be validated manually.
+# matrix in ci.yml stays Linux-only. Instead this runs on the release tag push — the same `push: tags`
+# trigger oracle.yml and bench-release.yml key off, matching release-android.yml / release-npm.yml.
+# release-plz pushes the vX.Y.Z tag with a PAT, which fires tag-push workflows; cargo-dist then cuts the
+# GitHub release with GITHUB_TOKEN, whose `release: published` event GitHub suppresses for downstream
+# workflows (recursive-workflow prevention, #712) — so keying off the tag push is what actually fires.
+# workflow_dispatch is kept so the matrix can be validated manually.
 #
 # Jobs mirror ci.yml's Linux legs exactly (toolchain, rust-cache, feature flags) so a real mac/win
 # break surfaces the same way it would on Linux:
@@ -17,8 +19,9 @@ name: CI (cross-platform)
 # SQLite). With that landed, windows-latest links the vendored SQLite amalgamation via cc.
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
 
 # Least privilege: CI only reads the repo.
