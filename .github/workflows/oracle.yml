@@ -43,6 +43,14 @@ on:
       - '.github/workflows/oracle.yml'
   push:
     branches: [main]
+    # A release tag push runs the heavy tier (see the tier select below), replacing the dead
+    # `release: published` trigger: cargo-dist creates the GitHub release with GITHUB_TOKEN, whose event
+    # GitHub suppresses for downstream workflows, but release-plz's PAT-pushed vX.Y.Z tag fires this —
+    # the release-android.yml / release-npm.yml pattern (#712). GitHub does NOT evaluate path filters
+    # for pushes of tags, so the `paths:` list below scopes only main-branch pushes; a release tag
+    # always fires regardless of which files the release commit touched.
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
     paths:
       # oracle runs the `rag-rat` binary (`index --full` + `oracle report`, see tools/oracle-run.sh)
       # over external corpora, so it gates core's parser/resolution AND the cli entry points that
@@ -67,8 +75,6 @@ on:
       - 'tools/oracle-report-bmf.py'
       - 'tools/oracle-report-md.py'
       - '.github/workflows/oracle.yml'
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tier:
@@ -109,7 +115,12 @@ jobs:
         run: |
           set -euo pipefail
           case "${{ github.event_name }}" in
-            release)           tier=heavy ;;
+            # A release tag push (release-plz pushes vX.Y.Z with a PAT) selects the heavy tier — this
+            # replaces the old `release` event_name, since the GITHUB_TOKEN-created release's
+            # `release: published` event is suppressed downstream (#712). A branch (main) push and a PR
+            # stay on the small tier.
+            push)
+              if [ "${{ github.ref_type }}" = tag ]; then tier=heavy; else tier=small; fi ;;
             workflow_dispatch) tier="${{ github.event.inputs.tier }}" ;;
             *)                 tier=small ;;
           esac
