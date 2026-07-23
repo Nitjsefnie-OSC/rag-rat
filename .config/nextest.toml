@@ -1,7 +1,24 @@
 # nextest profiles. The `ci` profile emits a JUnit report for Codecov Test Analytics.
 # Tests are parallel-safe (each uses its own temp DB; the library no longer shells out to `gh`),
 # so this runs at nextest's default per-core parallelism.
+
+[profile.default]
+# Bounded retries for environmental flakes under maximum parallelism (#867, the same failure class
+# as #672). Several individually-deterministic, process-isolated tests fail ~1/run ONLY under the
+# full-workspace `--test-threads 4` load and pass alone and on a clean re-run — the signature of
+# memory / open-fd / sqlite contention, not a logic bug (#672 reached the same conclusion). The
+# affected tests carry no shared mutable state and no wall-clock dependence to fix at the source:
+# the papertrail `schedule::tests::*` cases are pure functions of literal arguments (they can only
+# "fail" if a starved process is terminated by the `slow-timeout` below), and the oracle/core cases
+# run against a private in-memory sqlite DB, where a transient allocation failure surfaces as a
+# spurious result or panic rather than a reproducible assertion. A genuine regression still fails:
+# it reproduces on every attempt, so a bounded retry never masks it, while a one-off contention blip
+# no longer reds an unrelated PR's run. The short backoff lets the resource spike drain before the
+# retry.
+retries = { backoff = "exponential", count = 2, delay = "1s", max-delay = "5s", jitter = true }
+
 [profile.ci]
+# Inherits `retries` from `[profile.default]` above.
 # A wedged test should fail with its test name instead of leaving the whole CI job running.
 slow-timeout = { period = "60s", terminate-after = 2 }
 
