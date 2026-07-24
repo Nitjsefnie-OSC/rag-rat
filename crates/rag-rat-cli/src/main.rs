@@ -39,7 +39,12 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// decayed pages are only reclaimed on later alloc calls, which a quiet server rarely makes) and
 /// tighten the decay window from the 10s default so an idle server releases memory within ~1s.
 /// Best-effort — a server that holds slightly more RAM is better than one that won't boot.
-#[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
+///
+/// Skipped on macOS: jemalloc there rejects `background_thread` ("currently supports pthread only")
+/// and the subsequent `MALLCTL_ARENAS_ALL` (`arena.4096.*`) decay writes SEGFAULT the process at
+/// startup — crashing every `rag-rat` invocation before the command even runs. macOS keeps
+/// jemalloc as the allocator, just untuned (per the same boot-over-RAM priority above).
+#[cfg(all(not(target_env = "msvc"), not(target_os = "android"), not(target_os = "macos")))]
 fn configure_jemalloc() {
     use tikv_jemalloc_ctl::{background_thread, raw};
     // Purge decayed pages on a background thread; a quiet server makes few alloc calls, which is
@@ -63,7 +68,7 @@ fn main() -> anyhow::Result<()> {
     // Record this binary's git-stamped version (#585) so migration provenance and the stranded-
     // binary refusal name a dev build (`0.16.0+g<hash>`) distinctly from a release (`0.16.0`).
     rag_rat_base::version::set_binary_version(env!("RAG_RAT_VERSION"));
-    #[cfg(all(not(target_env = "msvc"), not(target_os = "android")))]
+    #[cfg(all(not(target_env = "msvc"), not(target_os = "android"), not(target_os = "macos")))]
     configure_jemalloc();
     let cli = Cli::parse();
 
@@ -685,7 +690,12 @@ mod tests {
         let config = discover_target_config_optional(&root)
             .unwrap()
             .expect("the existing target checkout's governing config should load");
-        assert_eq!(config.database, root.join("custom/index.sqlite"));
+        // Config::load resolves the relative `database` against the CANONICALIZED config dir
+        // (normalize_existing_dir → fs::canonicalize): /var→/private/var on macOS, \\?\ + long name
+        // on Windows. Canonicalize the base and join components so the expectation matches
+        // natively.
+        let root = root.canonicalize().unwrap();
+        assert_eq!(config.database, root.join("custom").join("index.sqlite"));
         let _ = std::fs::remove_dir_all(root);
     }
 }
