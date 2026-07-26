@@ -253,6 +253,12 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@t")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@t")
+            // Isolate from the ambient environment (#581): no user/system gitconfig leaks in
+            // (a hostile global `core.hooksPath` fails every commit here), and HOME is pinned
+            // to the temp root so nothing resolves to the developer's/CI runner's real home.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("HOME", root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -272,7 +278,7 @@ mod tests {
         let root_a = unique_temp_root();
         std::fs::create_dir_all(root_a.join("src")).unwrap();
         std::fs::write(root_a.join("src/a.rs"), "fn a() {}\n").unwrap();
-        git(&root_a, &["init", "-q"]);
+        git(&root_a, &["init", "-q", "-b", "main"]);
         git(&root_a, &["add", "-A"]);
         git(&root_a, &["commit", "-q", "-m", "init"]);
         let config_a = source_config(root_a.clone(), Language::Rust);
@@ -337,7 +343,7 @@ mod tests {
         let root_a = unique_temp_root();
         std::fs::create_dir_all(root_a.join("src")).unwrap();
         std::fs::write(root_a.join("src/a.rs"), "fn a() {}\n").unwrap();
-        git(&root_a, &["init", "-q"]);
+        git(&root_a, &["init", "-q", "-b", "main"]);
         git(&root_a, &["add", "-A"]);
         git(&root_a, &["commit", "-q", "-m", "init"]);
         let config_a = source_config(root_a.clone(), Language::Rust);
@@ -412,7 +418,7 @@ mod tests {
         let root_a = unique_temp_root();
         std::fs::create_dir_all(root_a.join("src")).unwrap();
         std::fs::write(root_a.join("src/a.rs"), "fn a() {}\n").unwrap();
-        git(&root_a, &["init", "-q"]);
+        git(&root_a, &["init", "-q", "-b", "main"]);
         git(&root_a, &["add", "-A"]);
         git(&root_a, &["commit", "-q", "-m", "init"]);
         let config_a = source_config(root_a.clone(), Language::Rust);
@@ -424,7 +430,7 @@ mod tests {
         let root_b = unique_temp_root();
         std::fs::create_dir_all(root_b.join("src")).unwrap();
         std::fs::write(root_b.join("keep.txt"), "not a rust file\n").unwrap();
-        git(&root_b, &["init", "-q"]);
+        git(&root_b, &["init", "-q", "-b", "main"]);
         git(&root_b, &["add", "-A"]);
         git(&root_b, &["commit", "-q", "-m", "init"]);
         let mut config_b = source_config(root_b.clone(), Language::Rust);
@@ -506,7 +512,7 @@ mod tests {
 
         // Now give the root a git identity the DB has NOT adopted (still under the placeholder), so
         // `resolve_config_repo_id` returns None and only the sole-repo fallback can recognize it.
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-q", "-m", "init"]);
 
@@ -534,7 +540,7 @@ mod tests {
         let root_a = unique_temp_root();
         std::fs::create_dir_all(root_a.join("src")).unwrap();
         std::fs::write(root_a.join("src/a.rs"), "fn a() {}\n").unwrap();
-        git(&root_a, &["init", "-q"]);
+        git(&root_a, &["init", "-q", "-b", "main"]);
         git(&root_a, &["add", "-A"]);
         git(&root_a, &["commit", "-q", "-m", "init"]);
         let config_a = source_config(root_a.clone(), Language::Rust);
@@ -577,7 +583,7 @@ mod tests {
         let root_a = unique_temp_root();
         std::fs::create_dir_all(root_a.join("src")).unwrap();
         std::fs::write(root_a.join("src/a.rs"), "fn a() {}\n").unwrap();
-        git(&root_a, &["init", "-q"]);
+        git(&root_a, &["init", "-q", "-b", "main"]);
         git(&root_a, &["add", "-A"]);
         git(&root_a, &["commit", "-q", "-m", "init"]);
         let config_a = source_config(root_a.clone(), Language::Rust);
