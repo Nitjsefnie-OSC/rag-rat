@@ -53,6 +53,17 @@ pub(crate) fn with_oracle_write_lock<T>(
 /// error. Prints the `OracleReport` (or the `Blocked` outcome) as JSON.
 fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
     let tool = args.tool.core();
+    // A live-only tool (`ra-lsp`) has no whole-checkout `.scip` — reject BOTH the tool-driven and
+    // the `--scip` prebuilt branches here (the prebuilt branch never reaches
+    // `produce_scip_with_tool`'s batch gate). Otherwise a `--scip` run would persist batch-shaped
+    // verdicts + a run row under the live identity and supersede genuine watcher-session verdicts
+    // in the currency gate (#534 review).
+    anyhow::ensure!(
+        tool.batch_capable(),
+        "`oracle run` cannot drive the live tool `{}` — it resolves from the watcher under \
+         `[oracle.live] enabled`, not a whole-checkout `.scip`",
+        tool.as_db_str()
+    );
     if let Some(scip_path) = &args.scip {
         // Pre-built index: reading a file is fast, so this whole path runs under the lock.
         let scip_bytes = fs::read(scip_path).map_err(|err| {
@@ -170,10 +181,29 @@ fn oracle_status(db: &IndexDatabase, args: &OracleStatusArgs) -> anyhow::Result<
             Some(version) => Some(db.oracle_status(tool, &version)?),
             None => None,
         };
+        // The live oracle without a batch baseline is moniker-blind (#534): it upgrades edge
+        // tiers under `local ra-lsp-<n>` sentinels, but clone-collapse (#275) and
+        // moniker-anchored memory relocation get nothing until a batch run completes. Surface
+        // that honestly when live verdicts exist but the batch counterpart has never run.
+        let note = if status.is_some()
+            && let Some(source) = tool.batch_moniker_source()
+            && db.latest_oracle_run_version(source)?.is_none()
+        {
+            Some(format!(
+                "live-only: no {} batch run in this checkout — edge tiers upgrade, but \
+                 clone-collapse + moniker anchoring are blind until `oracle run --tool {}` \
+                 completes",
+                source.as_db_str(),
+                source.as_db_str()
+            ))
+        } else {
+            None
+        };
         entries.push(serde_json::json!({
             "tool": tool.as_db_str(),
             "tool_available": availability,
             "verdicts": status,
+            "note": note,
         }));
     }
     print_output(&entries)
@@ -213,6 +243,17 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
             profile.tool
         )
     })?;
+    // A live-only tool (`ra-lsp`) is driven by the watcher, never by a whole-checkout report:
+    // the `--scip` branch bypasses `produce_scip_with_tool`'s batch-capability gate, so reject
+    // here or a corpus declaring it would persist batch-shaped runs under the live identity and
+    // hide genuine session verdicts from the currency gate (#534 review).
+    anyhow::ensure!(
+        tool.batch_capable(),
+        "corpus `{}` names live-only oracle tool `{}` — it has no whole-checkout `.scip` to \
+         report over (live verdicts come from the watcher under `[oracle.live]`)",
+        profile.corpus_id,
+        profile.tool
+    );
 
     // Fail closed if the active checkout's target bindings don't match the corpus profile (Codex on
     // #175). The report stamps this profile's `corpus_profile_hash`, asserting "these numbers are
@@ -618,6 +659,26 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(20)).expect("oracle run completes after unlock");
         assert!(ok, "oracle run should succeed once the lock is free");
         handle.join().unwrap();
+    }
+
+    /// #534: a live-only tool has no whole-checkout `.scip`, so `oracle run --tool ra-lsp` (even
+    /// with a prebuilt `--scip`, the branch that skips `produce_scip_with_tool`'s gate) is
+    /// rejected before touching the index — never persist a batch-shaped run under the live id.
+    #[test]
+    fn oracle_run_rejects_the_live_only_tool() {
+        let (root, config) = temp_config();
+        IndexDatabase::rebuild(&config).unwrap();
+        let scip_path = root.join("empty.scip");
+        std::fs::write(&scip_path, []).unwrap();
+        let args = OracleArgs {
+            command: OracleCommand::Run(OracleRunArgs {
+                tool: OracleToolArg::RaLsp,
+                scip: Some(scip_path),
+            }),
+        };
+        let err = super::oracle(&config, &args).unwrap_err();
+        assert!(err.to_string().contains("live tool"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The lock is RELEASED after `oracle run` returns — a subsequent acquire succeeds immediately,

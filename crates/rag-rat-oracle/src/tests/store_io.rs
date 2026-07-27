@@ -502,3 +502,166 @@ fn current_callee_monikers_drops_verdicts_without_a_live_edge() {
         "a verdict with no live edge is dropped; the live-edge-backed one is returned"
     );
 }
+
+/// `edge_join_candidates_for_paths` (the live oracle's worklist read, #534) scopes candidates to
+/// the named paths AND survives a worklist larger than one `IN`-list chunk — an accumulated
+/// watcher backlog must never fail the prepare with a bound-variable overflow and wedge the
+/// backlog.
+#[test]
+fn edge_join_candidates_for_paths_scopes_and_chunks() {
+    let h = Harness::new();
+    let a = h.add_file("a.rs", "fn a() { t(); }\n");
+    let edge_a = h.add_edge(a, "t", 9, 10, "NameOnly", None);
+    let b = h.add_file("b.rs", "fn b() { t(); }\n");
+    h.add_edge(b, "t", 9, 10, "NameOnly", None);
+    // c.rs exists but is NOT in the worklist.
+    let c = h.add_file("c.rs", "fn c() { t(); }\n");
+    h.add_edge(c, "t", 9, 10, "NameOnly", None);
+
+    // Scoped: only the named paths come back.
+    let candidates = store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[
+        "a.rs".to_string(),
+        "b.rs".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].edge_id, edge_a);
+    assert!(candidates.iter().all(|c| c.source_path != "c.rs"));
+
+    // Chunked: > 500 paths (499 fillers + the real one) crosses one chunk boundary and still
+    // resolves — the query is issued in bounded `IN` lists.
+    let mut big: Vec<String> = (0..600).map(|i| format!("src/filler-{i}.rs")).collect();
+    big.push("a.rs".to_string());
+    let candidates =
+        store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &big).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].edge_id, edge_a);
+
+    // Empty worklist → no query, no candidates.
+    assert!(
+        store::edge_join_candidates_for_paths(&h.conn, COMMIT, WORKTREE, &[]).unwrap().is_empty()
+    );
+}
+
+/// `live_covered_edges_for_path` (the budget-continuation coverage read, #534) must NOT count a
+/// verdict whose resolved DEFINITION no longer exists in the active checkout — the surfacing
+/// read rejects such a row, so continuation would otherwise skip re-resolving the edge forever
+/// behind evidence the read path never shows.
+#[test]
+fn live_covered_edges_excludes_a_stale_definition_verdict() {
+    let h = Harness::new();
+    let src = h.add_file("src.rs", "fn caller() { target(); }\n");
+    let sha = h.file_sha("src.rs");
+    // A live verdict resolving to a symbol that does NOT exist (id 9999) — a def that was
+    // deleted/reindexed away.
+    let stale = h.add_edge(src, "target", 14, 20, "NameOnly", None);
+    let key = h.edge_content_key(stale);
+    store::write_edge_oracle(&h.conn, OracleTool::RaLsp, "v", &EdgeOracleRow {
+        source_path: &key.source_path,
+        source_start_byte: key.source_start_byte,
+        source_end_byte: key.source_end_byte,
+        callee_start_byte: key.callee_start_byte,
+        callee_end_byte: key.callee_end_byte,
+        edge_kind: &key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: Some(9999),
+        scip_symbol: "local ra-lsp-stale",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+
+    let covered = store::live_covered_edges_for_path(
+        &h.conn,
+        OracleTool::RaLsp,
+        "v",
+        "src.rs",
+        &sha,
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+    assert!(covered.is_empty(), "a verdict with a vanished definition is not coverage");
+
+    // A verdict with NULL resolved_symbol_id (external-ish) or a live definition IS coverage.
+    let real_target = h.add_symbol(src, "target", 0, 25);
+    let live = h.add_edge_with_kind(src, "target", 14, 20, "references_type", "NameOnly", None);
+    let live_key = h.edge_content_key(live);
+    store::write_edge_oracle(&h.conn, OracleTool::RaLsp, "v", &EdgeOracleRow {
+        source_path: &live_key.source_path,
+        source_start_byte: live_key.source_start_byte,
+        source_end_byte: live_key.source_end_byte,
+        callee_start_byte: live_key.callee_start_byte,
+        callee_end_byte: live_key.callee_end_byte,
+        edge_kind: &live_key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: Some(real_target),
+        scip_symbol: "local ra-lsp-live",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", COMMIT, WORKTREE, "Completed", "{}")
+        .unwrap();
+    let covered = store::live_covered_edges_for_path(
+        &h.conn,
+        OracleTool::RaLsp,
+        "v",
+        "src.rs",
+        &sha,
+        COMMIT,
+        WORKTREE,
+    )
+    .unwrap();
+    assert_eq!(covered.len(), 1, "the live-definition verdict is coverage; the stale one is not");
+}
+
+/// Content-keyed verdict rows can be shared by identical checkout content, but continuation
+/// currency cannot: a sibling checkout's run must not make a fresh checkout skip LSP requests.
+#[test]
+fn live_covered_edges_requires_this_checkouts_current_run() {
+    let h = Harness::new();
+    let src = h.add_file("src.rs", "fn caller() { target(); }\n");
+    let edge = h.add_edge(src, "target", 14, 20, "NameOnly", None);
+    let key = h.edge_content_key(edge);
+    let sha = h.file_sha("src.rs");
+    store::write_edge_oracle(&h.conn, OracleTool::RaLsp, "v", &EdgeOracleRow {
+        source_path: &key.source_path,
+        source_start_byte: key.source_start_byte,
+        source_end_byte: key.source_end_byte,
+        callee_start_byte: key.callee_start_byte,
+        callee_end_byte: key.callee_end_byte,
+        edge_kind: &key.edge_kind,
+        file_sha: &sha,
+        resolved_symbol_id: None,
+        scip_symbol: "local ra-lsp-shared",
+        kind: OracleResolutionKind::Upgrade,
+    })
+    .unwrap();
+    store::record_oracle_run(
+        &h.conn,
+        OracleTool::RaLsp,
+        "v",
+        OTHER_COMMIT,
+        OTHER_WORKTREE,
+        "Completed",
+        "{}",
+    )
+    .unwrap();
+
+    let covered = || {
+        store::live_covered_edges_for_path(
+            &h.conn,
+            OracleTool::RaLsp,
+            "v",
+            "src.rs",
+            &sha,
+            COMMIT,
+            WORKTREE,
+        )
+        .unwrap()
+    };
+    assert!(covered().is_empty(), "a sibling's run does not establish this checkout's currency");
+
+    store::record_oracle_run(&h.conn, OracleTool::RaLsp, "v", COMMIT, WORKTREE, "Completed", "{}")
+        .unwrap();
+    assert_eq!(covered().len(), 1, "this checkout's matching run activates shared coverage");
+}

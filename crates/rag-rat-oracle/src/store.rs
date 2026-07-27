@@ -331,6 +331,452 @@ pub(crate) fn edge_join_candidates(
     Ok(out)
 }
 
+/// The `files.sha256` of ONE indexed path in the active checkout, or `None` when the path isn't
+/// indexed here (tombstones excluded, as in [`indexed_file_shas_in_scope`]). The live oracle's
+/// definition-side drift probe (#534): the LSP returns a bounded set of definition paths per
+/// pass, so materializing the whole-checkout map would be O(repo files) per pass under the write
+/// lock for no benefit.
+pub(crate) fn indexed_file_sha_for_path(
+    conn: &Connection,
+    path: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<Option<String>> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        &format!(
+            "SELECT sha256 FROM files WHERE path = ?1 AND kind != 'deleted' AND {scope}",
+            scope = active_checkout_file_predicate("?2", "?3"),
+        ),
+        params![path, commit_sha, worktree_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// An `edge_oracle` row's full content key: `(source_start_byte, source_end_byte,
+/// callee_start_byte, callee_end_byte, edge_kind)` — the identity the live pass's covered-skip
+/// tracks (never the callee start alone; two edges can share one token).
+pub(crate) type LiveEdgeKey = (i64, i64, i64, i64, String);
+
+/// The full content keys of a file's edges already covered by a CURRENT live verdict for
+/// `(tool, tool_version)` — current meaning this checkout's latest run selects `tool_version` and
+/// the row's `file_sha` matches the file's indexed content NOW (the content-addressed currency the
+/// live pass keys on, #534). The budget
+/// continuation mechanism: a file a prior pass truncated resumes where it stopped, because
+/// already-verdicted callees are skipped by the live pass. The key is the FULL edge identity
+/// (source span + callee span + edge kind), never the callee start alone: two edges can share
+/// one token (`calls_name` + `references_type`), and a start-byte key would let the first
+/// written row mark BOTH covered and starve the other forever.
+///
+/// A verdict whose resolved DEFINITION no longer exists in the active checkout (the def file was
+/// edited + reindexed between passes while THIS file's bytes held) is NOT counted covered — it
+/// applies the same definition-current predicate the surfacing reads use, so continuation
+/// re-resolves the edge instead of skipping it forever behind evidence the read path rejects.
+pub(crate) fn live_covered_edges_for_path(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    source_path: &str,
+    file_sha: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<std::collections::HashSet<LiveEdgeKey>> {
+    // Shared content-key rows are NOT usable continuation coverage until this checkout has a run
+    // establishing the same tool version as current. Without this gate, a sibling's rows can make
+    // a fresh checkout skip every request while surfacing rejects them for missing currency.
+    if latest_run_tool_version(conn, tool, commit_sha, worktree_id)?.as_deref()
+        != Some(tool_version)
+    {
+        return Ok(std::collections::HashSet::new());
+    }
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    let def_current = edge_oracle_def_current_predicate("?5", "?6");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT source_start_byte, source_end_byte, callee_start_byte, callee_end_byte, edge_kind
+         FROM edge_oracle
+         WHERE tool = ?1 AND tool_version = ?2 AND source_path = ?3 AND file_sha = \
+         ?4{repo_clause}{def_current}"
+    ))?;
+    let rows = stmt.query_map(
+        params![tool.as_db_str(), tool_version, source_path, file_sha, commit_sha, worktree_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        },
+    )?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveVersionMigration {
+    Copied(u64),
+    /// The destination version already owns the same content key for different file bytes. Because
+    /// `file_sha` is not in the PK, both checkout-scoped verdicts cannot coexist under that
+    /// version.
+    BlockedByContentCollision,
+}
+
+/// Copy every current-checkout `edge_oracle` row of `tool` from one `tool_version` to another.
+/// The live oracle's version-transition path (#534): a respawn
+/// probing a NEW `rust-analyzer --version` would otherwise make the first partial pass's run row
+/// the latest for the whole checkout and gate every prior-version verdict out of currency —
+/// collapsing live coverage to the handful of files the new session revisited. The rows are
+/// content-addressed (`file_sha` still gates drift), so copying them under the new version
+/// preserves coverage. An identical destination row wins via `INSERT OR IGNORE`; a destination
+/// row for DIFFERENT bytes blocks the whole transition before any copy, because the content-key PK
+/// cannot represent both and advancing currency would hide one checkout's valid verdict.
+///
+/// SCOPE (load-bearing): the copied set is restricted to rows whose LIVE EDGE belongs to the active
+/// `(commit_sha, worktree_id)` checkout — the SAME content join [`clear_edge_oracle_for_tool`]
+/// uses. `edge_oracle` rows carry no commit/worktree columns (their scope is the live-edge
+/// join), so a repo-wide UPDATE would relabel a SIBLING worktree's rows too while only THIS
+/// checkout gets the new-version run row. The old row MUST remain: identical-content sibling
+/// checkouts share one `edge_oracle` row, so destructively relabeling it would hide that verdict
+/// from every sibling whose currency still selects the old version.
+pub(crate) fn migrate_live_verdicts_to_version(
+    conn: &Connection,
+    tool: OracleTool,
+    from_version: &str,
+    to_version: &str,
+    commit_sha: &str,
+    worktree_id: &str,
+) -> anyhow::Result<LiveVersionMigration> {
+    let repo_clause = oracle_repo_scope_clause(conn, "old")?;
+    let dest_repo_clause = oracle_repo_scope_clause(conn, "dest")?;
+    let scope = active_checkout_file_predicate("?4", "?5");
+    // The active-checkout, current-CONTENT live-edge predicate: the row's `file_sha` must equal
+    // the checkout's CURRENT `files.sha256`, so a sibling worktree's row (same path + spans, but
+    // its own content sha) is NOT treated as this checkout's — without the sha correlation a
+    // a sibling worktree's row while only this checkout records the new-version run.
+    let active_current = format!(
+        "EXISTS (
+             SELECT 1
+             FROM edges_data
+             JOIN files ON files.id = edges_data.source_file_id
+             JOIN name_strings ek ON ek.id = edges_data.edge_kind_id
+             WHERE files.path = old.source_path
+               AND files.sha256 = old.file_sha
+               AND edges_data.source_start_byte = old.source_start_byte
+               AND edges_data.source_end_byte = old.source_end_byte
+               AND edges_data.callee_start_byte = old.callee_start_byte
+               AND edges_data.callee_end_byte = old.callee_end_byte
+               AND ek.value = old.edge_kind
+               AND edges_data.hidden = 0
+               AND {scope})"
+    );
+    let (repo_col, repo_value) =
+        if oracle_repo_scope(conn)?.is_some() { ("repo_id, ", "repo_id, ") } else { ("", "") };
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let generation = rag_rat_db::schema::active_generation(conn)?;
+    // Unlike the active-source predicate above, destination currency must look across EVERY
+    // checkout. Bypass temp.files and pin the raw tables to this repo's live generation.
+    let dest_current = "EXISTS (
+         SELECT 1
+         FROM main.edges_data all_edges
+         JOIN main.files all_files ON all_files.id = all_edges.source_file_id
+         JOIN main.name_strings all_kinds ON all_kinds.id = all_edges.edge_kind_id
+         WHERE all_files.repo_id = ?6 AND all_files.generation = ?7
+           AND all_files.path = dest.source_path AND all_files.sha256 = dest.file_sha
+           AND all_edges.source_start_byte = dest.source_start_byte
+           AND all_edges.source_end_byte = dest.source_end_byte
+           AND all_edges.callee_start_byte = dest.callee_start_byte
+           AND all_edges.callee_end_byte = dest.callee_end_byte
+           AND all_kinds.value = dest.edge_kind AND all_edges.hidden = 0)";
+    let collision = conn.query_row(
+        &format!(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM edge_oracle old
+                 JOIN edge_oracle dest
+                   ON dest.tool = old.tool
+                  AND dest.tool_version = ?3
+                  AND dest.source_path = old.source_path
+                  AND dest.source_start_byte = old.source_start_byte
+                  AND dest.source_end_byte = old.source_end_byte
+                  AND dest.callee_start_byte = old.callee_start_byte
+                  AND dest.callee_end_byte = old.callee_end_byte
+                  AND dest.edge_kind = old.edge_kind{dest_repo_clause}
+                 WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
+                   AND dest.file_sha != old.file_sha
+                   AND {active_current}
+                   AND {dest_current})"
+        ),
+        params![
+            tool.as_db_str(),
+            from_version,
+            to_version,
+            commit_sha,
+            worktree_id,
+            repo_id,
+            generation,
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if collision {
+        return Ok(LiveVersionMigration::BlockedByContentCollision);
+    }
+    // A destination collision that is NOT current anywhere is stale retained history (for example
+    // v1→v2→v1 after content changed). Remove it so INSERT below can copy current evidence instead
+    // of being silently ignored by the content-key PK.
+    conn.execute(
+        &format!(
+            "DELETE FROM edge_oracle AS dest
+             WHERE dest.tool = ?1 AND dest.tool_version = ?3{dest_repo_clause}
+               AND NOT {dest_current}
+               AND EXISTS (
+                   SELECT 1 FROM edge_oracle old
+                   WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
+                     AND old.source_path = dest.source_path
+                     AND old.source_start_byte = dest.source_start_byte
+                     AND old.source_end_byte = dest.source_end_byte
+                     AND old.callee_start_byte = dest.callee_start_byte
+                     AND old.callee_end_byte = dest.callee_end_byte
+                     AND old.edge_kind = dest.edge_kind
+                     AND old.file_sha != dest.file_sha
+                     AND {active_current})"
+        ),
+        params![
+            tool.as_db_str(),
+            from_version,
+            to_version,
+            commit_sha,
+            worktree_id,
+            repo_id,
+            generation,
+        ],
+    )?;
+    // COPY, never relabel: two checkouts with identical bytes + spans intentionally share the old
+    // row. Keeping it lets a sibling's old-version currency continue surfacing the verdict while
+    // this checkout switches to the copied new-version row.
+    let moved = conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO edge_oracle(
+                 {repo_col}source_path, source_start_byte, source_end_byte,
+                 callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, tool_version,
+                 resolved_symbol_id, scip_symbol, kind, computed_at)
+             SELECT {repo_value}source_path, source_start_byte, source_end_byte,
+                    callee_start_byte, callee_end_byte, edge_kind, file_sha, tool, ?3,
+                    resolved_symbol_id, scip_symbol, kind, computed_at
+             FROM edge_oracle old
+             WHERE old.tool = ?1 AND old.tool_version = ?2{repo_clause}
+               AND {active_current}"
+        ),
+        params![tool.as_db_str(), from_version, to_version, commit_sha, worktree_id],
+    )?;
+    Ok(LiveVersionMigration::Copied(moved as u64))
+}
+
+/// [`edge_join_candidates`] restricted to a set of source paths — the live oracle's per-pass
+/// worklist (#534): only the files the maintenance pass just reindexed. Same scope + ordering
+/// discipline as the whole-checkout variant. Paths are queried in bounded chunks (one `IN` list
+/// per chunk), so an accumulated backlog larger than SQLite's bound-variable limit can't fail
+/// the prepare and wedge the backlog forever.
+pub(crate) fn edge_join_candidates_for_paths(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+    paths: &[String],
+) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    const PATH_CHUNK: usize = 500;
+    let mut out = Vec::new();
+    for chunk in paths.chunks(PATH_CHUNK) {
+        out.extend(edge_join_candidates_in_paths(conn, commit_sha, worktree_id, chunk)?);
+    }
+    // Chunks concatenate in worklist order; the per-chunk ORDER BY keeps candidates grouped by
+    // path, which is all the live pass's per-file grouping requires.
+    Ok(out)
+}
+
+fn edge_join_candidates_in_paths(
+    conn: &Connection,
+    commit_sha: &str,
+    worktree_id: &str,
+    paths: &[String],
+) -> anyhow::Result<Vec<EdgeJoinCandidate>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Numbered params, NOT anonymous `?`: the scope predicate binds ?1/?2 (and an anonymous
+    // parameter would take slot 1, colliding with them), so the path list numbers from ?3.
+    let marks = (3..3 + paths.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "
+        SELECT edges.id,
+               files.path,
+               files.sha256,
+               edges.source_start_byte,
+               edges.source_end_byte,
+               edges.callee_start_byte,
+               edges.callee_end_byte,
+               edges.confidence,
+               edges.edge_kind,
+               edges.to_symbol_id
+        FROM edges
+        JOIN files ON files.id = edges.source_file_id
+        WHERE edges.callee_start_byte IS NOT NULL
+          AND edges.callee_end_byte IS NOT NULL
+          AND files.path IN ({marks})
+          AND {scope}
+        ORDER BY files.path, edges.callee_start_byte
+        ",
+        scope = active_checkout_file_predicate("?1", "?2"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // ?1/?2 are the checkout scope; the path list binds from ?3.
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&commit_sha, &worktree_id];
+    for path in paths {
+        params.push(path);
+    }
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(EdgeJoinCandidate {
+            edge_id: row.get(0)?,
+            source_path: row.get(1)?,
+            file_sha: row.get(2)?,
+            source_start_byte: row.get(3)?,
+            source_end_byte: row.get(4)?,
+            callee_start_byte: row.get(5)?,
+            callee_end_byte: row.get(6)?,
+            confidence: row.get(7)?,
+            edge_kind: row.get(8)?,
+            to_symbol_id: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The batch tool's persisted moniker for the logical symbol `symbol_id` belongs to — the string
+/// the LIVE writer copies verbatim into its `edge_oracle.scip_symbol` (#534). Interchangeability
+/// is literal string equality: the batch moniker is byte-identical to what the batch pass's own
+/// verdicts carry (for rust-analyzer `stabilize_moniker_version` is the identity), so
+/// clone-collapse + moniker-anchored memory relocation treat live and batch rows as one evidence
+/// set, and `current_callee_monikers`' cross-tool conflict-drop never fires on a co-covered
+/// span. `None` when the batch pass has no moniker for the symbol (never run, or the def maps
+/// outside its definitions) — the caller then falls back to a SCIP-local sentinel. Live only
+/// READS this table; only the batch pass writes it.
+pub(crate) fn batch_moniker_for_symbol(
+    conn: &Connection,
+    symbol_id: i64,
+    batch_tool: OracleTool,
+) -> anyhow::Result<Option<String>> {
+    use rusqlite::OptionalExtension as _;
+    // The qualifier is the `m` alias this query uses, so the repo clause names the alias, not the
+    // table.
+    let repo_clause = oracle_repo_scope_clause(conn, "m")?;
+    conn.query_row(
+        &format!(
+            "
+            SELECT m.moniker
+            FROM logical_symbol_monikers m
+            JOIN logical_symbol_members mem
+              ON mem.logical_symbol_id = m.logical_symbol_id
+            WHERE mem.symbol_id = ?1 AND m.tool = ?2{repo_clause}
+            LIMIT 1
+            "
+        ),
+        params![symbol_id, batch_tool.as_db_str()],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// The persisted `(file_sha, scip_symbol)` of the `edge_oracle` row at `row`'s content key for
+/// `(tool, tool_version)`, if any. The live writer reads this before its upsert (#534): an
+/// existing row whose `scip_symbol` CHANGES while its `file_sha` stays constant means the
+/// oracle evidence a scip-mode clone refinement consulted moved under an unchanged refinement
+/// key, so the refine cache must be invalidated (mirroring the batch run's hook). A same-value
+/// upsert (or a `file_sha` change, which already re-keys everything downstream) skips it.
+pub(crate) fn existing_verdict_scip_symbol(
+    conn: &Connection,
+    tool: OracleTool,
+    tool_version: &str,
+    row: &EdgeOracleRow<'_>,
+) -> anyhow::Result<Option<(String, String)>> {
+    use rusqlite::OptionalExtension as _;
+    let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
+    conn.query_row(
+        &format!(
+            "
+            SELECT file_sha, scip_symbol
+            FROM edge_oracle
+            WHERE tool = ?1 AND tool_version = ?2
+              AND source_path = ?3
+              AND source_start_byte = ?4 AND source_end_byte = ?5
+              AND callee_start_byte = ?6 AND callee_end_byte = ?7
+              AND edge_kind = ?8{repo_clause}
+            "
+        ),
+        params![
+            tool.as_db_str(),
+            tool_version,
+            row.source_path,
+            row.source_start_byte,
+            row.source_end_byte,
+            row.callee_start_byte,
+            row.callee_end_byte,
+            row.edge_kind,
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Whether `row`'s content key is still a live edge for `file_sha` in ANY checkout of the active
+/// repo. Live rows are content-keyed without `file_sha` in the PK, so an ordinary same-version
+/// upsert must not replace a different-SHA row while a sibling checkout still joins to it.
+pub(crate) fn verdict_content_is_current_anywhere(
+    conn: &Connection,
+    row: &EdgeOracleRow<'_>,
+    file_sha: &str,
+) -> anyhow::Result<bool> {
+    let repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let generation = rag_rat_db::schema::active_generation(conn)?;
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM main.edges_data all_edges
+             JOIN main.files all_files ON all_files.id = all_edges.source_file_id
+             JOIN main.name_strings ek ON ek.id = all_edges.edge_kind_id
+             WHERE all_files.repo_id = ?8 AND all_files.generation = ?9
+               AND all_files.path = ?1 AND all_files.sha256 = ?2
+               AND all_edges.source_start_byte = ?3
+               AND all_edges.source_end_byte = ?4
+               AND all_edges.callee_start_byte = ?5
+               AND all_edges.callee_end_byte = ?6
+               AND ek.value = ?7
+               AND all_edges.hidden = 0)",
+        params![
+            row.source_path,
+            file_sha,
+            row.source_start_byte,
+            row.source_end_byte,
+            row.callee_start_byte,
+            row.callee_end_byte,
+            row.edge_kind,
+            repo_id,
+            generation,
+        ],
+        |db_row| db_row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// All symbols defined in a file (by path, scoped to commit/worktree), with their byte spans, so a
 /// SCIP definition range can be mapped to the enclosing symbol by overlap.
 pub(crate) fn symbol_spans_for_path(

@@ -174,6 +174,11 @@ pub enum ConfigError {
          sync"
     )]
     PapertrailIntervalZero(&'static str),
+    #[error(
+        "[oracle.live] `max_requests_per_pass` must be positive — zero leaves every live path \
+         permanently backlogged"
+    )]
+    OracleLiveRequestBudgetZero,
 }
 
 pub use discovery::{
@@ -191,9 +196,9 @@ pub use types::{
     Config, DEFAULT_QUERY_ENDPOINT, DEFAULT_SYNC_RELAY, DistillLlmConfig, DreamLlmConfig,
     EmbeddingBackend, EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat,
     LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig,
-    PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget,
-    SearchConfig, SyncConfig, TargetKind, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig,
-    WatchConfig,
+    OracleLiveConfig, PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig,
+    ResolvedTarget, SearchConfig, SyncConfig, TargetKind, Tracker, TrackerAuth, TrackerConfig,
+    VersionCheckConfig, WatchConfig,
 };
 
 #[cfg(test)]

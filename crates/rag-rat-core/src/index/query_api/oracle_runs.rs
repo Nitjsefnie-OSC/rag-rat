@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rag_rat_base::time::now_ms;
 use rag_rat_oracle::{
-    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls,
+    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls, ToolManifest,
 };
 
 use super::*;
@@ -86,6 +86,40 @@ impl IndexDatabase {
             self.storage.connection(),
             &self.active_commit_sha,
             &self.active_worktree_id,
+        )
+    }
+
+    /// Run the live oracle's per-pass resolution (#534) over `worklist` (repo-relative Rust
+    /// paths the maintenance pass just reindexed, plus any backlog): resolve their callees
+    /// through the resident LSP `session` and write `ra-lsp` verdicts + a backing run row in one
+    /// transaction. The batch pass stays the canonical writer — live rows are a per-pass
+    /// freshness patch, and there is NO authoritative clear. Best-effort for LSP-side failures
+    /// (a dead server aborts the remaining worklist into `unfinished_paths`, never fails);
+    /// `Err` is DB-only.
+    pub fn run_live_oracle_pass(
+        &self,
+        session: &mut rag_rat_oracle::LiveOracleSession,
+        worklist: &[String],
+        max_requests: u64,
+        started_at_ms: i64,
+    ) -> anyhow::Result<rag_rat_oracle::LivePassReport> {
+        let Some(root) = self.storage.source_root() else {
+            anyhow::bail!(
+                "index has no source_root metadata; rebuild required for the live oracle pass"
+            );
+        };
+        let root = root.to_path_buf();
+        rag_rat_oracle::live_oracle_pass(
+            self.storage.connection(),
+            session,
+            &rag_rat_oracle::LivePassInput {
+                commit_sha: &self.active_commit_sha,
+                worktree_id: &self.active_worktree_id,
+                checkout_root: &root,
+                worklist,
+                max_requests,
+                started_at_ms,
+            },
         )
     }
 
@@ -228,10 +262,15 @@ impl IndexDatabase {
         self.run_oracle(tool, tool_version, scip_bytes, OracleShaSnapshots::default())
     }
 
-    /// Probe whether an oracle tool is installed, for `oracle status`. A `Blocked` probe is
-    /// informational (the tool isn't installed), never an error.
+    /// Probe whether an oracle tool is installed, for `oracle status`. Config-backed opens probe
+    /// from the checkout root so rustup directory overrides select the same rust-analyzer as the
+    /// watcher. A `Blocked` probe is informational (the tool isn't installed), never an error.
     pub fn probe_oracle_tool(&self, tool: OracleTool) -> rag_rat_oracle::ToolAvailability {
-        rag_rat_oracle::probe_oracle_tool(tool)
+        let manifest = ToolManifest::for_tool(tool);
+        match &self.config {
+            Some(config) => manifest.probe_in(&config.root),
+            None => manifest.probe(),
+        }
     }
 
     /// The `tool_version` of the most recent oracle run for `tool` in this checkout, or `None` when
