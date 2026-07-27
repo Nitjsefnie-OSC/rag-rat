@@ -1251,13 +1251,41 @@ fn integration_combines_version_check_and_hooks() {
 
 #[test]
 fn integration_blocks_unresolved_foreign_hook_conflicts() {
+    // `validate_hooks` resolves the repo through the env-aware `git_paths` (#213), so an ambient
+    // `GIT_DIR`/`GIT_WORK_TREE` (or a global `core.hooksPath`) would make this test
+    // machine-dependent (#970) — and seeding through the same env-aware path would write the
+    // fixture hook into an UNRELATED repo. Re-exec this test with a scrubbed environment instead
+    // of mutating the process-wide one.
+    if std::env::var_os("RAG_RAT_TEST_GIT_ENV_SCRUBBED").is_none() {
+        let home = rag_rat_base::test_scratch::ScratchDir::new("wizard-hooks-home");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "init::wizard::steps::tests::integration_blocks_unresolved_foreign_hook_conflicts",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RAG_RAT_TEST_GIT_ENV_SCRUBBED", "1")
+            .env("HOME", home.path())
+            // `/dev/null` config files (not merely removing the overrides, which would restore
+            // the machine's real system/global config), and no inline-config vectors: any of
+            // `GIT_CONFIG`/`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` could still smuggle a
+            // `core.hooksPath` into the child's `git_paths` resolution.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .status()
+            .unwrap();
+        assert!(status.success(), "scrubbed re-exec failed");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
-    let status = std::process::Command::new("git")
-        .arg("init")
-        .arg(dir.path())
-        .status()
-        .expect("git init should run");
-    assert!(status.success());
+    rag_rat_base::test_git::run(dir.path(), &["init", "-q"]);
     let gp = git_paths(dir.path()).unwrap();
     std::fs::create_dir_all(&gp.hooks_dir).unwrap();
     let hook = MANAGED_HOOKS[0];
