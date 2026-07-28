@@ -6,7 +6,9 @@
 //! receiver re-verifies via `account_ingest`.
 
 use rag_rat_oplog::{AccountId, account_entries_for_sync, local_account};
-use rag_rat_sync::{AuthRole, OplogSyncStore, run_session};
+use rag_rat_sync::{
+    AuthRole, OplogSyncStore, PeerAuthorization, PeerCapability, SessionCapabilities, run_session,
+};
 use rusqlite::Connection;
 
 const NOW: i64 = 1_700_000_000_000;
@@ -15,6 +17,48 @@ fn fresh_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
     conn
+}
+
+async fn enroll_member_over_endpoint(
+    owner_endpoint: &iroh::Endpoint,
+    joiner_endpoint: &iroh::Endpoint,
+    owner: &Connection,
+    joiner: &Connection,
+    account: AccountId,
+    relay: &str,
+) {
+    let local = rag_rat_oplog::local_device(joiner, NOW).unwrap();
+    let ticket = rag_rat_sync::mint_invite(owner, rag_rat_sync::InviteSpec {
+        account_id: account,
+        inviter_node_id: *owner_endpoint.id().as_bytes(),
+        relay_url: relay.into(),
+        role: rag_rat_oplog::DeviceRole::Member,
+        label: None,
+        now_ms: &|| NOW,
+        ttl: std::time::Duration::from_secs(60),
+    })
+    .unwrap();
+    let request = rag_rat_sync::EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey: local.ed25519_public_key(),
+        x25519_pubkey: local.x25519_public_key(),
+        transport_node_id: *joiner_endpoint.id().as_bytes(),
+        budget: rag_rat_oplog::enrollment_budget(joiner, account, NOW).unwrap(),
+        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(joiner, account).unwrap(),
+    };
+    let server = rag_rat_sync::accept_enrollment(owner_endpoint, owner, || NOW);
+    let client = rag_rat_sync::connect_and_enroll(
+        joiner_endpoint,
+        rag_rat_sync::endpoint_addr(owner_endpoint),
+        joiner,
+        account,
+        &request,
+        NOW,
+    );
+    let (server_result, client_result) = tokio::join!(server, client);
+    server_result.unwrap();
+    client_result.unwrap();
 }
 
 /// A device with an account restores it onto a fresh, empty peer over one session.
@@ -39,8 +83,20 @@ async fn a_fresh_peer_restores_an_account_over_the_session() {
     let (a_send, b_recv) = tokio::io::duplex(1 << 20);
     let (b_send, a_recv) = tokio::io::duplex(1 << 20);
     let (source_report, dest_report) = tokio::join!(
-        run_session(&mut source_store, a_send, a_recv, AuthRole::Acceptor),
-        run_session(&mut dest_store, b_send, b_recv, AuthRole::Dialer),
+        run_session(
+            &mut source_store,
+            a_send,
+            a_recv,
+            AuthRole::Acceptor,
+            SessionCapabilities::bidirectional(),
+        ),
+        run_session(
+            &mut dest_store,
+            b_send,
+            b_recv,
+            AuthRole::Dialer,
+            SessionCapabilities::bidirectional(),
+        ),
     );
     let source_report = source_report.unwrap();
     let dest_report = dest_report.unwrap();
@@ -83,8 +139,20 @@ async fn two_peers_in_sync_transfer_nothing() {
     let (a_send, b_recv) = tokio::io::duplex(1 << 16);
     let (b_send, a_recv) = tokio::io::duplex(1 << 16);
     let (ra, rb) = tokio::join!(
-        run_session(&mut a_store, a_send, a_recv, AuthRole::Acceptor),
-        run_session(&mut b_store, b_send, b_recv, AuthRole::Dialer),
+        run_session(
+            &mut a_store,
+            a_send,
+            a_recv,
+            AuthRole::Acceptor,
+            SessionCapabilities::bidirectional(),
+        ),
+        run_session(
+            &mut b_store,
+            b_send,
+            b_recv,
+            AuthRole::Dialer,
+            SessionCapabilities::bidirectional(),
+        ),
     );
     let (ra, rb) = (ra.unwrap(), rb.unwrap());
     assert_eq!(ra.entries_newly_stored, 0);
@@ -150,8 +218,20 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
-            run_session(&mut src, a_send, a_recv, AuthRole::Acceptor),
-            run_session(&mut dst, b_send, b_recv, AuthRole::Dialer),
+            run_session(
+                &mut src,
+                a_send,
+                a_recv,
+                AuthRole::Acceptor,
+                SessionCapabilities::bidirectional(),
+            ),
+            run_session(
+                &mut dst,
+                b_send,
+                b_recv,
+                AuthRole::Dialer,
+                SessionCapabilities::bidirectional(),
+            ),
         );
         ra.unwrap();
         rb.unwrap();
@@ -164,8 +244,20 @@ async fn a_fresh_peer_restores_the_accounts_content_after_the_account_log() {
         let (a_send, b_recv) = tokio::io::duplex(1 << 20);
         let (b_send, a_recv) = tokio::io::duplex(1 << 20);
         let (ra, rb) = tokio::join!(
-            run_session(&mut src, a_send, a_recv, AuthRole::Acceptor),
-            run_session(&mut dst, b_send, b_recv, AuthRole::Dialer),
+            run_session(
+                &mut src,
+                a_send,
+                a_recv,
+                AuthRole::Acceptor,
+                SessionCapabilities::bidirectional(),
+            ),
+            run_session(
+                &mut dst,
+                b_send,
+                b_recv,
+                AuthRole::Dialer,
+                SessionCapabilities::bidirectional(),
+            ),
         );
         ra.unwrap();
         rb.unwrap()
@@ -273,11 +365,17 @@ fn a_store_authorizes_its_own_binding_but_not_from_another_node() {
     let store = OplogSyncStore::new(&db, account, || NOW);
 
     let node = [4u8; 32];
-    let binding = store.local_binding(&node, NOW).unwrap();
-    assert!(!binding.is_empty(), "a store with a local device mints a real binding");
-    assert!(store.authorize(&binding, &node, NOW).unwrap(), "its own node id is authorized");
-    assert!(
-        !store.authorize(&binding, &[5u8; 32], NOW).unwrap(),
+    let local = store.local_auth(&node, NOW).unwrap();
+    assert!(!local.binding.is_empty(), "a store with a local device mints a real binding");
+    assert_eq!(local.capability, PeerCapability::ReadWrite);
+    assert_eq!(
+        store.authorize(&local.binding, &node, NOW).unwrap(),
+        PeerAuthorization::Granted(PeerCapability::ReadWrite),
+        "its owner role grants read-write access",
+    );
+    assert_eq!(
+        store.authorize(&local.binding, &[5u8; 32], NOW).unwrap(),
+        PeerAuthorization::Rejected,
         "the same binding from a different node id is refused",
     );
 }
@@ -296,9 +394,10 @@ fn a_store_authorizes_against_the_handshake_clock_not_its_construction_time() {
     let node = [4u8; 32];
 
     let much_later = NOW + 10 * 24 * 60 * 60 * 1000; // ten days after construction
-    let binding = stale.local_binding(&node, much_later).unwrap();
-    assert!(
-        stale.authorize(&binding, &node, much_later).unwrap(),
+    let local = stale.local_auth(&node, much_later).unwrap();
+    assert_eq!(
+        stale.authorize(&local.binding, &node, much_later).unwrap(),
+        PeerAuthorization::Granted(PeerCapability::ReadWrite),
         "a long-lived store still authorizes using the current handshake time",
     );
 }
@@ -309,16 +408,43 @@ fn a_store_authorizes_against_the_handshake_clock_not_its_construction_time() {
 fn a_store_without_an_account_presents_an_empty_binding_and_authorizes_nothing() {
     use rag_rat_sync::NodeAuth;
 
-    let db = fresh_db(); // schema only, no account
-    let account = AccountId::from_bytes([7u8; 32]);
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let node = [1u8; 32];
+    let owner_binding =
+        OplogSyncStore::new(&owner, account, || NOW).local_auth(&node, NOW).unwrap().binding;
+    let stale_binding = OplogSyncStore::new(&owner, account, || NOW)
+        .local_auth(&node, NOW - 24 * 60 * 60 * 1000 - 1)
+        .unwrap()
+        .binding;
+    let future_binding = OplogSyncStore::new(&owner, account, || NOW)
+        .local_auth(&node, NOW + 60 * 60 * 1000 + 1)
+        .unwrap()
+        .binding;
+    let db = fresh_db(); // schema only, no account authority
     let store = OplogSyncStore::new(&db, account, || NOW);
-    assert!(
-        store.local_binding(&[1u8; 32], NOW).unwrap().is_empty(),
-        "no local device => an anonymous (empty) binding",
+    let local = store.local_auth(&node, NOW).unwrap();
+    assert!(local.binding.is_empty(), "no local device => an anonymous (empty) binding");
+    assert_eq!(local.capability, PeerCapability::ReadOnly);
+    assert_eq!(
+        store.authorize(&owner_binding, &node, NOW).unwrap(),
+        PeerAuthorization::Unavailable,
+        "a valid binding cannot be decided until account authority is restored",
     );
-    assert!(
-        !store.authorize(&[0u8; 10], &[1u8; 32], NOW).unwrap(),
-        "an accountless store authorizes no peer",
+    assert_eq!(
+        store.authorize(&stale_binding, &node, NOW).unwrap(),
+        PeerAuthorization::Rejected,
+        "an expired binding is rejected before the unavailable-roster classification",
+    );
+    assert_eq!(
+        store.authorize(&future_binding, &node, NOW).unwrap(),
+        PeerAuthorization::Rejected,
+        "a future-dated binding is rejected before the unavailable-roster classification",
+    );
+    assert_eq!(
+        store.authorize(&[0u8; 10], &node, NOW).unwrap(),
+        PeerAuthorization::Rejected,
+        "a malformed binding is rejected rather than gaining bootstrap capability",
     );
 }
 
@@ -332,9 +458,17 @@ fn the_content_store_carries_the_same_node_auth() {
     let account = local_account(&db, NOW).unwrap();
     let store = OplogContentSyncStore::new(&db, account, || NOW);
     let node = [4u8; 32];
-    let binding = store.local_binding(&node, NOW).unwrap();
-    assert!(store.authorize(&binding, &node, NOW).unwrap(), "own node authorized");
-    assert!(!store.authorize(&binding, &[5u8; 32], NOW).unwrap(), "other node refused");
+    let local = store.local_auth(&node, NOW).unwrap();
+    assert_eq!(
+        store.authorize(&local.binding, &node, NOW).unwrap(),
+        PeerAuthorization::Granted(PeerCapability::ReadWrite),
+        "own node authorized",
+    );
+    assert_eq!(
+        store.authorize(&local.binding, &[5u8; 32], NOW).unwrap(),
+        PeerAuthorization::Rejected,
+        "other node refused",
+    );
 }
 
 /// LIVE: the real iroh endpoint, dialed peer-to-peer over the configured relay. Ignored by default
@@ -343,23 +477,29 @@ fn the_content_store_carries_the_same_node_auth() {
 #[tokio::test]
 #[ignore = "live: binds iroh endpoints and dials over the relay"]
 async fn a_real_iroh_round_trip_restores_an_account() {
+    use rag_rat_oplog::ensure_owned_stream_v2_in_tx;
+    use rusqlite::{Transaction, TransactionBehavior};
+
     let relay = std::env::var("RAG_RAT_SYNC_RELAY").expect("set RAG_RAT_SYNC_RELAY to run this");
 
     let source = fresh_db();
     let account_id = local_account(&source, NOW).unwrap();
-    let want = account_entries_for_sync(&source, account_id).unwrap();
     let dest = fresh_db();
 
     let listener = rag_rat_sync::build_endpoint([1u8; 32], &relay).await.unwrap();
     let dialer = rag_rat_sync::build_endpoint([2u8; 32], &relay).await.unwrap();
     let listener_addr = rag_rat_sync::endpoint_addr(&listener);
+    enroll_member_over_endpoint(&listener, &dialer, &source, &dest, account_id, &relay).await;
+
+    // Author one account-log entry after enrollment so the enrolled peer has something to pull.
+    let tx = Transaction::new_unchecked(&source, TransactionBehavior::Immediate).unwrap();
+    ensure_owned_stream_v2_in_tx(&tx, "live-restore", NOW).unwrap();
+    tx.commit().unwrap();
+    let want = account_entries_for_sync(&source, account_id).unwrap();
 
     let mut source_store = OplogSyncStore::new(&source, account_id, || NOW);
     let mut dest_store = OplogSyncStore::new(&dest, account_id, || NOW);
-    // The dest is a fresh peer with no local device (onboarding), so this round-trip uses `Open`;
-    // the node-authorization path is covered directly by the auth-phase tests below and the oplog
-    // node_binding unit tests.
-    let policy = rag_rat_sync::AuthPolicy::Open;
+    let policy = rag_rat_sync::AuthPolicy::Closed;
     let server =
         async { rag_rat_sync::accept_and_sync(&listener, &mut source_store, policy, || NOW).await };
     let client = async {
@@ -432,7 +572,8 @@ async fn a_real_iroh_round_trip_restores_content_via_alpn_dispatch() {
     let listener = rag_rat_sync::build_endpoint([3u8; 32], &relay).await.unwrap();
     let dialer = rag_rat_sync::build_endpoint([4u8; 32], &relay).await.unwrap();
     let listener_addr = rag_rat_sync::endpoint_addr(&listener);
-    let policy = rag_rat_sync::AuthPolicy::Open;
+    enroll_member_over_endpoint(&listener, &dialer, &source, &dest, account_id, &relay).await;
+    let policy = rag_rat_sync::AuthPolicy::Closed;
 
     // Account log FIRST — carries the roster + stream ownership that authorize content acceptance.
     {

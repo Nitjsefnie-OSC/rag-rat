@@ -15,7 +15,9 @@
 //! [`accept_and_sync`] run the mutual node-authorization handshake ([`run_auth_phase`]) BEFORE any
 //! inventory is exchanged. Under [`AuthPolicy::Closed`] a peer is admitted only if it presents a
 //! signed binding proving its authenticated node id belongs to a roster device of the account;
-//! under [`AuthPolicy::Open`] any peer is admitted (for a future public read-only knowledge base).
+//! under [`AuthPolicy::Open`] an acceptor admits any dialer to read but rejects its entry frames
+//! without a write-capable roster role. A fresh dialer may accept entries from the transport-pinned
+//! server it explicitly selected so it can restore the roster; storage still verifies every entry.
 //! The ONBOARDING case uses the separate [`ENROLL_ALPN`] exchange: an owner atomically redeems a
 //! one-time invite into a roster `DeviceAdd` before normal sync authentication can admit the new
 //! device.
@@ -301,7 +303,7 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
             SyncFailure::Endpoint(EndpointError::Connect("opening a stream timed out".into()))
         })?
         .map_err(|e| SyncFailure::Endpoint(EndpointError::Connect(e.to_string())))?;
-    run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+    let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
         role: AuthRole::Dialer,
         account_id: store.account_id(),
         local_node,
@@ -312,8 +314,9 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     })
     .await
     .map_err(SyncFailure::Auth)?;
-    let report =
-        run_session(store, send, recv, AuthRole::Dialer).await.map_err(SyncFailure::Session)?;
+    let report = run_session(store, send, recv, AuthRole::Dialer, capabilities)
+        .await
+        .map_err(SyncFailure::Session)?;
     // The role-ordered completion acknowledgement proves the acceptor consumed everything we
     // pushed before replying, and we consumed its whole stream before sending our acknowledgement.
     // The dialer therefore closes only after both directions are delivered.
@@ -368,7 +371,7 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     let now_ms = now_ms();
     // Authorize the dialer BEFORE run_session so no inventory (not even account confirmation)
     // leaves this peer until the remote passes our policy (#881).
-    run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
+    let capabilities = run_auth_phase(&mut send, &mut recv, &*store, AuthConfig {
         role: AuthRole::Acceptor,
         account_id: store.account_id(),
         local_node,
@@ -379,8 +382,9 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
     })
     .await
     .map_err(SyncFailure::Auth)?;
-    let report =
-        run_session(store, send, recv, AuthRole::Acceptor).await.map_err(SyncFailure::Session)?;
+    let report = run_session(store, send, recv, AuthRole::Acceptor, capabilities)
+        .await
+        .map_err(SyncFailure::Session)?;
     // The acceptor sends the final completion acknowledgement. Keep the connection alive until the
     // dialer reads it and closes, bounded so a vanished dialer cannot wedge the server.
     let _ = timeout(GRACEFUL_CLOSE_TIMEOUT, conn.closed()).await;
@@ -472,7 +476,7 @@ where
     let now_ms = now_ms();
     // The auth phase is store-agnostic (the binding is account-level), so authorize with the
     // account store BEFORE any inventory — no stream leaves this peer until it passes the policy.
-    run_auth_phase(&mut send, &mut recv, &*account_store, AuthConfig {
+    let capabilities = run_auth_phase(&mut send, &mut recv, &*account_store, AuthConfig {
         role: AuthRole::Acceptor,
         account_id: account_store.account_id(),
         local_node,
@@ -486,9 +490,9 @@ where
     // Route the session to the store the negotiated ALPN names (validated to be one of the two
     // routed ALPNs above, so the `else` is the content stream, not an unknown-ALPN fallthrough).
     let report = if alpn.as_slice() == SYNC_ALPN {
-        run_session(account_store, send, recv, AuthRole::Acceptor).await
+        run_session(account_store, send, recv, AuthRole::Acceptor, capabilities).await
     } else {
-        run_session(content_store, send, recv, AuthRole::Acceptor).await
+        run_session(content_store, send, recv, AuthRole::Acceptor, capabilities).await
     }
     .map_err(SyncFailure::Session)?;
     // Keep the acceptor alive until the dialer reads its final acknowledgement and closes.
@@ -535,7 +539,10 @@ impl std::error::Error for SyncFailure {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::auth::{LocalAuth, PeerAuthorization, PeerCapability};
 
     const NOW: i64 = 1_700_000_000_000;
 
@@ -543,6 +550,70 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
         conn
+    }
+
+    struct TestStore {
+        account: [u8; 32],
+        entries: HashMap<[u8; 32], Vec<u8>>,
+        local_capability: PeerCapability,
+        peer_authorization: PeerAuthorization,
+    }
+
+    impl TestStore {
+        fn new(
+            account: [u8; 32],
+            entries: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>,
+            local_capability: PeerCapability,
+            peer_capability: PeerCapability,
+        ) -> Self {
+            Self {
+                account,
+                entries: entries.into_iter().collect(),
+                local_capability,
+                peer_authorization: PeerAuthorization::Granted(peer_capability),
+            }
+        }
+    }
+
+    impl SyncStore for TestStore {
+        fn account_id(&self) -> [u8; 32] {
+            self.account
+        }
+
+        fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+            Ok(self.entries.iter().map(|(hash, bytes)| (*hash, bytes.clone())).collect())
+        }
+
+        fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<crate::session::Ingested> {
+            let hash: [u8; 32] = signed_bytes[..32].try_into()?;
+            match self.entries.entry(hash) {
+                std::collections::hash_map::Entry::Occupied(_) =>
+                    Ok(crate::session::Ingested::NoChange),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(signed_bytes.to_vec());
+                    Ok(crate::session::Ingested::Stored)
+                },
+            }
+        }
+    }
+
+    impl NodeAuth for TestStore {
+        fn local_auth(&self, _local_node: &[u8; 32], _now_ms: i64) -> anyhow::Result<LocalAuth> {
+            Ok(LocalAuth { binding: vec![1], capability: self.local_capability })
+        }
+
+        fn authorize(
+            &self,
+            _binding: &[u8],
+            _remote_node: &[u8; 32],
+            _now_ms: i64,
+        ) -> anyhow::Result<PeerAuthorization> {
+            Ok(self.peer_authorization)
+        }
+    }
+
+    fn test_entry(seed: u8) -> ([u8; 32], Vec<u8>) {
+        ([seed; 32], vec![seed; 40])
     }
 
     fn local_request(database: &Connection) -> EnrollmentRequest {
@@ -644,15 +715,18 @@ mod tests {
 
     #[tokio::test]
     async fn dialer_push_is_acknowledged_before_the_connection_closes() {
-        let source = database();
-        let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
-        let expected = rag_rat_oplog::account_entries_for_sync(&source, account).unwrap();
-        let destination = database();
-        let (listener, dialer) = loopback_endpoints().await;
-        let mut source_store = crate::store::OplogSyncStore::new(&source, account, || NOW);
+        let account = [0xa1; 32];
+        let expected: Vec<_> = (1..=3).map(test_entry).collect();
+        let mut source_store = TestStore::new(
+            account,
+            expected.clone(),
+            PeerCapability::ReadWrite,
+            PeerCapability::ReadWrite,
+        );
         let mut destination_store =
-            crate::store::OplogSyncStore::new(&destination, account, || NOW);
-        let policy = AuthPolicy::Open;
+            TestStore::new(account, [], PeerCapability::ReadWrite, PeerCapability::ReadWrite);
+        let (listener, dialer) = loopback_endpoints().await;
+        let policy = AuthPolicy::Closed;
 
         // This is the direction #926 exposed: the dialer has the data and may close as soon as its
         // own session returns, while the acceptor is still ingesting the pushed stream.
@@ -671,8 +745,170 @@ mod tests {
 
         assert_eq!(client_report.entries_sent, expected.len());
         assert_eq!(server_report.entries_newly_stored, expected.len());
-        let received = rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap();
-        assert_eq!(received.len(), expected.len(), "the acceptor ingested the full dialer push");
+        assert_eq!(
+            destination_store.entries.len(),
+            expected.len(),
+            "the acceptor ingested the full authorized dialer push",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_dialer_can_pull_over_a_real_connection() {
+        let account = [0xa2; 32];
+        let expected: Vec<_> = (1..=3).map(test_entry).collect();
+        let reader_only = test_entry(9);
+        let mut server_store = TestStore::new(
+            account,
+            expected.clone(),
+            PeerCapability::ReadWrite,
+            PeerCapability::ReadOnly,
+        );
+        let mut reader_store = TestStore::new(
+            account,
+            [reader_only.clone()],
+            PeerCapability::ReadOnly,
+            PeerCapability::ReadWrite,
+        );
+        let (listener, dialer) = loopback_endpoints().await;
+
+        let server = accept_and_sync(&listener, &mut server_store, AuthPolicy::Closed, || NOW);
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut reader_store,
+            AuthPolicy::Closed,
+            NOW,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        let server_report = server_result.unwrap();
+        let client_report = client_result.unwrap();
+        assert_eq!(server_report.entries_sent, expected.len());
+        assert_eq!(server_report.entries_received, 0);
+        assert_eq!(client_report.entries_sent, 0);
+        assert_eq!(client_report.entries_newly_stored, expected.len());
+        assert_eq!(server_store.entries.len(), expected.len());
+        assert_eq!(reader_store.entries.len(), expected.len() + 1);
+        assert!(reader_store.entries.contains_key(&reader_only.0));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_honors_remote_read_only_grants_for_both_streams() {
+        for alpn in [SYNC_ALPN, CONTENT_SYNC_ALPN] {
+            let database = database();
+            let account_id = rag_rat_oplog::local_account(&database, NOW).unwrap();
+            let account = account_id.to_bytes();
+            let account_entries =
+                rag_rat_oplog::account_entries_for_sync(&database, account_id).unwrap().len();
+            let server_entry = test_entry(1);
+            let stale_local_entry = test_entry(9);
+            let mut account_store =
+                crate::store::OplogSyncStore::new(&database, account_id, || NOW);
+            let mut content_store = TestStore::new(
+                account,
+                [server_entry.clone()],
+                PeerCapability::ReadWrite,
+                PeerCapability::ReadWrite,
+            );
+            // The production account authorizer rejects this fake binding under Open and grants the
+            // dialer read-only access even though the dialer still considers itself write-capable.
+            let mut stale_writer_store = TestStore::new(
+                account,
+                [stale_local_entry.clone()],
+                PeerCapability::ReadWrite,
+                PeerCapability::ReadWrite,
+            );
+            let (listener, dialer) = loopback_endpoints().await;
+
+            let server = accept_and_dispatch(
+                &listener,
+                &mut account_store,
+                &mut content_store,
+                AuthPolicy::Open,
+                || NOW,
+            );
+            let client = connect_and_sync(
+                &dialer,
+                direct_addr(&listener),
+                alpn,
+                &mut stale_writer_store,
+                AuthPolicy::Open,
+                NOW,
+            );
+            let (server_result, client_result) = tokio::join!(server, client);
+
+            let (negotiated, server_report) = server_result.unwrap();
+            let client_report = client_result.unwrap();
+            assert_eq!(negotiated, alpn);
+            assert_eq!(client_report.entries_sent, 0);
+            assert_eq!(server_report.entries_received, 0);
+            assert_eq!(
+                client_report.entries_newly_stored,
+                if alpn == SYNC_ALPN { account_entries } else { 1 },
+            );
+            assert!(!content_store.entries.contains_key(&stale_local_entry.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_open_dialer_can_pull_from_the_selected_server() {
+        let source = database();
+        let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
+        let expected = rag_rat_oplog::account_entries_for_sync(&source, account).unwrap();
+        let destination = database();
+        let (listener, dialer) = loopback_endpoints().await;
+        let mut source_store = crate::store::OplogSyncStore::new(&source, account, || NOW);
+        let mut destination_store =
+            crate::store::OplogSyncStore::new(&destination, account, || NOW);
+
+        let server = accept_and_sync(&listener, &mut source_store, AuthPolicy::Open, || NOW);
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut destination_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert_eq!(server_result.unwrap().entries_sent, expected.len());
+        assert_eq!(client_result.unwrap().entries_newly_stored, expected.len());
+        assert_eq!(
+            rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap().len(),
+            expected.len(),
+            "the anonymous dialer restored the selected server's account snapshot",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_open_dialer_suppresses_its_push() {
+        let source = database();
+        let account = rag_rat_oplog::local_account(&source, NOW).unwrap();
+        let destination = database();
+        let (listener, dialer) = loopback_endpoints().await;
+        let mut source_store = crate::store::OplogSyncStore::new(&source, account, || NOW);
+        let mut destination_store =
+            crate::store::OplogSyncStore::new(&destination, account, || NOW);
+
+        let server = accept_and_sync(&listener, &mut destination_store, AuthPolicy::Open, || NOW);
+        let client = connect_and_sync(
+            &dialer,
+            direct_addr(&listener),
+            SYNC_ALPN,
+            &mut source_store,
+            AuthPolicy::Open,
+            NOW,
+        );
+        let (server_result, client_result) = tokio::join!(server, client);
+
+        assert_eq!(server_result.unwrap().entries_received, 0);
+        assert_eq!(client_result.unwrap().entries_sent, 0);
+        assert!(
+            rag_rat_oplog::account_entries_for_sync(&destination, account).unwrap().is_empty(),
+            "anonymous open admission reaches no account ingest",
+        );
     }
 
     #[tokio::test]
