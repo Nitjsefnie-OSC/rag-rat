@@ -14,13 +14,24 @@ use std::{
 
 mod common;
 
-#[cfg(unix)]
-use common::ScratchRoot;
 use common::unique_dir;
+#[cfg(unix)]
+use common::{ScratchRoot, git, git_commit};
+#[cfg(unix)]
+use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate};
 
 fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::ExitStatus) {
+    run_hook_for(None, stdin_body, cwd)
+}
+
+fn run_hook_for(
+    harness: Option<&str>,
+    stdin_body: &str,
+    cwd: &std::path::Path,
+) -> (String, std::process::ExitStatus) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
         .arg("agent-hook")
+        .args(harness)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -43,6 +54,15 @@ fn run_hook(stdin_body: &str, cwd: &std::path::Path) -> (String, std::process::E
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status)
 }
 
+#[cfg(unix)]
+fn clone_candidate(name: &str) -> String {
+    format!(
+        "pub fn {name}(x: i64, y: i64) -> i64 {{\n    let a = x + y;\n    let b = a * 2;\n    let \
+         c = b - x;\n    let d = c + y;\n    let e = d * 3;\n    let f = e - a;\n    let g = f + \
+         b;\n    let h = g - c;\n    h + d + e + f + g\n}}\n"
+    )
+}
+
 #[test]
 fn no_rag_rat_toml_means_silent_exit_zero() {
     let dir = unique_dir("hook-noindex");
@@ -63,6 +83,29 @@ fn garbage_stdin_means_silent_exit_zero() {
     let (stdout, status) = run_hook("this is not json", &dir);
     assert!(status.success());
     assert!(stdout.is_empty());
+}
+
+#[test]
+fn cursor_and_vscode_missing_state_are_silent() {
+    let dir = unique_dir("hook-adapter-noindex");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cursor = serde_json::json!({
+        "hook_event_name": "sessionStart",
+        "conversation_id": "cursor-session",
+        "workspace_roots": [dir.as_path()],
+    });
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-session",
+        "cwd": dir.as_path(),
+        "tool_name": "run_in_terminal",
+        "tool_input": {"command": "rg anything"},
+    });
+    for (harness, input) in [("cursor", cursor), ("vscode", vscode)] {
+        let (stdout, status) = run_hook_for(Some(harness), &input.to_string(), &dir);
+        assert!(status.success(), "{harness} must fail open");
+        assert!(stdout.is_empty(), "{harness} must be silent without rag-rat state: {stdout}");
+    }
 }
 
 #[test]
@@ -193,6 +236,10 @@ impl TestRepo {
         rag_rat_base::locks::hook_socket_path_for(&self.config)
     }
 
+    fn add_file_memory(&self, marker: &str) {
+        add_file_memory(&self.config, marker);
+    }
+
     /// Spawn `rag-rat mcp` and drive `initialize` so the server is fully up and `run_stdio_unix`
     /// has spawned the hook listener.
     fn spawn_mcp_initialized(&self) -> McpServer {
@@ -236,7 +283,7 @@ impl TestRepo {
     }
 
     /// Run the hook client with a Grep `tool_input` for the indexed symbol under the given session,
-    /// cwd = repo root (so `find_config` walks up to our `rag-rat.toml`).
+    /// cwd = repo root (so governing config discovery reaches our `rag-rat.toml`).
     fn run_hook_session(&self, session_id: &str) -> String {
         let input = serde_json::json!({
             "session_id": session_id, "cwd": self.root.as_path(), "hook_event_name": "PreToolUse",
@@ -246,6 +293,77 @@ impl TestRepo {
         assert!(status.success(), "agent-hook must exit zero on every path");
         stdout
     }
+}
+
+#[cfg(unix)]
+struct LinkedTestRepo {
+    main: ScratchRoot,
+    linked: ScratchRoot,
+    config: rag_rat_base::config::Config,
+}
+
+#[cfg(unix)]
+impl LinkedTestRepo {
+    fn indexed() -> Self {
+        let main = unique_dir("hook-linked-main");
+        fs::create_dir_all(main.join("src")).unwrap();
+        fs::write(main.join("src/lib.rs"), "pub fn main_checkout_xyz() {}\n").unwrap();
+        fs::write(main.join(".gitignore"), ".rag-rat/\nrag-rat.toml\n").unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "user.email", "t@example.com"]);
+        git(&main, &["config", "user.name", "t"]);
+        git(&main, &["add", "-A"]);
+        git_commit(&main, &["-q", "-m", "base"]);
+
+        let config_path = main.join("rag-rat.toml");
+        fs::write(
+            &config_path,
+            "[index]\nroot = \".\"\ndatabase = \
+             \".rag-rat/index.sqlite\"\n\n[target_bindings]\nrust = [\"src\"]\n",
+        )
+        .unwrap();
+        let config = rag_rat_base::config::Config::load(&config_path).unwrap();
+        rag_rat_core::IndexDatabase::rebuild(&config).unwrap();
+
+        let linked = unique_dir("hook-linked-worktree");
+        git(&main, &["worktree", "add", "--detach", "-q", linked.to_str().unwrap()]);
+        assert!(!linked.join("rag-rat.toml").exists());
+        assert!(symbol_indexed_in_checkout(&config, &main, "main_checkout_xyz"));
+        Self { main, linked, config }
+    }
+
+    fn add_clone_candidate(&self) {
+        let path = self.linked.join("src/branch_clone.rs");
+        fs::write(&path, clone_candidate("branch_clone_xyz")).unwrap();
+        rag_rat_core::watch::reindex_paths(&self.config, &[path], |_| {}).unwrap();
+        assert!(symbol_indexed_in_checkout(&self.config, &self.linked, "branch_clone_xyz"));
+        assert!(!symbol_indexed_in_checkout(&self.config, &self.main, "branch_clone_xyz"));
+    }
+
+    fn add_file_memory(&self, marker: &str) {
+        add_file_memory(&self.config, marker);
+    }
+}
+
+#[cfg(unix)]
+fn add_file_memory(config: &rag_rat_base::config::Config, marker: &str) {
+    rag_rat_core::IndexDatabase::open_config(config)
+        .unwrap()
+        .memory_create(RepoMemoryCreate {
+            kind: "Invariant".to_string(),
+            title: marker.to_string(),
+            body: "The read hook must surface this memory title.".to_string(),
+            confidence: "high".to_string(),
+            created_by: Some("agent-hook-e2e".to_string()),
+            source: Some("agent".to_string()),
+            tags: Vec::new(),
+            payload_json: None,
+            bind: RepoMemoryBindTarget {
+                path: Some("src/lib.rs".to_string()),
+                ..Default::default()
+            },
+        })
+        .unwrap();
 }
 
 #[cfg(unix)]
@@ -366,6 +484,328 @@ fn posttooluse_backgrounds_a_scoped_reindex() {
     assert!(stdout.is_empty(), "PostToolUse prints nothing, got: {stdout}");
     // The reindex runs in a detached child; poll until the edit lands.
     wait_for_symbol(&repo.config, "added_via_hook_tuv", Duration::from_secs(30));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_payloads_emit_only_documented_context() {
+    let repo = TestRepo::indexed_with_symbol();
+    let cursor = serde_json::json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "cursor-e2e",
+        "cursor_version": "1.7.2",
+        "workspace_roots": [repo.root.as_path()],
+        "tool_name": "Shell",
+        "tool_input": {"command": "rg frobnicate_xyz", "private": "RAW-PAYLOAD-SENTINEL"},
+        "tool_output": "PRIVATE TOOL OUTPUT",
+    });
+    let (cursor_stdout, cursor_status) =
+        run_hook_for(Some("cursor"), &cursor.to_string(), &repo.root);
+    assert!(cursor_status.success());
+    let cursor_output: serde_json::Value = serde_json::from_str(cursor_stdout.trim()).unwrap();
+    assert!(cursor_output["additional_context"].as_str().unwrap().contains("frobnicate_xyz"));
+    assert!(!cursor_stdout.contains("RAW-PAYLOAD-SENTINEL"));
+    assert!(!cursor_stdout.contains("PRIVATE TOOL OUTPUT"));
+
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-e2e",
+        "cwd": repo.root.as_path(),
+        "tool_name": "run_in_terminal",
+        "tool_input": {"command": "rg frobnicate_xyz", "private": "RAW-PAYLOAD-SENTINEL"},
+        "transcript_path": "/private/transcript.jsonl",
+    });
+    let (vscode_stdout, vscode_status) =
+        run_hook_for(Some("vscode"), &vscode.to_string(), &repo.root);
+    assert!(vscode_status.success());
+    let vscode_output: serde_json::Value = serde_json::from_str(vscode_stdout.trim()).unwrap();
+    assert!(
+        vscode_output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("frobnicate_xyz")
+    );
+    assert!(!vscode_stdout.contains("RAW-PAYLOAD-SENTINEL"));
+    assert!(!vscode_stdout.contains("transcript.jsonl"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_read_payloads_emit_bounded_augmentation() {
+    let repo = TestRepo::indexed_with_symbol();
+    repo.add_file_memory("READ-AUGMENT-MARKER");
+    let cursor = serde_json::json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "cursor-read",
+        "workspace_roots": [repo.root.as_path()],
+        "tool_name": "Read",
+        "tool_input": {"file_path": repo.root.join("src/lib.rs")},
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.root);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(output["additional_context"].as_str().unwrap().contains("READ-AUGMENT-MARKER"));
+
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-read",
+        "cwd": repo.root.as_path(),
+        "tool_name": "read_file",
+        "tool_input": {"filePath": repo.root.join("src/lib.rs")},
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.root);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("READ-AUGMENT-MARKER")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_reads_resolve_main_governed_linked_worktrees() {
+    let repo = LinkedTestRepo::indexed();
+    repo.add_file_memory("LINKED-READ-AUGMENT-MARKER");
+    let linked_file = repo.linked.join("src/lib.rs");
+
+    let cursor = serde_json::json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "cursor-linked-read",
+        "workspace_roots": [repo.main.as_path(), repo.linked.as_path()],
+        "tool_name": "Read",
+        "tool_input": {"file_path": &linked_file},
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(output["additional_context"].as_str().unwrap().contains("LINKED-READ-AUGMENT-MARKER"));
+
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-linked-read",
+        "cwd": repo.linked.as_path(),
+        "tool_name": "read_file",
+        "tool_input": {"filePath": &linked_file},
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("LINKED-READ-AUGMENT-MARKER")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_session_start_wrap_the_orientation_digest() {
+    let repo = TestRepo::indexed_with_symbol();
+    let cursor = serde_json::json!({
+        "hook_event_name": "sessionStart",
+        "conversation_id": "cursor-start",
+        "workspace_roots": [repo.root.as_path()],
+        "composer_mode": "agent",
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.root);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(output["additional_context"].as_str().unwrap().contains("rag-rat repo intelligence"));
+
+    let vscode = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "vscode-start",
+        "cwd": repo.root.as_path(),
+        "source": "new",
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.root);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("rag-rat repo intelligence")
+    );
+
+    let resumed = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "vscode-resume",
+        "cwd": repo.root.as_path(),
+        "source": "resume",
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &resumed.to_string(), &repo.root);
+    assert!(status.success());
+    assert!(stdout.is_empty(), "resumed sessions must not receive another orientation digest");
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_after_file_edit_backgrounds_a_scoped_reindex() {
+    let repo = TestRepo::indexed_with_symbol();
+    fs::write(repo.root.join("src/lib.rs"), "pub fn cursor_edit_xyz() {}\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "afterFileEdit",
+        "conversation_id": "cursor-edit",
+        "workspace_roots": ["/unrelated-workspace", repo.root.as_path()],
+        "file_path": repo.root.join("src/lib.rs"),
+        "edits": [{"old_string": "frobnicate_xyz", "new_string": "cursor_edit_xyz"}],
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &input.to_string(), &repo.root);
+    assert!(status.success());
+    assert!(stdout.is_empty(), "edit reindex must not add AI context: {stdout}");
+    wait_for_symbol(&repo.config, "cursor_edit_xyz", Duration::from_secs(30));
+}
+
+#[cfg(unix)]
+#[test]
+fn vscode_post_edit_backgrounds_a_scoped_reindex() {
+    let repo = TestRepo::indexed_with_symbol();
+    fs::write(repo.root.join("src/lib.rs"), "pub fn vscode_edit_xyz() {}\n").unwrap();
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "vscode-edit",
+        "cwd": repo.root.as_path(),
+        "tool_name": "replace_string_in_file",
+        "tool_input": {"filePath": repo.root.join("src/lib.rs")},
+        "tool_response": "File edited successfully",
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &input.to_string(), &repo.root);
+    assert!(status.success());
+    assert!(stdout.is_empty(), "edit reindex must not add AI context: {stdout}");
+    wait_for_symbol(&repo.config, "vscode_edit_xyz", Duration::from_secs(30));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_reindex_only_the_active_linked_worktree() {
+    let repo = LinkedTestRepo::indexed();
+    let linked_file = repo.linked.join("src/lib.rs");
+
+    fs::write(&linked_file, "pub fn cursor_linked_xyz() {}\n").unwrap();
+    let cursor = serde_json::json!({
+        "hook_event_name": "afterFileEdit",
+        "conversation_id": "cursor-linked-edit",
+        "workspace_roots": [repo.main.as_path(), repo.linked.as_path()],
+        "file_path": &linked_file,
+        "edits": [{"new_string": "pub fn cursor_linked_xyz() {}"}],
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.linked);
+    assert!(status.success());
+    assert!(stdout.is_empty());
+    wait_for_checkout_symbol(
+        &repo.config,
+        &repo.linked,
+        "cursor_linked_xyz",
+        Duration::from_secs(30),
+    );
+    assert!(symbol_indexed_in_checkout(&repo.config, &repo.main, "main_checkout_xyz"));
+    assert!(!symbol_indexed_in_checkout(&repo.config, &repo.main, "cursor_linked_xyz"));
+
+    fs::write(&linked_file, "pub fn vscode_linked_xyz() {}\n").unwrap();
+    let vscode = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "session_id": "vscode-linked-edit",
+        "cwd": repo.linked.as_path(),
+        "tool_name": "multi_replace_string_in_file",
+        "tool_input": {
+            "replacements": [{
+                "filePath": &linked_file,
+                "newString": "pub fn vscode_linked_xyz() {}",
+            }],
+        },
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.linked);
+    assert!(status.success());
+    assert!(stdout.is_empty());
+    wait_for_checkout_symbol(
+        &repo.config,
+        &repo.linked,
+        "vscode_linked_xyz",
+        Duration::from_secs(30),
+    );
+    assert!(!symbol_indexed_in_checkout(&repo.config, &repo.linked, "cursor_linked_xyz"));
+    assert!(symbol_indexed_in_checkout(&repo.config, &repo.main, "main_checkout_xyz"));
+    assert!(!symbol_indexed_in_checkout(&repo.config, &repo.main, "vscode_linked_xyz"));
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_and_vscode_clone_checks_use_the_active_linked_worktree() {
+    let repo = LinkedTestRepo::indexed();
+    repo.add_clone_candidate();
+
+    let cursor_path = repo.linked.join("src/cursor_new.rs");
+    let cursor_content = clone_candidate("cursor_new_xyz");
+    fs::write(&cursor_path, &cursor_content).unwrap();
+    let cursor = serde_json::json!({
+        "hook_event_name": "postToolUse",
+        "conversation_id": "cursor-linked-clone",
+        "workspace_roots": [repo.main.as_path(), repo.linked.as_path()],
+        "tool_name": "Write",
+        "tool_input": {"file_path": &cursor_path, "content": cursor_content},
+    });
+    let (stdout, status) = run_hook_for(Some("cursor"), &cursor.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["additional_context"].as_str().unwrap().contains("branch_clone_xyz"),
+        "Cursor clone check must read the linked overlay: {stdout}"
+    );
+
+    let vscode_path = repo.linked.join("src/vscode_new.rs");
+    let vscode_content = clone_candidate("vscode_new_xyz");
+    let vscode = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": "vscode-linked-clone",
+        "cwd": repo.linked.as_path(),
+        "tool_name": "multi_replace_string_in_file",
+        "tool_input": {
+            "replacements": [{"filePath": &vscode_path, "newString": vscode_content}],
+        },
+    });
+    let (stdout, status) = run_hook_for(Some("vscode"), &vscode.to_string(), &repo.linked);
+    assert!(status.success());
+    let output: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("branch_clone_xyz"),
+        "VS Code multi-file clone check must read the linked overlay: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+fn symbol_indexed_in_checkout(
+    config: &rag_rat_base::config::Config,
+    checkout: &Path,
+    symbol: &str,
+) -> bool {
+    let mut db = rag_rat_core::IndexDatabase::open_config(config).unwrap();
+    db.use_worktree_scope(&config.root, Some(checkout)).unwrap();
+    db.symbols(symbol, None, 10).unwrap().iter().any(|candidate| candidate.name == symbol)
+}
+
+#[cfg(unix)]
+fn wait_for_checkout_symbol(
+    config: &rag_rat_base::config::Config,
+    checkout: &Path,
+    symbol: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if symbol_indexed_in_checkout(config, checkout, symbol) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("edited symbol `{symbol}` not indexed for {} within {timeout:?}", checkout.display());
 }
 
 #[cfg(unix)]
