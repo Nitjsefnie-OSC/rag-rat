@@ -8,10 +8,10 @@
 //! (a heal/bootstrap leaves `clone_delta_hint = None`) contributes no paths: live's scope is
 //! exactly "files the pass reindexed", and a whole-checkout sweep is the BATCH pass's job.
 //!
-//! Everything here is best-effort: a missing `rust-analyzer`, a failed spawn, or a dead server
-//! mid-pass never fails the maintenance pass — the worklist rides to the next pass via the
-//! backlog, and the session is dropped so a later pass respawns (crash tolerance/warm-up
-//! hardening is slice 3, #535).
+//! Everything here is best-effort: a missing `rust-analyzer`, a failed spawn, a warming server,
+//! or a dead server mid-pass never fails the maintenance pass — the worklist rides to the next
+//! pass via the backlog, and an aborted session is dropped so a later pass respawns. Bounded
+//! respawn backoff remains in #535.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -34,6 +34,11 @@ pub(crate) struct LiveOracleTail {
 impl LiveOracleTail {
     pub(crate) fn new() -> Self {
         Self { session: None, backlog: Vec::new() }
+    }
+
+    /// Whether the watcher must schedule another pass even if no filesystem event arrives.
+    pub(crate) fn retry_needed(&self) -> bool {
+        !self.backlog.is_empty()
     }
 
     /// One pass's live stage: the idle-shutdown sweep, then (when enabled and there is work)
@@ -90,14 +95,15 @@ impl LiveOracleTail {
                 // session so the next pass respawns a clean one instead of reusing a broken
                 // transport (the aborted files are already requeued in `unfinished_paths`).
                 if report.status.starts_with("Aborted:")
-                    && let Some(session) = self.session.take()
+                    && let Some(_aborted_session) = self.session.take()
                 {
+                    // Let the binding hard-kill on Drop; graceful shutdown would attempt another
+                    // bounded request against the same wedged transport.
                     tracing::warn!(
                         target: "rag_rat_core::watch",
                         status = %report.status,
                         "live oracle: server aborted; session dropped, respawn on next pass"
                     );
-                    session.shutdown();
                 }
                 if report.rows_written > 0 || !report.unfinished_paths.is_empty() {
                     tracing::info!(
