@@ -1,8 +1,10 @@
 // Sidebar tree views: per-file Clone Classes, Memories, and Issues & Decisions.
-// All three refresh off the active editor and the index-version poll, and all
-// read from the shared per-file FileStore (no per-view fetching).
+// All three describe the active editor's file, are filled by one pump off the
+// active-editor event and the index-version poll, and read from the shared
+// per-file FileStore (no per-view fetching).
 import * as vscode from 'vscode';
 import type { CloneRegion, DecisionRecord, PapertrailRef } from './client';
+import { logError } from './output';
 import type { FileData, FileStore } from './store';
 
 class Item extends vscode.TreeItem {
@@ -37,64 +39,219 @@ class Item extends vscode.TreeItem {
 }
 
 /**
- * How many times a tree load may be re-aimed at a newly active editor before giving up. Each
- * attempt awaits a real load, so the bound exists to end an unwinnable race with a user paging
- * through files, not to prevent a hot loop.
+ * What the sidebar is showing: one file's data, or the reason there is none.
+ *
+ * A state rather than a rendered list, because the pump decides what is TRUE and each view decides
+ * how to say it. That split is what lets the three views agree by construction, and it is where a
+ * new truth goes — a further reason the data cannot be shown, or a qualification on data that can
+ * (which lane of it is a carried-forward fallback, whether the file has moved under the answer) is
+ * a member here plus a rendering arm, not a special case threaded through the load path.
  */
-const STALE_LOAD_RETRIES = 4;
+type SidebarState =
+  | { kind: 'loading' }
+  /** No active editor, or a buffer with no indexed path — an unsaved one, or outside the repo. */
+  | { kind: 'unindexed' }
+  | { kind: 'offline' }
+  /** The load itself failed. Distinct from `offline`: nothing was learned about the server. */
+  | { kind: 'failed' }
+  | { kind: 'file'; path: string; data: FileData };
 
-abstract class FileView implements vscode.TreeDataProvider<Item> {
-  private emitter = new vscode.EventEmitter<Item | undefined>();
-  readonly onDidChangeTreeData = this.emitter.event;
+type SidebarMessage = Exclude<SidebarState, { kind: 'file' }>;
 
-  constructor(protected readonly store: FileStore) {}
-
-  refresh(): void {
-    this.emitter.fire(undefined);
+/** The one row a message state renders as. Built per view: a `TreeItem` belongs to one tree. */
+function messageItem(state: SidebarMessage): Item {
+  switch (state.kind) {
+    case 'loading':
+      return new Item('loading…', { icon: new vscode.ThemeIcon('loading~spin') });
+    case 'unindexed':
+      return new Item('open a file in the indexed repo', { icon: new vscode.ThemeIcon('info') });
+    case 'offline':
+      return new Item('lens server offline', { icon: new vscode.ThemeIcon('cloud-offline') });
+    case 'failed':
+      return new Item('lens data unavailable', {
+        description: 'see the rag-rat Lens log',
+        icon: new vscode.ThemeIcon('warning', new vscode.ThemeColor('editorWarning.foreground')),
+      });
+    default: {
+      // Adding a state without a row is a compile error, not a blank tree at runtime.
+      const unhandled: never = state;
+      throw new Error(`unhandled sidebar state: ${JSON.stringify(unhandled)}`);
+    }
   }
+}
+
+/**
+ * One of the three trees. It holds what it is showing; the pump is the only writer.
+ *
+ * `getChildren` is deliberately SYNCHRONOUS. `TreeDataProvider.getChildren` has no cancellation
+ * token and no way to decline to publish, so an implementation that awaits inside it makes
+ * completion order the arbiter of what the sidebar shows: with several invocations in flight a
+ * late one overwrites a newer one's result, and every value it can return is a publication — a
+ * cached tree can predate an invalidation, an empty one can blank a tree a newer load just filled.
+ * There is no safe return value, so the loading moves out instead. Reading state that is already
+ * resolved makes a read atomic, and leaves only the load path having to decide whether it is still
+ * entitled to write.
+ */
+abstract class FileView implements vscode.TreeDataProvider<Item> {
+  private readonly emitter = new vscode.EventEmitter<Item | undefined>();
+  readonly onDidChangeTreeData = this.emitter.event;
+  /**
+   * `loading`, never `[]`. The views exist before the first load can have answered, and an empty
+   * tree is a claim — "this file has nothing" — that nothing has established yet.
+   */
+  private items: Item[] = [messageItem({ kind: 'loading' })];
 
   getTreeItem(element: Item): vscode.TreeItem {
     return element;
   }
 
-  async getChildren(element?: Item): Promise<Item[]> {
-    if (element) {
-      return element.children ?? [];
-    }
-    // These views describe the ACTIVE file, so an answer about a document that stopped being
-    // active is wrong however good the data is. Rather than discard it — which would let a slow
-    // load, resolving after a newer one, blank the tree the newer one just filled — re-ask about
-    // wherever the user now is. Whichever request settles last then still describes the current
-    // editor, so the outcome no longer depends on completion order.
-    for (let attempt = 0; attempt < STALE_LOAD_RETRIES; attempt += 1) {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {
-        return [
-          new Item('open a file in the indexed repo', { icon: new vscode.ThemeIcon('info') }),
-        ];
-      }
-      const document = editor.document.uri.toString();
-      const loaded = await this.store.dataFor(editor.document);
-      if (vscode.window.activeTextEditor?.document.uri.toString() !== document) {
-        continue;
-      }
-      if (!loaded) {
-        // Distinguish "nothing to show for this buffer" from "the server did not answer": an
-        // unsaved buffer has no indexed path, and reporting that as an outage would be wrong.
-        return this.store.pathOf(editor.document)
-          ? [new Item('lens server offline', { icon: new vscode.ThemeIcon('cloud-offline') })]
-          : [new Item('open a file in the indexed repo', { icon: new vscode.ThemeIcon('info') })];
-      }
-      return this.roots(loaded.path, loaded.data);
-    }
-    // The active editor changed on every attempt, so the user is still moving and every switch
-    // has queued its own refresh. Returning nothing can still blank a tree a newer request just
-    // filled, because `getChildren` has no way to decline to publish — that residual is #1022,
-    // which replaces this shape with a synchronous read over state a single pump owns.
-    return [];
+  getChildren(element?: Item): Item[] {
+    return element ? element.children ?? [] : this.items;
   }
 
+  /**
+   * This view's rows for `state`. PURE — it shows nothing on its own, so the pump can render all
+   * three views before committing any of them.
+   */
+  render(state: SidebarState): Item[] {
+    return state.kind === 'file' ? this.roots(state.path, state.data) : [messageItem(state)];
+  }
+
+  /** Show already-rendered rows and make VS Code re-read them. The pump is the only caller. */
+  publish(items: Item[]): void {
+    this.items = items;
+    this.emitter.fire(undefined);
+  }
+
+  /**
+   * This view's tree for one file's data. The contract is unchanged by the pump — only its caller
+   * moved out of `getChildren`, so it now runs once a load is entitled to publish.
+   */
   protected abstract roots(path: string, data: FileData): Item[];
+}
+
+/**
+ * Loads the sidebar's data and publishes it to the three views.
+ *
+ * Everything the views show describes ONE document, loaded from ONE data source — so the premise a
+ * load ran under is part of its answer, and an answer under another premise is wrong however good
+ * the data is. This is where that is checked, on both sides of the await:
+ *
+ * - AFTER it, before publishing: the result is written only if this is still the newest load, still
+ *   aimed at the active editor, and still under the index state it started from. Anything else is
+ *   dropped rather than published — whatever superseded it publishes its own answer, which is why
+ *   every `invalidate`/`reset` in the extension is paired with a `refresh`.
+ * - BEFORE it, over what is already on screen: content whose premise no longer holds comes down
+ *   immediately rather than standing until a replacement arrives, which can take as long as the
+ *   request timeout.
+ *
+ * One pump for all three views rather than one each: they sit stacked in a single container, so a
+ * slow view left describing the previous file beside two describing the current one is the same
+ * wrong answer, only visibly. It also puts the decision to publish in one place instead of three.
+ */
+class SidebarPump {
+  private generation = 0;
+  /**
+   * The premise the views' current CONTENT answers: which document it describes, and which data
+   * source it came from. `undefined` while they hold a message — a message describes no file, so
+   * no change of premise can falsify it.
+   */
+  private shown: { document: string; source: number } | undefined;
+
+  constructor(
+    private readonly store: FileStore,
+    private readonly views: readonly FileView[],
+  ) {}
+
+  /** Reload for whatever editor is active now. */
+  refresh(): void {
+    // The load reports its own failures; this is the backstop for a throw inside that reporting.
+    void this.load().catch((error: unknown) => logError('sidebar', error));
+  }
+
+  private async load(): Promise<void> {
+    const generation = ++this.generation;
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      this.publish({ kind: 'unindexed' });
+      return;
+    }
+    const document = editor.document.uri.toString();
+    const source = this.store.sourceEpoch();
+    if (this.shown && (this.shown.document !== document || this.shown.source !== source)) {
+      // What is on screen answers a question nobody is asking any more — a different document, or a
+      // server/repository the store has declared unusable — and leaving it up asserts it about the
+      // file now on screen. Both premises are known to have changed BEFORE the load, so the tree
+      // comes down now rather than when a replacement happens to arrive.
+      //
+      // Only a CHANGED premise clears. An ordinary index invalidation reloads the same document
+      // from the same source, and emptying its tree on every version event would flicker for no
+      // gain.
+      this.publish({ kind: 'loading' });
+    }
+    const epoch = this.store.dataEpoch();
+    // Settle the load into a value, the way `probeStatus` does: a rejection has to pass the same
+    // entitlement checks as an answer before it may say anything.
+    const settled = await this.store.dataFor(editor.document).then(
+      (loaded) => ({ ok: true as const, loaded }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    if (
+      // A newer load owns the views. Same document and same epoch are not enough to make two loads
+      // interchangeable: the store re-points to a replacement endpoint and reloads without moving
+      // its epoch, so the earlier request can be carrying an older server's answer.
+      generation !== this.generation ||
+      // The host updates `activeTextEditor` before it delivers the change event, so a load can
+      // settle after the user has moved on but before anything told the pump to reload.
+      vscode.window.activeTextEditor?.document.uri.toString() !== document ||
+      // The index moved. `dataFor` withholds a payload computed under the old epoch, and reporting
+      // that withholding below as an outage would clear the tree over an ordinary reindex.
+      this.store.dataEpoch() !== epoch
+    ) {
+      return;
+    }
+    if (!settled.ok) {
+      // Nothing is known about this file, and a spinner left up forever says the opposite.
+      logError('sidebar', settled.error);
+      this.publish({ kind: 'failed' });
+      return;
+    }
+    if (!settled.loaded) {
+      // Distinguish "nothing to show for this buffer" from "the server did not answer": an
+      // unsaved buffer has no indexed path, and reporting that as an outage would be wrong.
+      this.publish(
+        this.store.pathOf(editor.document) ? { kind: 'offline' } : { kind: 'unindexed' },
+      );
+      return;
+    }
+    this.publish({ kind: 'file', path: settled.loaded.path, data: settled.loaded.data }, document);
+  }
+
+  /**
+   * Show `state` in all three views. `document` is the document a `file` state answers about, and
+   * recording it is what lets a later load tell whether the views still describe anything.
+   */
+  private publish(state: SidebarState, document?: string): void {
+    let rendered: readonly (readonly [FileView, Item[]])[];
+    try {
+      // Render every view BEFORE committing any: a payload one view's builder cannot turn into
+      // rows would otherwise leave the other two describing it, which is exactly the disagreement
+      // a single pump exists to prevent.
+      rendered = this.views.map((view) => [view, view.render(state)] as const);
+    } catch (error) {
+      logError('sidebar', error);
+      if (state.kind !== 'failed') {
+        this.publish({ kind: 'failed' });
+      }
+      return;
+    }
+    // Read the source HERE, after the load: one that re-points mid-flight answers from the source
+    // serving now, not the one it started under.
+    this.shown = document === undefined ? undefined : { document, source: this.store.sourceEpoch() };
+    for (const [view, items] of rendered) {
+      view.publish(items);
+    }
+  }
 }
 
 export class CloneClassesView extends FileView {
@@ -294,24 +451,17 @@ export function registerSidebar(
   context: vscode.ExtensionContext,
   store: FileStore,
 ): { refresh: () => void } {
-  const clones = new CloneClassesView(store);
-  const memories = new MemoriesView(store);
-  const papertrail = new PapertrailView(store);
+  const clones = new CloneClassesView();
+  const memories = new MemoriesView();
+  const papertrail = new PapertrailView();
+  const pump = new SidebarPump(store, [clones, memories, papertrail]);
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('rag-rat-lens.cloneClasses', clones),
     vscode.window.registerTreeDataProvider('rag-rat-lens.memories', memories),
     vscode.window.registerTreeDataProvider('rag-rat-lens.papertrail', papertrail),
-    vscode.window.onDidChangeActiveTextEditor(() => {
-      clones.refresh();
-      memories.refresh();
-      papertrail.refresh();
-    }),
+    // A switch is a reload, driven through the same pump as the index-version poll so the two
+    // cannot publish over each other.
+    vscode.window.onDidChangeActiveTextEditor(() => pump.refresh()),
   );
-  return {
-    refresh: () => {
-      clones.refresh();
-      memories.refresh();
-      papertrail.refresh();
-    },
-  };
+  return { refresh: () => pump.refresh() };
 }
