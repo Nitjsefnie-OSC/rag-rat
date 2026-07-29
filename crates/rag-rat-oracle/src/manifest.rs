@@ -134,6 +134,22 @@ impl ToolManifest {
                                live oracle (`[oracle.live] enabled`) can spawn it as a language \
                                server.",
             },
+            // The live clangd client (#536). `--background-index` is clangd's own default, PINNED
+            // here because it is load-bearing: it is what resolves a call across translation
+            // units, and with it off clangd answers with the header declaration instead. It also
+            // makes clangd persist an index into `$CHECKOUT/.cache/clangd/` — no flag or
+            // environment variable relocates that, so the write is accepted, and that one path
+            // (`.cache/clangd`, not `.cache` as a whole) is floored out of the discovery walk so a
+            // large, entirely machine-written index tree is never indexed as first-party code.
+            OracleTool::ClangdLsp => ToolManifest {
+                tool,
+                program: "clangd",
+                live_args: &["--background-index"],
+                languages: &["c", "cpp"],
+                install_hint: "clangd not found on PATH. Install it (e.g. `apt install clangd`, \
+                               or a release from github.com/clangd/clangd) so the live oracle \
+                               (`[oracle.live] enabled`) can spawn it as a language server.",
+            },
         }
     }
 
@@ -225,7 +241,7 @@ impl ToolManifest {
             // The live clients drive their program as an LSP server (no `.scip` subcommand
             // needed); a successful `--version` (already detected by `probe`) is the capability
             // signal.
-            OracleTool::RaLsp | OracleTool::TsLsp => true,
+            OracleTool::RaLsp | OracleTool::TsLsp | OracleTool::ClangdLsp => true,
         }
     }
 
@@ -235,6 +251,18 @@ impl ToolManifest {
     /// reported as `Blocked` (install-hint UX, exit 0) rather than a subprocess error. The
     /// pre-built `--scip` path never reaches here.
     pub fn prerequisite_blocked(&self, root: &Path) -> Option<String> {
+        self.prerequisite_blocked_with(root, None)
+    }
+
+    /// As [`Self::prerequisite_blocked`], but reusing a project layout the caller already
+    /// resolved. A live spawn resolves one to build the server's argv, and resolving a second
+    /// here would both double the checkout walk under the repository write lock and let the gate
+    /// and the argv observe different layouts if a database changed between the two scans.
+    pub fn prerequisite_blocked_with(
+        &self,
+        root: &Path,
+        layout: Option<&super::backend::ProjectLayout>,
+    ) -> Option<String> {
         match self.tool {
             // scip-python's "deps must be installed" prerequisite has no single sentinel file to
             // check (it's whatever the corpus `prepare` venv installs); a failed environment shows
@@ -300,19 +328,45 @@ impl ToolManifest {
             // The config does NOT have to be at the root: a monorepo whose projects live at
             // `packages/*/tsconfig.json` warms fine, because the FIRST project load is what the
             // cycle reports. Requiring a root config would wrongly disable those checkouts.
-            OracleTool::TsLsp => (!super::backend::LiveBackend::for_tool(self.tool)
-                .is_some_and(|backend| backend.checkout_can_signal_readiness(root)))
-            .then(|| {
-                format!(
-                    "the live TypeScript oracle found no tsconfig.json under {} — \
-                     typescript-language-server only reports project-load progress for a real \
-                     tsconfig project, and that signal is what tells the oracle its answers are \
-                     trustworthy (asked mid-load it resolves an imported callee to the import \
-                     statement instead of the definition). Add a tsconfig.json for the project \
-                     (most TypeScript projects ship one) to enable it.",
-                    root.display()
-                )
-            }),
+            // The live clangd client needs the SAME compilation database the batch backend does,
+            // for an additional reason: it is what clangd builds its cross-translation-unit index
+            // from. Without one a call resolves only to its header declaration, and clangd emits
+            // no project-load progress at all — so the backend could never report ready.
+            // Both progress-signalled live backends gate on the SAME question — "is there a
+            // project here whose load this server would report?" — so they share the check.
+            // The HINT is per backend: the shared sentence states the gate, and the marker's own
+            // detail names the measured symptom and the command that fixes it, which differ per
+            // server. `checkout_can_signal_readiness` is the same search the warm-up uses, so the
+            // gate and the warm-up cannot disagree.
+            OracleTool::ClangdLsp | OracleTool::TsLsp => {
+                let backend = super::backend::LiveBackend::for_tool(self.tool)?;
+                let resolved;
+                let layout = match layout {
+                    Some(layout) => layout,
+                    None => {
+                        resolved = backend.resolve_layout(root);
+                        &resolved
+                    },
+                };
+                // A progress-signalled backend that declared no marker could never signal either,
+                // so it still blocks — with the generic wording, since there is no file to name.
+                let (marker, detail) =
+                    backend.project_marker.map_or(("project", "Add one to enable it."), |marker| {
+                        (marker.file, marker.hint_detail)
+                    });
+                (!backend.checkout_can_signal_readiness(root, layout)).then(|| {
+                    format!(
+                        "the live {} oracle found no {} project under {} — {} only reports \
+                         project-load progress for a real project, and that signal is what tells \
+                         the oracle its answers are trustworthy. {}",
+                        backend.display_name,
+                        marker,
+                        root.display(),
+                        self.program,
+                        detail,
+                    )
+                })
+            },
         }
     }
 
@@ -399,7 +453,7 @@ impl ToolManifest {
             // Unreachable: every batch driver gates live-only tools out BEFORE building a command
             // (`produce_scip_with_tool` returns `Blocked`, the auto-run loop and the wizard filter
             // on `batch_capable`). A live tool has no whole-checkout index invocation.
-            tool @ (OracleTool::RaLsp | OracleTool::TsLsp) => unreachable!(
+            tool @ (OracleTool::RaLsp | OracleTool::TsLsp | OracleTool::ClangdLsp) => unreachable!(
                 "{} is a live oracle backend with no scip_command — the caller must gate on \
                  OracleTool::batch_capable()",
                 tool.as_db_str()
@@ -525,6 +579,47 @@ mod tests {
     }
 
     #[test]
+    fn the_live_clangd_backend_pins_background_indexing_and_needs_a_compdb() {
+        // `--background-index` is clangd's own default, pinned because it is load-bearing: it is
+        // what resolves a call across translation units. With it off clangd answers with the
+        // header declaration instead, and emits no project-load progress at all.
+        let manifest = ToolManifest::for_tool(OracleTool::ClangdLsp);
+        assert_eq!(manifest.program, "clangd");
+        assert_eq!(manifest.live_args, ["--background-index"]);
+        assert_eq!(manifest.languages, ["c", "cpp"], "one server, both dialects");
+
+        // The compilation database is what clangd builds that index from — the same file the
+        // batch scip-clang backend requires, for its own reasons.
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("clangd-lsp-prereq");
+        let blocked = manifest.prerequisite_blocked(&dir).expect("no compdb ⇒ Blocked");
+        // The two progress-signalled backends share the gate but not the hint: this one names
+        // clangd's marker, clangd's measured symptom, and the command that produces a database.
+        // Nothing here may read as the TypeScript backend's advice.
+        assert!(blocked.contains("the live C/C++ oracle"), "{blocked}");
+        assert!(blocked.contains("compile_commands.json"), "{blocked}");
+        assert!(blocked.contains("header declaration"), "{blocked}");
+        assert!(blocked.contains("bear -- make"), "{blocked}");
+        assert!(!blocked.contains("tsconfig.json"), "{blocked}");
+        assert!(!blocked.contains("import statement"), "{blocked}");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+        // A syntactically valid but EMPTY database describes no project: measured, clangd emits
+        // no readiness cycle for one, so accepting it would report the backend runnable while it
+        // could only ever sit in `Warming`.
+        std::fs::write(dir.join("compile_commands.json"), "[]").unwrap();
+        assert!(
+            manifest.prerequisite_blocked(&dir).is_some(),
+            "an empty compilation database is not a warmable project",
+        );
+        std::fs::write(
+            dir.join("compile_commands.json"),
+            r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c"}]"#,
+        )
+        .unwrap();
+        assert!(manifest.prerequisite_blocked(&dir).is_none());
+    }
+
+    #[test]
     fn the_live_typescript_backend_requires_a_warmable_tsconfig_project() {
         // Not the batch backend's source-tree reason: typescript-language-server only reports its
         // project-load progress for a real tsconfig project. With none anywhere it emits no signal
@@ -534,7 +629,14 @@ mod tests {
         let manifest = ToolManifest::for_tool(OracleTool::TsLsp);
         let dir = rag_rat_base::test_scratch::ScratchDir::new("ts-lsp-prereq");
         let blocked = manifest.prerequisite_blocked(&dir).expect("no project ⇒ Blocked");
+        // Its own marker, its own measured symptom, its own nudge — and none of clangd's, which
+        // shares the gate and would otherwise be indistinguishable here.
+        assert!(blocked.contains("the live TypeScript oracle"), "{blocked}");
         assert!(blocked.contains("tsconfig.json"), "{blocked}");
+        assert!(blocked.contains("import statement instead of the definition"), "{blocked}");
+        assert!(blocked.contains("most TypeScript projects ship one"), "{blocked}");
+        assert!(!blocked.contains("compile_commands.json"), "{blocked}");
+        assert!(!blocked.contains("header declaration"), "{blocked}");
         // A config need not sit at the ROOT, and it must have a file to open: the progress cycle
         // reports a PROJECT load, so an empty project is nothing to warm on.
         std::fs::create_dir_all(dir.join("packages/app")).unwrap();

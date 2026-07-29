@@ -46,6 +46,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
+use std::time::Instant;
 
 use path_slash::PathExt as _;
 use rag_rat_base::hash::hex_sha256;
@@ -53,7 +54,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 use url::Url;
 
-use super::backend::LiveBackend;
+use super::backend::{self, LiveBackend, ProjectLayout};
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
 use super::store::{self, EdgeOracleRow};
@@ -68,6 +69,11 @@ pub struct LiveOracleSession {
     client: LspClient,
     tool_version: String,
     root_uri: String,
+    /// The checkout's project layout, and when it was resolved. Every layout question the pass
+    /// asks reads this rather than re-walking the checkout — the pass holds the repository write
+    /// lock while it runs — and it is re-resolved once it ages out (`LAYOUT_MAX_AGE`).
+    layout: ProjectLayout,
+    layout_resolved_at: Instant,
 }
 
 /// Why a live session could not be established. The distinction is operational, not cosmetic: a
@@ -83,6 +89,64 @@ pub enum LiveSpawnBlocked {
     Unavailable,
 }
 
+/// What a spawn learns about the checkout before any process exists: the probed version its
+/// verdicts are stamped with, and the project layout its argv is built from.
+struct SpawnPreflight {
+    version: String,
+    layout: ProjectLayout,
+}
+
+/// The gates a spawn passes before it starts a process, in the order that costs the least and
+/// diagnoses the best.
+///
+/// Availability is decided FIRST — the same order [`ToolManifest::probe_runnable_in`] applies, and
+/// for the same two reasons. Resolving the layout walks the whole checkout, and spawn attempts are
+/// made from the maintenance pass while it holds the repository write lock, so a checkout with no
+/// language server must not pay for that walk on every attempt. It is also the better diagnosis: in
+/// a checkout with neither the server nor a project, the absent server is what the operator has to
+/// act on, and being told to add a compilation database for a program that cannot run sends them
+/// after the wrong problem.
+///
+/// The layout is then resolved ONCE and shared by the prerequisite gate, the spawn argv, and every
+/// later pass. Resolving it twice would both double the walk and let the gate and the argv observe
+/// different layouts if a database moved between the two scans.
+///
+/// The prerequisite gate is not cosmetic for these backends: a checkout with no project emits no
+/// readiness signal at all, so the session could only ever sit in `Warming`.
+fn resolve_preflight(
+    backend: &LiveBackend,
+    manifest: &ToolManifest,
+    checkout_root: &Path,
+    availability: ToolAvailability,
+) -> Result<SpawnPreflight, LiveSpawnBlocked> {
+    let ToolAvailability::Available { version, .. } = availability else {
+        return Err(LiveSpawnBlocked::Unavailable);
+    };
+    let layout = backend.resolve_layout(checkout_root);
+    match manifest.prerequisite_blocked_with(checkout_root, Some(&layout)) {
+        Some(hint) => Err(LiveSpawnBlocked::Prerequisite(hint)),
+        None => Ok(SpawnPreflight { version, layout }),
+    }
+}
+
+/// Test seam: the state [`LiveOracleSession::spawn`] derives from the checkout, supplied directly
+/// so a test can drive the pass's layout-dependent branches — the per-file "can this session
+/// configure that file" gate, and the age-out re-resolve that ends a session whose pinned database
+/// has moved. Neither is reachable through a session whose layout is the empty default.
+#[cfg(test)]
+pub(crate) struct InjectedSession<'a> {
+    pub(crate) tool: OracleTool,
+    pub(crate) client: LspClient,
+    pub(crate) tool_version: &'a str,
+    pub(crate) root_uri: &'a str,
+    /// Build this with [`LiveBackend::resolve_layout`] against a real fixture directory: a
+    /// hand-built layout would assert against a resolver the pass never runs.
+    pub(crate) layout: ProjectLayout,
+    /// When `layout` was resolved. `Instant::now()` keeps it valid for the whole pass; anything
+    /// older than [`backend::LAYOUT_MAX_AGE`] makes the first pass re-resolve and compare.
+    pub(crate) layout_resolved_at: Instant,
+}
+
 impl LiveOracleSession {
     /// Probe `tool`'s language server and spawn the resident client for `checkout_root`.
     ///
@@ -96,28 +160,32 @@ impl LiveOracleSession {
             return Err(LiveSpawnBlocked::Unavailable);
         };
         let manifest = ToolManifest::for_tool(tool);
-        // The prerequisite gate is not cosmetic for every backend: the live TypeScript client
-        // needs a tsconfig project because that is what makes the server emit the project-load
-        // signal it has no other way to report. Spawning without it would resolve definitions
-        // during a warm-up window that answers WRONG rather than null.
-        if let Some(hint) = manifest.prerequisite_blocked(checkout_root) {
-            return Err(LiveSpawnBlocked::Prerequisite(hint));
-        }
-        let ToolAvailability::Available { version, .. } = manifest.probe_in(checkout_root) else {
-            return Err(LiveSpawnBlocked::Unavailable);
-        };
+        // The probe is this call's ARGUMENT, so the checkout walk inside can never precede it.
+        let SpawnPreflight { version, layout } = resolve_preflight(
+            &backend,
+            &manifest,
+            checkout_root,
+            manifest.probe_in(checkout_root),
+        )?;
         let Some(root_uri) = root_uri_for(checkout_root) else {
             return Err(LiveSpawnBlocked::Unavailable);
         };
         let mut client = LspClient::spawn(
             manifest.program,
-            manifest.live_args,
+            &backend.spawn_args(manifest.live_args, &layout),
             checkout_root,
             backend.readiness,
         )
         .map_err(|_| LiveSpawnBlocked::Unavailable)?;
         client.initialize(&root_uri).map_err(|_| LiveSpawnBlocked::Unavailable)?;
-        Ok(Self { backend, client, tool_version: version, root_uri })
+        Ok(Self {
+            backend,
+            client,
+            tool_version: version,
+            root_uri,
+            layout,
+            layout_resolved_at: Instant::now(),
+        })
     }
 
     /// Test seam: a session over an injected (fake-server) client transport. Runs the
@@ -140,19 +208,47 @@ impl LiveOracleSession {
 
     /// The tool-parameterized warm session seam: drives the pass through a specific backend's
     /// language ids, sentinel namespace, and moniker source.
+    ///
+    /// The layout is the empty default, which a backend with a checkout-scoped project marker
+    /// reads as "no compilation database anywhere" and therefore skips every file for. Those
+    /// backends need [`Self::from_injected`].
     #[cfg(test)]
     pub(crate) fn from_warming_client_for(
         tool: OracleTool,
-        mut client: LspClient,
+        client: LspClient,
         tool_version: &str,
         root_uri: &str,
     ) -> Self {
+        Self::from_injected(InjectedSession {
+            tool,
+            client,
+            tool_version,
+            root_uri,
+            layout: ProjectLayout::default(),
+            layout_resolved_at: Instant::now(),
+        })
+    }
+
+    /// Test seam: a warming session over an injected client AND an injected project layout. Runs
+    /// the `initialize` handshake exactly like [`Self::spawn`] so the negotiated encoding is real.
+    #[cfg(test)]
+    pub(crate) fn from_injected(injected: InjectedSession<'_>) -> Self {
+        let InjectedSession {
+            tool,
+            mut client,
+            tool_version,
+            root_uri,
+            layout,
+            layout_resolved_at,
+        } = injected;
         client.initialize(root_uri).expect("test server completes the handshake");
         Self {
             backend: LiveBackend::for_tool(tool).expect("a live backend"),
             client,
             tool_version: tool_version.to_string(),
             root_uri: root_uri.to_string(),
+            layout,
+            layout_resolved_at,
         }
     }
 
@@ -202,10 +298,13 @@ impl LiveOracleSession {
         };
         let opened = worklist
             .iter()
-            .filter(|path| self.backend.open_signals_readiness(checkout_root, path))
+            .filter(|path| self.backend.open_signals_readiness(checkout_root, path, &self.layout))
             .find_map(|path| open_document(&checkout_root.join(path)))
             .or_else(|| {
-                self.backend.warmup_document(checkout_root).as_deref().and_then(open_document)
+                self.backend
+                    .warmup_document(checkout_root, &self.layout)
+                    .as_deref()
+                    .and_then(open_document)
             });
         let Some((language_id, uri, text)) = opened else {
             return;
@@ -217,6 +316,30 @@ impl LiveOracleSession {
 
     fn needs_warmup_open(&self) -> bool {
         self.client.needs_warmup_open()
+    }
+
+    /// Whether this session can configure `path` (repo-relative) well enough to trust its answers.
+    fn can_resolve_path(&self, checkout_root: &Path, path: &str) -> bool {
+        self.backend.session_can_resolve(checkout_root, path, &self.layout)
+    }
+
+    /// Re-resolve the checkout's project layout if the cached one has aged out, and report
+    /// whether the session is still valid for it.
+    ///
+    /// `false` means the checkout now pins a DIFFERENT database (one appeared, moved, or was
+    /// removed). That cannot be corrected in place: the server was spawned with an argv derived
+    /// from the old layout, so the session has to be replaced.
+    fn layout_still_holds(&mut self, checkout_root: &Path) -> bool {
+        if self.layout_resolved_at.elapsed() < backend::LAYOUT_MAX_AGE {
+            return true;
+        }
+        let fresh = self.backend.resolve_layout(checkout_root);
+        self.layout_resolved_at = Instant::now();
+        if !fresh.pins_same_database_as(&self.layout) {
+            return false;
+        }
+        self.layout = fresh;
+        true
     }
 
     /// Test barrier: one synchronous round trip. The transport is FIFO, so a returned response
@@ -246,6 +369,26 @@ pub struct LivePassInput<'a> {
     pub started_at_ms: i64,
 }
 
+/// Why a live pass ended early, when it did.
+///
+/// THAT a pass aborted is the contract callers act on — every abort drops the session, because
+/// neither a dead transport nor an argv derived from a layout that has since moved can be
+/// corrected in place. Callers read this rather than [`LivePassReport::status`], whose wording is
+/// operator-facing text and not something to parse.
+///
+/// The variants separate the two causes because they are diagnosed and reproduced differently, and
+/// because a caller that ever needs to tell "the checkout changed under us" from "the server died"
+/// must not have to infer it from a string. Today nothing branches on which one it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivePassAbort {
+    /// The checkout now pins a DIFFERENT compilation database than the one this session's argv was
+    /// derived from. The session cannot be corrected in place and has to be replaced.
+    LayoutChanged,
+    /// The language server died, wedged, or errored — mid-pass or at the pass-entry readiness
+    /// check. The checkout is unchanged.
+    Server,
+}
+
 /// Outcome of one live pass, mirroring `OracleReport`'s shape. Persisted opaquely as the run
 /// row's `stats_json` (when a run is recorded).
 #[derive(Debug, Clone, Default, Serialize)]
@@ -267,6 +410,11 @@ pub struct LivePassReport {
     /// Writes skipped because a sibling checkout still owns the same content key + tool version
     /// for different file bytes (the schema cannot represent both because SHA is outside the PK).
     pub skipped_content_collisions: u64,
+    /// Candidates skipped because this session could not configure their file — the backend's
+    /// server would have answered with heuristic flags, which resolves cross-unit calls wrongly
+    /// rather than not at all. Never deferred: only a change to the checkout's project layout can
+    /// make them resolvable.
+    pub skipped_unconfigured: u64,
     /// Definitions skipped as out-of-corpus for live purposes: target outside the checkout root,
     /// in an unindexed file, or mapping to no indexed symbol. Live writes no `resolved-external`
     /// rows (see the module docs).
@@ -285,6 +433,19 @@ pub struct LivePassReport {
     /// Worklist paths the request budget didn't reach — the caller's backlog into the next pass.
     #[serde(skip)]
     pub unfinished_paths: Vec<String>,
+    /// Worklist paths skipped WHOLE because this session could not configure them — the files
+    /// `skipped_unconfigured` counted candidates in, at most one entry per worklist path.
+    ///
+    /// Deliberately not `unfinished_paths`: retrying cannot help until the checkout's layout
+    /// changes, and a caller that reads a backlog as "schedule another pass" would then spin on
+    /// work every pass can only skip again. The caller holds these aside instead and requeues them
+    /// when a pass reports [`LivePassAbort::LayoutChanged`].
+    #[serde(skip)]
+    pub skipped_unconfigured_paths: Vec<String>,
+    /// Why the pass ended early, if it did. `status` carries the same fact as operator-facing
+    /// text; this is the half a caller branches on.
+    #[serde(skip)]
+    pub abort: Option<LivePassAbort>,
     pub status: String,
 }
 
@@ -298,6 +459,17 @@ pub fn live_oracle_pass(
     input: &LivePassInput<'_>,
 ) -> anyhow::Result<LivePassReport> {
     let mut report = LivePassReport::default();
+    // BEFORE the readiness gate, deliberately: a session that never becomes ready would otherwise
+    // never reach this check, so a database removed during warm-up would leave it warming forever
+    // with no way back. End the pass instead and let the watcher replace the session — its argv
+    // was derived from the old layout, so it cannot be corrected in place.
+    if !session.layout_still_holds(input.checkout_root) {
+        report.unfinished_paths = input.worklist.to_vec();
+        report.abort = Some(LivePassAbort::LayoutChanged);
+        report.status =
+            "Aborted: the checkout now points at a different compilation database".to_string();
+        return Ok(report);
+    }
     match session.readiness_checkpoint() {
         Ok(Some(_)) => {},
         Ok(None) => {
@@ -312,6 +484,7 @@ pub fn live_oracle_pass(
         },
         Err(err) => {
             report.unfinished_paths = input.worklist.to_vec();
+            report.abort = Some(LivePassAbort::Server);
             report.status = format!("Aborted: {err}");
             return Ok(report);
         },
@@ -395,6 +568,19 @@ pub fn live_oracle_pass(
         let Some(callees) = by_path.get(path.as_str()) else {
             continue;
         };
+        // The session may be unable to CONFIGURE this file even though its language qualifies:
+        // with several compilation databases in a checkout, clangd is pointed at none, and a file
+        // whose database it cannot find on its own gets heuristic flags. Measured, that resolves a
+        // cross-translation-unit call to the callee's HEADER DECLARATION — a wrong verdict, not a
+        // missing one, and the covered-skip budget would never revisit it. Skip rather than
+        // resolve, and do NOT defer: retrying cannot help until the checkout's layout changes.
+        // RETAINED for the caller instead, so the layout change that makes the file resolvable can
+        // bring it back — without a backlog entry that would schedule passes able only to re-skip.
+        if !session.can_resolve_path(input.checkout_root, path) {
+            report.skipped_unconfigured += callees.len() as u64;
+            report.skipped_unconfigured_paths.push(path.clone());
+            continue;
+        }
         // Budget gate: nothing left → every candidate-bearing path from here rides the backlog.
         let remaining = input.max_requests.saturating_sub(report.requests_used) as usize;
         if remaining == 0 {
@@ -689,6 +875,11 @@ pub fn live_oracle_pass(
         }
     }
 
+    // Every early exit reachable from here is the server's — a dead transport or a readiness
+    // error. A layout change returns above, before any file is touched.
+    if aborted.is_some() {
+        report.abort = Some(LivePassAbort::Server);
+    }
     // A run row is recorded for a pass that WROTE verdicts OR migrated the tool version: the
     // migration is what makes the new `tool_version` current for the currency gate, and without
     // a backing run row the migrated rows stay invisible (the gate keys on the LATEST run).
@@ -779,7 +970,62 @@ fn path_from_uri(root_uri: &str, uri: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_base::test_scratch::ScratchDir;
+
     use super::*;
+
+    #[test]
+    fn a_checkout_with_neither_a_server_nor_a_project_reports_the_missing_server() {
+        // A backend's prerequisite and its binary can be unmet at the same time, and the two are
+        // not equally actionable: telling an operator to generate a compilation database for a
+        // program that is not installed sends them after the wrong problem, and answering that
+        // question at all costs a walk of the whole checkout while the maintenance pass holds the
+        // repository write lock — paid on every spawn attempt, none of which can succeed.
+        //
+        // Availability is supplied rather than probed, so this pins the ORDER on any machine,
+        // whether or not the servers happen to be installed on it. `ra-lsp` is absent from the
+        // table deliberately: it has no checkout prerequisite beyond its binary, so there is no
+        // second gate for the probe to outrank.
+        for (tool, marker, version) in [
+            (OracleTool::ClangdLsp, "compile_commands.json", "clangd-test-1"),
+            (OracleTool::TsLsp, "tsconfig.json", "ts-test-1"),
+        ] {
+            let scratch = ScratchDir::new("live-preflight");
+            let root = scratch.path();
+            let backend = LiveBackend::for_tool(tool).expect("a live backend");
+            let manifest = ToolManifest::for_tool(tool);
+            let blocked = ToolAvailability::Blocked {
+                tool: tool.as_db_str().to_string(),
+                program: manifest.program.to_string(),
+                hint: manifest.install_hint.to_string(),
+            };
+
+            assert_eq!(
+                resolve_preflight(&backend, &manifest, root, blocked).err(),
+                Some(LiveSpawnBlocked::Unavailable),
+                "an absent {tool:?} outranks the checkout prerequisite it makes moot",
+            );
+
+            // Control: the SAME checkout blocks on its prerequisite once the program can run —
+            // without this the assertion above would also pass for a gate that never reports a
+            // prerequisite at all. The two ways a spawn declines stay operationally distinct: a
+            // prerequisite block is permanent until the checkout changes and a human has to act on
+            // it, while an absent server is the degradation the watcher just keeps retrying.
+            let available = ToolAvailability::Available {
+                tool: tool.as_db_str().to_string(),
+                program: manifest.program.to_string(),
+                version: version.to_string(),
+            };
+            match resolve_preflight(&backend, &manifest, root, available) {
+                Err(LiveSpawnBlocked::Prerequisite(hint)) => {
+                    assert!(hint.contains(marker), "the {tool:?} hint names the fix: {hint}");
+                },
+                Err(LiveSpawnBlocked::Unavailable) =>
+                    panic!("a runnable {tool:?} plus no project is a prerequisite block"),
+                Ok(_) => panic!("a checkout with no {marker} must not spawn a {tool:?} session"),
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]

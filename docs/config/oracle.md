@@ -36,6 +36,7 @@ patch for files being edited, and where both tools cover the same edge the batch
 |---|---|---|---|
 | `ra-lsp` | Rust | `rust-analyzer` | — |
 | `ts-lsp` | TypeScript / TSX | `typescript-language-server` | a `tsconfig.json` project (see below) |
+| `clangd-lsp` | C / C++ | `clangd` | a `compile_commands.json` in the checkout (see below) |
 
 ```toml
 [oracle.live]
@@ -56,6 +57,32 @@ trusts an answer (asked mid-load, the server resolves an imported callee to the 
 rather than the definition). The config does not have to be at the checkout root — a monorepo with
 `packages/*/tsconfig.json` is fine — but a checkout with none is reported `Blocked` rather than run
 blind.
+
+**C/C++ needs a `compile_commands.json`, and clangd writes into the checkout.** clangd resolves a
+call across translation units only through its background index, and it builds that index from the
+compilation database — without one it answers with the callee's header declaration instead, and
+reports no progress the oracle can wait on, so the backend is `Blocked`. A single usable database
+may sit anywhere in the checkout: clangd itself only looks in an opened file's ancestor directories
+and their `build/` subdirectory, so rag-rat finds it and points the server at it with
+`--compile-commands-dir`. An out-of-tree CMake build (`build/`, `out/`, `cmake-build-debug/`, …)
+therefore works unchanged. That index is persisted to `.cache/clangd/` *inside the checkout*: no
+clangd flag or environment variable relocates it, and disabling it is what costs the
+cross-translation-unit resolution. So enabling the live oracle in a C/C++ checkout means accepting
+that write. rag-rat floors `.cache/clangd/` specifically — not `.cache/` itself, which a repo may
+genuinely track for sources, and the floor is unconditional and cannot be whitelisted back. That
+keeps a large, entirely machine-written tree out of the discovery walk and stops anything
+source-shaped appearing there from being indexed as first-party code — the same category as
+`.rag-rat`, a tool's own index living inside the checkout.
+
+**Several databases in one checkout narrow what gets resolved.** `--compile-commands-dir` is
+global, so when a checkout holds more than one `compile_commands.json` rag-rat passes it for none:
+forcing one project's database onto another project's files would give them the wrong include and
+define flags, and so a wrong definition. clangd's own per-file lookup decides instead, and it
+searches only an opened file's ancestor directories and their `build/` subdirectory. A file whose
+database is not there is **skipped** rather than resolved with fallback flags — a fallback-flags
+answer resolves a cross-translation-unit call to the callee's header declaration, which is a wrong
+verdict rather than a missing one. If that costs coverage, either move each database to where
+clangd looks for it or keep one database per checkout.
 
 **Standalone:** `[oracle.live]` does NOT imply or require `[oracle] auto_run`. Without a batch
 baseline the live pass is *moniker-blind* — it upgrades edge confidence tiers under `local

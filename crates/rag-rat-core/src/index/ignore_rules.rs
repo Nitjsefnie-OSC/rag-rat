@@ -96,6 +96,21 @@ const FLOOR_DIRS: &[&str] = &[
     "__pycache__",
 ];
 
+/// Floors that are a PATH, not a bare directory name — matched as consecutive components anywhere
+/// under `config.root`.
+///
+/// `.cache` alone is far too broad to floor: the floor is unconditional and cannot be whitelisted
+/// back, so flooring the name would silently drop a tracked `.cache/` that a repo genuinely uses
+/// for sources. What has to be excluded is `.cache/clangd/` — the index the live clangd oracle
+/// makes the checkout write to itself, which no clangd flag or environment variable can relocate.
+///
+/// This is the same category as `.rag-rat` above: a tool's own index, living inside the checkout,
+/// which must never be walked or indexed as if it were source. Its `.idx` artifacts carry no
+/// target extension and so would not arm the watcher on their own, but the tree is large and
+/// entirely machine-written, and anything source-shaped appearing there would otherwise be
+/// classified as first-party code.
+const FLOOR_PATHS: &[&[&str]] = &[&[".cache", "clangd"]];
+
 /// Whether a single path component matches a floor directory name (see [`FLOOR_DIRS`]).
 fn is_floor_dir(name: &str) -> bool {
     FLOOR_DIRS.contains(&name)
@@ -387,9 +402,54 @@ pub(crate) fn target_ancestor_dirs(root: &Path, target_dirs: &[PathBuf]) -> Vec<
     dirs
 }
 
-/// Whether any component of the (`config.root`-relative) `rel` path is a floor directory name.
+/// Whether the (`config.root`-relative) `rel` path is floored: any component is a floor directory
+/// name, or any run of consecutive components matches a [`FLOOR_PATHS`] entry.
+///
+/// One allocation-free, short-circuiting pass over the components: this is the per-path gate of the
+/// indexing walk ([`IgnoreMatcher::is_ignored`]), so it runs once for every path discovered and
+/// must not allocate per call. `matched_len[i]` is how many leading components of `FLOOR_PATHS[i]`
+/// the run ending at the component just read has matched.
 fn rel_contains_floor_dir(rel: &Path) -> bool {
-    rel.components().any(|component| component.as_os_str().to_str().is_some_and(is_floor_dir))
+    // `floor[*matched]` below indexes with a value that is only ever 0 or 1, or one past a match
+    // that did not reach `floor.len()` — so it is in bounds for every non-empty floor path. Pin
+    // non-emptiness at compile time rather than leaving a panic reachable from the walk.
+    const _: () = {
+        let mut i = 0;
+        while i < FLOOR_PATHS.len() {
+            assert!(!FLOOR_PATHS[i].is_empty(), "a floor path needs at least one component");
+            i += 1;
+        }
+    };
+
+    let mut matched_len = [0usize; FLOOR_PATHS.len()];
+    for component in rel.components() {
+        // A component that is not valid UTF-8 can match no floor entry, and as `None` it also fails
+        // both arms below — so it BREAKS a floor path's run of consecutive components. Dropping it
+        // instead would splice its neighbours together and read `.cache/<non-utf8>/clangd` as
+        // `.cache/clangd`, unconditionally excluding a tracked tree that merely happens to sit
+        // between them.
+        let name = component.as_os_str().to_str();
+        if name.is_some_and(is_floor_dir) {
+            return true;
+        }
+        for (floor, matched) in FLOOR_PATHS.iter().zip(matched_len.iter_mut()) {
+            *matched = if name == Some(floor[*matched]) {
+                *matched + 1
+            } else if name == Some(floor[0]) {
+                // A component that fails to extend the run but equals the floor's FIRST element
+                // starts a fresh run, so `.cache/.cache/clangd` is floored. (One counter remembers
+                // one candidate run, which is exact only while no floor path's prefix repeats
+                // inside itself — none does.)
+                1
+            } else {
+                0
+            };
+            if *matched == floor.len() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The gitignore base for `root` given an enclosing worktree root `wt`, or `None` when `wt` is not
@@ -446,6 +506,133 @@ mod tests {
         assert!(m.is_ignored(&tmp.join("node_modules/pkg/index.ts"), false));
         assert!(m.is_ignored(&tmp.join(".build/checkouts/Dep/Sources/Dep.swift"), false));
         assert!(!m.is_ignored(&tmp.join("src/lib.rs"), false));
+    }
+
+    #[test]
+    fn the_clangd_index_floor_holds_in_a_real_linked_worktree() {
+        // A real `git worktree add` checkout, not merely a nested directory: a linked worktree has
+        // its own root and a `.git` FILE rather than a directory, and the live oracle runs per
+        // checkout — each spawning its own clangd, each writing its own `.cache/clangd`. The floor
+        // is applied relative to whichever checkout is being indexed, so neither disturbs the
+        // other's sources.
+        //
+        // This is a MATCHER-level check on two independently compiled matchers; it says nothing
+        // about the rows two checkouts sharing ONE database actually persist. That is
+        // `schema_bootstrap_tests::worktree_overlay::visibility::
+        // clangd_index_floor_holds_for_both_checkouts_sharing_one_database`, which indexes both
+        // checkouts into one database and asserts on the stored file rows.
+        let (_scratch, main) = tempdir();
+        git_init(&main);
+        write(&main.join("src/lib.c"), "int a(void){return 0;}\n");
+        rag_rat_base::test_git::run(&main, &["add", "-A"]);
+        rag_rat_base::test_git::run(&main, &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "seed",
+        ]);
+        // Derived from this scratch directory's own unique name: a fixed name in the shared
+        // scratch root collides between repeated or concurrent runs, and `git worktree add`
+        // fails on an existing path.
+        let linked = main
+            .parent()
+            .expect("scratch parent")
+            .join(format!("{}-linked", main.file_name().expect("scratch name").to_string_lossy(),));
+        rag_rat_base::test_git::run(&main, &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            &linked.to_string_lossy(),
+        ]);
+        assert!(linked.join(".git").is_file(), "a linked worktree carries a .git FILE");
+
+        let linked_matcher = IgnoreMatcher::compile(&linked, &[PathBuf::from(".")]);
+        assert!(linked_matcher.is_ignored(&linked.join(".cache/clangd/index/a.idx"), false));
+        assert!(
+            !linked_matcher.is_ignored(&linked.join("src/lib.c"), false),
+            "the linked checkout's own sources still index",
+        );
+        assert!(
+            !linked_matcher.is_ignored(&linked.join(".cache/cmake-build/gen.c"), false),
+            "and the narrow floor does not swallow the rest of a tracked .cache",
+        );
+
+        // The main checkout floors its OWN index, and its sources are untouched by the sibling's
+        // presence — the active-checkout/sibling separation this topology exists to check.
+        let main_matcher = IgnoreMatcher::compile(&main, &[PathBuf::from(".")]);
+        assert!(main_matcher.is_ignored(&main.join(".cache/clangd/index/a.idx"), false));
+        assert!(!main_matcher.is_ignored(&main.join("src/lib.c"), false));
+        assert!(
+            !main_matcher.is_ignored(&linked.join("src/lib.c"), false),
+            "a sibling checkout outside this root is not governed by its matcher at all",
+        );
+
+        rag_rat_base::test_git::run(&main, &[
+            "worktree",
+            "remove",
+            "--force",
+            &linked.to_string_lossy(),
+        ]);
+    }
+
+    #[test]
+    fn clangds_own_index_is_floored_without_swallowing_every_dot_cache() {
+        // The live clangd oracle makes the checkout's OWN tooling write here: clangd persists its
+        // background index to `.cache/clangd/index/` and no flag relocates it. That tree is large
+        // and entirely machine-written — the same category as `.rag-rat` — so it is kept out of the
+        // discovery walk, and nothing source-shaped appearing under it is indexed as first-party
+        // code.
+        let (_scratch, tmp) = tempdir();
+        let m = compile(&tmp);
+        assert!(m.is_ignored(&tmp.join(".cache/clangd"), true));
+        assert!(m.is_ignored(&tmp.join(".cache/clangd/index/main.c.ABC123.idx"), false));
+        // …but the floor is unconditional and cannot be whitelisted back, so it must NOT swallow a
+        // `.cache/` a repo genuinely tracks, nor a nested one it happens to own.
+        assert!(!m.is_ignored(&tmp.join(".cache"), true));
+        assert!(!m.is_ignored(&tmp.join(".cache/generated/api.ts"), false));
+        assert!(!m.is_ignored(&tmp.join("src/.cache/fixtures/sample.c"), false));
+        // The floor is a consecutive-component match, so a same-named pair deeper in the tree is
+        // floored too (a nested checkout's clangd index), while `clangd` alone never is.
+        assert!(m.is_ignored(&tmp.join("vendor/dep/.cache/clangd/index/a.idx"), false));
+        assert!(!m.is_ignored(&tmp.join("src/clangd/wrapper.c"), false));
+    }
+
+    #[test]
+    fn floor_path_run_restarts_on_a_repeated_first_component() {
+        let (_scratch, tmp) = tempdir();
+        let m = compile(&tmp);
+        // `.cache/.cache/clangd`: the second `.cache` cannot EXTEND the run the first started (the
+        // floor's second element is `clangd`), but it must start a fresh run that `clangd` then
+        // completes — otherwise a nested `.cache` above the index tree would un-floor it.
+        assert!(m.is_ignored(&tmp.join(".cache/.cache/clangd/index/a.idx"), false));
+        // The restart is still a consecutive-run match, not a "saw both names" match.
+        assert!(!m.is_ignored(&tmp.join(".cache/.cache/generated/api.ts"), false));
+    }
+
+    // A component that is not valid UTF-8 matches no floor entry, and must BREAK the floor path's
+    // run of consecutive components: `.cache/<non-utf8>/clangd` is a tracked tree that merely
+    // happens to sit between the two floor names, and the floor cannot be whitelisted back.
+    #[cfg(unix)]
+    #[test]
+    fn floor_path_run_is_broken_by_a_non_utf8_component() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let (_scratch, tmp) = tempdir();
+        let m = compile(&tmp);
+        let non_utf8 = OsStr::from_bytes(b"\xff\xfe");
+        let between = tmp.join(".cache").join(non_utf8).join("clangd/src.c");
+        assert!(
+            !m.is_ignored(&between, false),
+            "a non-UTF-8 component between the floor names must not be spliced away",
+        );
+        // Control: the same path WITHOUT the intervening component is floored, so the assertion
+        // above is about the broken run and not about the path escaping the floor some other way.
+        assert!(m.is_ignored(&tmp.join(".cache/clangd/src.c"), false));
     }
 
     #[test]
