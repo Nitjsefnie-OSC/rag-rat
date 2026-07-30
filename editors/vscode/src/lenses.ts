@@ -3,13 +3,16 @@
 // coupling, issues/PRs per file, distill decision records, extract-helper
 // preview for refined clone classes.
 import * as vscode from 'vscode';
+import { lensHttpStatus } from './client';
 import type {
   CloneRegion,
   CouplingPartner,
   DecisionRecord,
   LensClient,
   PapertrailRef,
+  SymbolCallers,
   SymbolGraph,
+  SymbolSelector,
 } from './client';
 import type { FileStore } from './store';
 
@@ -87,6 +90,85 @@ function openDoc(title: string, markdown: string): Thenable<void> {
   return lensDocs ? lensDocs.open(title, markdown) : Promise.resolve();
 }
 
+/**
+ * Arguments for `rag-rat-lens.showCallers`, built in ONE place for every surface that dispatches
+ * it.
+ *
+ * The CodeLens and the hover link render from the same `SymbolGraph` row and reach the same
+ * handler, so the tuple is a shared contract rather than each surface's own detail: a surface that
+ * assembles it locally can pass a shape the handler no longer reads, and a surface that sends the
+ * row's name instead of its handle answers for every overload sharing that name rather than for
+ * the row the reader is looking at. `undefined` = the row names no symbol the server can resolve,
+ * so the surface must offer no link at all.
+ *
+ * Both fields are normalized to `null` because the hover's half of this contract is a JSON
+ * `command:` URI, which drops an `undefined` field entirely — a server that omits `id` would
+ * otherwise have the two surfaces build tuples that differ in shape while behaving alike, which is
+ * exactly the drift an untyped boundary hides.
+ */
+export function callerCommandArguments(
+  symbol: SymbolGraph,
+): [SymbolSelector, string] | undefined {
+  return symbol.id || symbol.qname
+    ? [{ id: symbol.id ?? null, qname: symbol.qname ?? null }, symbol.name]
+    : undefined;
+}
+
+/**
+ * How a caller lens says its handle covers more than the declaration it sits on.
+ *
+ * The count in the lens title is this row's own, but the drill-down behind it is answered for
+ * every declaration the row's handle covers — and where those differ, the reader is entitled to
+ * know BEFORE clicking, not only from the quick pick's placeholder afterwards. A grouped handle is
+ * the server's answer about identity (cfg variants of one function are one symbol), so the lens
+ * neither hides it nor pretends a narrower selector exists.
+ *
+ * `undefined` = a server that does not report the reach, and `1` = a handle that covers this row
+ * alone; neither gets a marker, because there is nothing to qualify.
+ */
+export function sharedHandleMarker(
+  declarations: number | undefined,
+): { title: string; tooltip: string } | undefined {
+  return declarations !== undefined && declarations > 1
+    ? {
+        title: `  ⧉${declarations}`,
+        tooltip: `This symbol shares one identity with ${declarations - 1} other declaration${
+          declarations > 2 ? 's' : ''
+        } — cfg variants, or declarations the index cannot tell apart. Callers are reported for all of them.`,
+      }
+    : undefined;
+}
+
+/**
+ * What the caller quick pick says it is showing.
+ *
+ * `matched_symbols` is the whole answer, and it is read the same way on BOTH lanes: `> 1` means
+ * the rows are a union over that many symbols, so `N callers of foo` would state a narrower claim
+ * than the server made. Which selector produced the union does not change what a reader is
+ * looking at, and both selectors can produce one — a qualified name covers every overload in the
+ * file, and a handle covers every declaration grouped under one identity (a function's cfg
+ * variants, say). Reading the count only on the fallback lane discards the one signal that is
+ * present and correct on the other.
+ *
+ * `0` is reachable only from the fallback lane — a handle with no symbol behind it is a 404, not
+ * an empty answer — and means the name named nothing indexed, so the rows came from unresolved
+ * call sites alone. A server that reports no count says nothing, so neither do we.
+ */
+export function callersPlaceholder(
+  name: string,
+  rowCount: number,
+  answer: Pick<SymbolCallers, 'matched_symbols'>,
+): string {
+  const matched = answer.matched_symbols;
+  if (matched === undefined || matched === 1) {
+    return `${rowCount} callers of ${name}`;
+  }
+  if (matched === 0) {
+    return `${rowCount} callers by name — nothing indexed is named ${name}`;
+  }
+  return `${rowCount} callers of ${matched} symbols named ${name}`;
+}
+
 export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this.changed.event;
@@ -112,7 +194,8 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
       const line = Math.min(Math.max(0, s.start_line - 1), document.lineCount - 1);
       const range = new vscode.Range(line, 0, line, 0);
       const total = s.callers.exact + s.callers.syntactic + s.callers.name_only + s.callers.ambiguous;
-      if (total > 0 && s.qname) {
+      const callers = callerCommandArguments(s);
+      if (total > 0 && callers) {
         const tiers = [
           s.callers.exact ? `${s.callers.exact} exact` : '',
           s.callers.syntactic ? `${s.callers.syntactic} syntactic` : '',
@@ -123,15 +206,22 @@ export class SignalLensProvider implements vscode.CodeLensProvider, vscode.Dispo
         ]
           .filter(Boolean)
           .join(' · ');
+        const shared = sharedHandleMarker(s.id_declarations);
         lenses.push(
           new vscode.CodeLens(range, {
             title:
               `⤴ ${total} (${tiers})` +
               (s.fan_in_bucket === 'critical' || s.fan_in_bucket === 'high'
                 ? `  ⚑${s.fan_in_bucket} load`
-                : ''),
+                : '') +
+              (shared?.title ?? ''),
+            ...(shared ? { tooltip: shared.tooltip } : {}),
             command: 'rag-rat-lens.showCallers',
-            arguments: [s.qname, s.name],
+            // The lens is built from ONE symbol row, so it carries that row's handle, and the
+            // count in this title is that row's own. Where the handle covers a group, the
+            // drill-down behind it is wider than the count in front of it — which is what the
+            // marker says. Passing the name alone is what made every lens on a name answer alike.
+            arguments: callers,
           }),
         );
       } else if (s.fan_in_bucket === 'critical' || s.fan_in_bucket === 'high') {
@@ -225,8 +315,26 @@ export function registerSignalCommands(
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(DOC_SCHEME, (lensDocs = new LensDocProvider())),
 
-    vscode.commands.registerCommand('rag-rat-lens.showCallers', async (qname: string, name: string) => {
-      const rows = (await client.symbolCallers(qname)) as CallerRow[];
+    vscode.commands.registerCommand('rag-rat-lens.showCallers', async (selector: SymbolSelector, name: string) => {
+      let answer: SymbolCallers;
+      try {
+        answer = await client.symbolCallers(selector);
+      } catch (error) {
+        // A handle the server no longer knows is a stale gutter decoration, not something the
+        // reader did wrong: the declaration was edited and reindexed under a new handle while
+        // this lens kept the old one. `symbolCallers` already retried by name for every row that
+        // carried one, so reaching here means this row had only the handle. Say that, rather
+        // than raising a "contributed command failed" notification over it. Any other failure is
+        // a real one and keeps surfacing as one.
+        if (lensHttpStatus(error) !== 404) {
+          throw error;
+        }
+        await vscode.window.showWarningMessage(
+          `${name} is no longer in the index under the handle this lens carries — reopen the file to refresh it.`,
+        );
+        return;
+      }
+      const rows = answer.callers as CallerRow[];
       const picked = await vscode.window.showQuickPick(
         rows.map((r) => ({
           label: `$(symbol-method) ${r.name}`,
@@ -234,7 +342,7 @@ export function registerSignalCommands(
           detail: `${r.path}:${r.source_start_line}`,
           row: r,
         })),
-        { placeHolder: `${rows.length} callers of ${name}` },
+        { placeHolder: callersPlaceholder(name, rows.length, answer) },
       );
       if (picked) {
         await openLocation(picked.row.path, picked.row.source_start_line);

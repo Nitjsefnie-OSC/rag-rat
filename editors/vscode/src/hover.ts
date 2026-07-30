@@ -1,6 +1,7 @@
 // Symbol hovers: graph trust data at a glance — caller decomposition,
 // load-bearing bucket, dispatch variants — without opening a quick pick.
 import * as vscode from 'vscode';
+import { callerCommandArguments, sharedHandleMarker } from './lenses';
 import type { FileStore } from './store';
 
 export class GraphHoverProvider implements vscode.HoverProvider {
@@ -40,8 +41,17 @@ export class GraphHoverProvider implements vscode.HoverProvider {
         : '_no static callers (never proof of dead code)_',
     ].filter(Boolean);
     md.appendMarkdown(parts.join('  \n'));
-    if (s.qname) {
-      const args = encodeURIComponent(JSON.stringify([s.qname, s.name]));
+    // Same qualifier the CodeLens shows: the counts above are this declaration's, the link below
+    // answers for every declaration the row's handle covers, and where those differ the reader is
+    // told before following it.
+    const shared = sharedHandleMarker(s.id_declarations);
+    if (shared) {
+      md.appendMarkdown(`  \n⧉ ${escapeMarkdown(shared.tooltip)}`);
+    }
+    // Same command, same arguments as the CodeLens over this row — see `callerCommandArguments`.
+    const callers = callerCommandArguments(s);
+    if (callers) {
+      const args = encodeURIComponent(JSON.stringify(callers));
       md.appendMarkdown(`  \n[show callers](command:rag-rat-lens.showCallers?${args})`);
     }
     if (s.dispatch.length) {

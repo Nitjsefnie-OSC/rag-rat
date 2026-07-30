@@ -9,6 +9,7 @@ mod chunks;
 pub(crate) mod clones;
 mod enrichments;
 mod files;
+mod handles;
 mod hops;
 mod status;
 mod treemap;
@@ -23,7 +24,7 @@ pub use files::{
     LensDispatchDetail, LensFileGraph, LensFileSymbolGraph, LensFileSymbols, LensGraphCallerCounts,
     LensSymbol,
 };
-pub use hops::{LensCallees, LensCallers, LensSymbolHop};
+pub use hops::{LensCallees, LensCallers, LensHopResolvedBy, LensHopSelector, LensSymbolHop};
 pub use status::{LensStatus, LensVersion};
 pub use treemap::{LensTreemap, LensTreemapFile};
 

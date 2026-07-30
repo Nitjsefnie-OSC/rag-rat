@@ -73,14 +73,25 @@ pub(crate) fn reverse_predicate(mode: GraphResolutionMode, logical: bool) -> &'s
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )",
+            // LOGICAL ATTRIBUTION RULE (mirrored in `forward_source_predicate`): a RESOLVED
+            // endpoint is attributed by logical membership ALONE. The name arm applies only where
+            // `to_symbol_id IS NULL` — an edge the resolver could not bind, whose recorded target
+            // name is the only attribution there is (and shared with any same-name sibling). Were
+            // the name arm to run on resolved rows too it would hand this symbol an edge the
+            // resolver bound to a DIFFERENT symbol of the same qualified name, which is the
+            // overload collapse the logical seed exists to end (#1028). Dropping the arm entirely
+            // is the opposite error: this SQL runs BEFORE the read-side oracle enrichment, which
+            // rewrites hops in memory and never touches the `edges` row — so an unresolved edge
+            // refused here is one no compiler verdict can put back, in any later run.
             GraphResolutionMode::Syntactic =>
                 "(edges.to_symbol_id IN (
                     SELECT symbol_id
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                   )
-                  OR edges.target_qualified_name_id =
-                        (SELECT id FROM name_strings WHERE value = ?1))",
+                  OR (edges.to_symbol_id IS NULL
+                      AND edges.target_qualified_name_id =
+                            (SELECT id FROM name_strings WHERE value = ?1)))",
             GraphResolutionMode::Fuzzy =>
                 "edges.to_symbol_id IN (
                     SELECT symbol_id
@@ -160,13 +171,19 @@ pub(crate) fn forward_source_predicate(mode: GraphResolutionMode, logical: bool)
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )",
+            // Mirror of the logical attribution rule on `reverse_predicate`: membership decides a
+            // resolved source, the name arm covers only a source the resolver left unbound — a
+            // file-level edge, or a body whose enclosing symbol was not indexed. `from_name` holds
+            // the ENCLOSING SYMBOL'S QUALIFIED NAME, which two overloads share, so an ungated arm
+            // would put a sibling overload's outgoing edges on this symbol's callee list.
             GraphResolutionMode::Syntactic =>
                 "edges.from_symbol_id IN (
                     SELECT symbol_id
                     FROM logical_symbol_members
                     WHERE logical_symbol_id = ?8
                  )
-                 OR edges.from_name_id = (SELECT id FROM name_strings WHERE value = ?1)",
+                 OR (edges.from_symbol_id IS NULL
+                     AND edges.from_name_id = (SELECT id FROM name_strings WHERE value = ?1))",
             GraphResolutionMode::Fuzzy =>
                 "from_symbols.id IN (
                     SELECT symbol_id
@@ -382,6 +399,27 @@ pub fn unique_symbol_name(conn: &Connection, name: &str) -> anyhow::Result<bool>
         |row| row.get("symbol_count"),
     )?;
     Ok(count == 1)
+}
+/// How many active-scope symbols a NAME seed expands to under the `Syntactic` predicates above.
+///
+/// Lives beside those predicates because it answers the same question they do and must not drift
+/// from them: a symbol is a seed match when its qualified name IS `symbol`, or — only while the
+/// seed's short name is unique, which is the `?7` gate the predicates themselves carry — when its
+/// name is that short name. A caller that counts the qualified arm alone reports zero for the
+/// unqualified seed a traversal resolves perfectly well through the short-name arm.
+///
+/// GENERATION-SCOPED via the `files` view, for the reason spelled out on `unique_symbol_name`.
+pub fn syntactic_seed_symbol_count(conn: &Connection, symbol: &str) -> anyhow::Result<u64> {
+    let short = short_name(symbol);
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) AS symbol_count FROM symbols
+         JOIN files ON files.id = symbols.file_id
+         LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
+         WHERE qn.value = ?1 OR (?2 = 1 AND symbols.name = ?3)",
+        rusqlite::params![symbol, unique_symbol_name(conn, short)?, short],
+        |row| row.get("symbol_count"),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 pub(crate) fn resolution_label(
     mode: GraphResolutionMode,

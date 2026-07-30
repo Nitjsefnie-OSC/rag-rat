@@ -14,7 +14,40 @@ export interface Status {
   live_file_count: number;
 }
 
+/**
+ * How a hop request names its symbol. `id` — the server's opaque `sym_<hex>` symbol handle — is
+ * the stable identity and the only selector that separates two overloads: they share a qualified
+ * name, so `qname` alone reports the union of their callers. Declarations the server groups under
+ * one identity share a handle too, and both the row that hands it out and the answer it produces
+ * report how far it reaches. `qname` remains as the fallback for a row the server could not hand a
+ * handle for, and for a handle it no longer knows.
+ */
+export interface SymbolSelector {
+  id: string | null;
+  qname: string | null;
+}
+
+/**
+ * The `/api/symbol/callers` envelope, kept whole rather than unwrapped to `callers`: the server
+ * says which selector it answered by and how many symbols that selector covered, and a reader
+ * shown the union of two overloads' callers has to be told that is what it is.
+ *
+ * Both fields are OPTIONAL because the server and this extension version independently — a server
+ * built before the hop routes took a handle sends neither, and absence must read as "this server
+ * cannot say", never as an assumed `'id'`.
+ */
+export interface SymbolCallers {
+  callers: unknown[];
+  resolved_by?: 'id' | 'ref';
+  /** Symbols the selector expanded to; `> 1` on EITHER lane means `callers` is their union. */
+  matched_symbols?: number;
+}
+
 export interface FileSymbol {
+  /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
+  id: string | null;
+  /** Declarations `id` covers — see [`SymbolGraph.id_declarations`]. */
+  id_declarations?: number;
   name: string;
   qname: string | null;
   kind: string;
@@ -84,6 +117,17 @@ export interface FileMemory {
 }
 
 export interface SymbolGraph {
+  /** Opaque `sym_<hex>` symbol handle — pass it back verbatim; never parse it as a number. */
+  id: string | null;
+  /**
+   * How many declarations `id` covers. `1` for almost every row; `> 1` where the server groups
+   * several declarations — a function's cfg variants, say — under one identity, so a hop request
+   * carrying this handle is answered for all of them and no selector can narrow it further.
+   *
+   * OPTIONAL because a server built before this field sends nothing, and absence must read as
+   * "this server cannot say" rather than an assumed `1`.
+   */
+  id_declarations?: number;
   name: string;
   qname: string | null;
   kind: string;
@@ -140,6 +184,49 @@ export interface VersionToken {
   revision: string;
 }
 
+/**
+ * A rejection that carries the status the Lens server answered with.
+ *
+ * Read it through [`lensHttpStatus`] rather than `instanceof`: the extension ships two bundles
+ * (desktop and web worker) and a class identity is per-bundle, so the structural read is the one
+ * that holds wherever the error is caught.
+ */
+export class LensHttpError extends Error {
+  constructor(
+    readonly lensHttpStatus: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'LensHttpError';
+  }
+}
+
+/** The status behind a rejection; `undefined` when nothing answered at all (transport failure). */
+export function lensHttpStatus(error: unknown): number | undefined {
+  const status = (error as { lensHttpStatus?: unknown } | null | undefined)?.lensHttpStatus;
+  return typeof status === 'number' ? status : undefined;
+}
+
+/**
+ * Whether re-reading discovery could change this outcome.
+ *
+ * A 4xx is a statement about the REQUEST: the discovered endpoint understood it and rejected it,
+ * so re-deriving that endpoint cannot turn a 404 for a stale symbol handle — or a 400 for a
+ * malformed one — into a hit. Invalidating on it discards a working endpoint, and the cached
+ * identity every other lane shares, to arrive back at the same one. The credential statuses are
+ * the exception, because the credential is exactly what discovery carries.
+ *
+ * A transport failure (no status at all) or a 5xx says nothing about the request, and either can
+ * mean this is no longer the server to be talking to — the pre-existing retry stands there.
+ */
+function rediscoveryCanHelp(error: unknown): boolean {
+  const status = lensHttpStatus(error);
+  if (status === undefined || status >= 500) {
+    return true;
+  }
+  return status === 401 || status === 403;
+}
+
 export class LensClient {
   constructor(private readonly resolver: LensEndpointResolver) {}
 
@@ -152,7 +239,7 @@ export class LensClient {
     try {
       return await this.request<T>(endpoint, route, params, signal);
     } catch (error) {
-      if (signal?.aborted) {
+      if (signal?.aborted || !rediscoveryCanHelp(error)) {
         throw error;
       }
       this.resolver.invalidate();
@@ -183,7 +270,7 @@ export class LensClient {
     });
     if (!res.ok) {
       const body = (await res.text()).slice(0, 200);
-      throw new Error(`${route} -> ${res.status}: ${body}`);
+      throw new LensHttpError(res.status, `${route} -> ${res.status}: ${body}`);
     }
     return (await res.json()) as T;
   }
@@ -239,8 +326,38 @@ export class LensClient {
   ): Promise<{ refs: PapertrailRef[]; decisions: DecisionRecord[] }> {
     return this.get('/api/file/papertrail', { path }, signal);
   }
-  async symbolCallers(qname: string, limit = 50): Promise<unknown[]> {
-    return (await this.get<{ callers: unknown[] }>('/api/symbol/callers', { qname, limit: String(limit) })).callers;
+  /**
+   * Callers of ONE symbol. Sends the handle when the row carried one so overloads stay apart, and
+   * falls back to the qualified name when it did not — the server then answers with every symbol
+   * of that name, which is the older, ambiguous behaviour. The whole envelope is returned so the
+   * caller can say which of the two it got.
+   *
+   * The name is ALSO the fallback for a handle the server no longer knows. A handle is derived
+   * from the declaration, so editing a signature mints a new one on the next index pass while the
+   * CodeLens already drawn in the gutter still carries the old — a 404 there means the row went
+   * stale, not that the symbol is gone, and the same row supplied a name that still resolves.
+   * Answering wide (and saying so, through `matched_symbols`) beats failing a click that worked
+   * before the handle lane existed. Retried only on 404: a 400 means this client built a
+   * malformed handle, and quietly widening the answer would hide the bug that produced it.
+   */
+  // `async` so a selector-less call REJECTS rather than throwing synchronously: the command
+  // handler awaits this, and a synchronous throw would escape its error path.
+  async symbolCallers(selector: SymbolSelector, limit = 50): Promise<SymbolCallers> {
+    const route = '/api/symbol/callers';
+    const limits: Record<string, string> = { limit: String(limit) };
+    if (selector.id) {
+      try {
+        return await this.get<SymbolCallers>(route, { ...limits, id: selector.id });
+      } catch (error) {
+        if (lensHttpStatus(error) !== 404 || !selector.qname) {
+          throw error;
+        }
+      }
+    }
+    if (!selector.qname) {
+      throw new Error('symbolCallers needs a symbol handle or a qualified name');
+    }
+    return this.get<SymbolCallers>(route, { ...limits, qname: selector.qname });
   }
 
   async watchVersions(signal: AbortSignal, onVersion: (version: VersionToken) => void): Promise<void> {
