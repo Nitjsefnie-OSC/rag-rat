@@ -44,6 +44,16 @@
 //!     `0700`; ownership verification is Unix-only (see the fn). A poisoned namespace fails the
 //!     suite loudly; it is never swept.
 //!
+//! # Why the handed-out paths are deliberately NOT canonical
+//!
+//! Production's `Config::load` canonicalizes its root, and index/overlay code depends on that. On
+//! macOS the system temp is already non-canonical (`/var` → `/private/var`) and on Windows it
+//! carries 8.3 names (`RUNNER~1`), so a fixture that keeps its own copy of the scratch path is
+//! holding a second spelling of the root production never sees — the mis-scoping that produces is
+//! invisible on Linux, where the two spellings used to coincide. [`aliased_root`] hands scratch
+//! paths out through a symlink inside the namespace so Linux carries that divergence too, and
+//! [`canonical_config_root`] is what a fixture's hand-built `Config` normalizes its root with.
+//!
 //! Not `#[cfg(test)]`: that gate does not propagate across crates, and fixtures in sibling crates
 //! (`rag-rat-core`, `rag-rat-cli`, …) consume this helper. It is not part of the semver-stable API
 //! surface. Matches the existing `rag_rat_oracle::test_support` convention.
@@ -313,9 +323,122 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
     SWEEP.call_once(|| sweep_stale(&root));
 
     let name = format!("{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
-    let dir = root.join(name);
+    let dir = aliased_root(&root).join(name);
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// Name of the self-referential symlink inside the namespace that makes every handed-out scratch
+/// path NON-CANONICAL on Unix (see [`aliased_root`]). Not a valid scratch dir name itself —
+/// [`scratch_dir`] always appends `-<pid>-<seq>` — so it can never collide with a `tag`.
+///
+/// Gated with its only reader: [`aliased_root`]'s link-creating branch is Unix-only, so an
+/// ungated const here would be `dead_code` on Windows, where the cross-platform legs deny
+/// warnings.
+#[cfg(unix)]
+const NON_CANONICAL_ALIAS: &str = "via-symlink";
+
+/// `root`, reached through a symlinked ancestor so the paths this module hands out are NOT
+/// canonical.
+///
+/// Production's `Config::load` normalizes its root through `canonicalize()`, and index/overlay
+/// code depends on that (the worktree overlay derives `config.root`'s subdir by stripping it
+/// against a canonicalized repo workdir). On macOS the system temp is already non-canonical
+/// (`/var` → `/private/var`) and on Windows it expands 8.3 names like `RUNNER~1`, so a fixture that
+/// keeps its own copy of the scratch path is comparing against a root production never sees.
+/// Linux was the one platform where the two spellings coincided — which is exactly why that class
+/// of bug reached the macOS/Windows legs instead of the per-PR Linux matrix (#1027).
+///
+/// `<namespace>/via-symlink` is a symlink to the namespace itself, so `<namespace>/via-symlink/x`
+/// and `<namespace>/x` are the same directory under two spellings — the Linux stand-in for the
+/// divergence the other platforms hand over for free. It lives INSIDE the namespace
+/// [`ensure_secure_root`] has already verified (a real, euid-owned, `0700` directory), so it adds
+/// no attack surface, and [`sweep_stale`] skips symlink entries so it is never followed or swept.
+///
+/// Unix-only: creating a symlink on Windows needs developer mode or elevation, and Windows has its
+/// own non-canonical spelling anyway — the tripwire tests are gated the same way, so nothing on
+/// Windows depends on this branch.
+///
+/// On Unix it returns `root` unchanged when the link cannot be made (a mount or policy that denies
+/// symlink creation). That is NOT a graceful degradation: the divergence the tripwires assert
+/// disappears with it, so
+/// `scratch_paths_are_not_canonical_so_linux_covers_the_macos_root_divergence` and the per-fixture
+/// `*_diverges_from_its_scratch_spelling` probes fail. Failing loudly is the intended outcome — a
+/// suite that stayed green while silently dropping this coverage is how the class reached the
+/// cross-platform legs in the first place (#1027).
+///
+/// # What it does NOT cover
+///
+/// The alias only reaches paths handed out by [`scratch_dir`] / [`ScratchDir`]. A fixture that
+/// rolls its own root — `std::env::temp_dir().join(...)`, `tempfile::tempdir()` — opts out: that
+/// root is already canonical on Linux, [`canonical_config_root`] degenerates to a no-op, and the
+/// root-spelling class stops being covered on the per-PR matrix. Build index `Config` fixtures on
+/// [`ScratchDir`] for that reason (the roots not on it today are synthetic paths, explicitly
+/// canonicalized ones, and the bench corpus, none of which carry a scratch spelling at all).
+///
+/// It is also only an approximation of Windows: `std::fs::canonicalize` there returns a `\\?\`
+/// verbatim path and expands 8.3 names, neither of which a Unix symlink produces. A root-spelling
+/// bug specific to those two shapes still surfaces first on the cross-platform legs.
+fn aliased_root(root: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        let alias = root.join(NON_CANONICAL_ALIAS);
+        // Racy by construction (every test process runs this): tolerate an already-created link.
+        if std::fs::symlink_metadata(&alias).is_err() {
+            let _ = std::os::unix::fs::symlink(".", &alias);
+        }
+        if std::fs::symlink_metadata(&alias).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return alias;
+        }
+    }
+    root.to_path_buf()
+}
+
+/// `root` in the canonical form a `Config` loaded from disk would carry.
+///
+/// `Config::load` normalizes its root through `canonicalize()`, and index/overlay code depends on
+/// that: the worktree overlay derives `config.root`'s subdir by stripping it against a
+/// canonicalized repo workdir, so a hand-built `Config` holding a non-canonical root strips to
+/// nothing and scopes the refresh at the repo root instead of the config root. A fixture that
+/// builds its `Config` by hand must therefore canonicalize the same way — otherwise it exercises a
+/// configuration production can never produce, and the mis-scoping stays invisible (#1027).
+///
+/// Fixtures hand roots over before creating them (a `git worktree add` destination must not
+/// exist), which plain `canonicalize()` rejects, so this canonicalizes the longest EXISTING
+/// ancestor and re-joins the remainder. For a root that exists it is exactly `canonicalize()`.
+///
+/// A root with NO existing ancestor below the filesystem root comes back UNCHANGED, and that is
+/// load-bearing rather than a degenerate case. Placement and event-classification tests reason over
+/// SYNTHETIC paths (`/repo`, `/main/.git/worktrees`, `/checkout/packages`) that are never on disk;
+/// `Config::load` rejects such a root outright (`normalize_existing_dir` requires the directory to
+/// exist), so there is no production spelling to match and inventing one would only introduce a
+/// divergence. Windows is where that bites: `canonicalize()` on the bare root yields the current
+/// drive's `\\?\C:\` verbatim prefix, so a canonicalized `/repo` would stop matching the sibling
+/// literals the same test compares it against — a mismatch the Linux legs can never see (#1027).
+pub fn canonical_config_root(root: impl Into<PathBuf>) -> PathBuf {
+    let root = root.into();
+    resolve_through_existing_ancestor(&root).unwrap_or(root)
+}
+
+/// `path` resolved through its deepest EXISTING ancestor: that ancestor canonicalized, with the
+/// components below it re-joined verbatim. `None` when the ascent reaches a filesystem root or
+/// prefix without finding one.
+///
+/// The ascent deliberately stops ABOVE the filesystem root instead of resolving it. A path with no
+/// existing ancestor at all names nothing on this machine, so there is no spelling to normalize
+/// toward — and on Windows `canonicalize()` of the bare root returns the current drive's `\\?\C:\`
+/// verbatim form, which would rewrite the path into one none of its siblings match.
+fn resolve_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut probe = path;
+    loop {
+        let (parent, name) = (probe.parent()?, probe.file_name()?);
+        if let Ok(canonical) = probe.canonicalize() {
+            return Some(tail.iter().rev().fold(canonical, |acc, part| acc.join(part)));
+        }
+        tail.push(name);
+        probe = parent;
+    }
 }
 
 /// One uniquely owned scratch directory, removed on drop.
@@ -551,9 +674,90 @@ mod tests {
     #[test]
     fn accepts_normal_single_component_tag() {
         let dir = ScratchDir::new("normal-tag");
-        assert_eq!(dir.path().parent(), Some(scratch_root().as_path()));
+        // The parent is the namespace, reached through the non-canonical alias on Unix.
+        assert_eq!(dir.path().parent(), Some(aliased_root(&scratch_root()).as_path()));
+        // Both sides canonical: [`scratch_root`] is `std::env::temp_dir()`-derived and therefore
+        // NOT canonical itself on macOS (`/var` → `/private/var`) or Windows (`\\?\` verbatim, 8.3
+        // expansion). Comparing a canonicalized left against a raw right is the very defect #1027
+        // exists to remove — it would pass only on a Linux box with a canonical `$TMPDIR`.
+        assert_eq!(
+            canonical_config_root(dir.path()).parent(),
+            Some(canonical_config_root(scratch_root()).as_path()),
+        );
         let name = dir.path().file_name().and_then(|n| n.to_str()).unwrap_or_default();
         assert!(name.starts_with("normal-tag-"), "unexpected scratch name {name:?}");
+    }
+
+    /// The scratch paths this module hands out must NOT be canonical on Unix, so a Linux run
+    /// exercises the same root divergence macOS (`/var` → `/private/var`) and Windows (8.3
+    /// `RUNNER~1`) produce by default — the divergence that let a mis-scoped worktree overlay
+    /// reach the cross-platform legs unnoticed (#1027). Bites if [`aliased_root`] is neutered:
+    /// the class would silently stop being covered on the per-PR matrix.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_paths_are_not_canonical_so_linux_covers_the_macos_root_divergence() {
+        let dir = ScratchDir::new("alias-probe");
+        let canonical = canonical_config_root(dir.path());
+        assert_ne!(
+            canonical,
+            dir.path(),
+            "scratch paths must reach the directory through a symlinked ancestor",
+        );
+        // Same directory, two spellings: a file written through one is visible through the other.
+        std::fs::write(dir.path().join("probe"), "payload").unwrap();
+        assert_eq!(std::fs::read_to_string(canonical.join("probe")).unwrap(), "payload");
+        // Canonical against canonical: a raw `scratch_root()` here would carry the system temp's
+        // own non-canonical spelling on macOS/Windows and never match (#1027).
+        assert!(
+            canonical.starts_with(canonical_config_root(scratch_root())),
+            "the canonical form stays in the namespace",
+        );
+    }
+
+    /// [`canonical_config_root`] must match `Config::load`'s `canonicalize()` for an EXISTING root
+    /// and still resolve the symlinked ancestors of a root that does not exist yet — fixtures hand
+    /// over `git worktree add` destinations before creating them.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_config_root_resolves_an_absent_leaf_through_its_symlinked_ancestors() {
+        let dir = ScratchDir::new("absent-leaf-probe");
+        let existing = canonical_config_root(dir.path());
+        assert_eq!(existing, dir.path().canonicalize().unwrap());
+
+        let absent = dir.path().join("not-created-yet/nested");
+        assert_eq!(canonical_config_root(&absent), existing.join("not-created-yet/nested"));
+        // Once it exists, plain canonicalization agrees.
+        std::fs::create_dir_all(&absent).unwrap();
+        assert_eq!(canonical_config_root(&absent), absent.canonicalize().unwrap());
+    }
+
+    /// The ancestor search stops ABOVE the filesystem root, so a SYNTHETIC path — one with no
+    /// existing ancestor at all — resolves to nothing and [`canonical_config_root`] hands it back
+    /// untouched.
+    ///
+    /// The placement and event-classification tests reason over paths that are never on disk
+    /// (`/repo`, `/main/.git/worktrees`, `/checkout/packages`) and compare `config.root` against
+    /// sibling literals spelled the same way. Resolving the bare root would rewrite one side of
+    /// every one of those comparisons and neither of the others — on Windows into the current
+    /// drive's `\\?\C:\` verbatim form (#1027). The search is asserted directly because on Unix
+    /// canonicalizing `/` is the identity, so `canonical_config_root` alone cannot tell the two
+    /// behaviours apart here.
+    #[test]
+    fn the_existing_ancestor_search_stops_above_the_filesystem_root() {
+        let synthetic = PathBuf::from("/rag-rat-no-such-root/packages/crate");
+        assert!(!synthetic.exists(), "the probe must not exist: {synthetic:?}");
+        assert!(
+            resolve_through_existing_ancestor(&synthetic).is_none(),
+            "a path with no existing ancestor must not resolve through the filesystem root",
+        );
+        assert_eq!(canonical_config_root(&synthetic), synthetic);
+
+        // The contrast: an absent leaf whose ancestor DOES exist still resolves through it.
+        let dir = ScratchDir::new("ancestor-search");
+        assert_eq!(
+            resolve_through_existing_ancestor(&dir.join("absent/leaf")),
+            Some(dir.path().canonicalize().unwrap().join("absent/leaf")),
+        );
     }
 
     #[test]
