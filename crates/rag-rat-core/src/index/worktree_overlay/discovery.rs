@@ -32,12 +32,61 @@ impl WorktreeOverlayDelta {
     }
 }
 
+/// Whether a refresh's [`WorktreeOverlayReport::changed_paths`] accounts for EVERY path whose
+/// effective content it may have changed.
+///
+/// Distinct from [`WorktreeOverlayReport::status_complete`], which answers a different question —
+/// "may this refresh's outcome be recorded as a skip-proof basis?" A path-scoped refresh is
+/// deliberately `status_complete = false` (it never reconciles the whole overlay, so it must not
+/// arm the #577 skip) while its path list is exactly what the caller asked for, hence `Complete`
+/// here. Deriving one from the other would make every event-driven pass — the hot path — look
+/// lossy and push consumers into a needless whole-checkout fallback.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ChangedPathsCoverage {
+    /// Every path this refresh may have changed is listed.
+    Complete,
+    /// The list may be MISSING paths: the linked working-tree status read failed, so dirty,
+    /// untracked, and working-tree-deleted files never became candidates. A consumer must treat
+    /// the whole checkout as potentially stale rather than trusting the list. The default, so a
+    /// skipped or defaulted report never reads as authoritative.
+    #[default]
+    Partial,
+}
+
 #[derive(Debug, Default)]
 pub struct WorktreeOverlayReport {
     /// The overlay scope's `worktree_id`; empty when `linked_path` was not a valid linked sibling
     /// (the pass was skipped).
     pub worktree_id: String,
+    /// The directory [`Self::changed_paths`] are relative to: this checkout's equivalent of
+    /// `config.root`. NOT the checkout root — when `config.root` is a repo SUBDIR the two differ
+    /// (`<linked>/crate` vs `<linked>`), and a consumer that joined at the checkout root would
+    /// resolve `src/lib.rs` instead of `crate/src/lib.rs`. Empty when the pass was skipped.
+    ///
+    /// Returned rather than rebasing the paths onto the checkout root so they keep the one
+    /// spelling the overlay rows and `target_for_path` already use — a consumer writing rows and
+    /// a consumer opening files both stay in the same coordinate system.
+    pub source_root: PathBuf,
     pub indexed: usize,
+    /// The config-root-relative paths whose effective indexed content this refresh changed: files
+    /// it WROTE, files it SHADOWED (tombstoned), and files it UNSHADOWED (pruned — dropping an
+    /// overlay row makes the base version visible to this checkout again, which changes what a
+    /// query serves just as much as a write does).
+    ///
+    /// Built from what the transaction COMMITTED, not from the candidates it considered. That
+    /// distinction is the whole value of the field: the candidate set of a diverged worktree is
+    /// its entire branch diff, and reporting that on every pass would name the same files forever
+    /// while nothing changed — leaving a consumer no better off than re-scanning the checkout, and
+    /// contradicting the empty-entry meaning [`crate::watch::OverlayRefresh`] documents. An idle
+    /// refresh of a static worktree reports nothing, matching its write-free behaviour.
+    ///
+    /// Still a SUPERSET, by a small and bounded margin: a path that survived the identity skip but
+    /// then failed to parse is listed though no row moved. That direction is deliberate —
+    /// over-reporting costs a consumer one redundant look, omitting a path leaves it serving stale
+    /// content. Read [`Self::coverage`] first: a `Partial` list is not even a superset.
+    pub changed_paths: Vec<PathBuf>,
+    /// Whether [`Self::changed_paths`] is the complete set. See [`ChangedPathsCoverage`].
+    pub coverage: ChangedPathsCoverage,
     pub tombstoned: usize,
     pub pruned: usize,
     /// Whether the working-tree status portion of the delta was read in FULL (see

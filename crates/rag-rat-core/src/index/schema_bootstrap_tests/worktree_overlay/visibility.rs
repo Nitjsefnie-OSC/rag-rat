@@ -188,13 +188,13 @@ fn refresh_worktree_overlays_reconciles_overlay_scope_embeddings() {
     let options = ai::ReconcileOptions { batch_size: Some(8), ..Default::default() };
     let budget = crate::watch::ReconcileBudget::new(options, std::time::Instant::now());
     // The pass refreshes the overlay AND reconciles its embeddings inline.
-    let changed = crate::watch::refresh_worktree_overlays(
+    let refresh = crate::watch::refresh_worktree_overlays(
         &mut db,
         &config,
         Some(&budget),
         &crate::watch::OverlayScope::All,
     );
-    assert!(changed, "the overlay changed (a new branch file was indexed)");
+    assert!(refresh.changed, "the overlay changed (a new branch file was indexed)");
 
     // In the overlay scope, the new branch file's chunk must carry a Current embedding — not be
     // left BM25-only. `refresh_worktree_overlays` restored the base scope, so re-enter the
@@ -744,6 +744,295 @@ fn lens_content_hash_follows_the_active_checkout_not_main() {
         db.lens_file_content_sha256("src/only_on_branch.rs").unwrap(),
         None,
         "a branch-only file is absent from the base scope, not silently named by another row"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn an_overlay_refresh_reports_which_checkout_reindexed_which_paths() {
+    // The refresh used to answer only "did anything change". That is enough for the pass's own
+    // control flow but not for a consumer that must act ON a particular checkout: a resident
+    // language server is rooted at one tree and can only answer for that tree (#1010).
+    //
+    // Two linked worktrees sharing one database, only ONE of them edited: the report must name the
+    // edited checkout and its path, and must not attribute that work to its sibling.
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let edited = unique_temp_root();
+    let quiet = unique_temp_root();
+    let _ = fs::remove_dir_all(&edited);
+    let _ = fs::remove_dir_all(&quiet);
+    run_git(&main, &["worktree", "add", "-q", "-b", "edited", edited.to_str().unwrap()]);
+    run_git(&main, &["worktree", "add", "-q", "-b", "quiet", quiet.to_str().unwrap()]);
+    // Only the first worktree diverges.
+    fs::write(edited.join("src/base.rs"), "pub fn base_fn() { let branch = 1; }\n").unwrap();
+    run_git(&edited, &["add", "."]);
+    run_git(&edited, &["commit", "-q", "-m", "branch edit"]);
+
+    let refresh = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    assert!(refresh.changed, "the edited worktree changed, so the pass changed something");
+    let edited_id = crate::watch::enclosing_worktree_id(&edited);
+    let quiet_id = crate::watch::enclosing_worktree_id(&quiet);
+    assert!(
+        refresh
+            .reindexed
+            .get(&edited_id)
+            .is_some_and(|entry| entry.paths.iter().any(|path| path.ends_with("src/base.rs"))),
+        "the edited checkout must name the path it reindexed: {:?}",
+        refresh.reindexed,
+    );
+    assert!(
+        refresh.reindexed.get(&quiet_id).is_none_or(|entry| entry.paths.is_empty()),
+        "an unedited sibling must not be credited with the other's work: {:?}",
+        refresh.reindexed,
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&edited);
+    let _ = fs::remove_dir_all(&quiet);
+}
+
+#[test]
+fn a_reported_path_resolves_against_the_reported_source_root_not_the_checkout_root() {
+    // The paths are config-root-relative (`src/lib.rs`), but the map is keyed by the CHECKOUT
+    // root. When `config.root` is a repo subdir the two differ, so a consumer that joined a path
+    // onto the key would open `<linked>/src/lib.rs` — which does not exist — instead of
+    // `<linked>/crate/src/lib.rs`. The report carries the directory its paths are relative to
+    // (#1010).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("crate/src")).unwrap();
+    // Canonical root, mirroring `Config::load` — see
+    // `worktree_overlay_serves_a_subdir_rooted_config`.
+    let main = main.canonicalize().unwrap();
+    fs::write(main.join("crate/src/lib.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    // Config rooted at the SUBDIR `crate`.
+    let config = source_config(main.join("crate"), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("crate/src/lib.rs"), "pub fn linked_fn() {}\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch"]);
+
+    let refresh = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    let linked_id = crate::watch::enclosing_worktree_id(&linked);
+    let entry = refresh
+        .reindexed
+        .get(&linked_id)
+        .unwrap_or_else(|| panic!("the linked checkout must be reported: {:?}", refresh.reindexed));
+    assert_eq!(entry.paths, vec![PathBuf::from("src/lib.rs")], "paths stay config-root-relative");
+    // The property that matters: joining a reported path onto the reported root reaches the file
+    // the refresh actually read. Joining onto the checkout root does not.
+    let resolved = entry.source_root.join("src/lib.rs");
+    assert_eq!(
+        fs::read_to_string(&resolved).unwrap(),
+        "pub fn linked_fn() {}\n",
+        "source_root + path must reach the branch file: {resolved:?}"
+    );
+    assert!(
+        !linked.join("src/lib.rs").exists(),
+        "the checkout root is the WRONG base here — that is what this test pins"
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn an_overlay_refresh_reports_paths_whose_rows_it_pruned() {
+    // Pruning an overlay row un-shadows the base version for that checkout, so the path's
+    // effective content changes exactly as much as a write does. Reporting only the files the
+    // refresh WROTE would leave a per-checkout consumer serving the branch version of a file that
+    // has gone back to the base one, until something unrelated edits it again (#1010).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/base.rs"), "pub fn base_fn() { let branch = 1; }\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch edit"]);
+    // First refresh: the divergence produces an overlay row.
+    let first = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    let linked_id = crate::watch::enclosing_worktree_id(&linked);
+    assert!(first.reindexed.contains_key(&linked_id), "the divergence must be reported");
+
+    // The branch goes back to the base state: nothing to write, but the stale overlay row is
+    // pruned and the base file becomes visible to this checkout again.
+    run_git(&linked, &["reset", "-q", "--hard", "HEAD~1"]);
+    let second = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    let entry = second
+        .reindexed
+        .get(&linked_id)
+        .unwrap_or_else(|| panic!("the checkout was visited: {:?}", second.reindexed));
+    assert!(
+        entry.paths.iter().any(|path| path.ends_with("src/base.rs")),
+        "the un-shadowed path must be reported even though the refresh wrote nothing: {entry:?}",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn an_idle_refresh_of_a_diverged_checkout_reports_a_visit_with_no_paths() {
+    // A diverged worktree's CANDIDATE set is its whole branch diff, and the refresh re-derives it
+    // every sweep — but an unchanged file is identity-skipped and no row moves. Reporting the
+    // candidates would name the same files on every pass forever while nothing changed, which is
+    // no better for a consumer than re-scanning the checkout and contradicts the empty-entry
+    // meaning ("visited, no work"). The list is built from what the transaction committed (#1010).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A committed divergence, so the branch diff stays NON-EMPTY on every later pass.
+    fs::write(linked.join("src/base.rs"), "pub fn base_fn() { let branch = 1; }\n").unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch edit"]);
+
+    let linked_id = crate::watch::enclosing_worktree_id(&linked);
+    let first = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+    assert!(
+        first.reindexed.get(&linked_id).is_some_and(|entry| !entry.paths.is_empty()),
+        "the first refresh really did write the diverged file: {:?}",
+        first.reindexed,
+    );
+
+    // Nothing touched since. The candidate set is unchanged (still the whole branch diff), but
+    // every candidate identity-skips.
+    let second = crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    assert!(!second.changed, "an idle overlay refresh writes nothing");
+    let entry = second
+        .reindexed
+        .get(&linked_id)
+        .unwrap_or_else(|| panic!("the checkout was still VISITED: {:?}", second.reindexed));
+    assert!(
+        entry.paths.is_empty(),
+        "an idle refresh must report the visit with NO paths, not re-report its branch diff: \
+         {entry:?}",
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
+#[test]
+fn a_path_scoped_refresh_reports_complete_coverage_despite_an_incomplete_status() {
+    // Two different questions share the word "complete". `status_complete` asks "may this
+    // refresh's outcome arm the #577 skip?" — always false on the path-scoped route, which never
+    // reconciles the whole overlay. `coverage` asks "is the reported path list the whole story?"
+    // — true there, because the caller named the exact paths. Deriving the second from the first
+    // would mark every event-driven pass lossy and push consumers into a whole-checkout fallback
+    // on the hot path (#1010).
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/base.rs"), "pub fn base_fn() {}\n").unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A whole-delta pass first, so the basis is recorded and the next pass can go path-scoped.
+    crate::watch::refresh_worktree_overlays(
+        &mut db,
+        &config,
+        None,
+        &crate::watch::OverlayScope::All,
+    );
+
+    // A dirty edit delivered as an EVENT PATH — the route that takes
+    // `index_worktree_overlay_paths`.
+    fs::write(linked.join("src/base.rs"), "pub fn base_fn() { let branch = 1; }\n").unwrap();
+    let scope = crate::watch::OverlayScope::Paths(BTreeMap::from([(
+        linked.clone(),
+        BTreeSet::from([linked.join("src/base.rs")]),
+    )]));
+    let refresh = crate::watch::refresh_worktree_overlays(&mut db, &config, None, &scope);
+
+    let linked_id = crate::watch::enclosing_worktree_id(&linked);
+    let entry = refresh.reindexed.get(&linked_id).unwrap_or_else(|| {
+        panic!("the event-named checkout must be reported: {:?}", refresh.reindexed)
+    });
+    assert!(
+        entry.paths.iter().any(|path| path.ends_with("src/base.rs")),
+        "the event path must be reported: {entry:?}",
+    );
+    assert_eq!(
+        entry.coverage,
+        crate::index::ChangedPathsCoverage::Complete,
+        "the caller named the exact paths, so nothing is missing from the list: {entry:?}",
     );
 
     let _ = fs::remove_dir_all(&main);
