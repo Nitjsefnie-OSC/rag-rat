@@ -316,6 +316,7 @@ pub const SYMBOL_KIND_RANK: &[(&str, i64)] = &[
     ("operator", 2),
     // Members and values.
     ("const", 3),
+    ("var", 3),
     ("property", 3),
     ("static", 3),
     ("enum_case", 3),

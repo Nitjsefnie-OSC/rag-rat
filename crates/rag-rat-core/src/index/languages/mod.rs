@@ -16,6 +16,7 @@ pub(super) use super::edges::extract::{EdgeEmitter, EdgeVisit};
 use super::parser::ParserKind;
 
 mod c_family;
+mod go;
 mod kotlin;
 mod markdown;
 mod python;
@@ -246,6 +247,7 @@ pub(super) fn parser_backend(language: Language) -> &'static dyn ParserBackend {
         Language::Python => &python::SUPPORT,
         Language::Swift => &swift::SUPPORT,
         Language::Markdown => &markdown::SUPPORT,
+        Language::Go => &go::SUPPORT,
     }
 }
 
@@ -258,6 +260,7 @@ pub(super) fn edge_extractor(language: Language) -> Option<EdgeExtractor> {
         Language::Python => Some(python::python_edges),
         Language::Swift => Some(swift::swift_edges),
         Language::Markdown => None,
+        Language::Go => Some(go::go_edges),
     }
 }
 
@@ -268,6 +271,7 @@ pub(super) fn resolver_policy(language: Language) -> Option<&'static ResolutionP
         Language::C | Language::Cpp => Some(&c_family::RESOLVER_POLICY),
         Language::Python => Some(&python::RESOLVER_POLICY),
         Language::Swift => Some(&swift::RESOLVER_POLICY),
+        Language::Go => Some(&go::RESOLVER_POLICY),
         _ => None,
     }
 }
@@ -396,6 +400,15 @@ mod tests {
                 )),
             ),
             (Language::Markdown, None),
+            (
+                Language::Go,
+                Some((
+                    DeclarationIdentity::CollapseEquivalent,
+                    ImportBinding::Uses,
+                    TypeBinding::AnySymbol,
+                    ReceiverFallback::Type,
+                )),
+            ),
         ];
 
         assert_eq!(expected.len(), Language::all().len());

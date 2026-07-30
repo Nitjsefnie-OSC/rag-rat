@@ -46,10 +46,11 @@ fn gitignored_root_venv_does_not_drop_the_root_entrypoint() {
     assert!(output.status.success(), "init --dry-run should succeed: {output:?}");
     let rendered = String::from_utf8_lossy(&output.stdout);
     // The gitignored `env/` is skipped by the scan (as the index would skip it), so `.` is still a
-    // safe default for the root entrypoint.
+    // safe default for the root entrypoint. `myapp` is a descendant of `.` and gets absorbed by
+    // ancestor/descendant dedup, leaving `.` alone in the binding set.
     assert!(
-        rendered.contains("python = [\".\", \"myapp\"]"),
-        "expected `.` + package binding, got:\n{rendered}"
+        rendered.contains("python = [\".\"]"),
+        "expected `.` binding (myapp absorbed by dedup), got:\n{rendered}"
     );
     assert!(!root.join("rag-rat.toml").exists(), "dry-run must not write a config");
 }

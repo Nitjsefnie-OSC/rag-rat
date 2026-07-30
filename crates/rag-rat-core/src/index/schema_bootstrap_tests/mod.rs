@@ -979,6 +979,7 @@ mod embedding_policy_fast_path;
 mod fts_corruption;
 mod generation_rebuild;
 mod git_history_reload;
+mod go_corpus;
 mod graph_edges;
 mod head_move_carry;
 mod index_paths;

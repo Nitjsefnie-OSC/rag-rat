@@ -15,6 +15,7 @@ pub enum Language {
     Cpp,
     Python,
     Swift,
+    Go,
     Markdown,
 }
 
@@ -28,7 +29,7 @@ struct LanguageSpec {
     supports_embeddings: bool,
 }
 
-const LANGUAGE_SPECS: [LanguageSpec; 8] = [
+const LANGUAGE_SPECS: [LanguageSpec; 9] = [
     LanguageSpec {
         language: Language::Rust,
         name: "rust",
@@ -86,6 +87,14 @@ const LANGUAGE_SPECS: [LanguageSpec; 8] = [
         supports_embeddings: true,
     },
     LanguageSpec {
+        language: Language::Go,
+        name: "go",
+        aliases: &["golang"],
+        simple_extensions: &["go"],
+        target_extensions: &["go"],
+        supports_embeddings: true,
+    },
+    LanguageSpec {
         language: Language::Markdown,
         name: "markdown",
         aliases: &["md"],
@@ -96,7 +105,7 @@ const LANGUAGE_SPECS: [LanguageSpec; 8] = [
 ];
 
 impl Language {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Rust,
         Self::TypeScript,
         Self::Kotlin,
@@ -104,6 +113,7 @@ impl Language {
         Self::Cpp,
         Self::Python,
         Self::Swift,
+        Self::Go,
         Self::Markdown,
     ];
 

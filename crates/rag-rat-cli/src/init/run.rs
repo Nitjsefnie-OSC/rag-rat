@@ -281,25 +281,8 @@ pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
     let bindings: BTreeMap<Language, Vec<PathBuf>> = languages
         .iter()
         .filter_map(|language| {
-            let candidates = candidate_dirs(scan, *language);
-            let defaults = candidates
-                .iter()
-                .filter(|candidate| candidate.default)
-                .map(|candidate| candidate.path.clone())
-                .collect::<Vec<_>>();
-            if !defaults.is_empty() {
-                return Some((*language, defaults));
-            }
-            // No safe default. For Python this is an env-only repo (every `.py` under a dependency
-            // tree — `candidate_dirs` deliberately refuses to promote `.` over it, #173): OMIT the
-            // binding rather than fall back to `["."]`, which would index the installed deps (#181
-            // — the empty-default state must survive into the non-interactive plan, not
-            // get reconverted to `.` here). For other languages, `.` is the reasonable
-            // "index everything" default.
-            if *language == Language::Python && !candidates.is_empty() {
-                return None;
-            }
-            Some((*language, vec![PathBuf::from(".")]))
+            let defaults = resolved_bindings(scan, *language);
+            if defaults.is_empty() { None } else { Some((*language, defaults)) }
         })
         .collect();
     // Keep `languages` consistent with the bindings actually emitted (a dropped env-only Python
@@ -751,5 +734,44 @@ mod default_plan_tests {
             .find(|m| m.model_id == rag_rat_base::embedding_models::HASH_MODEL_ID)
             .unwrap();
         assert!(!active.installed, "hash must NOT have been installed as a silent fallback");
+    }
+
+    /// Root `go.mod`, no root-level `.go` file, >32 leaf package dirs: `default_plan` must go
+    /// through `resolved_bindings`'s manifest-root promotion + `dedup_ancestors` so the module
+    /// root absorbs every leaf package into a single `.` binding (BIND-01).
+    #[test]
+    fn default_plan_absorbs_a_large_go_module_into_the_root() {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("go-default-plan-big");
+        std::fs::write(root.join("go.mod"), "module example.com/big\n\ngo 1.22\n").unwrap();
+        for i in 0..40 {
+            let dir = root.join(format!("pkg{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("file.go"), "package pkg\n").unwrap();
+        }
+
+        let scan = scan_repo(&root).unwrap();
+        let plan = default_plan(".".to_string(), &scan);
+
+        assert_eq!(plan.bindings.get(&Language::Go), Some(&vec![PathBuf::from(".")]));
+    }
+
+    /// `default_plan` must surface every independently-default directory, not just the top 32 —
+    /// `resolved_bindings` wraps the uncapped `default_dirs`, not the UI-capped `candidate_dirs`.
+    #[test]
+    fn default_plan_does_not_truncate_more_than_32_independent_defaults() {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("rust-default-plan-uncapped");
+        let mut expected = Vec::new();
+        for i in 0..40 {
+            let dir = root.join(format!("pkg{i}/src"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
+            expected.push(PathBuf::from(format!("pkg{i}/src")));
+        }
+        expected.sort();
+
+        let scan = scan_repo(&root).unwrap();
+        let plan = default_plan(".".to_string(), &scan);
+
+        assert_eq!(plan.bindings.get(&Language::Rust), Some(&expected));
     }
 }

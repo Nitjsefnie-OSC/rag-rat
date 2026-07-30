@@ -2,7 +2,7 @@ mod render;
 mod run;
 mod scan;
 mod wizard;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
@@ -92,6 +92,12 @@ pub(crate) struct RepoScan {
     /// (`.cpp`/`.cc`/…), else to **C**. Bare `Language::from_path` calls every `.h` C, which would
     /// bind a C++ library's header tree as `c` and parse it as C — see [`scan::assign_headers`].
     deferred_headers: Vec<PathBuf>,
+    /// Per-language manifest root directories found during the walk (e.g. a dir holding a
+    /// `go.mod`) — used to seed default bindings for languages whose source layout is
+    /// manifest-anchored rather than dir-count-anchored. `BTreeMap`/`BTreeSet` (not
+    /// `HashMap`/`HashSet`) for deterministic iteration order — same-scan-twice must yield
+    /// identical output (BIND-08).
+    manifest_roots: BTreeMap<Language, BTreeSet<PathBuf>>,
 }
 
 impl RepoScan {
@@ -482,16 +488,16 @@ mod tests {
             total_source_bytes: 0,
             has_python_virtualenv: false,
             deferred_headers: Vec::new(),
+            manifest_roots: BTreeMap::new(),
         };
 
         let plan = default_plan(".".to_string(), &scan);
 
         assert_eq!(plan.languages, vec![Language::Rust, Language::Markdown]);
         assert_eq!(plan.bindings[&Language::Rust], vec![PathBuf::from("src")]);
-        assert_eq!(plan.bindings[&Language::Markdown], vec![
-            PathBuf::from("."),
-            PathBuf::from("docs")
-        ]);
+        // `.` recursively covers `docs`, so `dedup_ancestors` (BIND-07) collapses the
+        // redundant descendant binding — `.` alone is the correct default set.
+        assert_eq!(plan.bindings[&Language::Markdown], vec![PathBuf::from(".")]);
     }
 
     #[test]
@@ -519,6 +525,7 @@ mod tests {
             total_source_bytes: 0,
             has_python_virtualenv: false,
             deferred_headers: Vec::new(),
+            manifest_roots: BTreeMap::new(),
         };
 
         let defaults = candidate_dirs(&scan, Language::C)

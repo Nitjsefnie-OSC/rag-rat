@@ -46,6 +46,8 @@ fn is_literal_kind(kind: &str, lang: Language) -> bool {
                 | "raw_str_part"
                 | "raw_str_end_part"
                 | "str_escaped_char"
+                | "interpreted_string_literal_content"
+                | "raw_string_literal_content"
                 | "integer"
                 | "float"
                 | "number"
@@ -579,6 +581,36 @@ mod tests {
         assert!(
             ncpp_x.iter().any(|tok| tok == "LIT_CHARACTER"),
             "C++ char value must bucket to LIT_CHARACTER: {ncpp_x:?}"
+        );
+    }
+
+    /// Go smoke + string-bucketing test (T9/wave 4): a simple Go function normalizes without
+    /// panicking/falling back, and two near-identical functions differing ONLY in string-literal
+    /// contents normalize to the SAME token stream — proving `interpreted_string_literal_content`
+    /// is bucketed (see `is_literal_kind` doc) so clone detection catches the pair.
+    #[test]
+    fn go_smoke_and_string_bucket() {
+        let g1 = r#"func f() int {
+    a := log("hello")
+    b := log("world")
+    return a + b
+}"#;
+        let g2 = r#"func f() int {
+    a := log("foo")
+    b := log("bar")
+    return a + b
+}"#;
+        let n1 = norm_lang(g1, "t.go", Language::Go);
+        let n2 = norm_lang(g2, "t.go", Language::Go);
+        assert!(!n1.is_empty(), "Go normalize stream must be non-empty");
+        assert_eq!(
+            n1, n2,
+            "Go string-content-only diff must normalize equal (interpreted_string_literal_content \
+             bucketed)"
+        );
+        assert!(
+            !n1.iter().any(|t| t == "hello" || t == "world" || t == "foo" || t == "bar"),
+            "Go string VALUES must never reach the normalized stream: {n1:?}"
         );
     }
 

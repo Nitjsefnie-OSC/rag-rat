@@ -212,6 +212,7 @@ pub enum ParserKind {
     Cpp,
     Python,
     Swift,
+    Go,
     Markdown,
 }
 
@@ -235,6 +236,7 @@ pub(crate) fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
         ParserKind::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         ParserKind::Python => tree_sitter_python::LANGUAGE.into(),
         ParserKind::Swift => tree_sitter_swift::LANGUAGE.into(),
+        ParserKind::Go => tree_sitter_go::LANGUAGE.into(),
         ParserKind::Markdown => return None,
     })
 }

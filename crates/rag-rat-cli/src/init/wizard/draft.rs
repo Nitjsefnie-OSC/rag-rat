@@ -15,7 +15,7 @@ use rag_rat_base::language::Language;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
 use crate::init::render::{config_root_value, display_rel, render_config};
-use crate::init::scan::{candidate_dirs, estimated_chunks, recommend_backend};
+use crate::init::scan::{estimated_chunks, recommend_backend, resolved_bindings};
 use crate::init::{InitPlan, RepoScan};
 
 /// The embedding remote connection mode, derived from `RemoteEmbeddingConfig`.
@@ -354,7 +354,10 @@ impl WizardDraft {
     /// Build a fresh draft from a `RepoScan`, mirroring `init::run::default_plan` logic:
     ///
     /// - Languages: those with a non-zero file count in `scan`.
-    /// - Directories: the default-flagged candidates from `candidate_dirs`.
+    /// - Directories: delegates to the shared `scan::resolved_bindings` helper (also used by
+    ///   `init::run::default_plan`), which wraps `default_dirs` — folding in manifest-root
+    ///   promotion (Go) and the "no safe default → omit Python / fall back to '.' for others" edge
+    ///   case — so both entry points resolve bindings identically (BIND-03).
     /// - Embedding backend: `recommend_backend` based on estimated chunk count.
     /// - Oracle: off (must be opted in explicitly).
     /// - Version check: on (the default).
@@ -369,23 +372,11 @@ impl WizardDraft {
             if scan.language_counts().get(&lang).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            let candidates = candidate_dirs(scan, lang);
-            let defaults: Vec<PathBuf> =
-                candidates.iter().filter(|c| c.default).map(|c| c.path.clone()).collect();
-
-            // Python env-only repo: no safe default → omit the binding entirely (matches
-            // default_plan's behaviour — `candidate_dirs` deliberately refuses to promote `.`
-            // over a dependency tree).
-            if lang == Language::Python && !candidates.is_empty() && defaults.is_empty() {
+            let dirs = resolved_bindings(scan, lang);
+            if dirs.is_empty() {
+                // Python env-only repo: no safe default → omit the binding entirely.
                 continue;
             }
-
-            let dirs = if defaults.is_empty() {
-                // Non-Python with no default candidate: fall back to "." (index everything).
-                vec![PathBuf::from(".")]
-            } else {
-                defaults
-            };
             bindings.insert(lang, dirs);
         }
 
@@ -1605,6 +1596,42 @@ mod tests {
         assert!(!d.hooks.git);
         // root_abs must be the absolute path passed in.
         assert_eq!(d.root_abs, root_abs);
+    }
+
+    /// BIND-03 (task 11, `complete-default-bindings-coverage`): the interactive wizard path
+    /// (`WizardDraft::from_scan`) and the non-interactive path (`init::run::default_plan`) must
+    /// resolve *byte-for-byte identical* bindings when driven against the same real on-disk
+    /// fixture — root `go.mod`, no root-level `.go` file, >32 leaf package dirs, the same
+    /// fixture shape the black-box CLI integration test in
+    /// `tests/init_yes_writes_valid_config.rs::init_yes_binds_a_large_go_module_at_its_root`
+    /// drives through the actual `init --yes` subprocess. Both delegate to
+    /// `scan::resolved_bindings`, so this test fails if that ever stops being true for either
+    /// call site.
+    #[test]
+    fn from_scan_matches_default_plan_for_a_large_go_module() {
+        use crate::init::run::default_plan;
+        use crate::init::scan::scan_repo;
+
+        let root = rag_rat_base::test_scratch::ScratchDir::new("go-from-scan-big");
+        std::fs::write(root.join("go.mod"), "module example.com/big\n\ngo 1.22\n").unwrap();
+        for i in 0..40 {
+            let dir = root.join(format!("pkg{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("file.go"), "package pkg\n").unwrap();
+        }
+
+        let scan = scan_repo(&root).unwrap();
+        let plan = default_plan(".".to_string(), &scan);
+        let draft = WizardDraft::from_scan(&scan, ".".to_string(), root.to_path_buf());
+
+        assert_eq!(draft.bindings.get(&Language::Go), Some(&vec![PathBuf::from(".")]));
+        // Full binding-map parity, not just Go — the two call sites must never diverge for any
+        // language, since both now delegate to the same `resolved_bindings` helper.
+        assert_eq!(
+            draft.bindings, plan.bindings,
+            "interactive (from_scan) and non-interactive (default_plan) bindings must be \
+             identical for the same scan"
+        );
     }
 
     // ── Distill + tracker emission ──────────────────────────────────────────────

@@ -64,6 +64,22 @@ pub(crate) fn scan_dir(
     for entry in entries {
         let path = entry.path();
         let file_type = entry.file_type()?;
+        if file_type.is_file() && entry.file_name() == "go.mod" {
+            // Record the manifest root by filename PRESENCE only — never parse `go.mod` content
+            // (BIND-01). A malformed or empty `go.mod` still marks its parent dir as a Go
+            // manifest root; content validity is irrelevant here.
+            let parent = path.parent().unwrap_or(dir);
+            let relative_parent = parent.strip_prefix(root).unwrap_or(parent);
+            let relative_parent = if relative_parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative_parent
+            };
+            scan.manifest_roots
+                .entry(Language::Go)
+                .or_default()
+                .insert(relative_parent.to_path_buf());
+        }
         if file_type.is_dir() {
             let name = entry.file_name().to_string_lossy().into_owned();
             // A real Python VIRTUALENV (detected by content — a `pyvenv.cfg`, NOT by an ambiguous
@@ -143,6 +159,10 @@ pub(crate) fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCand
     let Some(counts) = scan.dir_counts.get(&language) else {
         return Vec::new();
     };
+    // Single source of truth for what's actually a default (BIND-02): membership here comes
+    // from `default_dirs`, not a re-run of the heuristic — keeps this capped UI list and the
+    // uncapped binding set from ever drifting apart.
+    let resolved_defaults = default_dirs(scan, language);
     // `dir_counts` is populated only by `scan_dir`, whose walk already applies the shared
     // IgnoreMatcher and skips the hard floor. Do not rebuild that matcher here on every render; the
     // candidate set is derived from the filtered scan.
@@ -152,40 +172,43 @@ pub(crate) fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCand
         .map(|(path, count)| DirCandidate {
             path: path.clone(),
             count: *count,
-            default: default_dir(scan, language, path),
+            default: resolved_defaults.contains(path),
         })
         .collect::<Vec<_>>();
-    // When nothing is a natural default, promote the largest candidate — but NEVER a Python
-    // dependency tree (`env/`, `site-packages`, …): in a repo whose only `.py` files live under a
-    // virtualenv, promoting it would write a binding into installed deps. If every candidate is a
-    // dependency dir, leave none defaulted (no binding beats the wrong binding).
-    if !candidates.iter().any(|candidate| candidate.default)
-        && let Some(best) = candidates
-            .iter_mut()
-            .filter(|candidate| !fallback_excluded(language, &candidate.path))
-            // For Python, don't promote the aggregate `.` bucket when the root holds no real source
-            // directly: in an env-only repo every `.py` lives under a dependency tree (those dirs
-            // are `fallback_excluded`), so `.` would win on aggregate count alone and write
-            // `python = ["."]` over installed deps (#173). A root with genuine entrypoints has a
-            // non-zero direct count and is already a default above, so it never reaches here.
-            .filter(|candidate| {
-                language != Language::Python
-                    || candidate.path != Path::new(".")
-                    || python_root_has_direct_source(scan, &candidate.path)
-            })
-            .max_by_key(|candidate| candidate.count)
-    {
-        best.default = true;
-    }
     candidates.sort_by(|a, b| {
         b.default
             .cmp(&a.default)
             .then_with(|| b.count.cmp(&a.count))
             .then_with(|| a.path.cmp(&b.path))
     });
+    if candidates.len() > 32 {
+        tracing::debug!(
+            "{} additional {language:?} directory candidates beyond the top 32 shown in the UI",
+            candidates.len() - 32
+        );
+    }
     candidates.truncate(32);
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
     candidates
+}
+
+/// Shared helper both plan-generation call sites (`run.rs::default_plan`,
+/// `draft.rs::WizardDraft::from_scan`) use so they can no longer drift apart. Wraps the
+/// uncapped `default_dirs`, applying the same "no safe default" edge case both call sites used
+/// to implement separately: for Python with candidates present but none flagged default (an
+/// env-only repo — every `.py` lives under a dependency tree, see `fallback_excluded`),
+/// return empty so the caller omits the language rather than falling back to `["."]`, which
+/// would index installed deps (#173/#181). Every other language falls back to `["."]`.
+pub(crate) fn resolved_bindings(scan: &RepoScan, language: Language) -> Vec<PathBuf> {
+    let defaults = default_dirs(scan, language);
+    if !defaults.is_empty() {
+        return defaults;
+    }
+    let has_candidates = scan.dir_counts.get(&language).is_some_and(|counts| !counts.is_empty());
+    if language == Language::Python && has_candidates {
+        return Vec::new();
+    }
+    vec![PathBuf::from(".")]
 }
 pub(crate) fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> bool {
     let text = display_rel(path);
@@ -219,6 +242,10 @@ pub(crate) fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> b
                     || text == "src"
                     || text.ends_with("/src")),
         Language::Markdown => text == "docs" || text == ".",
+        Language::Go =>
+            text == "src"
+                || text.ends_with("/src")
+                || directly_contains_source(scan, language, path),
     }
 }
 
@@ -284,6 +311,68 @@ pub(crate) fn directly_contains_source(scan: &RepoScan, language: Language, path
 }
 pub(crate) fn path_depth(path: &Path) -> usize {
     if path == Path::new(".") { 0 } else { path.components().count() }
+}
+
+/// Uncapped, unbounded-depth derivation of the default binding dirs for a language (BIND-04,
+/// BIND-08). Same natural-default + fallback-promotion logic `candidate_dirs` uses, minus its
+/// UI-only `path_depth <= 4` filter and `truncate(32)`: this is the raw set init logic reasons
+/// over, not the trimmed set the picker UI renders. Manifest-root promotion is a later task —
+/// deliberately not implemented here.
+pub(crate) fn default_dirs(scan: &RepoScan, language: Language) -> Vec<PathBuf> {
+    let Some(counts) = scan.dir_counts.get(&language) else {
+        return Vec::new();
+    };
+    // Step 1: every dir the per-language `default_dir` heuristic flags as a natural default —
+    // uncapped depth, no top-32 truncation.
+    let mut defaults: Vec<PathBuf> =
+        counts.keys().filter(|path| default_dir(scan, language, path)).cloned().collect();
+    // Step 2: promote each recorded manifest root (currently Go's `go.mod` dirs) as an
+    // additional default — module roots absorb their leaf-package defaults via the
+    // `dedup_ancestors` pass below, so a Go repo with a root `go.mod` and no root-level
+    // `.go` file still collapses to a single recursive `.` binding (BIND-01).
+    if let Some(manifest_roots) = scan.manifest_roots.get(&language) {
+        defaults.extend(manifest_roots.iter().cloned());
+    }
+    // Step 3: nothing natural — fall back to the single highest-count candidate, same
+    // Python-exclusion-aware promotion rule `candidate_dirs` applies.
+    if defaults.is_empty()
+        && let Some((best_path, _)) = counts
+            .iter()
+            .filter(|(path, _)| !fallback_excluded(language, path))
+            .filter(|(path, _)| {
+                language != Language::Python
+                    || **path != Path::new(".")
+                    || python_root_has_direct_source(scan, path)
+            })
+            .max_by_key(|(_, count)| **count)
+    {
+        defaults.push(best_path.clone());
+    }
+    // Step 4: collapse descendants into their shallowest kept ancestor.
+    dedup_ancestors(defaults)
+}
+
+/// Drop any path that is a descendant of another path already in the set — e.g. `.` and
+/// `src/foo` collapse to just `.`. Generalizes the ad hoc "Python `.` wins alone" special case
+/// (see `python_root_has_direct_source` / the Python arm of `default_dir`) into a
+/// language-agnostic pass usable for any binding set. Shallowest paths win: sort by depth
+/// ascending first, then keep a path only if no already-kept path is an ancestor of it (via
+/// `starts_with`). Output is sorted for deterministic, order-independent results.
+pub(crate) fn dedup_ancestors(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_by_key(|path| path_depth(path));
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        // `Path::starts_with` does NOT treat "." as an ancestor of a relative path (it compares
+        // components literally, and "." has none once normalized) — so "." needs an explicit
+        // check to act as the universal root every other relative path descends from.
+        let has_kept_ancestor =
+            kept.iter().any(|ancestor| ancestor == Path::new(".") || path.starts_with(ancestor));
+        if !has_kept_ancestor {
+            kept.push(path);
+        }
+    }
+    kept.sort();
+    kept
 }
 
 #[cfg(test)]
@@ -494,13 +583,249 @@ mod python_dir_tests {
         let candidates = candidate_dirs(&scan, Language::Python);
         let default_paths: Vec<String> =
             candidates.iter().filter(|c| c.default).map(|c| display_rel(&c.path)).collect();
-        assert!(
-            default_paths.contains(&".".to_string()),
-            "root entrypoints make `.` a default: {candidates:?}"
+        // `.` recursively covers `myapp`, so `dedup_ancestors` (BIND-07) collapses the
+        // redundant descendant binding — `.` alone is the correct default set.
+        assert_eq!(
+            default_paths,
+            vec![".".to_string()],
+            "root ancestor `.` absorbs the package dir default: {candidates:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod go_manifest_root_tests {
+    use super::*;
+
+    #[test]
+    fn go_mod_presence_records_its_parent_dir() {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("go-manifest-present");
+        fs::create_dir_all(root.join("svc")).unwrap();
+        fs::write(root.join("svc/go.mod"), "module example.com/svc\n\ngo 1.22\n").unwrap();
+        fs::write(root.join("svc/main.go"), "package main\n").unwrap();
+
+        let scan = scan_repo(&root).unwrap();
+
         assert!(
-            default_paths.contains(&"myapp".to_string()),
-            "the package dir is still a default: {candidates:?}"
+            scan.manifest_roots
+                .get(&Language::Go)
+                .is_some_and(|roots| roots.contains(&PathBuf::from("svc"))),
+            "svc/go.mod must record svc as a Go manifest root: {:?}",
+            scan.manifest_roots.get(&Language::Go)
         );
+    }
+
+    #[test]
+    fn no_go_mod_anywhere_yields_an_empty_go_manifest_set() {
+        let root = rag_rat_base::test_scratch::ScratchDir::new("go-manifest-absent");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+        let scan = scan_repo(&root).unwrap();
+
+        assert!(
+            scan.manifest_roots.get(&Language::Go).is_none_or(|roots| roots.is_empty()),
+            "no go.mod anywhere must leave the Go manifest set empty: {:?}",
+            scan.manifest_roots.get(&Language::Go)
+        );
+    }
+
+    #[test]
+    fn malformed_or_empty_go_mod_still_records_its_parent_dir() {
+        // Filename-presence only, never content-parsing (BIND-01): an empty file still counts.
+        let root = rag_rat_base::test_scratch::ScratchDir::new("go-manifest-malformed");
+        fs::create_dir_all(root.join("broken")).unwrap();
+        fs::write(root.join("broken/go.mod"), "").unwrap();
+
+        let scan = scan_repo(&root).unwrap();
+
+        assert!(
+            scan.manifest_roots
+                .get(&Language::Go)
+                .is_some_and(|roots| roots.contains(&PathBuf::from("broken"))),
+            "an empty go.mod must still record its parent dir: {:?}",
+            scan.manifest_roots.get(&Language::Go)
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedup_ancestors_tests {
+    use super::*;
+
+    #[test]
+    fn a_descendant_collapses_into_its_ancestor() {
+        let paths = vec![PathBuf::from("."), PathBuf::from("src/foo")];
+        assert_eq!(dedup_ancestors(paths), vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn unrelated_paths_are_kept_unchanged() {
+        let paths = vec![PathBuf::from("pkg1"), PathBuf::from("pkg2"), PathBuf::from("pkg3")];
+        assert_eq!(dedup_ancestors(paths.clone()), vec![
+            PathBuf::from("pkg1"),
+            PathBuf::from("pkg2"),
+            PathBuf::from("pkg3")
+        ]);
+    }
+
+    #[test]
+    fn output_is_deterministic_across_repeated_runs() {
+        let paths = vec![PathBuf::from("b/child"), PathBuf::from("a"), PathBuf::from("b")];
+        let first = dedup_ancestors(paths.clone());
+        let second = dedup_ancestors(paths);
+        assert_eq!(first, second);
+        assert_eq!(first, vec![PathBuf::from("a"), PathBuf::from("b")]);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_output() {
+        let paths: Vec<PathBuf> = Vec::new();
+        assert_eq!(dedup_ancestors(paths), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn nested_descendants_collapse_into_the_shallowest_shared_ancestor() {
+        let paths =
+            vec![PathBuf::from("pkg"), PathBuf::from("pkg/sub"), PathBuf::from("pkg/sub/deep")];
+        assert_eq!(dedup_ancestors(paths), vec![PathBuf::from("pkg")]);
+    }
+}
+
+#[cfg(test)]
+mod default_dirs_tests {
+    use super::*;
+
+    #[test]
+    fn natural_default_dir_is_returned() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Rust), vec![PathBuf::from("src")]);
+    }
+
+    #[test]
+    fn no_natural_default_falls_back_to_highest_count_candidate() {
+        // No "src"/"app"-shaped dir for TypeScript, so the fallback-promotion rule picks the
+        // highest count dir instead of leaving the language unbound. `.` is the aggregate bucket
+        // every file increments (see `add_file_to_dir_counts`), so it wins the count race and, for
+        // a non-Python language, is a legal fallback candidate (no Python-exclusion applies).
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("lib")).unwrap();
+        fs::write(root.path().join("lib/a.ts"), "export const a = 1;\n").unwrap();
+        fs::write(root.path().join("lib/b.ts"), "export const b = 2;\n").unwrap();
+        fs::create_dir_all(root.path().join("other")).unwrap();
+        fs::write(root.path().join("other/c.ts"), "export const c = 3;\n").unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::TypeScript), vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn python_fallback_never_promotes_a_dependency_tree() {
+        // Every .py file lives under a virtualenv-shaped dependency dir: the Python-exclusion-aware
+        // fallback must promote nothing rather than write a binding into installed deps.
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".venv/lib/site-packages/pkg")).unwrap();
+        fs::write(root.path().join(".venv/lib/site-packages/pkg/mod.py"), "def f():\n    pass\n")
+            .unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Python), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn dedup_ancestors_is_applied_to_the_result() {
+        // A default `.` (via python_root_has_direct_source) alongside a nested Python package dir
+        // must collapse to just `.` — dedup_ancestors is exercised, not skipped.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("manage.py"), "# entrypoint\n").unwrap();
+        fs::create_dir_all(root.path().join("app")).unwrap();
+        fs::write(root.path().join("app/main.py"), "def main():\n    pass\n").unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Python), vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn uncapped_depth_is_not_filtered_like_candidate_dirs() {
+        // A default dir deeper than the candidate_dirs UI-only path_depth <= 4 filter must still
+        // surface from default_dirs — it is the uncapped, unbounded-depth derivation.
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("a/b/c/d/src");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        let deep_rel = PathBuf::from("a/b/c/d/src");
+        assert!(
+            path_depth(&deep_rel) > 4,
+            "fixture must exceed the candidate_dirs depth filter to exercise uncapped depth"
+        );
+        assert_eq!(default_dirs(&scan, Language::Rust), vec![deep_rel]);
+    }
+
+    #[test]
+    fn more_than_32_defaults_are_not_truncated() {
+        // candidate_dirs truncates to the top 32 by count; default_dirs must not apply that
+        // UI-only cap — all 40 top-level Rust `src` dirs must come back.
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for i in 0..40 {
+            let dir = root.path().join(format!("pkg{i}/src"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
+            expected.push(PathBuf::from(format!("pkg{i}/src")));
+        }
+        expected.sort();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Rust), expected);
+    }
+
+    #[test]
+    fn go_module_root_absorbs_more_than_32_leaf_packages() {
+        // Root go.mod, no root-level .go file, >32 package dirs: module root must absorb
+        // every leaf package via manifest-root promotion + dedup_ancestors (BIND-01).
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("go.mod"), "module example.com/big\n\ngo 1.22\n").unwrap();
+        for i in 0..40 {
+            let dir = root.path().join(format!("pkg{i}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("file.go"), "package pkg\n").unwrap();
+        }
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Go), vec![PathBuf::from(".")]);
+    }
+
+    #[test]
+    fn multiple_independent_go_modules_are_each_promoted() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["svc-a", "svc-b"] {
+            let dir = root.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("go.mod"), format!("module example.com/{name}\n\ngo 1.22\n"))
+                .unwrap();
+            fs::write(dir.join("main.go"), "package main\n").unwrap();
+        }
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Go), vec![
+            PathBuf::from("svc-a"),
+            PathBuf::from("svc-b")
+        ]);
+    }
+
+    #[test]
+    fn go_default_dirs_without_manifest_root_is_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/main.go"), "package main\n").unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        assert_eq!(default_dirs(&scan, Language::Go), vec![PathBuf::from("src")]);
     }
 }

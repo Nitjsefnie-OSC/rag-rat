@@ -39,12 +39,19 @@ pub(super) fn base_candidates_for(
     scan: &crate::init::RepoScan,
     lang: Language,
 ) -> Vec<DirCandidate> {
-    let cs = candidate_dirs(scan, lang);
+    let mut cs = candidate_dirs(scan, lang);
     if cs.is_empty() {
-        vec![DirCandidate { path: PathBuf::from("."), count: 0, default: true }]
-    } else {
-        cs
+        return vec![DirCandidate { path: PathBuf::from("."), count: 0, default: true }];
     }
+    // BIND-06: `candidate_dirs` is capped (32 entries) for display, but a default can fall
+    // outside that cap. Union in any such default so the wizard UI always shows it, even
+    // though it never made the capped/browsable list.
+    for path in crate::init::scan::default_dirs(scan, lang) {
+        if !cs.iter().any(|c| c.path == path) {
+            cs.push(DirCandidate { path, count: 0, default: true });
+        }
+    }
+    cs
 }
 
 fn cached_base_candidates_for(lang: Language, state: &WizardState) -> Vec<DirCandidate> {
@@ -533,4 +540,61 @@ pub(super) fn validate_indexing(state: &WizardState) -> CheckResult {
 
 fn has_effective_simple_bindings(state: &WizardState) -> bool {
     state.draft.bindings.values().any(|dirs| !dirs.is_empty())
+}
+
+#[cfg(test)]
+mod base_candidates_for_tests {
+    use std::fs;
+
+    use super::*;
+    use crate::init::{default_dirs, scan_repo};
+
+    #[test]
+    fn defaults_outside_top_32_are_unioned_in_and_tagged_default() {
+        // 40 top-level Rust `src` dirs: candidate_dirs caps display at 32, but every one of the
+        // 40 is a default per default_dirs. base_candidates_for must surface all 40, with the
+        // ones that fell outside the cap appended as synthetic count:0 default:true rows.
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            let dir = root.path().join(format!("pkg{i}/src"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        }
+
+        let scan = scan_repo(root.path()).unwrap();
+        let capped = candidate_dirs(&scan, Language::Rust);
+        assert_eq!(capped.len(), 32, "candidate_dirs must still cap the display list at 32");
+
+        let result = base_candidates_for(&scan, Language::Rust);
+        assert_eq!(result.len(), 40, "all 40 defaults must be present even though the cap is 32");
+        for path in default_dirs(&scan, Language::Rust) {
+            let candidate = result
+                .iter()
+                .find(|c| c.path == path)
+                .unwrap_or_else(|| panic!("missing default path {path:?} in result"));
+            assert!(candidate.default, "unioned/capped default {path:?} must be tagged default");
+        }
+    }
+
+    #[test]
+    fn small_candidate_set_is_unchanged_by_the_union() {
+        // <=32 candidates total: every default is already present in the capped list, so the
+        // union must add nothing — no spurious duplicate rows.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("src");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let scan = scan_repo(root.path()).unwrap();
+        let capped = candidate_dirs(&scan, Language::Rust);
+        assert!(capped.len() <= 32);
+
+        let result = base_candidates_for(&scan, Language::Rust);
+        assert_eq!(result.len(), capped.len(), "no duplicate rows should be added");
+        for (r, c) in result.iter().zip(capped.iter()) {
+            assert_eq!(r.path, c.path);
+            assert_eq!(r.count, c.count);
+            assert_eq!(r.default, c.default);
+        }
+    }
 }
