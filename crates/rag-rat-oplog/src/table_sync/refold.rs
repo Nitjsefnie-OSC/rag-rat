@@ -167,7 +167,8 @@ fn replay_pending_entry(
     // it. Leaving the entry pending costs nothing: once the producer authors that edit (at a
     // lamport above this entry's, since authoring counts parked entries), a later replay lands
     // and loses on the merits.
-    if apply::row_has_unsent_local_change(tx, spec, &context.repo_id, pending.stream_id, op.pk())? {
+    if apply::replay_would_destroy_unsent_work(tx, spec, &context.repo_id, pending.stream_id, &op)?
+    {
         return Ok(());
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };
@@ -1109,6 +1110,130 @@ mod tests {
             "the two devices converge on the same row once both understand the column set"
         );
         assert_eq!(old_dev.pending_count(), 0, "and nothing is left outstanding");
+    }
+
+    #[test]
+    fn a_row_this_binary_cannot_read_does_not_fail_the_refold_and_is_repaired_by_it() {
+        // #1017, and the reason it is severe: this pass runs at STORE OPEN, so an error here does
+        // not fail one replay — it fails the open, and `index --full` takes the same path, so there
+        // is no recovery. A `Bool` column outside 0/1 is the one cell a STRICT schema cannot rule
+        // out, and no registry lint can require the `CHECK (col IN (0, 1))` that would.
+        const BOOL_OLD: TableSpec = TableSpec {
+            name: "t_bool",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+            local_columns: &["later"],
+            repo_column: None,
+        };
+        const BOOL_NEW: TableSpec = TableSpec {
+            spec_version: 2,
+            columns: &[
+                ColumnSpec::required("flag", ValueType::Bool),
+                ColumnSpec::added("later", ValueType::Text, 2, DefaultValue::Null),
+            ],
+            local_columns: &[],
+            ..BOOL_OLD
+        };
+        let table = "CREATE TABLE t_bool(id TEXT PRIMARY KEY, flag INTEGER, later TEXT) STRICT;";
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute_batch(table).unwrap();
+        b.conn.execute_batch(table).unwrap();
+
+        // A authors r1 under the wider column set; B cannot project it and parks it.
+        a.conn.execute("INSERT INTO t_bool(id, flag, later) VALUES ('r1', 0, 'wide')", []).unwrap();
+        let entries = a.produce(&[BOOL_NEW], "repo");
+        assert_eq!(entries.len(), 1);
+        b.enroll(a.pubkey().fingerprint());
+        b.ingest(&[BOOL_OLD], "repo", &entries, &a.pubkey());
+        assert_eq!(b.pending_count(), 1);
+
+        // B's own copy of the row is outside the Bool domain — written raw, so it never went
+        // through the applier's typed cells.
+        b.conn.execute("INSERT INTO t_bool(id, flag, later) VALUES ('r1', 2, NULL)", []).unwrap();
+
+        assert!(
+            refold_stale_projections_against(&b.conn, &[BOOL_NEW]).unwrap(),
+            "the refold must complete — an error here is an index that never opens again",
+        );
+        let row: (i64, Option<String>) = b
+            .conn
+            .query_row("SELECT flag, later FROM t_bool WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            row,
+            (0, Some("wide".to_string())),
+            "and the replayed winner rewrites the whole row, which is what repairs the bad cell",
+        );
+        assert_eq!(b.pending_count(), 0, "the entry is no longer outstanding");
+    }
+
+    #[test]
+    fn a_parked_remove_does_not_delete_a_row_this_binary_cannot_read() {
+        // The other half of #1017's guard, and the destructive one. An UPSERT may replay over an
+        // unreadable row because a winner rewrites every synced column and repairs it. A REMOVE has
+        // no such floor: it deletes the row outright — local-only columns included — so a row whose
+        // unreadable cell is an unsent local edit would be destroyed at store open, before anything
+        // had a chance to author it.
+        const BOOL: TableSpec = TableSpec {
+            name: "t_bool",
+            scope_id: "demo/1",
+            spec_version: 1,
+            pk: &[ColumnSpec::required("id", ValueType::Text)],
+            columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+            local_columns: &["local_only"],
+            repo_column: None,
+        };
+        let table =
+            "CREATE TABLE t_bool(id TEXT PRIMARY KEY, flag INTEGER, local_only TEXT) STRICT;";
+
+        let mut a = Device::new();
+        let mut b = Device::new();
+        a.conn.execute_batch(table).unwrap();
+        b.conn.execute_batch(table).unwrap();
+
+        // A publishes r1; B ingests it normally, so B's chain holds the Remove's predecessor.
+        a.conn.execute("INSERT INTO t_bool(id, flag) VALUES ('r1', 1)", []).unwrap();
+        let upserts = a.produce(&[BOOL], "repo");
+        assert_eq!(upserts.len(), 1, "the row is published first");
+        b.enroll(a.pubkey().fingerprint());
+        assert_eq!(b.ingest(&[BOOL], "repo", &upserts, &a.pubkey()), vec![IngestOutcome::Applied]);
+
+        // B then edits its copy raw — unsent, outside the Bool domain, and carrying a local-only
+        // column a delete would take with it.
+        b.conn
+            .execute("UPDATE t_bool SET flag = 2, local_only = 'keep me' WHERE id = 'r1'", [])
+            .unwrap();
+
+        // A deletes the row and authors the `Remove`. B ingests it through a binary whose registry
+        // does not carry the table — the mixed-version shared store this engine treats as
+        // first-class — so it is retained for the refold rather than applied.
+        a.conn.execute("DELETE FROM t_bool WHERE id = 'r1'", []).unwrap();
+        let removes = a.produce(&[BOOL], "repo");
+        assert_eq!(removes.len(), 1, "the local delete is authored as a Remove");
+        assert_eq!(b.ingest(OLD_REGISTRY, "repo", &removes, &a.pubkey()), vec![
+            IngestOutcome::Retained(PendingReason::TableNotInScope.as_db_str())
+        ]);
+        assert_eq!(b.pending_count(), 1);
+
+        assert!(refold_stale_projections_against(&b.conn, &[BOOL]).unwrap());
+        let survived: (i64, Option<String>) = b
+            .conn
+            .query_row("SELECT flag, local_only FROM t_bool WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            survived,
+            (2, Some("keep me".to_string())),
+            "the unsent row survives the replayed remove, local-only column included",
+        );
+        assert_eq!(b.pending_count(), 1, "and the entry stays outstanding rather than being lost");
     }
 
     #[test]

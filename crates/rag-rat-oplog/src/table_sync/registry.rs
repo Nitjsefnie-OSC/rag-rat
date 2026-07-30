@@ -22,8 +22,11 @@ use super::schema_facts::{self, CheckVerdict, PhysicalColumn};
 ///
 /// `Bool` stores as a STRICT `INTEGER` and must hold only 0 or 1. SQLite does not enforce that
 /// domain without a `CHECK (col IN (0, 1))`, which no pragma exposes for the lint to require — so a
-/// `Bool` column SHOULD carry that CHECK, and `read_typed` fail-closes (errors, halting the pass —
-/// never silently coercing) on any other integer as the runtime backstop.
+/// `Bool` column SHOULD carry that CHECK, and the runtime backstop is that `read_typed` refuses any
+/// other integer rather than coercing it. `Text` has the same shape: STRICT pins the storage class,
+/// not that the bytes are valid UTF-8. Both are refused as a VALUE, not an error: the reader runs
+/// under the refold at store open, where an error would fail every subsequent open, so a row with
+/// such a cell is carried as unreadable — never published, never deleted — until it is repaired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueType {
     Text,
@@ -528,9 +531,10 @@ pub(crate) fn assert_spec_covers_schema(conn: &Connection, spec: &TableSpec) -> 
 
     // The table MUST be STRICT. STRICT enforces the declared column type at write time, so a value
     // the producer read (by its `ValueType`) can never be affinity-coerced to a different stored
-    // type — which would make the post-write `synced_row_hash` read-back throw and wedge ingest
-    // after the row was already written. It also makes pk columns NOT NULL. It is the schema
-    // convention for every new table regardless.
+    // type. It pins the storage CLASS only, not the value's domain within it — a `Bool` can still
+    // hold 2 and a `Text` can still hold invalid UTF-8 — which is why `read_typed` carries those as
+    // unreadable rather than relying on the schema. It also makes pk columns NOT NULL, and is the
+    // schema convention for every new table regardless.
     // A GENERATED column is invisible to the rest of this lint and to the applier alike:
     // `PRAGMA table_info` omits it, so the exhaustiveness diff never classifies it, and the
     // applier never supplies it. It is not inert, though — its expression can read a synced column,
