@@ -274,6 +274,61 @@ pub fn take_handoff() -> Option<HandoffV1> {
     }
 }
 
+/// Drop `SIGUSR1` on the floor for now — the FIRST half of the fleet interlock, and the first
+/// thing `rag-rat mcp` should do.
+///
+/// [`rag_rat_core::fleet::trigger`] picks its targets by reading other processes' environ: a
+/// `rag-rat mcp` carrying [`UPGRADE_BIN_ENV`] is taken as proof that a `SIGUSR1` handler is
+/// installed, and is signaled on that basis. That environ is visible from `execve` onward, while
+/// the real handler cannot exist until there is a Tokio runtime to own it — and config discovery,
+/// logging setup, and runtime construction all happen in between. Left alone, a trigger landing in
+/// that gap terminates the server outright (`SIGUSR1`'s default disposition) instead of upgrading
+/// it. Ignoring costs the process at most one upgrade opportunity — it stays on the old binary
+/// until the client disconnects, exactly like a session with nothing to hand off — which is the
+/// documented fallback, and infinitely better than dying.
+///
+/// [`arm_sigusr1`] replaces this with the real handler as soon as the runtime is up.
+pub fn suppress_sigusr1_until_armed() {
+    // Gate on what the TRIGGER considers eligible, not on whether we could actually upgrade. Those
+    // differ: `install_path` rejects a set-but-empty variable, while the scan predicate matches on
+    // presence alone — so an empty value yields a process that is targetable but cannot upgrade,
+    // which is exactly the case that must not die on the signal.
+    if !rag_rat_core::fleet::self_advertises_upgrade() {
+        // Not a target, so leave the default disposition alone rather than silently changing
+        // signal behavior for every `rag-rat mcp`.
+        return;
+    }
+    // SAFETY: `signal(2)` with a valid signal number and the standard `SIG_IGN` disposition. No
+    // handler runs and no memory is touched.
+    unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+}
+
+/// Observe `SIGUSR1` on the Tokio runtime — the SECOND half of the interlock, replacing the
+/// blanket ignore installed by [`suppress_sigusr1_until_armed`] with a stream the server can act
+/// on. Returns `None` when the OS refused, having left the signal ignored rather than fatal.
+///
+/// Call this BEFORE serving. Serving blocks on the client's first message, which may never arrive,
+/// so arming afterwards would leave the process merely ignoring upgrades for an unbounded stretch.
+/// What the signal *does* is decided later, once the session is understood.
+pub(crate) fn arm_sigusr1() -> Option<tokio::signal::unix::Signal> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    match signal(SignalKind::user_defined1()) {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            eprintln!(
+                "hot-upgrade: could not install SIGUSR1 handler ({err}); ignoring the signal"
+            );
+            // Stay ignored (already the case if `suppress_sigusr1_until_armed` ran): this process
+            // advertises itself as signal-safe through its environ either way, so it must not die
+            // on a signal it turned out it cannot handle. Hot-upgrade is lost for this session.
+            // SAFETY: as in `suppress_sigusr1_until_armed`.
+            unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+            None
+        },
+    }
+}
+
 /// Whether this binary speaks `version` — the resume version gate. An unknown version means the
 /// new binary can't honor the client's negotiated session, so it must not skip `initialize`.
 pub fn protocol_supported(version: &str) -> bool {
@@ -385,6 +440,36 @@ mod tests {
         assert_eq!(read.old_binary_inode, 42);
         assert!(read.residue.is_empty());
         assert!(!path.exists(), "temp file is unlinked after read");
+    }
+
+    /// The handoff file is a contract between two DIFFERENT binaries: the predecessor writes it,
+    /// then `exec`s the newly installed one, which reads it. Those binaries can be built against
+    /// different rmcp releases, so `peer_info` must stay readable across an rmcp upgrade — the
+    /// whole point of the hot path is resuming without re-`initialize`. A model change that
+    /// renames or newly requires a field inside `InitializeRequestParams` silently downgrades
+    /// every hot-upgrade to a cold restart (`take_handoff` swallows the parse error), which no
+    /// same-version round-trip test can catch. This literal is the exact JSON a predecessor emits.
+    #[test]
+    fn handoff_written_by_a_differently_built_binary_still_deserializes() {
+        let written_by_predecessor = r#"{
+            "format_version": 1,
+            "negotiated_protocol_version": "2025-06-18",
+            "peer_info": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "claude-code", "version": "2.0.0" }
+            },
+            "residue": [],
+            "old_binary_inode": 42,
+            "upgrade_started_unix_ms": 1700000000000
+        }"#;
+        let handoff: HandoffV1 = serde_json::from_str(written_by_predecessor)
+            .expect("a predecessor's handoff must deserialize after an rmcp upgrade");
+        assert_eq!(handoff.format_version, HandoffV1::FORMAT_VERSION);
+        assert_eq!(handoff.negotiated_protocol_version, "2025-06-18");
+        assert_eq!(handoff.peer_info.protocol_version.as_str(), "2025-06-18");
+        assert_eq!(handoff.peer_info.client_info.name, "claude-code");
+        assert!(protocol_supported(&handoff.negotiated_protocol_version));
     }
 
     #[tokio::test]
