@@ -882,7 +882,7 @@ fn clangd_is_told_where_a_compilation_database_it_could_not_find_lives() {
     std::fs::create_dir_all(dir.join("out")).unwrap();
     std::fs::write(dir.join("out/compile_commands.json"), COMPDB).unwrap();
 
-    let args = clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir)));
+    let args = clangd.spawn_args(&clangd.resolve_layout(&scope(&dir)));
     assert_eq!(args[0], "--background-index", "the static argv comes first");
     assert!(
         args.contains(&compdb_arg(&dir.join("out"))),
@@ -1045,7 +1045,7 @@ fn a_broken_second_database_still_disqualifies_global_pinning() {
 
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "a second database disqualifies pinning even when it is unusable",
     );
@@ -1058,7 +1058,7 @@ fn a_broken_second_database_still_disqualifies_global_pinning() {
     // Remove the broken one and the checkout is genuinely single-database again.
     std::fs::remove_file(dir.join("sub/build/compile_commands.json")).unwrap();
     let layout = clangd.resolve_layout(&scope(&dir));
-    assert!(clangd.spawn_args(&["--background-index"], &layout).contains(&compdb_arg(&dir)));
+    assert!(clangd.spawn_args(&layout).contains(&compdb_arg(&dir)));
     assert!(clangd.session_can_resolve(&scope(&dir), "sub/main.c", &layout));
 }
 
@@ -1409,7 +1409,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     std::os::unix::fs::symlink(dir.join("out"), dir.join("current-build")).unwrap();
 
     let layout = clangd.resolve_layout(&scope(&dir));
-    let args = clangd.spawn_args(&["--background-index"], &layout);
+    let args = clangd.spawn_args(&layout);
     assert!(
         args.contains(&compdb_arg(&dir.join("out")))
             || args.contains(&compdb_arg(&dir.join("current-build"))),
@@ -1426,7 +1426,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     std::fs::write(dir.join("other/build/compile_commands.json"), COMPDB).unwrap();
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "two distinct databases are still two",
     );
@@ -1435,7 +1435,7 @@ fn one_database_reached_through_a_symlink_alias_is_not_two_databases() {
     std::fs::write(dir.join("other/build/compile_commands.json"), "[]").unwrap();
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "an unusable second database disqualifies pinning too",
     );
@@ -1465,9 +1465,7 @@ fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
     // Control FIRST: with no nested checkout the scan is complete, so this pins.
     let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
-        clangd
-            .spawn_args(&["--background-index"], &layout)
-            .contains(&compdb_arg(&dir.join("build"))),
+        clangd.spawn_args(&layout).contains(&compdb_arg(&dir.join("build"))),
         "a checkout with one database and nothing hidden is pinned",
     );
 
@@ -1483,7 +1481,7 @@ fn a_nested_checkout_makes_the_layout_unprovable_rather_than_simply_smaller() {
 
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "a hidden nested checkout makes global pinning unprovable, so it is declined",
     );
@@ -1510,9 +1508,7 @@ fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
     // A shallow database alone pins.
     let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
-        clangd
-            .spawn_args(&["--background-index"], &layout)
-            .contains(&compdb_arg(&dir.join("build"))),
+        clangd.spawn_args(&layout).contains(&compdb_arg(&dir.join("build"))),
         "the control must pin, or this test proves nothing about truncation",
     );
 
@@ -1524,7 +1520,7 @@ fn a_scan_that_could_not_look_everywhere_never_reports_a_sole_database() {
 
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "a scan that hit its depth bound cannot claim the database it found is the only one",
     );
@@ -1719,7 +1715,7 @@ fn a_key_outside_the_modelled_format_is_uncertainty_rather_than_acceptance() {
 
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "a database clangd would refuse must not be pinned",
     );
@@ -1741,7 +1737,7 @@ fn a_key_outside_the_modelled_format_is_uncertainty_rather_than_acceptance() {
     let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
         clangd
-            .spawn_args(&["--background-index"], &layout)
+            .spawn_args(&layout)
             .iter()
             .any(|arg| arg.to_string_lossy().starts_with("--compile-commands-dir=")),
         "`output` is part of the format and must stay loadable",
@@ -1776,7 +1772,7 @@ fn a_database_this_crate_cannot_parse_is_not_trusted_but_does_not_block_the_back
         "a database this crate cannot read must not report the whole backend blocked",
     );
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "…but it is not proof of anything either, so the session is not pinned to it",
     );
@@ -1849,9 +1845,7 @@ fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
 
     let layout = clangd.resolve_layout(&scope(&dir));
     assert!(
-        clangd
-            .spawn_args(&["--background-index"], &layout)
-            .contains(&compdb_arg(&dir.join("build"))),
+        clangd.spawn_args(&layout).contains(&compdb_arg(&dir.join("build"))),
         "the checkout has exactly one database; a link out of it must not make that two",
     );
 
@@ -1861,7 +1855,7 @@ fn the_marker_search_does_not_follow_a_symlink_out_of_the_checkout() {
     std::fs::write(dir.join("inside/build/compile_commands.json"), COMPDB).unwrap();
     let layout = clangd.resolve_layout(&scope(&dir));
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &layout),
+        clangd.spawn_args(&layout),
         vec![OsString::from("--background-index")],
         "a second database inside the checkout still counts",
     );
@@ -1970,7 +1964,7 @@ fn a_hidden_build_directory_still_counts_as_a_compilation_database() {
     );
     assert!(
         clangd
-            .spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir)))
+            .spawn_args(&clangd.resolve_layout(&scope(&dir)))
             .contains(&compdb_arg(&dir.join(".build"))),
     );
     // The warm-up document still comes from the visible tree.
@@ -1997,7 +1991,7 @@ fn a_vendored_or_vcs_database_is_never_mistaken_for_the_checkouts_own() {
 
     assert!(
         clangd
-            .spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir)))
+            .spawn_args(&clangd.resolve_layout(&scope(&dir)))
             .contains(&OsString::from(format!("--compile-commands-dir={}", dir.display()))),
         "the checkout's own database is still the single unambiguous one",
     );
@@ -2019,7 +2013,7 @@ fn several_compilation_databases_are_left_to_the_servers_own_per_file_lookup() {
         std::fs::write(dir.join(project).join("main.c"), "int main(void){return 0;}\n").unwrap();
     }
     assert_eq!(
-        clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&dir))),
+        clangd.spawn_args(&clangd.resolve_layout(&scope(&dir))),
         vec![OsString::from("--background-index")],
         "no database may be forced globally when several exist",
     );
@@ -2050,18 +2044,15 @@ fn a_backend_with_no_checkout_scoped_marker_gets_only_its_static_argv() {
     let (_dir_guard, dir) = checkout("static-argv");
     std::fs::write(dir.join("tsconfig.json"), "{}").unwrap();
     let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
-    assert_eq!(ts.spawn_args(&["--stdio"], &ts.resolve_layout(&scope(&dir))), vec![
-        OsString::from("--stdio")
-    ]);
+    assert_eq!(ts.spawn_args(&ts.resolve_layout(&scope(&dir))), vec![OsString::from("--stdio")]);
     let rust = LiveBackend::for_tool(OracleTool::RaLsp).unwrap();
-    assert!(rust.spawn_args(&[], &rust.resolve_layout(&scope(&dir))).is_empty());
+    assert!(rust.spawn_args(&rust.resolve_layout(&scope(&dir))).is_empty());
     // And with no database anywhere, clangd gets no directory to point at either.
     let (_empty_guard, empty) = checkout("static-argv-empty");
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
-    assert_eq!(
-        clangd.spawn_args(&["--background-index"], &clangd.resolve_layout(&scope(&empty))),
-        vec![OsString::from("--background-index")],
-    );
+    assert_eq!(clangd.spawn_args(&clangd.resolve_layout(&scope(&empty))), vec![OsString::from(
+        "--background-index"
+    )],);
 }
 
 #[test]
