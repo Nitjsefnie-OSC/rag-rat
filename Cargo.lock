@@ -5026,7 +5026,6 @@ dependencies = [
  "minicbor",
  "model2vec-rs",
  "notify",
- "path-slash",
  "protobuf",
  "pulldown-cmark",
  "rag-rat-base",
@@ -5184,7 +5183,6 @@ name = "rag-rat-oracle"
 version = "0.21.1"
 dependencies = [
  "anyhow",
- "path-slash",
  "protobuf",
  "rag-rat-base",
  "rag-rat-clones",
