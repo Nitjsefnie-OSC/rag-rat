@@ -232,20 +232,48 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
             .transpose()?
             .flatten()
             .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
+        // Seal ONCE per roster change, not once per publish, and hand the advertiser the bytes.
+        //
+        // Sealing needs a connection; the advertiser is a spawned task and cannot hold one. So this
+        // loop — which already owns the connection and already folds the WAL between sessions — is
+        // where sealing happens, and the watch carries the result. Republishing identical bytes is
+        // safe (same key, same nonce, same plaintext) and keeps the advertiser database-free.
+        //
+        // A sealing error here is LOGGED, not swallowed: the advertiser cannot reseal on its own,
+        // and the between-sessions reseal below only runs after an inbound connection — which a
+        // host that was never advertised may never receive. A silent empty value would leave it
+        // undiscoverable with nothing in the log saying why. Recovering without inbound traffic is
+        // a known gap (#1086).
+        let mut announcement = discovery_tag.map(|tag| {
+            let sealed = seal_announcement(conn, &tag, &local_node);
+            let observed = rag_rat_oplog::discovery::roster_stamp(conn).ok().flatten();
+            let stamp = stamp_after_seal(observed, None, sealed.is_ok());
+            let bytes = match sealed {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(%error, "sealing this host's announcement failed; it will not be discoverable until the next successful reseal");
+                    None
+                },
+            };
+            let (tx, rx) = tokio::sync::watch::channel(bytes);
+            (tag, tx, rx, stamp)
+        });
         // Aborted on the way out of this scope, so the loop cannot outlive the endpoint it
         // advertises.
-        let _advertiser =
-            discovery_tag.zip(discovery_service_addr(config, &relay)).map(|(tag, service)| {
+        let _advertiser = announcement
+            .as_ref()
+            .map(|(tag, _, rx, _)| (*tag, rx.clone()))
+            .zip(discovery_service_addr(config, &relay))
+            .map(|((tag, announcement), service)| {
                 AbortOnDrop(tokio::spawn(rag_rat_sync::discovery::advertise(
                     rag_rat_sync::discovery::Advertise {
                         endpoint: endpoint.clone(),
                         service,
                         tag,
-                        node: local_node,
+                        announcement,
                         ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
                             config.sync.push_interval_secs,
                         ),
-                        now_ms: time::now_ms,
                     },
                 )))
             });
@@ -327,6 +355,49 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
             // `-wal` sidecar grows unbounded (passive autocheckpoint is pinned off). Size-gated and
             // best-effort, mirroring the watcher's per-pass fold.
             db.fold_wal();
+            // Re-seal between sessions, where the roster can have moved: an accept-loop ingest is
+            // the only way it changes under a serving host, since the session lock excludes a
+            // colocated device sync and no command authors roster changes. A device enrolled while
+            // this host is running therefore becomes a recipient at the next renewal; the
+            // advertiser re-reads the watch every tick, so the update needs no signal beyond this.
+            if let Some((tag, tx, _, stamp)) = &mut announcement {
+                // Compare the ROSTER, not the envelope. Sealing draws a fresh ephemeral per wrap,
+                // so two seals of an unchanged roster differ in every byte — comparing envelopes
+                // would re-seal after every session, the advertiser would stop recognising its own
+                // live announcement, and it would republish on every tick until the tag was full of
+                // its own copies. That is precisely the failure seal-once exists to avoid.
+                let observed =
+                    rag_rat_oplog::discovery::roster_stamp(conn).unwrap_or_else(|error| {
+                        tracing::warn!(%error, "could not read the roster; keeping the current announcement");
+                        *stamp
+                    });
+                // The comparison itself is out of reach of a test — `serve_with` binds an endpoint,
+                // takes the session lock, and loops until interrupted — so what it depends on is
+                // pinned elsewhere instead: `stamp_after_seal` carries the bookkeeping rule, and
+                // the op-log crate pins the two facts that make the bug possible and this fix
+                // correct (two seals of an unchanged roster differ in every byte; the stamp does
+                // not).
+                if observed != *stamp {
+                    tracing::debug!("the roster moved; re-sealing this host's announcement");
+                    let resealed = seal_announcement(conn, tag, &local_node);
+                    *stamp = stamp_after_seal(observed, *stamp, resealed.is_ok());
+                    match resealed {
+                        Ok(bytes) => {
+                            let _ = tx.send(bytes);
+                        },
+                        // The roster moved but re-sealing failed. Withdraw the previous envelope
+                        // rather than let the advertiser keep renewing it: it is sealed to the OLD
+                        // roster, so a just-removed device could otherwise keep opening it — and
+                        // being observed through it — indefinitely, well past the one-TTL revocation
+                        // window. The stamp is left unchanged (a failed seal keeps it), so the next
+                        // session retries against the moved roster.
+                        Err(error) => {
+                            tracing::warn!(%error, "re-sealing failed after a roster change; withdrawing the stale announcement until a re-seal succeeds");
+                            let _ = tx.send(None);
+                        },
+                    }
+                }
+            }
             if once {
                 break;
             }
@@ -632,13 +703,26 @@ pub(crate) fn device_sync_run(
                     // every device that discovers it a dial that can only time out, and occupying
                     // one of the few per-tag slots that a REACHABLE peer needs. Only a node that
                     // accepts connections is worth announcing.
+                    fetch: true,
                     publish: None,
                     ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
                         config.sync.push_interval_secs,
                     ),
-                    now_ms: time::now_ms(),
                 }
             }),
+            // Opening happens here, where a connection is available. An announcement sealed to a
+            // roster this device is no longer on simply will not open, and is dropped with the
+            // malformed ones — a device that has been removed stops finding its former peers by
+            // discovery, which is the point of sealing them.
+            &|payload| {
+                discovery_tag.and_then(|tag| {
+                    rag_rat_oplog::discovery::open_discovery_announcement(conn, &tag, payload)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "could not open a discovered announcement");
+                            None
+                        })
+                })
+            },
         )
         .await;
         let peers = resolved.peers;
@@ -751,6 +835,101 @@ fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::
             );
             None
         },
+    }
+}
+
+/// Seal this host's announcement to the account's current roster, or `None` when there is nothing
+/// to advertise.
+///
+/// `None` covers a store with no account and a roster holding only this device — the latter has no
+/// one to be discovered BY, so publishing would spend a slot to tell nobody. A sealing failure is
+/// logged and treated the same way: discovery is routing advice, and a host that cannot advertise
+/// still serves every peer that reaches it through a configured `server_peers` entry.
+/// `Ok(None)` and `Err` mean different things and the caller must not conflate them: `Ok(None)` is
+/// a settled decision not to advertise (no account, a lone device, a roster too large to seal),
+/// while `Err` is an attempt that failed and is worth repeating. See [`stamp_after_seal`].
+fn seal_announcement(
+    conn: &Connection,
+    tag: &[u8; 32],
+    local_node: &[u8; 32],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(sealed) =
+        rag_rat_oplog::discovery::seal_discovery_announcement(conn, tag, local_node)?
+    else {
+        return Ok(None);
+    };
+    Ok(match classify_announcement(sealed.recipients, sealed.bytes.len()) {
+        AnnouncementVerdict::Advertise => Some(sealed.bytes),
+        AnnouncementVerdict::SoleRosterMember => {
+            tracing::debug!("not advertising: this device is the account's only roster member");
+            None
+        },
+        AnnouncementVerdict::TooLargeToPublish => {
+            tracing::warn!(
+                recipients = sealed.recipients,
+                bytes = sealed.bytes.len(),
+                max_bytes = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES,
+                "not advertising: this account's roster is too large to seal into one announcement"
+            );
+            None
+        },
+    })
+}
+
+/// The roster stamp to remember after an attempt to seal — the bookkeeping that decides whether the
+/// next session re-seals.
+///
+/// **Record the roster that was OBSERVED, never one derived from the sealing result.** A seal that
+/// deliberately produces no announcement — a lone device, or a roster too large to fit one publish
+/// — still reacted to a real roster, and forgetting it makes every later session see a change that
+/// did not happen. For an oversized roster that is a full re-seal, dozens of X25519 operations, and
+/// a repeated warning after every sync session, forever, on an account that never changed. Taking
+/// the announcement bytes as an input is what made that mistake expressible; this signature cannot
+/// see them.
+///
+/// A FAILED attempt keeps the previous stamp instead, so the next session retries it. That is the
+/// one case where repeating the work is the point: the failure is transient, and recording the new
+/// roster would mean never sealing against it.
+fn stamp_after_seal(
+    observed: Option<rag_rat_oplog::discovery::RosterStamp>,
+    last: Option<rag_rat_oplog::discovery::RosterStamp>,
+    sealed_ok: bool,
+) -> Option<rag_rat_oplog::discovery::RosterStamp> {
+    if sealed_ok { observed } else { last }
+}
+
+/// Why a sealed announcement is, or is not, worth publishing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncementVerdict {
+    Advertise,
+    /// No one to be discovered BY, so publishing would spend a slot to tell nobody.
+    SoleRosterMember,
+    /// Past what the service accepts in one publish.
+    TooLargeToPublish,
+}
+
+/// Decide whether a sealed announcement should be published, from its recipient count and size.
+///
+/// **The size rule is the one that fails silently without it.** An envelope grows 80 bytes per
+/// roster-effective device, so an account past roughly 25 of them seals something the service will
+/// refuse — and a refusal looks exactly like a transient one, so the host keeps retrying while
+/// being absent from discovery, with nothing anywhere saying why. Catching it here turns that into
+/// one warning naming the count, the size, and the limit.
+///
+/// It does NOT truncate the recipient list to fit. Which recipients were dropped would decide who
+/// can find this host, and choosing them arbitrarily is a worse failure than not advertising —
+/// splitting the envelope across several announcements is the way past the ceiling.
+///
+/// Named and tested separately for the same reason as [`serve_should_advertise`]: its caller needs
+/// a database with a roster of a given size, and the composition it feeds runs an accept loop until
+/// interrupted.
+fn classify_announcement(recipients: usize, bytes: usize) -> AnnouncementVerdict {
+    if bytes > rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES {
+        AnnouncementVerdict::TooLargeToPublish
+    } else if recipients > 1 {
+        AnnouncementVerdict::Advertise
+    } else {
+        AnnouncementVerdict::SoleRosterMember
     }
 }
 
@@ -917,10 +1096,10 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
-        discovery_service_addr, fold_peer_outcomes, join, node_secret, record_device_sync,
-        serve_should_advertise,
+        AnnouncementVerdict, DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, classify_announcement,
+        decode_node_secret, device_can_serve, device_can_sync, device_sync_due, device_sync_run,
+        discovery_node_or_configured, discovery_service_addr, fold_peer_outcomes, join,
+        node_secret, record_device_sync, serve_should_advertise, stamp_after_seal,
     };
 
     fn account_of(conn: &Connection) -> rag_rat_oplog::AccountId {
@@ -1054,6 +1233,78 @@ mod tests {
             "--once is a scripted check, not a host; its announcement would outlive the process"
         );
         assert!(!serve_should_advertise(false, false, true));
+    }
+
+    /// The roster size at which a host stops being able to advertise, pinned exactly.
+    ///
+    /// Two properties, and the second is the one that was missing. Sealing to more devices than fit
+    /// one publish is not a hypothetical: an envelope is one version byte plus 80 bytes per
+    /// roster-effective device, so the ceiling arrives at 25 recipients — well inside the roster
+    /// sizes accounts are otherwise built for. Without this branch the oversized publish is refused
+    /// by the service, the refusal is indistinguishable from a transient error, and the host
+    /// retries forever while absent from discovery with nothing explaining why.
+    ///
+    /// Asserted at the boundary on BOTH sides, because an off-by-one here is invisible in
+    /// production — it costs the largest accounts their discovery and nothing else changes.
+    #[test]
+    fn a_roster_too_large_to_seal_into_one_announcement_is_refused_not_truncated() {
+        const VERSION_BYTE: usize = 1;
+        const WRAP_LEN: usize = 32 + 48;
+        let envelope_len = |recipients: usize| VERSION_BYTE + recipients * WRAP_LEN;
+        let max = rag_rat_sync::discovery::MAX_ANNOUNCEMENT_BYTES;
+
+        let fits = (1..).take_while(|n| envelope_len(*n) <= max).last().expect("some roster fits");
+        assert_eq!(fits, 25, "the documented recipient ceiling moved");
+
+        assert_eq!(
+            classify_announcement(fits, envelope_len(fits)),
+            AnnouncementVerdict::Advertise,
+            "the largest roster that fits must still advertise"
+        );
+        assert_eq!(
+            classify_announcement(fits + 1, envelope_len(fits + 1)),
+            AnnouncementVerdict::TooLargeToPublish,
+            "one recipient past the limit must be refused, not truncated to fit"
+        );
+
+        // The sole-member rule still applies, and size is judged first: a lone device is not
+        // advertised whatever its envelope weighs.
+        assert_eq!(
+            classify_announcement(1, envelope_len(1)),
+            AnnouncementVerdict::SoleRosterMember
+        );
+        assert_eq!(classify_announcement(2, envelope_len(2)), AnnouncementVerdict::Advertise);
+    }
+
+    /// An unchanged roster must never look like a changed one — including when it seals to nothing.
+    ///
+    /// The trap is that "nothing to advertise" has two causes with opposite handling. A lone device
+    /// or an oversized roster is a SETTLED decision about a roster that was really observed, and
+    /// forgetting it makes every subsequent session detect a phantom change and re-seal: for a
+    /// 25-plus-device account that is dozens of X25519 operations and a repeated warning after
+    /// every sync, forever. A transient failure is the opposite — there the previous stamp must
+    /// survive so the next session tries again.
+    #[test]
+    fn the_remembered_roster_is_the_one_observed_not_the_one_successfully_advertised() {
+        let roster = Some([7u8; 32]);
+        let older = Some([3u8; 32]);
+
+        assert_eq!(
+            stamp_after_seal(roster, None, true),
+            roster,
+            "a roster that sealed to no announcement is still a roster we reacted to"
+        );
+        assert_eq!(stamp_after_seal(roster, older, true), roster, "a real change is recorded");
+        assert_eq!(
+            stamp_after_seal(roster, older, false),
+            older,
+            "a failed seal keeps the old stamp so the next session retries"
+        );
+        assert_eq!(
+            stamp_after_seal(roster, None, false),
+            None,
+            "a first attempt that failed leaves nothing recorded, so it is retried"
+        );
     }
 
     /// `[sync] discovery = false` silences the service for BOTH callers, because both resolve its

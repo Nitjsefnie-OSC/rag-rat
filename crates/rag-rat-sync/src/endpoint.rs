@@ -148,6 +148,11 @@ pub struct DiscoveredPeers {
 /// None` reduces this to the configured resolver. A configured id that does not parse is logged
 /// and counted rather than aborting the pass, so one typo cannot suppress every other peer.
 ///
+/// `open_announcement` recovers a node id from a sealed announcement, or `None` for one this
+/// device cannot read. It is a parameter rather than something this crate does itself because
+/// sealing is the op-log crate's concern; passing a closure that always returns `None` reduces this
+/// to the configured-peer resolver.
+///
 /// **Everything is compared on the raw 32 bytes, never the display string.**
 /// [`iroh::EndpointId::from_str`] accepts 64-char lowercase hex (the `Display` form) OR standard
 /// base32, and uppercases before base32-decoding, so three distinct strings can name one peer —
@@ -157,6 +162,7 @@ pub async fn discover_peers(
     configured_peers: &[String],
     relay_url: &str,
     discovery: Option<crate::discovery::DiscoveryExchange<'_>>,
+    open_announcement: &dyn Fn(&[u8]) -> Option<[u8; 32]>,
 ) -> DiscoveredPeers {
     let mut peers: Vec<(String, EndpointAddr)> = Vec::new();
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
@@ -194,13 +200,36 @@ pub async fn discover_peers(
             "peer discovery degraded; continuing with the peers already resolved"
         );
     }
-    for node in outcome.peers {
+    // Announcements arrive sealed. Opening happens HERE rather than inside the exchange because it
+    // needs a database connection, which is not `Sync` and so cannot cross the await inside the
+    // spawned advertise loop that shares that code.
+    //
+    // Failures are INDIVIDUAL throughout the loop below. Failing the batch would let one bad
+    // entry, which anyone able to compute the tag may publish, hide every good one.
+    // The peer cap is applied HERE, to announcements that actually resolved, and not in the
+    // exchange to raw payloads. Capping payloads would let anyone able to compute the tag suppress
+    // every real advertiser with a handful of unopenable entries — see `MAX_ANNOUNCEMENTS`.
+    let mut admitted = 0usize;
+    for payload in &outcome.announcements {
+        if admitted >= crate::discovery::MAX_ANNOUNCEMENTS {
+            tracing::debug!(
+                cap = crate::discovery::MAX_ANNOUNCEMENTS,
+                "discovered the most peers one pass admits; ignoring the rest"
+            );
+            break;
+        }
+        // One that will not open is skipped without spending cap budget: it is sealed to a roster
+        // this device has left, malformed, or from a newer version.
+        let Some(node) = open_announcement(payload) else { continue };
         if node == local_node || !seen.insert(node) {
             continue;
         }
         match peer_addr_from_bytes(&node, relay_url) {
             // The label comes off the parsed id rather than a second fallible conversion.
-            Ok(addr) => peers.push((addr.id.to_string(), addr)),
+            Ok(addr) => {
+                peers.push((addr.id.to_string(), addr));
+                admitted += 1;
+            },
             // `from_bytes` rejects a non-canonical point. Dropped individually: anyone who can
             // compute the tag can publish garbage, and one bad entry must not hide the good ones.
             Err(error) =>
@@ -769,6 +798,11 @@ mod tests {
         assert_eq!(reconcile_step(&quiet, 8, 8), ReconcileStep::Stop { converged: true });
     }
 
+    /// A configured-peers-only resolve: nothing published, nothing to open.
+    fn no_announcements(_payload: &[u8]) -> Option<[u8; 32]> {
+        None
+    }
+
     #[tokio::test]
     async fn discover_peers_resolves_valid_ids_and_counts_invalid_ones() {
         let valid = node_id_to_string(&node_id_from_secret([7u8; 32])).unwrap();
@@ -776,6 +810,7 @@ mod tests {
             &[valid.clone(), "not-a-node-id".to_string()],
             "https://relay.example",
             None,
+            &no_announcements,
         )
         .await;
         assert_eq!(
@@ -838,7 +873,8 @@ mod tests {
 
         let configured =
             [hex.clone(), base32_upper.clone(), base32_lower.clone(), base32_upper.clone()];
-        let resolved = discover_peers(&configured, "https://relay.example", None).await;
+        let resolved =
+            discover_peers(&configured, "https://relay.example", None, &no_announcements).await;
         assert_eq!(resolved.peers.len(), 1, "every spelling names one peer, dialed once");
         assert_eq!(resolved.peers[0].0, hex, "the first spelling configured wins");
         assert_eq!(

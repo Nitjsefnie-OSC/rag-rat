@@ -3,16 +3,16 @@
 //! The client half of discovery is only as trustworthy as what it was tested against, so this stub
 //! is deliberately literal: it speaks the same CBOR the counterpart does (through the test-only
 //! service-side codec in [`super::wire`], which is itself pinned to the measured golden vectors)
-//! and it reproduces the two service behaviours that shape this client's design — announcements are
-//! APPENDED under a tag and never replaced, and a tag holds at most [`PER_TAG_CAP`] live entries,
-//! REJECTING rather than evicting once full.
+//! and it reproduces the three service behaviours that shape this client's design — announcements
+//! are APPENDED under a tag and never replaced, a full tag EVICTS its oldest entry rather than
+//! refusing the newcomer, and a fetch returns only as much as fits one response frame.
 //!
 //! [`Behaviour`] covers the failure modes the client must survive. A stub that only ever answered
 //! correctly would leave every fail-open path untested, and those paths are the whole reason
 //! discovery is safe to run inside the sync session lock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::presets;
@@ -24,8 +24,42 @@ use super::wire::{
     WireAnnouncement, read_frame, write_frame,
 };
 
-/// The real service's per-tag cap. Mirrored so the exhaustion behaviour under test is the real one.
-pub(crate) const PER_TAG_CAP: usize = 8;
+/// How long [`Behaviour::SlowPublish`] holds a publish response back. Well inside the client's
+/// exchange deadline — the point is a slow answer, not a timeout.
+pub(crate) const SLOW_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The real service's per-tag cap, mirrored so what the tests exercise is what deployments do.
+///
+/// Mirroring matters more than the number: a stub pinned to a stale value tests a service that no
+/// longer exists, and the failure is silent — every assertion still passes, against fiction.
+pub(crate) const PER_TAG_CAP: usize = 32;
+
+/// The service's response budget: as much as fits comfortably inside one frame.
+const FETCH_RESPONSE_BUDGET: usize = super::wire::MAX_FRAME_LEN / 4 * 3;
+
+/// Charged before any announcement, for the envelope around the list.
+const RESPONSE_ENVELOPE_BUDGET: usize = 64;
+
+/// The encoded size of one announcement on this wire.
+///
+/// A payload travels as a CBOR array of INTEGERS, not a byte string, so each byte costs one encoded
+/// byte below 24 and two at or above it. Estimating by payload length instead would be wrong by
+/// nearly double — and would let the stub hand back responses the real service could never send,
+/// which is the one thing a stub must not do.
+fn encoded_announcement_len(payload: &[u8], expires_at_ms: i64) -> usize {
+    let payload_bytes: usize = payload.iter().map(|byte| if *byte < 24 { 1 } else { 2 }).sum();
+    1 + cbor_head_len(payload.len() as u64) + payload_bytes + cbor_head_len(expires_at_ms as u64)
+}
+
+fn cbor_head_len(value: u64) -> usize {
+    match value {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
 
 /// How the stub answers. Each variant is a failure the client must absorb without harming the
 /// configured-peer path.
@@ -46,6 +80,24 @@ pub(crate) enum Behaviour {
     StallPublish,
     /// Answer fetches with one unusable payload alongside the real ones.
     GarbageAmongTheGood,
+    /// STORE a publish, then never answer it — the client times out and sees the write as
+    /// ambiguous, though it did land. The failure #2's fix turns from unbounded slot churn into a
+    /// bounded gap: a service that accepts writes but cannot acknowledge them.
+    AckLostAfterStore,
+    /// Store a publish immediately, then wait [`SLOW_PUBLISH_DELAY`] before answering it.
+    ///
+    /// A service under load, and the shape that separates two clocks a client could time renewal
+    /// from: the entry's TTL starts when the service STORES it, not when the client learns that it
+    /// did. Answering instantly makes the two indistinguishable.
+    SlowPublish,
+    /// Store publishes normally, but answer every fetch with an EMPTY list.
+    ///
+    /// The real service returns a size-bounded random SAMPLE of a tag, so a live announcement —
+    /// including the fetcher's own — is routinely missing from a response. This is that sample at
+    /// its most adversarial, and it exists to catch anything that infers "not present in this
+    /// response" means "not published": the inference is false, and acting on it makes a host
+    /// republish endlessly and evict the peers it was trying to join.
+    ForgetfulFetch,
 }
 
 pub(crate) struct StubService {
@@ -54,6 +106,10 @@ pub(crate) struct StubService {
     /// The stub's own clock, advanced by the test. Owned per-instance rather than read from the
     /// system so expiry and reaping are exact, and so nothing is shared between tests.
     now_ms: Arc<AtomicI64>,
+    /// Fetch requests served, so a test can assert on requests NOT made. A publish-only caller
+    /// that quietly starts fetching is invisible to every assertion about stored
+    /// announcements.
+    fetches: Arc<AtomicUsize>,
 }
 
 impl StubService {
@@ -69,12 +125,18 @@ impl StubService {
             .expect("bind the stub discovery service");
         let tags = Arc::new(Mutex::new(HashMap::new()));
         let now = Arc::new(AtomicI64::new(now_ms));
-        let service =
-            Self { endpoint: endpoint.clone(), tags: Arc::clone(&tags), now_ms: Arc::clone(&now) };
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let service = Self {
+            endpoint: endpoint.clone(),
+            tags: Arc::clone(&tags),
+            now_ms: Arc::clone(&now),
+            fetches: Arc::clone(&fetches),
+        };
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let tags = Arc::clone(&tags);
                 let now = Arc::clone(&now);
+                let fetches = Arc::clone(&fetches);
                 tokio::spawn(async move {
                     let Ok(conn) = incoming.await else { return };
                     // Swallowed streams are PARKED, not dropped: dropping a send stream closes it,
@@ -95,8 +157,27 @@ impl StubService {
                             parked.push((send, recv));
                             continue;
                         }
+                        if matches!(request, DiscoveryRequest::Fetch { .. }) {
+                            fetches.fetch_add(1, Ordering::Relaxed);
+                        }
                         let response =
                             answer(&tags, &request, behaviour, now.load(Ordering::Relaxed));
+                        // AFTER `answer` has stored it: a slow service has already accepted the
+                        // announcement and started its TTL, and is merely slow to say so.
+                        if behaviour == Behaviour::AckLostAfterStore
+                            && matches!(request, DiscoveryRequest::Publish { .. })
+                        {
+                            // Stored by `answer` above; the ack is simply never sent. Parked, not
+                            // dropped: dropping the send stream would surface as a prompt error
+                            // rather than the timeout a lost ack actually produces.
+                            parked.push((send, recv));
+                            continue;
+                        }
+                        if behaviour == Behaviour::SlowPublish
+                            && matches!(request, DiscoveryRequest::Publish { .. })
+                        {
+                            tokio::time::sleep(SLOW_PUBLISH_DELAY).await;
+                        }
                         if write_frame(&mut send, &response.encode()).await.is_err() {
                             return;
                         }
@@ -136,6 +217,11 @@ impl StubService {
             .unwrap_or_default()
     }
 
+    /// How many fetches this stub has answered.
+    pub(crate) fn fetches(&self) -> usize {
+        self.fetches.load(Ordering::Relaxed)
+    }
+
     /// Seed an announcement directly, bypassing the wire — for setting up a tag's prior state.
     pub(crate) fn seed(&self, tag: [u8; TAG_LEN], payload: Vec<u8>, expires_at_ms: i64) {
         self.tags
@@ -160,11 +246,12 @@ fn answer(
                 return refusal(DiscoveryErrorCode::RateLimited, "slow down");
             }
             let entries = tags.entry(*tag).or_default();
-            // Reap expired, then REJECT when full — the service never evicts to make room, which is
-            // why a tag an attacker fills holds zero real peers rather than eight bad ones.
+            // Reap expired, then EVICT the oldest to make room. The service stopped refusing a
+            // publish into a full tag: refusing let whoever filled it first hold it for a whole
+            // TTL, so the tag carried no real advertisers at all.
             entries.retain(|entry| entry.expires_at_ms > now_ms);
-            if entries.len() >= PER_TAG_CAP {
-                return refusal(DiscoveryErrorCode::PerTagCapExceeded, "tag is full");
+            while entries.len() >= PER_TAG_CAP {
+                entries.remove(0);
             }
             // APPEND, never replace: republishing the same node id adds a second live copy.
             entries.push(WireAnnouncement {
@@ -174,12 +261,32 @@ fn answer(
             DiscoveryResponse::Published { withdraw_token: vec![0xaa; 8] }
         },
         DiscoveryRequest::Fetch { tag } => {
-            let mut announcements = tags
+            if behaviour == Behaviour::ForgetfulFetch {
+                return DiscoveryResponse::Fetched { announcements: Vec::new() };
+            }
+            let live = tags
                 .get(tag)
                 .map(|entries| {
                     entries.iter().filter(|e| e.expires_at_ms > now_ms).cloned().collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            // BOUND the response to one frame, as the service does. Without this a tag holding a
+            // realistic number of sealed envelopes produces a response neither side can send, and
+            // the client's own frame handling would never be exercised against it.
+            //
+            // Deterministic here where the service samples at random: a test wants a repeatable
+            // subset, and the property random selection exists for — that no advertiser is starved
+            // over repeated fetches — belongs to the service's own suite, not to a client stub.
+            let mut used = RESPONSE_ENVELOPE_BUDGET;
+            let mut announcements = Vec::new();
+            for entry in live {
+                let cost = encoded_announcement_len(&entry.payload, entry.expires_at_ms);
+                if used + cost > FETCH_RESPONSE_BUDGET {
+                    break;
+                }
+                used += cost;
+                announcements.push(entry);
+            }
             if behaviour == Behaviour::GarbageAmongTheGood {
                 // A payload that is not 32 bytes. Anyone who can compute the tag can publish this.
                 announcements.insert(0, WireAnnouncement {

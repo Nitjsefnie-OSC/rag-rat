@@ -73,27 +73,36 @@ becomes meaningful on any device, because a device that advertises itself will b
 ### Scale
 
 Dials grow linearly with the number of devices — each device dials the host, not every other device
-— and only the hosts advertise, so the per-tag announcement limit is a limit on **hosts**, not on
-devices. One or two hosts stay well inside it no matter how many devices sync through them.
+— and only the hosts advertise, so the per-tag *slot* limit counts **hosts**, not devices. One or
+two hosts stay well inside it no matter how many devices sync through them. Device count reaches
+discovery by a different route: it sets the size of each announcement, which is the 25-device
+ceiling above.
 
 Adding hosts is how you spread load or place one nearer a group of devices; devices that dial more
 than one host also propagate changes between those hosts.
 
-## The limit on advertised hosts
+## The limits on discovery
 
-The discovery service holds at most 8 live announcements per account and refuses further publishes
-rather than evicting. A host keeps about two live announcements of itself, so **roughly four hosts
-can advertise at once**. Devices cost nothing here — they only fetch.
+Two separate ceilings, with different symptoms. Neither binds for an ordinary account, and both
+degrade rather than breaking: discovery is routing advice, so anything it fails to find is still
+reachable through `server_peers`.
 
-Four hosts is far more than most accounts want, so this is unlikely to bind. If it does, it degrades
-rather than breaking:
+**How many hosts can advertise.** The service holds at most 32 live announcements per account and
+evicts the oldest to make room rather than refusing a newcomer. A host renews at half the TTL, so it
+keeps about two live announcements of itself — **roughly sixteen hosts advertising at once**.
+Devices cost nothing here; they only fetch. Past that, hosts evict each other and discoverability
+**flaps**: a host findable this hour may not be next hour. Pin those hosts in `server_peers` instead.
 
-- A host whose publish is refused **stops being discoverable**. It keeps serving normally, and any
-  device that reaches it through `server_peers` is unaffected.
-- Which hosts hold the free slots shifts as announcements expire, so **discoverability flaps** — a
-  host findable this hour may not be next hour.
+**How many devices an account can have.** An announcement is sealed once per recipient, so it grows
+by 80 bytes per roster-effective device against a publish limit of 2048 bytes — a ceiling of about
+**25 devices**. Past it a host logs `roster is too large to seal into one announcement` and does not
+advertise; it serves normally, and every device that reaches it through `server_peers` is
+unaffected. The announcement is never truncated to fit, because which recipients got dropped would
+silently decide who can find that host.
 
-The fix is to pin the hosts in `server_peers` rather than relying on discovery for all of them.
+A fetch is bounded the same way: the service answers with as much as fits one response frame, chosen
+at random, so a busy tag returns a **sample** rather than everything. A device therefore learns some
+of its peers per pass and the rest on later passes.
 
 ## Settings
 
@@ -149,13 +158,19 @@ use — including any you add later.
 ## What each service learns
 
 - **The relay** forwards opaque encrypted QUIC traffic between peers.
-- **The discovery service** is a blind key-value store keyed on a tag it cannot link to an account.
-  The tag comes from account-scoped key material only enrolled devices hold — not from the account
-  id, which every host you have ever dialed knows — so an outsider cannot compute it or find your
-  hosts. What the service itself *can* see under that pseudonym is the advertised node ids
-  themselves — in the clear, and dialable — along with how many there are and when they stop
-  renewing. Unlinkability is the guarantee; hiding which hosts advertise, how many, and when, is
-  not.
+- **The discovery service** is a key-value store keyed on a tag it cannot link to an account. The
+  tag comes from account-scoped key material only enrolled devices hold — not from the account id,
+  which every host you have ever dialed knows — so an outsider cannot compute it or find your hosts.
+  Announcements are sealed to the account's current devices, so the service reads no node id out of
+  a payload.
+
+  It learns your node ids anyway, by a different route: publishes and fetches arrive over
+  authenticated connections, so the service sees the node id at the other end of each one. Under
+  that tag it can therefore see which nodes advertise, which nodes ask, how many there are, and when
+  they stop renewing — that is, your active device set and its liveness. Sealing is aimed at whoever
+  can compute the tag *without* being the service, which is the case that actually arises: a removed
+  device, or a leaked tag. Unlinkability of tag to account is the guarantee; hiding your devices from
+  the service is not.
 - **Neither is trusted.** A discovered address is routing advice only: every peer, discovered or
   configured, passes full mutual roster authorization before a single log entry is exchanged. A
   forged announcement costs a failed dial and nothing else.
@@ -163,8 +178,34 @@ use — including any you add later.
 Discovery failing — unreachable, slow, rate-limited, or answering with nonsense — never fails a
 sync. The configured peers are dialed exactly as they would have been.
 
-One known gap: a device removed from the roster can no longer sync, but keeps the ability to compute
-the account's discovery tag, so it can still see which hosts are advertised and when. Fixing that
-needs rotatable discovery key material —
-[#1080](https://github.com/cq27-dev/rag-rat/issues/1080). Pin your hosts in `server_peers` if that
-matters to you before it lands; discovery is then not in the path at all.
+### What a removed device keeps
+
+Removing a device revokes it, but per host and not instantly: a serving host authorizes every peer
+against its own local roster projection, so it stops syncing with the removed device only once it has
+learned and folded the removal — the same per-host propagation that governs sealing below. A removal
+authored on another device reaches a host only when an authorized peer syncs it there; until then
+that host still treats the device as enrolled and syncs with it. The device also stops appearing as a
+recipient of anything sealed afterwards. Two further things survive removal even at a host that has
+folded it, because they do not depend on anything the account can take back:
+
+- **The discovery tag**, which is derived from immutable account material already in that device's
+  database. It can therefore keep watching the tag: how many hosts advertise and when they renew or
+  stop, and — because each sealed envelope is a version byte plus a fixed 80 bytes per recipient —
+  the exact number of devices on the account, `(len - 1) / 80`, tracked across enrollments and
+  removals without opening a single wrap. It can also publish junk under the tag, costing whoever
+  fetches it a wasted slot. What it can no longer do is read a host's node id out of any
+  announcement sealed after its removal. Rotating the tag itself is
+  [#1081](https://github.com/cq27-dev/rag-rat/issues/1081); padding the envelope to hide device
+  count is [#1087](https://github.com/cq27-dev/rag-rat/issues/1087).
+- **Announcements sealed before it stops being a recipient**, which stay openable by it until they
+  expire — at most one TTL, so 15 minutes at the default cadence. The window is measured from when a
+  host **learns** of the removal, not from when it was authored: a removal authored on another
+  device does not reach a host until an authorized peer syncs it there, and until then the host
+  keeps the removed device in its own effective roster and re-seals every renewal to include it. A
+  host that no remaining device ever reaches never learns, and keeps a removed device openable
+  indefinitely — one more reason a host is only as current as its last inbound sync.
+
+Neither grants access to data. Every peer, discovered or configured, still passes full mutual roster
+authorization before a single log entry moves, and a removed device fails it at any host that has
+folded the removal. Pin your hosts in `server_peers` and set `discovery = false` if you would rather
+the tag not be in the path at all.
