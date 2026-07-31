@@ -1480,8 +1480,6 @@ fn migration_092_normalizes_invite_receipts() {
 /// it, so the assertion keeps meaning something when a later migration also touches it.
 #[test]
 fn migration_096_holds_entries_awaiting_a_chain_predecessor() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 96, "move this pin with the next schema migration");
-
     let bare = rusqlite::Connection::open_in_memory().unwrap();
     assert!(
         !schema::table_exists(&bare, "table_sync_gapped_entries").unwrap(),
@@ -1972,4 +1970,83 @@ fn migration_094_tracks_lens_enrichment_changes_in_constant_time() {
     .unwrap();
     conn.execute("DELETE FROM repos WHERE repo_id = 'retired'", [])
         .expect("retiring a repo with Lens metadata must not reinsert rows during FK cascade");
+}
+
+/// V097 (#1048) rekeys the persisted Windows path spellings an older binary wrote in the `\\?\`
+/// verbatim form, so an upgrade does not orphan every scoped row it indexed.
+///
+/// Both halves have to be host-independent, and this pins the LEDGER half. A store migrated on
+/// Linux must read as current to a Windows binary — otherwise it is `Older` there and the whole
+/// tail re-runs — and a store migrated on Windows must not read as `Newer` on Linux and refuse to
+/// open at all. Asserted on whichever platform runs it, so the legs of CI check it between them.
+///
+/// The ROW half is host-independent too, and is pinned separately by
+/// `the_production_pass_rekeys_a_windows_store_on_any_host`: the rekey rule decides a property of
+/// the stored string rather than of the host, precisely so this ledger row cannot be stamped by a
+/// binary that did not do the work.
+#[test]
+fn migration_097_records_the_same_ladder_entry_on_every_platform() {
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 97, "move this pin with the next schema migration");
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+    let status = schema::status(&conn).unwrap();
+    assert_eq!(status.current_version, schema::LATEST_SCHEMA_VERSION);
+    // `Compatible` is the load-bearing half: a ledger row that recorded a DIFFERENT checksum on
+    // this platform would surface as `Dirty` here, and a skipped stamp as `Older`.
+    assert_eq!(
+        status.state,
+        schema::SchemaState::Compatible,
+        "V097's ledger row must be stamped identically wherever the migration runs",
+    );
+    let recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_version WHERE id = '097_windows_verbatim_path_rekey'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1, "the forward migration records V097");
+    // `schema::apply` is the `index --full` recovery and replays the WHOLE ladder over an existing
+    // store, so the pass has to be replay-safe on the real schema, not just on a fixture.
+    schema::migrations::apply_windows_verbatim_path_rekey(&conn).expect("replay is a no-op");
+}
+
+/// The rekey's table list is the WHOLE class, checked against the live schema rather than against
+/// the author's memory: any table carrying a `worktree_id` is keyed by a canonicalized checkout
+/// path and goes stale on the same upgrade, so a new one must join the sweep.
+///
+/// This is the guard that makes the fix a class fix. Without it, the next table to grow a
+/// `worktree_id` silently misses the rekey and its rows are pruned as a dead checkout on the next
+/// Windows upgrade — exactly the failure V097 exists to prevent, one table at a time.
+#[test]
+fn migration_097_covers_every_worktree_id_column_in_the_schema() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.name FROM sqlite_master m
+             WHERE m.type = 'table'
+               AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.name = 'worktree_id')
+             ORDER BY m.name",
+        )
+        .unwrap();
+    let in_schema: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    let mut covered: Vec<String> = schema::migrations::V097_WORKTREE_ID_SCOPED_TABLES
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect();
+    covered.sort();
+    assert_eq!(
+        in_schema, covered,
+        "every table with a `worktree_id` must be in V097_WORKTREE_ID_SCOPED_TABLES — an \
+         uncovered one keeps the old Windows spelling on upgrade, falls out of the active scope, \
+         and is deleted by the next GC as a checkout that no longer exists",
+    );
 }
