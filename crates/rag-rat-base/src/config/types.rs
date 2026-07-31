@@ -301,6 +301,15 @@ impl Default for VersionCheckConfig {
 /// `[sync] relay_url`, and per-invocation via the `RAG_RAT_SYNC_RELAY` env var at the call site.
 pub const DEFAULT_SYNC_RELAY: &str = "https://relay.cq27.dev";
 
+/// The project's shipped default peer-discovery service.
+///
+/// This is a node id, NOT a URL: the discovery service is a separate iroh peer reached BY NODE ID
+/// through [`DEFAULT_SYNC_RELAY`], not the relay itself. Overridable via `[sync]
+/// discovery_node_id`, and per-invocation via the `RAG_RAT_SYNC_DISCOVERY_NODE` env var at the call
+/// site.
+pub const DEFAULT_DISCOVERY_NODE: &str =
+    "c2c133affcb63f044efb808e8d1746ebe4f0425576cbc45878d4531446106583";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncConfig {
     /// The iroh relay URL peers pin for discovery and relay fallback. Defaults to
@@ -308,14 +317,54 @@ pub struct SyncConfig {
     /// `RAG_RAT_SYNC_RELAY` env var overrides this at the call site (ops/tests).
     pub relay_url: String,
     /// Server peer node ids this device replicates its account log with on the maintenance path,
-    /// each dialed via [`relay_url`](Self::relay_url). Empty (the default) disables device-side
-    /// sync entirely. Entries are trimmed, de-duplicated, and non-empty here; the node-id FORMAT
-    /// is validated at dial time (the config layer has no iroh dependency), where an
-    /// unparseable entry is warned and skipped rather than failing the whole sync.
+    /// each dialed via [`relay_url`](Self::relay_url).
+    ///
+    /// Empty (the default) no longer means device-side sync is off: peers the account advertises
+    /// to the discovery service are dialed too, so a pass runs whenever the roster holds a
+    /// second device. What an entry here buys is a peer that is reached WITHOUT the discovery
+    /// service — unconditional, unaffected by that service being down, and tried first.
+    ///
+    /// Entries are trimmed, de-duplicated, and non-empty here; the node-id FORMAT is validated at
+    /// dial time (the config layer has no iroh dependency), where an unparseable entry is warned
+    /// and skipped rather than failing the whole sync. De-duplication here is LITERAL, so one node
+    /// written two ways survives as two entries and is collapsed at dial time instead.
     pub server_peers: Vec<String>,
     /// Minimum seconds between device-side sync attempts on the maintenance path (default 300).
-    /// `0` attempts on every trigger. Only consulted when `server_peers` is non-empty.
+    /// `0` attempts on every trigger. Also sets the TTL this device publishes its own announcement
+    /// under, when [`discoverable`](Self::discoverable) is on.
     pub push_interval_secs: u64,
+    /// Use the peer-discovery service at all (default true).
+    ///
+    /// Turning it off makes sync depend on nothing but the relay: peers come from `server_peers`
+    /// and nowhere else, and this device neither queries the service nor advertises to it. For an
+    /// operator who pins their hosts and would rather not talk to a third party on a cadence, this
+    /// is the switch — without it a pinned device is INDEPENDENT of the service but still queries
+    /// it each pass, in case the account advertises a host that was never pinned.
+    ///
+    /// With this off, [`discoverable`](Self::discoverable) has nothing to act on and is ignored.
+    pub discovery: bool,
+    /// Advertise this node to the peer-discovery service so the account's devices can dial it
+    /// without a static `server_peers` entry (default false).
+    ///
+    /// Read by `rag-rat sync serve` ONLY, for as long as a device cannot accept connections
+    /// (#1079). The device-side maintenance pass never publishes,
+    /// whatever this says: it dials outward and never listens, so announcing it would advertise an
+    /// address that cannot accept a connection and that stops existing when the pass ends seconds
+    /// later — costing every device that discovered it a dial that can only time out, and holding
+    /// one of the few per-tag slots a reachable host needs.
+    ///
+    /// FETCHING is not gated on this. A device that advertises nothing still learns where its
+    /// host is, which is what lets a machine behind NAT reach one without becoming reachable
+    /// itself. Turning this on is what makes an always-on host findable.
+    pub discoverable: bool,
+    /// The peer-discovery service's node id — a NODE ID, not a URL, dialed through
+    /// [`relay_url`](Self::relay_url). Defaults to [`DEFAULT_DISCOVERY_NODE`]. The
+    /// `RAG_RAT_SYNC_DISCOVERY_NODE` env var overrides this at the call site (ops/tests).
+    ///
+    /// The FORMAT is validated at dial time, like [`server_peers`](Self::server_peers) — the
+    /// config layer has no iroh dependency. An unparseable value disables discovery for the
+    /// pass and is logged; it never fails a sync.
+    pub discovery_node_id: String,
 }
 
 impl Default for SyncConfig {
@@ -324,6 +373,9 @@ impl Default for SyncConfig {
             relay_url: DEFAULT_SYNC_RELAY.to_string(),
             server_peers: Vec::new(),
             push_interval_secs: 300,
+            discovery: true,
+            discoverable: false,
+            discovery_node_id: DEFAULT_DISCOVERY_NODE.to_string(),
         }
     }
 }

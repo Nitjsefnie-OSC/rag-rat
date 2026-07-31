@@ -506,8 +506,9 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
     }
 }
 
-/// Best-effort device-side sync riding the git trigger: after ordinary maintenance, dial the
-/// configured `[sync] server_peers` and replicate this account's op log. Like papertrail it never
+/// Best-effort device-side sync riding the git trigger: after ordinary maintenance, dial this
+/// account's peers — those configured in `[sync] server_peers` plus any the account advertises to
+/// the discovery service — and replicate its op log. Like papertrail it never
 /// holds the repo write lock (each account ingest is a short SQLite transaction) and every failure
 /// is folded into the report — a broken peer must never fail the git hook. The cadence watermark
 /// and the per-database session lock dedup the several triggers one git action fires.
@@ -522,7 +523,7 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
     match device_sync_run(config, db.connection()) {
         Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
             "status": "disabled",
-            "reason": "no [sync] server_peers, no local account, or this device is not roster-effective",
+            "reason": "no local account, or this device is not roster-effective",
         }),
         Ok(DeviceSyncOutcome::Skipped) => serde_json::json!({
             "status": "skipped",

@@ -80,6 +80,28 @@ fn effective_relay_url(config: &Config) -> String {
     }
 }
 
+/// The peer-discovery service this invocation queries: `RAG_RAT_SYNC_DISCOVERY_NODE` (ops/tests)
+/// overrides the configured `[sync] discovery_node_id`, which itself defaults to the shipped
+/// service. A NODE ID, not a URL — the service is a separate iroh peer reached through the relay.
+fn effective_discovery_node(config: &Config) -> String {
+    discovery_node_or_configured(
+        std::env::var("RAG_RAT_SYNC_DISCOVERY_NODE").ok().as_deref(),
+        config,
+    )
+}
+
+/// The precedence rule behind [`effective_discovery_node`], with the environment read lifted out.
+///
+/// Split so the rule is testable without mutating process-global state: env-var tests are
+/// invisible under a per-process test runner and race under an in-process one, and this repository
+/// is verified under both.
+fn discovery_node_or_configured(from_env: Option<&str>, config: &Config) -> String {
+    match from_env {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => config.sync.discovery_node_id.clone(),
+    }
+}
+
 /// A one-time enrollment invite `sync init` mints as it starts hosting the pairing exchange.
 struct InviteMint {
     role: rag_rat_oplog::DeviceRole,
@@ -192,10 +214,47 @@ fn serve_with(config: &Config, once: bool, mint: Option<InviteMint>) -> anyhow::
         };
         let policy = AuthPolicy::Closed;
 
+        // Advertise this host to the account's other devices for as long as it serves.
+        //
+        // `serve` is the node that most needs announcing — it is the always-on peer a laptop
+        // behind NAT is trying to reach — and it is the one node the device-sync path can never
+        // announce, because that path only runs on the maintenance hook and `serve` has no
+        // maintenance hook. Without its own timer the only publishers would be the only fetchers.
+        //
+        // Not gated on the roster count the device path uses: `serve` outlives the roster it
+        // started with, and a host that stopped advertising because it was alone when it booted
+        // would be invisible to the device enrolled an hour later. `--once` does not publish — it
+        // is a scripted single-connection check, not a host.
+        let advertising =
+            serve_should_advertise(config.sync.discovery, config.sync.discoverable, once);
+        let discovery_tag = advertising
+            .then(|| rag_rat_sync::discovery::discovery_secret(conn))
+            .transpose()?
+            .flatten()
+            .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
+        // Aborted on the way out of this scope, so the loop cannot outlive the endpoint it
+        // advertises.
+        let _advertiser =
+            discovery_tag.zip(discovery_service_addr(config, &relay)).map(|(tag, service)| {
+                AbortOnDrop(tokio::spawn(rag_rat_sync::discovery::advertise(
+                    rag_rat_sync::discovery::Advertise {
+                        endpoint: endpoint.clone(),
+                        service,
+                        tag,
+                        node: local_node,
+                        ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
+                            config.sync.push_interval_secs,
+                        ),
+                        now_ms: time::now_ms,
+                    },
+                )))
+            });
+
         tracing::info!(
             node_id = %endpoint.id(),
             relay = %relay,
             minted_invite = invite.is_some(),
+            discoverable = config.sync.discoverable,
             "sync serve listening"
         );
         // The dialable node identity must reach the operator on stdout: repository logging is off
@@ -464,16 +523,21 @@ const DEVICE_SYNC_LAST_META_KEY: &str = "sync_device_last_at_ms";
 /// What a device-side sync attempt did — folded into the maintenance hook report.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeviceSyncOutcome {
-    /// No server peers configured, no local account, or the device is not roster-effective.
+    /// Nothing to do: no local account, or this device is not roster-effective. Note that having
+    /// no configured peer is NOT one of the reasons — a pass with an empty `server_peers` still
+    /// runs and still looks.
     Disabled,
     /// The cadence gate suppressed this attempt (a sync ran within `push_interval_secs`).
     Skipped,
     /// The per-database session lock is held (a serve peer or another sync); retry next pass.
     Deferred,
-    /// Ran against the configured peers (resolved through the discovery seam): `ok` sessions
-    /// succeeded, `errors` failed. `peers` is the configured count and `ok + errors == peers` — a
-    /// configured id that failed to resolve is logged and counted as an error, so a typo stays
-    /// visible rather than shrinking the peer set to a healthy-looking zero.
+    /// Ran against the peers this pass resolved — configured plus discovered: `ok` sessions
+    /// succeeded, `errors` failed, and `ok + errors == peers`.
+    ///
+    /// `peers` is what was ATTEMPTED, not what was configured. The two diverge in both directions:
+    /// discovery adds peers no config named, and several configured spellings of one node collapse
+    /// into a single dial. A configured id that failed to resolve is logged and counted as an
+    /// error, so a typo stays visible rather than shrinking the peer set to a healthy-looking zero.
     Ran { peers: usize, ok: usize, errors: usize },
 }
 
@@ -487,13 +551,23 @@ pub(crate) fn device_sync_run(
     config: &Config,
     conn: &Connection,
 ) -> anyhow::Result<DeviceSyncOutcome> {
-    if config.sync.server_peers.is_empty() {
-        return Ok(DeviceSyncOutcome::Disabled);
-    }
     // Device-side sync must NOT mint identity: an unenrolled store simply has nothing to sync.
+    // Read the account FIRST — ahead of the configured-peers check it used to sit behind — because
+    // whether an empty `server_peers` means "nothing to do" is now an account-scoped question.
     let Some(account_id) = rag_rat_oplog::read_local_account(conn)? else {
         return Ok(DeviceSyncOutcome::Disabled);
     };
+    // An enrolled account is reason enough to run: this pass may have nothing configured and know
+    // of no other device, and still need to fetch.
+    //
+    // Deliberately NOT gated on the local roster holding a second device. That count is REPLICATED
+    // state — it is only current if this device has synced recently — so using it to decide whether
+    // to sync is circular, and the circle closes badly: a store restored from a backup taken before
+    // the other devices were enrolled believes it is alone, declines to look, and therefore never
+    // receives the roster entries that would tell it otherwise. It stays wedged forever while a
+    // reachable host sits there advertising. The cost of getting this wrong in the permissive
+    // direction is one fetch per cadence for an account that really is alone; in the strict
+    // direction it is a device that can never recover.
     if !device_sync_due(conn, config.sync.push_interval_secs)? {
         return Ok(DeviceSyncOutcome::Skipped);
     }
@@ -523,34 +597,59 @@ pub(crate) fn device_sync_run(
         return Ok(DeviceSyncOutcome::Disabled);
     }
     let relay = effective_relay_url(config);
-    // Resolve which peers to dial through the discovery seam — explicit config today, with
-    // relay-side account-keyed discovery landing behind it (`rag_rat_sync::discover_peers`, #988).
-    // Each entry pairs the peer's node-id string (for logs) with its dialable address; a configured
-    // id that does not parse is logged and dropped there, so it never becomes a dial attempt.
-    let configured = config.sync.server_peers.len();
-    let peers = rag_rat_sync::discover_peers(account_id, &config.sync.server_peers, &relay);
-    // Count the dropped (unresolvable) configured ids as errors: otherwise an all-typo
-    // `server_peers` reports a healthy-looking `ran` with zero peers and stamps the cadence
-    // watermark, silently suppressing sync until the next interval (repository logging is off
-    // by default).
-    let unresolved = configured.saturating_sub(peers.len());
+    // Key material for the account's discovery tag. Absent only when no account is minted, which
+    // the read above already ruled out; treat it as "no discovery" rather than an error either way.
+    let discovery_tag = rag_rat_sync::discovery::discovery_secret(conn)?
+        .map(|secret| rag_rat_sync::discovery::account_tag(&secret));
+    let discovery_service = discovery_service_addr(config, &relay);
 
     let runtime =
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    let result: anyhow::Result<(usize, usize)> = runtime.block_on(async {
+    let result: anyhow::Result<(usize, usize, usize)> = runtime.block_on(async {
         let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
             .await
             .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
-        let mut ok = 0usize;
-        let mut errors = unresolved;
+        // Resolve which peers to dial: the configured ids plus whatever the account advertises.
+        // INSIDE the runtime and AFTER the bind on purpose — publishing advertises this endpoint's
+        // identity, so there is nothing to announce until it exists. Each entry pairs the peer's
+        // node-id string (for logs) with its dialable address; a configured id that does not parse
+        // is logged and counted there, so it never becomes a dial attempt.
+        let resolved = rag_rat_sync::discover_peers(
+            &config.sync.server_peers,
+            &relay,
+            discovery_tag.zip(discovery_service).map(|(tag, service)| {
+                rag_rat_sync::discovery::DiscoveryExchange {
+                    endpoint: &endpoint,
+                    service,
+                    tag,
+                    // FETCH ONLY, whatever `[sync] discoverable` says — that flag is honoured by
+                    // `serve_with`, which is a different process state.
+                    //
+                    // This pass never calls `accept_and_dispatch`: it dials out and drops the
+                    // endpoint when it finishes, seconds later. Advertising here would publish an
+                    // address that cannot accept a connection and stops existing almost
+                    // immediately, while the announcement lives on for its whole TTL — costing
+                    // every device that discovers it a dial that can only time out, and occupying
+                    // one of the few per-tag slots that a REACHABLE peer needs. Only a node that
+                    // accepts connections is worth announcing.
+                    publish: None,
+                    ttl_seconds: rag_rat_sync::discovery::publish_ttl_seconds(
+                        config.sync.push_interval_secs,
+                    ),
+                    now_ms: time::now_ms(),
+                }
+            }),
+        )
+        .await;
+        let peers = resolved.peers;
+        let mut reached = Vec::with_capacity(peers.len());
         for (peer, addr) in &peers {
             // Own a copy of the resolved address: it is dialed twice (account log, then content),
             // and `addr` is a borrow into `peers`.
             let addr = (*addr).clone();
             // Account log FIRST — it carries the roster + stream ownership that AUTHORIZE content,
-            // so leading with it minimizes parking on the peer. The account-log result
-            // IS the peer's outcome, so `ok + errors` (seeded with the unresolvable count)
-            // stays equal to the number of configured peers. `/3` content rides on top:
+            // so leading with it minimizes parking on the peer. The account-log result IS the
+            // peer's outcome — exactly one entry in `reached` per peer. `/3` content rides on top:
             // best-effort, attempted only once the account log reached the peer, and a
             // content hiccup is logged — never a peer failure.
             // Reconcile each stream to a fixpoint (#878): a single session can report `Done` while
@@ -612,13 +711,9 @@ pub(crate) fn device_sync_run(
                     Err(e) => tracing::warn!(peer, error = %e, "device sync (content) failed"),
                 }
             }
-            if account_ok {
-                ok += 1;
-            } else {
-                errors += 1;
-            }
+            reached.push(account_ok);
         }
-        anyhow::Ok((ok, errors))
+        anyhow::Ok(fold_peer_outcomes(resolved.unresolved_configured, &reached))
     });
 
     // Stamp the cadence watermark on ANY completed attempt — a per-peer failure OR an endpoint-bind
@@ -627,8 +722,74 @@ pub(crate) fn device_sync_run(
     // ignoring `push_interval_secs`. A bind failure still surfaces (the caller reports it and never
     // fails the hook), but it is now cadence-limited exactly like an unreachable peer.
     record_device_sync(conn)?;
-    let (ok, errors) = result?;
-    Ok(DeviceSyncOutcome::Ran { peers: configured, ok, errors })
+    let (peers, ok, errors) = result?;
+    Ok(DeviceSyncOutcome::Ran { peers, ok, errors })
+}
+
+/// The discovery service's dialable address, or `None` (logged) when the configured id is unusable.
+///
+/// One seam for both callers — the device-sync pass and the serving host — so the resolution rule,
+/// the `[sync] discovery` switch, and the malformed-id warning cannot drift apart. `None` means
+/// this invocation does not talk to the discovery service, for either reason. The service is a
+/// separate iroh peer reached BY NODE ID through the same relay as the peers, not the relay
+/// itself.
+fn discovery_service_addr(config: &Config, relay: &str) -> Option<rag_rat_sync::EndpointAddr> {
+    // The single switch. Gating HERE rather than at each caller is what makes
+    // `[sync] discovery = false` mean "no contact with the service" rather than "no contact from
+    // whichever paths someone remembered to check" — a new caller inherits it by construction.
+    if !config.sync.discovery {
+        return None;
+    }
+    let discovery_node = effective_discovery_node(config);
+    match rag_rat_sync::peer_addr(&discovery_node, relay) {
+        Ok(addr) => Some(addr),
+        Err(error) => {
+            tracing::warn!(
+                service = discovery_node,
+                %error,
+                "skipping peer discovery: [sync] discovery_node_id is not a usable node id"
+            );
+            None
+        },
+    }
+}
+
+/// Whether a serving host should advertise itself.
+///
+/// Three independent reasons not to, each easy to get wrong by omission rather than by writing
+/// something false: `[sync] discovery` turns the service off entirely, `[sync] discoverable` is
+/// opt-in on top of that, and `--once` is a scripted single-connection check rather than a host —
+/// advertising from it would publish an announcement that outlives the process by a whole TTL,
+/// pointing peers at a node that has already exited.
+///
+/// Named and tested separately because the composition it feeds is not reachable from a test: the
+/// caller binds an endpoint, takes the session lock, and runs an accept loop until interrupted.
+fn serve_should_advertise(discovery: bool, discoverable: bool, once: bool) -> bool {
+    discovery && discoverable && !once
+}
+
+/// A spawned task that is aborted when this guard drops, so a background loop cannot outlive the
+/// resources it borrows conceptually (here: the endpoint `serve` advertises).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Fold the per-peer session results into the `(peers, ok, errors)` a [`DeviceSyncOutcome::Ran`]
+/// reports. `reached[i]` is whether peer `i`'s account-log session succeeded.
+///
+/// Pure, and separately tested, because this accounting is where the mistake lives when it is made.
+/// The obvious spelling — deriving the unresolvable count as `configured - peers.len()` — is wrong
+/// the moment discovery can add peers or duplicate spellings can collapse, and it under-counts
+/// errors all the way to a healthy-looking zero over an all-typo `server_peers`. A unit test on the
+/// resolver's return value cannot see that, because the subtraction lives HERE, at the caller.
+fn fold_peer_outcomes(unresolved_configured: usize, reached: &[bool]) -> (usize, usize, usize) {
+    let ok = reached.iter().filter(|reached| **reached).count();
+    let errors = reached.len() - ok + unresolved_configured;
+    (reached.len() + unresolved_configured, ok, errors)
 }
 
 /// The cadence gate: whether enough time has passed since the last device-side sync attempt.
@@ -757,8 +918,26 @@ mod tests {
 
     use super::{
         DEVICE_SYNC_LAST_META_KEY, DeviceSyncOutcome, decode_node_secret, device_can_serve,
-        device_can_sync, device_sync_due, device_sync_run, join, node_secret, record_device_sync,
+        device_can_sync, device_sync_due, device_sync_run, discovery_node_or_configured,
+        discovery_service_addr, fold_peer_outcomes, join, node_secret, record_device_sync,
+        serve_should_advertise,
     };
+
+    fn account_of(conn: &Connection) -> rag_rat_oplog::AccountId {
+        rag_rat_oplog::read_local_account(conn).unwrap().expect("the fixture minted an account")
+    }
+
+    /// How many devices the LOCAL roster projection believes are effective, counted directly so a
+    /// test can prove the state it claims to exercise without a public API existing for its sake.
+    fn roster_device_count(conn: &Connection, account: rag_rat_oplog::AccountId) -> usize {
+        conn.query_row(
+            "SELECT COUNT(DISTINCT device_fingerprint) FROM account_roster_history
+             WHERE account_id = ?1 AND closed_at IS NULL",
+            rusqlite::params![account.to_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap() as usize
+    }
 
     fn schema_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -773,6 +952,16 @@ mod tests {
             PathBuf::from("/nonexistent/db.sqlite"),
             PathBuf::from("/nonexistent"),
         )
+    }
+
+    /// `min_config` with a real database path, for the tests that run far enough into
+    /// `device_sync_run` to take the per-database session lock — which needs a directory it can
+    /// actually create lock files in. The returned `TempDir` must outlive the config.
+    fn config_with_real_lock_dir() -> (Config, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            Config::minimal_for_database(dir.path().join("db.sqlite"), dir.path().to_path_buf());
+        (config, dir)
     }
 
     #[test]
@@ -793,13 +982,139 @@ mod tests {
         assert!(device_sync_due(&conn, 300).unwrap(), "a future watermark is treated as due");
     }
 
+    /// The accounting the old `configured.saturating_sub(peers.len())` got wrong. Restoring that
+    /// subtraction makes the discovery row report 1 error instead of 3, and the all-typo row report
+    /// 0 instead of 2 — a pass that looks healthy while syncing with nobody.
     #[test]
-    fn device_sync_run_is_disabled_without_configured_peers() {
-        let conn = schema_conn();
+    fn peer_outcomes_count_every_attempt_including_the_ids_that_never_resolved() {
         assert_eq!(
-            device_sync_run(&min_config(), &conn).unwrap(),
-            DeviceSyncOutcome::Disabled,
-            "no [sync] server_peers => device-side sync is off"
+            fold_peer_outcomes(0, &[true, true]),
+            (2, 2, 0),
+            "two configured peers, both reached"
+        );
+        assert_eq!(
+            fold_peer_outcomes(2, &[]),
+            (2, 0, 2),
+            "an all-typo server_peers reports errors, never a healthy-looking empty run"
+        );
+        assert_eq!(
+            fold_peer_outcomes(3, &[true, false]),
+            (5, 1, 4),
+            "unresolvable ids are attempts too: they seed errors and count toward peers"
+        );
+        // Discovery adds peers no config named, so `peers` exceeds the configured count. The old
+        // subtraction could not represent this at all.
+        let (peers, ok, errors) = fold_peer_outcomes(1, &[true, true, false, true]);
+        assert_eq!((peers, ok, errors), (5, 3, 2));
+        assert_eq!(
+            ok + errors,
+            peers,
+            "ok + errors == peers is the invariant the hook report reads"
+        );
+    }
+
+    /// The env override exists for ops and tests; without it, pointing a checkout at a throwaway
+    /// discovery service would mean editing committed config.
+    #[test]
+    fn the_discovery_node_env_override_wins_over_the_configured_service() {
+        let mut config = min_config();
+        config.sync.discovery_node_id = "configured-node".to_string();
+        assert_eq!(
+            discovery_node_or_configured(Some("  env-node  "), &config),
+            "env-node",
+            "the override wins and is trimmed"
+        );
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                discovery_node_or_configured(absent, &config),
+                "configured-node",
+                "an unset or blank override falls through to the configured service ({absent:?})"
+            );
+        }
+    }
+
+    /// Both reasons a serving host stays silent, enumerated — each is an omission-shaped mistake.
+    ///
+    /// `--once` matters more than it looks: an announcement outlives the process by a whole TTL, so
+    /// a one-shot check that advertised would leave peers dialing a node that has already exited.
+    #[test]
+    fn a_serving_host_advertises_only_when_opted_in_and_not_running_one_shot() {
+        assert!(
+            serve_should_advertise(true, true, false),
+            "a discoverable long-running host advertises"
+        );
+        assert!(!serve_should_advertise(true, false, false), "[sync] discoverable is opt-in");
+        assert!(
+            !serve_should_advertise(false, true, false),
+            "[sync] discovery = false means there is no service to advertise to, whatever else \
+             says"
+        );
+        assert!(
+            !serve_should_advertise(true, true, true),
+            "--once is a scripted check, not a host; its announcement would outlive the process"
+        );
+        assert!(!serve_should_advertise(false, false, true));
+    }
+
+    /// `[sync] discovery = false` silences the service for BOTH callers, because both resolve its
+    /// address through one seam. Gating at each call site instead would leave a new caller talking
+    /// to the service by default.
+    #[test]
+    fn switching_discovery_off_leaves_no_service_address_for_anyone_to_use() {
+        let (mut config, _dir) = config_with_real_lock_dir();
+        assert!(
+            discovery_service_addr(&config, "https://relay.invalid").is_some(),
+            "the shipped default resolves, or the negative below proves nothing"
+        );
+
+        config.sync.discovery = false;
+        assert!(
+            discovery_service_addr(&config, "https://relay.invalid").is_none(),
+            "no address means no fetch and nothing to advertise to"
+        );
+        assert!(
+            !serve_should_advertise(config.sync.discovery, true, false),
+            "and a host cannot advertise even with discoverable set"
+        );
+    }
+
+    /// A pass with NO configured peers and a roster that shows only this device still runs.
+    ///
+    /// It used to return `Disabled` here, on the reasoning that a lone device has nobody to find.
+    /// That reasoning was circular: the roster count is replicated state, current only if this
+    /// device has synced recently, so a store restored from a backup predating the other devices
+    /// believes it is alone, declines to look, and never receives the entries that would correct
+    /// it — wedged forever while a reachable host advertises. Re-introduce that gate and this test
+    /// goes red.
+    ///
+    /// Hermetic: a reserved-TLD relay and an unparseable service id mean no network call. That is
+    /// also this test's limit, and it is worth naming rather than implying: because the service id
+    /// does not resolve, the pass "looks" at nothing, so the test pins the ABSENCE of the early
+    /// return and not the presence of a discovery query. **One mutation survives it, and the whole
+    /// suite: passing `None` as `discover_peers`' discovery argument whenever `server_peers` is
+    /// empty.** That reintroduces exactly the wedge described above. Closing it needs the driver to
+    /// reach an in-process service, which needs either a live relay (the repository already gates
+    /// such tests behind `RAG_RAT_SYNC_RELAY`) or a test-only injection point in production code —
+    /// neither of which is worth more than saying so here.
+    #[test]
+    fn a_lone_looking_roster_does_not_stop_the_pass_from_looking() {
+        let conn = schema_conn();
+        rag_rat_oplog::local_account(&conn, 1_700_000_000_000).unwrap();
+        assert_eq!(
+            roster_device_count(&conn, account_of(&conn)),
+            1,
+            "exactly the state that used to short-circuit: the roster knows of nobody else"
+        );
+
+        let (mut config, _dir) = config_with_real_lock_dir();
+        assert!(config.sync.server_peers.is_empty(), "and nothing is configured either");
+        config.sync.relay_url = "https://relay.invalid".to_string();
+        config.sync.discovery_node_id = "not-a-node-id".to_string();
+
+        assert_eq!(
+            device_sync_run(&config, &conn).unwrap(),
+            DeviceSyncOutcome::Ran { peers: 0, ok: 0, errors: 0 },
+            "the pass runs and looks; zero peers were reachable, which is not an error"
         );
     }
 

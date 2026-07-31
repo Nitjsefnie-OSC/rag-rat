@@ -17,6 +17,7 @@
 
 pub mod auth;
 pub mod codec;
+pub mod discovery;
 pub mod endpoint;
 pub mod enrollment;
 pub mod session;
@@ -28,15 +29,21 @@ pub use auth::{
     PeerCapability, SessionCapabilities, run_auth_phase,
 };
 pub use endpoint::{
-    EndpointError, MAX_RECONCILE_ROUNDS, ReconcileReport, SyncFailure, accept_and_dispatch,
-    accept_and_sync, accept_enrollment, build_endpoint, connect_and_enroll, connect_and_reconcile,
-    connect_and_sync, discover_peers, endpoint_addr, node_id_from_secret, node_id_to_string,
-    peer_addr, peer_addr_from_bytes,
+    DiscoveredPeers, EndpointError, MAX_RECONCILE_ROUNDS, ReconcileReport, SyncFailure,
+    accept_and_dispatch, accept_and_sync, accept_enrollment, build_endpoint, connect_and_enroll,
+    connect_and_reconcile, connect_and_sync, discover_peers, endpoint_addr, node_id_from_secret,
+    node_id_to_string, peer_addr, peer_addr_from_bytes,
 };
 pub use enrollment::{
     ENROLL_ALPN, EnrollmentReceipt, EnrollmentRequest, EnrollmentTicket, InviteError, InviteSpec,
     mint_invite, redeem_invite, run_enrollment_acceptor, run_enrollment_dialer,
 };
+/// The dialable address type every peer-facing helper here hands back.
+///
+/// Re-exported so a caller can NAME what `peer_addr` returns and what `DiscoveryExchange`
+/// wants without taking an iroh dependency of its own — the CLI has none, and keeping it that
+/// way is what makes this crate the single place the transport is chosen.
+pub use iroh::EndpointAddr;
 pub use session::{
     DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES, SessionError, SessionReport, SyncStore,
     run_session, run_session_with_idle_timeout,
