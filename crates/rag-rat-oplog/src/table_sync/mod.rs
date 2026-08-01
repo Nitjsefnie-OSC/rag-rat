@@ -18,6 +18,10 @@ mod row_op;
 mod schema_facts;
 mod scope_stream;
 mod store;
+mod transport;
+
+/// Largest signed table-entry envelope accepted by storage and the `/5` transport.
+pub const TABLE_SYNC_ENTRY_MAX_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 pub(crate) use refold::refold_stale_projections_against;
@@ -33,4 +37,8 @@ pub(crate) use scope_stream::scope_stream_id;
 #[cfg(test)]
 pub(crate) use store::{
     PendingReason, author_row_entry, mark_entry_pending, record_stream_context,
+};
+pub use transport::{
+    TableSyncIngestOutcome, TableSyncStream, table_sync_entries_for_stream, table_sync_ingest,
+    table_sync_signed_hash, table_sync_supported_streams, table_sync_validate_stream,
 };
