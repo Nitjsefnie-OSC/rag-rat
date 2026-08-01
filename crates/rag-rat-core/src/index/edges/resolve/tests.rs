@@ -12,6 +12,13 @@ fn seeded_conn() -> Connection {
     conn
 }
 
+/// No package map: every candidate is eligible, which is how a non-Cargo corpus resolves.
+fn no_packages() -> &'static std::collections::HashMap<i64, i64> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashMap<i64, i64>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashMap::new)
+}
+
 fn add_file(conn: &Connection, path: &str, commit: &str) -> i64 {
     conn.execute(
         "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
@@ -50,6 +57,47 @@ fn add_edge(
     )
     .unwrap();
     // `edges` is a view; `last_insert_rowid` does not survive its INSTEAD OF trigger (#79).
+    conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+}
+
+fn add_receiver_type_edge(
+    conn: &Connection,
+    source_file_id: i64,
+    to_name: &str,
+    target_qualified_name: &str,
+    receiver_type_hint: &str,
+) -> i64 {
+    add_receiver_type_edge_at_byte(
+        conn,
+        source_file_id,
+        to_name,
+        target_qualified_name,
+        receiver_type_hint,
+        0,
+    )
+}
+
+fn add_receiver_type_edge_at_byte(
+    conn: &Connection,
+    source_file_id: i64,
+    to_name: &str,
+    target_qualified_name: &str,
+    receiver_type_hint: &str,
+    source_start_byte: i64,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, target_qualified_name, edge_kind, confidence, \
+         resolution, receiver_hint, receiver_type_hint, source_start_byte) VALUES (?1, ?2, ?3, \
+         'calls_name', 'NameOnly', 'unresolved', 'w', ?4, ?5)",
+        params![
+            source_file_id,
+            to_name,
+            target_qualified_name,
+            receiver_type_hint,
+            source_start_byte
+        ],
+    )
+    .unwrap();
     conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
 }
 
@@ -469,6 +517,7 @@ fn full_rebuild_uses_language_of_symbol_less_swift_files() {
         target_qualified_name: None,
         evidence: Some("parse()".to_string()),
         receiver_hint: None,
+        receiver_type_hint: None,
         source_span: EdgeSpan { start_line: 1, end_line: 1, start_byte: 0, end_byte: 7 },
         callee_span: None,
         import_scope: None,
@@ -666,9 +715,12 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
                 edge_kind: EdgeKind::CallsName,
                 evidence: Some("make()"),
                 receiver_hint: Some(receiver),
+                receiver_type: None,
                 source_file_id: 1,
                 source_language: Some(Language::Swift.as_str()),
                 imported_external: true,
+                receiver_package: None,
+                file_package: no_packages(),
             },
             &index,
         );
@@ -678,6 +730,956 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
         assert_eq!(confidence, EdgeConfidence::Syntactic);
         assert_eq!(resolution, "target_name_fallback");
     }
+}
+
+#[test]
+fn external_receiver_type_hint_never_binds_locally() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "crate::Worker::run".to_string();
+    run.scope_path = "Worker::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let request = |receiver_type: ReceiverTypeIdentity<'static>| ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("run()"),
+        receiver_hint: Some("w"),
+        receiver_type: Some(receiver_type),
+        source_file_id: 1,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    let (target, confidence, reason) =
+        resolve_symbol(request(ReceiverTypeIdentity::LocalUnqualified("Worker")), &index)
+            .expect("a local Worker receiver resolves");
+    assert_eq!(target.id, symbols[0].id);
+    assert_eq!(confidence, EdgeConfidence::Syntactic);
+    assert_eq!(reason, "receiver_type");
+
+    // Same call, but `Worker` came from `use external::Worker;` — the receiver-type branch must
+    // not bind the call to the unrelated local `Worker::run`.
+    if let Some((_, _, reason)) =
+        resolve_symbol(request(ReceiverTypeIdentity::ExternalQualified("Worker")), &index)
+    {
+        assert!(
+            !matches!(reason, "receiver_type" | "scope_degeneric"),
+            "externally-imported receiver type must not drive resolution, got {reason}"
+        );
+    }
+}
+
+#[test]
+fn external_receiver_alias_keeps_its_import_origin() {
+    let conn = seeded_conn();
+    set_local_crate_roots(&conn, "mycrate");
+    let caller = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "b.rs", NEW);
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Worker",
+        "b.rs::Worker",
+        "Worker",
+        "struct",
+        Language::Rust,
+    );
+    add_symbol_scope(&conn, defs, "run", "b.rs::run", "Worker::run");
+    add_import_edge(&conn, caller, "Alias", "use dep::Worker as Alias;");
+    let call = add_receiver_type_edge(&conn, caller, "run", "w::run", "Alias");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, call);
+    assert_eq!(to, None, "the alias's external origin must survive rewriting to Worker");
+    assert_eq!(resolution, "unresolved");
+}
+
+#[test]
+fn local_receiver_alias_keeps_its_complete_owner_path() {
+    let conn = seeded_conn();
+    let caller = add_file(&conn, "caller.rs", NEW);
+    let defs = add_file(&conn, "defs.rs", NEW);
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Worker",
+        "defs.rs::nested_worker",
+        "a::Worker",
+        "struct",
+        Language::Rust,
+    );
+    let nested = add_symbol_scope(&conn, defs, "run", "defs.rs::nested_run", "a::Worker::run");
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Worker",
+        "defs.rs::root_worker",
+        "Worker",
+        "struct",
+        Language::Rust,
+    );
+    add_symbol_scope(&conn, defs, "run", "defs.rs::root_run", "Worker::run");
+    add_import_edge(&conn, caller, "Alias", "use crate::a::Worker as Alias;");
+    let call = add_receiver_type_edge(&conn, caller, "run", "w::run", "Alias");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    let (to, _, resolution) = edge_state(&conn, call);
+    assert_eq!(to, Some(nested), "Alias must retain the nested owner instead of binding Worker");
+    assert_eq!(resolution, "receiver_type");
+}
+
+#[test]
+fn relative_grouped_and_workspace_aliases_resolve_only_their_complete_owner() {
+    let conn = seeded_conn();
+    set_local_crate_roots(&conn, "this_crate\nsibling");
+    let caller = add_file(&conn, "caller.rs", NEW);
+    let defs = add_file(&conn, "defs.rs", NEW);
+    let unrelated = add_symbol_scope(&conn, defs, "run", "defs.rs::root_run", "Worker::run");
+    let outer =
+        add_symbol_scope(&conn, defs, "run", "defs.rs::outer_run", "outer::workers::Worker::run");
+    let local = add_symbol_scope(
+        &conn,
+        defs,
+        "run",
+        "defs.rs::local_run",
+        "outer::inner::local::Worker::run",
+    );
+    let workspace =
+        add_symbol_scope(&conn, defs, "run", "defs.rs::workspace_run", "workspace::Worker::run");
+    add_symbol_scope_language(
+        &conn,
+        caller,
+        "workers",
+        "caller.rs::workers",
+        "outer::workers",
+        "module",
+        Language::Rust,
+    );
+
+    add_import_edge_scoped(&conn, caller, "outer", "mod outer", 10, 500, 10);
+    add_import_edge_scoped(&conn, caller, "inner", "mod inner", 100, 400, 100);
+    let imports = [
+        ("Direct", "use super::workers::Worker as Direct;", "Direct"),
+        ("Grouped", "use super::workers::{Worker as Grouped};", "Grouped"),
+        ("Nested", "use super::{workers::{Worker as Nested}};", "Nested"),
+        ("Workers", "use super::workers::{self as Workers};", "Workers::Worker"),
+        ("SelfAlias", "use self::local::Worker as SelfAlias;", "SelfAlias"),
+        ("Workspace", "use sibling::workspace::Worker as Workspace;", "Workspace"),
+        ("Root", "use crate::{self as Root};", "Root::outer::workers::Worker"),
+    ];
+    let calls = imports
+        .iter()
+        .map(|(name, declaration, hint)| {
+            add_import_edge_scoped(&conn, caller, name, declaration, 100, 400, 100);
+            add_receiver_type_edge_at_byte(&conn, caller, "run", "w::run", hint, 150)
+        })
+        .collect::<Vec<_>>();
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    for (index, call) in calls.into_iter().enumerate() {
+        let expected = match index {
+            0 | 1 | 2 | 3 | 6 => outer,
+            4 => local,
+            5 => workspace,
+            _ => unreachable!(),
+        };
+        let (to, _, resolution) = edge_state(&conn, call);
+        assert_eq!(to, Some(expected), "alias case {index} selected the wrong owner");
+        assert_ne!(to, Some(unrelated), "alias case {index} fell back to the type tail");
+        assert_eq!(resolution, "receiver_type");
+    }
+}
+
+#[test]
+fn unproven_qualified_receiver_cannot_tail_bind_a_local_type() {
+    let conn = seeded_conn();
+    let caller = add_file(&conn, "a.rs", NEW);
+    let defs = add_file(&conn, "b.rs", NEW);
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Client",
+        "b.rs::Client",
+        "Client",
+        "struct",
+        Language::Rust,
+    );
+    add_symbol_scope(&conn, defs, "execute", "b.rs::execute", "Client::execute");
+    add_symbol_scope_language(
+        &conn,
+        defs,
+        "Client",
+        "b.rs::local_client",
+        "local_mod::Client",
+        "struct",
+        Language::Rust,
+    );
+    let local_execute = add_symbol_scope(
+        &conn,
+        defs,
+        "execute",
+        "b.rs::local_execute",
+        "local_mod::Client::execute",
+    );
+    let external =
+        add_receiver_type_edge(&conn, caller, "execute", "c::execute", "reqwest::Client");
+    let local = add_receiver_type_edge(&conn, caller, "execute", "c::execute", "local_mod::Client");
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    resolve_all_edges(&conn).unwrap();
+
+    assert_eq!(edge_state(&conn, external).0, None, "an unknown qualified root fails closed");
+    assert_eq!(
+        edge_state(&conn, local).0,
+        Some(local_execute),
+        "a qualified owner proven by a local type definition still resolves"
+    );
+}
+
+#[test]
+fn bare_root_receiver_does_not_suffix_match_nested_owner() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "inner::Worker::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("w.run()"),
+            receiver_hint: Some("w"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    );
+    assert!(resolved.is_none(), "root Worker must not bind inner::Worker::run by suffix");
+}
+
+/// A workspace stores every crate's root-level `Worker::run` under the SAME scope key, so nothing
+/// in the key separates them. When only one crate's `Worker` carries the method — the other's may
+/// come from an external trait default, which mints no local symbol — the lookup finds a single
+/// candidate and binds across the crate boundary.
+///
+/// A bare hint with no `use` behind it names this file's own crate, so the answer has to come from
+/// its package. An IMPORT-BOUND hint is left alone: `use sibling::Worker;` then `w.run()` is the
+/// ordinary multi-crate idiom, and its answer genuinely lives elsewhere.
+#[test]
+fn a_bare_receiver_owner_does_not_cross_a_package_boundary() {
+    let mut run = preferred_candidate(2, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "crates/b/src/lib.rs::run".to_string();
+    run.scope_path = "Worker::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+    // File 1 is package 10 (the caller); file 2, holding the only `Worker::run`, is package 20.
+    let packages = std::collections::HashMap::from([(1i64, 10i64), (2i64, 20i64)]);
+
+    let request = |receiver_package: Option<i64>| ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("w.run()"),
+        receiver_hint: Some("w"),
+        receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+        source_file_id: 1,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package,
+        file_package: &packages,
+    };
+
+    assert!(
+        resolve_symbol(request(Some(10)), &index).is_none(),
+        "the caller's own `Worker` must not bind another package's method"
+    );
+    // A LEXICALLY QUALIFIED hint encodes no more crate identity than a bare one: two crates each
+    // declaring `inner::Worker` store one key, so it is restricted the same way.
+    let mut nested = preferred_candidate(2, Language::Rust, "function");
+    nested.name = "run".to_string();
+    nested.qualified_name = "crates/b/src/inner.rs::run".to_string();
+    nested.scope_path = "inner::Worker::run".to_string();
+    let nested_symbols = [nested];
+    let nested_index = SymbolIndex::build(&nested_symbols);
+    let qualified = |receiver_package: Option<i64>| ResolveSymbolRequest {
+        receiver_type: Some(ReceiverTypeIdentity::LocalQualified("inner::Worker")),
+        ..request(receiver_package)
+    };
+    assert!(
+        resolve_symbol(qualified(Some(10)), &nested_index).is_none(),
+        "a qualified hint from another package must not bind either"
+    );
+    assert!(
+        resolve_symbol(qualified(None), &nested_index).is_some(),
+        "and an import-bound one still reaches the crate it names"
+    );
+    let imported = resolve_symbol(request(None), &index)
+        .expect("an import-bound receiver still reaches the crate it was imported from");
+    assert_eq!(imported.0.id, symbols[0].id);
+    assert_eq!(imported.2, "receiver_type");
+}
+
+/// A receiver identity that is not local closes the bare-name fallback too. `ExternalQualified`
+/// proves the owner belongs to a dependency, so no local symbol can be the answer — that is what
+/// classifying it is FOR — and `Ambiguous` is unusable evidence, which is still not the same as no
+/// evidence. Gating the door on a LOCAL identity let both walk through to repo-wide name matching.
+#[test]
+fn a_nonlocal_receiver_identity_closes_the_bare_name_fallback() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "Unrelated::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let request = |receiver_type: Option<ReceiverTypeIdentity<'static>>| ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("w.run()"),
+        receiver_hint: Some("w"),
+        receiver_type,
+        source_file_id: 1,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    for identity in [
+        ReceiverTypeIdentity::ExternalQualified("Worker"),
+        ReceiverTypeIdentity::Ambiguous,
+        ReceiverTypeIdentity::LocalUnqualified("Worker"),
+    ] {
+        assert!(
+            resolve_symbol(request(Some(identity)), &index).is_none(),
+            "a receiver identity must not fall through to an unrelated local `run`"
+        );
+    }
+    // The control: with NO receiver evidence at all the fallback is still available.
+    assert!(
+        resolve_symbol(ResolveSymbolRequest { receiver_hint: None, ..request(None) }, &index)
+            .is_some(),
+        "no receiver evidence leaves the bare-name fallback open"
+    );
+}
+
+#[test]
+fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "WorkerExt::run".to_string();
+    let mut worker_impl = preferred_candidate(2, Language::Rust, "impl");
+    worker_impl.name = "Worker".to_string();
+    worker_impl.qualified_name = "src/lib.rs::WorkerExt impl".to_string();
+    worker_impl.scope_path = "Worker as WorkerExt".to_string();
+    worker_impl.file_id = run.file_id;
+    let mut worker_ext = preferred_candidate(3, Language::Rust, "trait");
+    worker_ext.name = "WorkerExt".to_string();
+    worker_ext.qualified_name = "src/lib.rs::WorkerExt".to_string();
+    worker_ext.scope_path = "WorkerExt".to_string();
+    worker_ext.file_id = run.file_id;
+    let symbols = [run, worker_impl, worker_ext];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: Some("WorkerExt::run"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("self.run()"),
+            receiver_hint: Some("self"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    )
+    .expect("the trait-qualified target remains stronger than an unmatched receiver owner");
+    assert_eq!(resolved.0.id, symbols[0].id);
+    assert_eq!(resolved.2, "scope_exact");
+
+    let bare = resolve_symbol(
+        ResolveSymbolRequest {
+            target_qualified_name: None,
+            ..ResolveSymbolRequest {
+                name: "run",
+                target_qualified_name: Some("WorkerExt::run"),
+                edge_kind: EdgeKind::CallsName,
+                evidence: Some("self.run()"),
+                receiver_hint: Some("self"),
+                receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+                source_file_id: 1,
+                source_language: Some(Language::Rust.as_str()),
+                imported_external: false,
+                receiver_package: None,
+                file_package: no_packages(),
+            }
+        },
+        &index,
+    )
+    .expect("a unique trait default method remains available through self");
+    assert_eq!(bare.0.id, symbols[0].id);
+    assert_eq!(bare.2, "target_name_fallback");
+}
+
+#[test]
+fn typed_local_receiver_reaches_only_compatible_trait_default() {
+    let mut trait_run = preferred_candidate(1, Language::Rust, "function");
+    trait_run.name = "run".to_string();
+    trait_run.qualified_name = "src/lib.rs::trait_run".to_string();
+    trait_run.scope_path = "Runs::run".to_string();
+    let mut runs = preferred_candidate(1, Language::Rust, "trait");
+    runs.name = "Runs".to_string();
+    runs.qualified_name = "src/lib.rs::Runs".to_string();
+    runs.scope_path = "Runs".to_string();
+    let mut other_run = preferred_candidate(1, Language::Rust, "function");
+    other_run.name = "run".to_string();
+    other_run.qualified_name = "src/lib.rs::other_run".to_string();
+    other_run.scope_path = "Other::run".to_string();
+    let mut other = preferred_candidate(1, Language::Rust, "struct");
+    other.name = "Other".to_string();
+    other.qualified_name = "src/lib.rs::Other".to_string();
+    other.scope_path = "Other".to_string();
+    let mut worker_impl = preferred_candidate(1, Language::Rust, "impl");
+    worker_impl.name = "Worker<_>".to_string();
+    worker_impl.qualified_name = "src/lib.rs::Worker as Runs".to_string();
+    worker_impl.scope_path = "Worker<_> as Runs<Item>".to_string();
+    let symbols = [trait_run, runs, other_run, other, worker_impl];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: Some("w::run"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("w.run()"),
+            receiver_hint: Some("w"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker<u8>")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    )
+    .expect("the concrete receiver may use a trait's default method");
+    assert_eq!(resolved.0.scope_path, "Runs::run");
+    assert_eq!(resolved.2, "target_name_fallback");
+}
+
+#[test]
+fn normalized_receiver_fallback_rejects_different_concrete_arguments() {
+    let mut u8_run = preferred_candidate(1, Language::Rust, "function");
+    u8_run.name = "run".to_string();
+    u8_run.scope_path = "Foo<u8> as Runs::run".to_string();
+    let mut u16_run = preferred_candidate(2, Language::Rust, "function");
+    u16_run.name = "run".to_string();
+    u16_run.scope_path = "Foo<u16> as Runs::run".to_string();
+    let request = || ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("value.run()"),
+        receiver_hint: Some("value"),
+        receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Foo<u8>")),
+        source_file_id: 9,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    let both = [u8_run, u16_run];
+    let index = SymbolIndex::build(&both);
+    let resolved = resolve_symbol(request(), &index).unwrap();
+    assert_eq!(resolved.0.scope_path, "Foo<u8> as Runs::run");
+
+    let wrong_only = [both[1].clone()];
+    assert!(resolve_symbol(request(), &SymbolIndex::build(&wrong_only)).is_none());
+}
+
+#[test]
+fn nested_trait_default_accepts_an_explicit_same_package_impl_identity() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.scope_path = "traits::Runs::run".to_string();
+    let mut runs = preferred_candidate(2, Language::Rust, "trait");
+    runs.name = "Runs".to_string();
+    runs.scope_path = "traits::Runs".to_string();
+    runs.file_id = run.file_id;
+    let mut worker_impl = preferred_candidate(3, Language::Rust, "impl");
+    worker_impl.name = "Worker".to_string();
+    worker_impl.scope_path = "Worker as crate.traits.Runs".to_string();
+    let symbols = [run, runs, worker_impl];
+    let index = SymbolIndex::build(&symbols);
+    let packages = HashMap::from([(1, 10), (3, 10), (9, 10)]);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("worker.run()"),
+            receiver_hint: Some("worker"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 9,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: Some(10),
+            file_package: &packages,
+        },
+        &index,
+    )
+    .expect("an explicit current-crate trait path proves the nested trait identity");
+    assert_eq!(resolved.0.scope_path, "traits::Runs::run");
+}
+
+#[test]
+fn same_named_trait_in_another_package_cannot_prove_a_default() {
+    let mut foreign_run = preferred_candidate(20, Language::Rust, "function");
+    foreign_run.name = "run".to_string();
+    foreign_run.scope_path = "Runs::run".to_string();
+    let mut foreign_runs = preferred_candidate(21, Language::Rust, "trait");
+    foreign_runs.name = "Runs".to_string();
+    foreign_runs.scope_path = "Runs".to_string();
+    foreign_runs.file_id = foreign_run.file_id;
+    let mut local_impl = preferred_candidate(10, Language::Rust, "impl");
+    local_impl.name = "Worker".to_string();
+    local_impl.scope_path = "Worker as Runs".to_string();
+    let symbols = [foreign_run, foreign_runs, local_impl];
+    let index = SymbolIndex::build(&symbols);
+    let packages = HashMap::from([(10, 1), (20, 2), (30, 1)]);
+
+    assert!(
+        resolve_symbol(
+            ResolveSymbolRequest {
+                name: "run",
+                target_qualified_name: None,
+                edge_kind: EdgeKind::CallsName,
+                evidence: Some("worker.run()"),
+                receiver_hint: Some("worker"),
+                receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+                source_file_id: 30,
+                source_language: Some(Language::Rust.as_str()),
+                imported_external: false,
+                receiver_package: Some(1),
+                file_package: &packages,
+            },
+            &index,
+        )
+        .is_none(),
+        "package 1's `impl Runs` is not evidence for package 2's `Runs::run`"
+    );
+}
+
+#[test]
+fn unproven_imported_and_blanket_trait_defaults_fail_closed() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.scope_path = "traits::Runs::run".to_string();
+    let mut runs = preferred_candidate(2, Language::Rust, "trait");
+    runs.name = "Runs".to_string();
+    runs.scope_path = "traits::Runs".to_string();
+    runs.file_id = run.file_id;
+    let packages = HashMap::from([(1, 10), (3, 10), (9, 10)]);
+    let request = || ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("worker.run()"),
+        receiver_hint: Some("worker"),
+        receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+        source_file_id: 9,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: Some(10),
+        file_package: &packages,
+    };
+
+    for impl_scope in ["Worker as Runs", "_ as traits.Runs"] {
+        let mut unproven_impl = preferred_candidate(3, Language::Rust, "impl");
+        unproven_impl.name = "Worker".to_string();
+        unproven_impl.scope_path = impl_scope.to_string();
+        let symbols = [run.clone(), runs.clone(), unproven_impl];
+        let index = SymbolIndex::build(&symbols);
+        assert!(
+            resolve_symbol(request(), &index).is_none(),
+            "`{impl_scope}` does not prove applicability to this concrete owner"
+        );
+    }
+}
+
+#[test]
+fn rust_receiver_fallback_rejects_unjustified_owners() {
+    let mut free_clone = preferred_candidate(1, Language::Rust, "function");
+    free_clone.name = "clone".to_string();
+    free_clone.qualified_name = "src/free.rs::clone".to_string();
+    free_clone.scope_path = "clone".to_string();
+    let mut unknown_clone = preferred_candidate(2, Language::Rust, "function");
+    unknown_clone.name = "clone".to_string();
+    unknown_clone.qualified_name = "src/ext.rs::clone".to_string();
+    unknown_clone.scope_path = "UnknownExt::clone".to_string();
+    let mut trait_clone = preferred_candidate(4, Language::Rust, "function");
+    trait_clone.name = "clone".to_string();
+    trait_clone.qualified_name = "crates/other/src/lib.rs::clone".to_string();
+    trait_clone.scope_path = "CloneLike::clone".to_string();
+    let mut clone_like = preferred_candidate(4, Language::Rust, "trait");
+    clone_like.name = "CloneLike".to_string();
+    clone_like.qualified_name = "crates/other/src/lib.rs::CloneLike".to_string();
+    clone_like.scope_path = "CloneLike".to_string();
+    let mut trait_run = preferred_candidate(3, Language::Rust, "function");
+    trait_run.name = "run".to_string();
+    trait_run.qualified_name = "crates/other/src/lib.rs::run".to_string();
+    trait_run.scope_path = "Runs::run".to_string();
+    let mut runs = preferred_candidate(3, Language::Rust, "trait");
+    runs.name = "Runs".to_string();
+    runs.qualified_name = "crates/other/src/lib.rs::Runs".to_string();
+    runs.scope_path = "Runs".to_string();
+
+    let receiver_call = |name: &'static str, receiver: &'static str| ResolveSymbolRequest {
+        name,
+        target_qualified_name: None,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("receiver.call()"),
+        receiver_hint: Some(receiver),
+        receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+        source_file_id: 10,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    for clone in [free_clone, unknown_clone] {
+        let symbols = [clone];
+        let index = SymbolIndex::build(&symbols);
+        assert!(
+            resolve_symbol(receiver_call("clone", "self"), &index).is_none(),
+            "self.clone() must not bind an ownerless or unknown-owner method"
+        );
+    }
+
+    let symbols = [trait_clone, clone_like];
+    let index = SymbolIndex::build(&symbols);
+    assert!(
+        resolve_symbol(receiver_call("clone", "self"), &index).is_none(),
+        "self.clone() must not bind an unrelated trait default without an indexed impl"
+    );
+
+    let symbols = [trait_run, runs];
+    let index = SymbolIndex::build(&symbols);
+    assert!(
+        resolve_symbol(receiver_call("run", "worker"), &index).is_none(),
+        "a typed Worker call must not bind a default from a trait Worker is not known to implement"
+    );
+}
+
+#[test]
+fn an_untyped_rust_value_receiver_never_uses_bare_name_fallback() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/free.rs::run".to_string();
+    run.scope_path = "run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+    let request = |target_qualified_name, receiver_hint| ResolveSymbolRequest {
+        name: "run",
+        target_qualified_name,
+        edge_kind: EdgeKind::CallsName,
+        evidence: Some("factory().run()"),
+        receiver_hint,
+        receiver_type: None,
+        source_file_id: 1,
+        source_language: Some(Language::Rust.as_str()),
+        imported_external: false,
+        receiver_package: None,
+        file_package: no_packages(),
+    };
+
+    assert!(resolve_symbol(request(Some("factory()::run"), Some("factory()")), &index).is_none());
+    assert!(
+        resolve_symbol(request(None, None), &index).is_some(),
+        "a genuinely bare call keeps the existing fallback"
+    );
+}
+
+#[test]
+fn projected_self_path_never_falls_back_to_the_impl_owner() {
+    let mut run = preferred_candidate(1, Language::Rust, "function");
+    run.name = "run".to_string();
+    run.qualified_name = "src/lib.rs::run".to_string();
+    run.scope_path = "Factory::run".to_string();
+    let symbols = [run];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: Some("Self::Assoc::run"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("Self::Assoc::run()"),
+            receiver_hint: Some("Self"),
+            receiver_type: None,
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    );
+    assert!(resolved.is_none(), "an unresolved associated type must not become Factory::run");
+}
+
+#[test]
+fn cpp_operator_scopes_are_never_rust_degenericized() {
+    let mut less = preferred_candidate(1, Language::Cpp, "function");
+    less.name = "operator<".to_string();
+    less.qualified_name = "src/lib.cpp::operator<".to_string();
+    less.scope_path = "Foo::operator<".to_string();
+    let symbols = [less];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "operator<<",
+            target_qualified_name: Some("Foo::operator<<"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("value << other"),
+            receiver_hint: None,
+            receiver_type: None,
+            source_file_id: 1,
+            source_language: Some(Language::Cpp.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    );
+    assert!(resolved.is_none(), "C++ operator< must not normalize into operator<<");
+}
+
+#[test]
+fn receiver_type_identity_classification() {
+    let external = |root: &str| {
+        if root == "url" || root == "Url" { RootOrigin::External } else { RootOrigin::Local }
+    };
+    // Qualified with a local root.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("workers::Worker"), external),
+        Some(ReceiverTypeIdentity::LocalQualified("workers::Worker"))
+    );
+    // Qualified with an externally-imported root.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("url::Url"), external),
+        Some(ReceiverTypeIdentity::ExternalQualified("url::Url"))
+    );
+    // A bare name that IS the external import.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Url"), external),
+        Some(ReceiverTypeIdentity::ExternalQualified("Url"))
+    );
+    // A bare local name.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Worker"), external),
+        Some(ReceiverTypeIdentity::LocalUnqualified("Worker"))
+    );
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Foo<module::Item>"), |root| {
+            assert_eq!(root, "Foo");
+            RootOrigin::Local
+        }),
+        Some(ReceiverTypeIdentity::LocalUnqualified("Foo<module::Item>"))
+    );
+    // Present-but-empty evidence is Ambiguous (suppresses bare fallback); absent is None.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("  "), external),
+        Some(ReceiverTypeIdentity::Ambiguous)
+    );
+    assert_eq!(ReceiverTypeIdentity::classify(None, external), None);
+    // Two `cfg` branches importing one name from different crates leave no root to act on. A
+    // picked winner would be load order deciding between a local bind and an external decline.
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("Worker"), |_| RootOrigin::Ambiguous),
+        Some(ReceiverTypeIdentity::Ambiguous)
+    );
+    assert_eq!(
+        ReceiverTypeIdentity::classify(Some("workers::Worker"), |_| RootOrigin::Ambiguous),
+        Some(ReceiverTypeIdentity::Ambiguous)
+    );
+}
+
+#[test]
+fn two_trait_impls_on_one_type_decline_receiver_resolution() {
+    // `impl TraitA for Worker { fn run }` + `impl TraitB for Worker { fn run }` with identical
+    // signatures: the trait marker in the raw scope keeps them distinct, both surface as
+    // `Worker::run` through normalization, and a `worker.run()` hint that could hit either must
+    // decline instead of confidently picking the first row.
+    let mut a = preferred_candidate(1, Language::Rust, "function");
+    a.name = "run".to_string();
+    a.qualified_name = "src/worker.rs::run".to_string();
+    a.scope_path = "Worker as TraitA::run".to_string();
+    let mut b = preferred_candidate(2, Language::Rust, "function");
+    b.name = "run".to_string();
+    b.qualified_name = "src/worker.rs::run".to_string();
+    b.scope_path = "Worker as TraitB::run".to_string();
+    let symbols = [a, b];
+    let index = SymbolIndex::build(&symbols);
+
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("run()"),
+            receiver_hint: Some("worker"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    );
+    if let Some((_, _, reason)) = resolved {
+        assert!(
+            !matches!(reason, "receiver_type" | "scope_degeneric"),
+            "two candidate trait impls must stay ambiguous, got {reason}"
+        );
+    }
+
+    // With only ONE trait impl in scope the same hint binds through the normalized surface.
+    let solo = [symbols[0].clone()];
+    let solo_index = SymbolIndex::build(&solo);
+    let (target, confidence, reason) = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "run",
+            target_qualified_name: None,
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("run()"),
+            receiver_hint: Some("worker"),
+            receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &solo_index,
+    )
+    .expect("a single trait impl resolves through the normalized scope");
+    assert_eq!(target.id, 1);
+    assert_eq!(confidence, EdgeConfidence::Syntactic);
+    assert_eq!(reason, "scope_degeneric");
+}
+
+/// The four pointer shapes of one owner as they are actually emitted.
+fn pointer_shape_impls() -> [IndexedSymbol; 4] {
+    ["W as Neg::neg", "&W as Neg::neg", "&mut W as Neg::neg", "*const W as Neg::neg"]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, scope)| {
+            let mut symbol = preferred_candidate(offset as i64 + 1, Language::Rust, "function");
+            symbol.name = "neg".to_string();
+            symbol.qualified_name = "src/w.rs::neg".to_string();
+            symbol.scope_path = scope.to_string();
+            symbol
+        })
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("four impls")
+}
+
+/// `impl Neg for W` / `for &W` / `for &mut W` / `for *const W`: four impls, four scopes, four
+/// logical symbols. A WRITTEN `W::neg` is `impl Neg for W`'s method and no other, so the qualified
+/// surface has to keep the wrapper or the call declines against impls it could not have reached.
+#[test]
+fn a_written_path_binds_the_impl_whose_owner_it_spells() {
+    let symbols = pointer_shape_impls();
+    let index = SymbolIndex::build(&symbols);
+
+    let (target, confidence, reason) = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "neg",
+            target_qualified_name: Some("W::neg"),
+            edge_kind: EdgeKind::CallsName,
+            evidence: Some("W::neg(&w)"),
+            receiver_hint: None,
+            receiver_type: None,
+            source_file_id: 1,
+            source_language: Some(Language::Rust.as_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    )
+    .expect("a written path names exactly one impl");
+    assert_eq!(target.id, 1);
+    assert_eq!(confidence, EdgeConfidence::Syntactic);
+    assert_eq!(reason, "scope_degeneric");
+}
+
+/// …and the same corpus through an INFERRED `W` receiver: autoref reaches every one of the four,
+/// so the hint must decline rather than pick the unwrapped owner.
+///
+/// This one pins behaviour the surface split does NOT change — it passes with the split reverted,
+/// because the single fold peeled wrappers for the receiver too. It earns its place as the guard
+/// against the one mis-wiring that would look like an improvement: pointing the receiver lookup at
+/// the qualified surface, which would make this call bind the unwrapped owner instead of declining.
+/// The split's own witnesses are `a_written_path_binds_the_impl_whose_owner_it_spells` and
+/// `the_qualified_surface_keeps_the_wrapper_the_receiver_surface_peels`.
+#[test]
+fn an_autoref_receiver_hint_stays_ambiguous_across_pointer_shapes() {
+    let symbols = pointer_shape_impls();
+    let index = SymbolIndex::build(&symbols);
+
+    assert!(
+        resolve_symbol(
+            ResolveSymbolRequest {
+                name: "neg",
+                target_qualified_name: None,
+                edge_kind: EdgeKind::CallsName,
+                evidence: Some("w.neg()"),
+                receiver_hint: Some("w"),
+                receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("W")),
+                source_file_id: 1,
+                source_language: Some(Language::Rust.as_str()),
+                imported_external: false,
+                receiver_package: None,
+                file_package: no_packages(),
+            },
+            &index,
+        )
+        .is_none(),
+        "an autoref call site cannot choose between four pointer-shape impls"
+    );
 }
 
 #[test]
@@ -1287,16 +2289,43 @@ fn worktree_package_roots_do_not_leak_across_scopes() {
     let local_a = add_symbol(&conn, file_a, "Thing", "crate::Thing");
     // A same-named local symbol in B's scope, the temptation the suppression must resist.
     let _local_b = add_symbol(&conn, file_b, "Thing", "crate::Thing");
+    let run_a = add_symbol_scope(&conn, file_a, "run", "src/lib.rs::run", "workers::Worker::run");
+    let _run_b = add_symbol_scope(&conn, file_b, "run", "src/lib.rs::run", "workers::Worker::run");
     add_import_edge_scoped(&conn, file_a, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
     add_import_edge_scoped(&conn, file_b, "Thing", "use local::Thing;", 0, 9999, MOD_FILE_ROOT);
+    add_import_edge_scoped(
+        &conn,
+        file_a,
+        "Alias",
+        "use local::workers::Worker as Alias;",
+        0,
+        9999,
+        MOD_FILE_ROOT,
+    );
+    add_import_edge_scoped(
+        &conn,
+        file_b,
+        "Alias",
+        "use local::workers::Worker as Alias;",
+        0,
+        9999,
+        MOD_FILE_ROOT,
+    );
     let ref_a = add_edge_at_byte(&conn, file_a, "Thing", "", 100);
     let ref_b = add_edge_at_byte(&conn, file_b, "Thing", "", 100);
+    let call_a = add_receiver_type_edge_at_byte(&conn, file_a, "run", "w::run", "Alias", 100);
+    let call_b = add_receiver_type_edge_at_byte(&conn, file_b, "run", "w::run", "Alias", 100);
 
     // Resolve worktree A's scope: `local` is A's own alias → LOCAL, binds to A's `Thing`.
     crate::index::install_scope_view(&conn, NEW, wt_a).unwrap();
     resolve_all_edges(&conn).unwrap();
     let (to, _, _) = edge_state(&conn, ref_a);
     assert_eq!(to, Some(local_a), "worktree A declares `local` — its bare ref binds local");
+    assert_eq!(
+        edge_state(&conn, call_a).0,
+        Some(run_a),
+        "worktree A canonicalizes its local path alias to the complete receiver owner"
+    );
 
     // Resolve worktree B's scope: `local` is NOT B's alias → EXTERNAL, the bare ref is
     // suppressed. If B were following A's package map (the #106 leak), this would bind local.
@@ -1308,6 +2337,11 @@ fn worktree_package_roots_do_not_leak_across_scopes() {
         "worktree B does NOT declare `local` — it must not see worktree A's alias as local"
     );
     assert_eq!(resolution, "unresolved");
+    assert_eq!(
+        edge_state(&conn, call_b).0,
+        None,
+        "worktree B must not normalize an alias using worktree A's package roots"
+    );
 }
 
 /// The dedicated import-scope columns must NOT perturb the SCIP-oracle candidate set: import
@@ -1913,4 +2947,86 @@ fn scoped_resolve_repoints_staged_inedge_onto_moved_target() {
     let (to, _, resolution) = edge_state(&conn, edge);
     assert_eq!(to, Some(new_target), "the staged in-edge re-points onto the target's NEW id");
     assert_eq!(resolution, "qualified_suffix");
+}
+
+fn add_edge_full(
+    conn: &Connection,
+    source_file_id: i64,
+    to_name: &str,
+    target_qualified_name: Option<&str>,
+    receiver_hint: Option<&str>,
+    receiver_type_hint: Option<&str>,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO edges(source_file_id, to_name, target_qualified_name, receiver_hint, \
+         receiver_type_hint, edge_kind, confidence, resolution) VALUES (?1, ?2, ?3, ?4, ?5, \
+         'calls_name', 'NameOnly', 'unresolved')",
+        params![source_file_id, to_name, target_qualified_name, receiver_hint, receiver_type_hint],
+    )
+    .unwrap();
+    conn.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap()
+}
+
+#[test]
+fn test_receiver_type_resolution() {
+    let conn = seeded_conn();
+    let file = add_file(&conn, "worker.rs", NEW);
+    let target_sym = add_symbol_scope(&conn, file, "run", "crate::Worker::run", "Worker::run");
+
+    let edge_id = add_edge_full(&conn, file, "run", None, Some("worker"), Some("Worker"));
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[file]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_id);
+    assert_eq!(to, Some(target_sym));
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "receiver_type");
+}
+
+#[test]
+fn test_receiver_type_resolution_declines_ambiguous_owners() {
+    let conn = seeded_conn();
+    let source = add_file(&conn, "caller.rs", NEW);
+    let first = add_file(&conn, "first.rs", NEW);
+    let second = add_file(&conn, "second.rs", NEW);
+    add_symbol_scope(&conn, first, "run", "first::Worker::run", "Worker::run");
+    add_symbol_scope(&conn, second, "run", "second::Worker::run", "Worker::run");
+
+    let edge_id = add_edge_full(&conn, source, "run", None, Some("worker"), Some("Worker"));
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[source]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_id);
+    assert_eq!(to, None, "two distinct Worker::run owners remain unresolved");
+    assert_eq!(confidence, "NameOnly");
+    assert_eq!(resolution, "unresolved");
+}
+
+#[test]
+fn test_scope_degeneric_resolution() {
+    let conn = seeded_conn();
+    let file = add_file(&conn, "index.rs", NEW);
+    let target_sym = add_symbol_scope(
+        &conn,
+        file,
+        "build",
+        "crate::SymbolIndex<'a>::build",
+        "SymbolIndex<'a>::build",
+    );
+
+    let edge_id =
+        add_edge_full(&conn, file, "build", Some("SymbolIndex::build"), Some("SymbolIndex"), None);
+
+    crate::index::install_scope_view(&conn, NEW, "").unwrap();
+    stage_edge_rewrite_files(&conn, &[file]);
+    resolve_changed_edges(&conn).unwrap();
+
+    let (to, confidence, resolution) = edge_state(&conn, edge_id);
+    assert_eq!(to, Some(target_sym));
+    assert_eq!(confidence, "Syntactic");
+    assert_eq!(resolution, "scope_degeneric");
 }

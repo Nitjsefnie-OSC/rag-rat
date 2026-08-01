@@ -372,9 +372,10 @@ pub(crate) fn apply_repo_memory_call_paths(conn: &Connection) -> rusqlite::Resul
 
 pub(crate) fn apply_repo_memory_call_path_edges(conn: &Connection) -> rusqlite::Result<()> {
     // The ordered edges behind a server-derived call-path hash (#38). `edge_fingerprint` is the
-    // exact, row-id-independent identity (path+lines+names+kind+target); the looser
-    // from/to/kind/target columns let validation re-find an edge that moved lines (relocated)
-    // rather than reporting the whole path gone. One row per edge, ordered by `ordinal`.
+    // exact, row-id-independent identity (path+lines+names+kind+target+resolved callee); the looser
+    // columns let validation re-find an edge that moved lines only when its stable callee identity
+    // still agrees. `callee_identity_known` distinguishes a new unresolved edge (known NULL) from
+    // a pre-V099 row that never recorded callee identity. One row per edge, ordered by `ordinal`.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS repo_memory_call_path_edges(
@@ -387,6 +388,8 @@ pub(crate) fn apply_repo_memory_call_path_edges(conn: &Connection) -> rusqlite::
             edge_kind TEXT NOT NULL,
             target_qualified_name TEXT,
             receiver_hint TEXT,
+            callee_logical_symbol_id INTEGER,
+            callee_identity_known INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(memory_id, edge_sequence_hash, ordinal),
             FOREIGN KEY(memory_id) REFERENCES repo_memories(id) ON DELETE CASCADE
         );
@@ -951,6 +954,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "edges_data", "import_scope_start_byte", "INTEGER")?;
     add_column_if_missing(conn, "edges_data", "import_scope_end_byte", "INTEGER")?;
     add_column_if_missing(conn, "edges_data", "import_mod_id", "INTEGER")?;
+    add_column_if_missing(conn, "edges_data", "receiver_type_hint_id", "INTEGER")?;
     // Same guarantee for the materialized visibility flag (V075): the view WHERE below references
     // `d.hidden`, and this function runs at V020 — before V075 adds the column in the linear
     // ladder. The V075 backfill then hides any pre-existing dispatch-fact/suppressed rows.
@@ -980,6 +984,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                tqn.value AS target_qualified_name,
                d.evidence,
                rh.value AS receiver_hint,
+               rth.value AS receiver_type_hint,
                res.value AS resolution,
                d.callee_start_byte,
                d.callee_end_byte,
@@ -1003,6 +1008,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                d.to_name_id,
                d.target_qualified_name_id,
                d.receiver_hint_id,
+               d.receiver_type_hint_id,
                d.edge_kind_id,
                d.confidence_id,
                d.resolution_id
@@ -1011,6 +1017,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
         LEFT JOIN name_strings tn ON tn.id = d.to_name_id
         LEFT JOIN name_strings tqn ON tqn.id = d.target_qualified_name_id
         LEFT JOIN name_strings rh ON rh.id = d.receiver_hint_id
+        LEFT JOIN name_strings rth ON rth.id = d.receiver_type_hint_id
         LEFT JOIN name_strings res ON res.id = d.resolution_id
         LEFT JOIN name_strings ek ON ek.id = d.edge_kind_id
         LEFT JOIN name_strings conf ON conf.id = d.confidence_id
@@ -1034,6 +1041,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.to_name);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.target_qualified_name);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.receiver_hint);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.receiver_type_hint);
             INSERT OR IGNORE INTO name_strings(value)
                 VALUES (COALESCE(NEW.resolution, 'unresolved'));
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.edge_kind);
@@ -1042,7 +1050,8 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 id, source_file_id, from_symbol_id, to_symbol_id, from_name_id, to_name_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 target_start_line, target_end_line, target_qualified_name_id, evidence,
-                receiver_hint_id, resolution_id, callee_start_byte, callee_end_byte,
+                receiver_hint_id, receiver_type_hint_id, resolution_id,
+                callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id, hidden
             )
@@ -1056,6 +1065,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                 (SELECT id FROM name_strings WHERE value = NEW.target_qualified_name),
                 NEW.evidence,
                 (SELECT id FROM name_strings WHERE value = NEW.receiver_hint),
+                (SELECT id FROM name_strings WHERE value = NEW.receiver_type_hint),
                 (SELECT id FROM name_strings
                  WHERE value = COALESCE(NEW.resolution, 'unresolved')),
                 NEW.callee_start_byte, NEW.callee_end_byte,
@@ -1074,6 +1084,7 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.to_name);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.target_qualified_name);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.receiver_hint);
+            INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.receiver_type_hint);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.resolution);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.edge_kind);
             INSERT OR IGNORE INTO name_strings(value) VALUES (NEW.confidence);
@@ -1093,6 +1104,8 @@ pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
                     (SELECT id FROM name_strings WHERE value = NEW.target_qualified_name),
                 evidence = NEW.evidence,
                 receiver_hint_id = (SELECT id FROM name_strings WHERE value = NEW.receiver_hint),
+                receiver_type_hint_id =
+                    (SELECT id FROM name_strings WHERE value = NEW.receiver_type_hint),
                 resolution_id = (SELECT id FROM name_strings WHERE value = NEW.resolution),
                 callee_start_byte = NEW.callee_start_byte,
                 callee_end_byte = NEW.callee_end_byte,
@@ -1385,6 +1398,7 @@ pub(crate) fn known_version(migrations: &[AppliedMigration]) -> u32 {
             MIGRATION_097_ID => Some(97),
             MIGRATION_098_ID => Some(98),
             MIGRATION_099_ID => Some(99),
+            MIGRATION_100_ID => Some(100),
             _ => None,
         })
         .max()
@@ -1493,6 +1507,7 @@ pub(crate) fn known_migration(id: &str) -> bool {
             | MIGRATION_097_ID
             | MIGRATION_098_ID
             | MIGRATION_099_ID
+            | MIGRATION_100_ID
             | DIRTY_MIGRATION_ID
     )
 }
@@ -1598,6 +1613,7 @@ pub(crate) fn migration_checksum_mismatch(migration: &AppliedMigration) -> bool 
         MIGRATION_097_ID => migration.checksum != MIGRATION_097_CHECKSUM,
         MIGRATION_098_ID => migration.checksum != MIGRATION_098_CHECKSUM,
         MIGRATION_099_ID => migration.checksum != MIGRATION_099_CHECKSUM,
+        MIGRATION_100_ID => migration.checksum != MIGRATION_100_CHECKSUM,
         _ => false,
     }
 }
@@ -7387,6 +7403,31 @@ mod windows_verbatim_rekey_tests {
         rekey_persisted_path_spellings(&conn, strip_verbatim).unwrap();
         assert_eq!(scalar(&conn, "SELECT worktree_id FROM files"), r"C:\repo");
     }
+}
+
+/// V100 (#976): intern the Rust receiver-type hint and make call-path identity target-aware.
+///
+/// Conservative receiver-type inference records the type a method call was made ON, so resolution
+/// can bind `worker.run()` to `Worker::run` instead of every `run` in the repo. The value is an
+/// interned `name_strings` id, like the sibling name columns, because the same handful of type
+/// paths repeat across every call site in a file. The `edges` view is rebuilt so readers see the
+/// new column without a second migration.
+pub fn apply_receiver_type_hint_interning(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges_data", "receiver_type_hint_id", "INTEGER")?;
+    add_column_if_missing(
+        conn,
+        "repo_memory_call_path_edges",
+        "callee_logical_symbol_id",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "repo_memory_call_path_edges",
+        "callee_identity_known",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_edges_view(conn)?;
+    Ok(())
 }
 
 #[cfg(test)]

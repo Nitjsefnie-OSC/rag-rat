@@ -518,6 +518,17 @@ pub(crate) struct CallPathEdge {
     pub(crate) edge_kind: String,
     pub(crate) target_qualified_name: Option<String>,
     pub(crate) receiver_hint: Option<String>,
+    pub(crate) callee_logical_symbol_id: Option<i64>,
+}
+
+/// Row-independent fields that may re-find an edge after its source lines move. Callee identity is
+/// part of this loose match so relocation never changes which symbol the edge reaches.
+pub(crate) struct EdgeLooseIdentity {
+    pub(crate) from_name: Option<String>,
+    pub(crate) to_name: String,
+    pub(crate) edge_kind: String,
+    pub(crate) target_qualified_name: Option<String>,
+    pub(crate) callee_logical_symbol_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -534,12 +545,21 @@ pub(crate) struct ChunkAnchor {
 pub(crate) struct EdgeAnchor {
     edge_id: i64,
     fingerprint: String,
+    /// The pre-#567 8-field compatibility fingerprint. Present for every live edge because a
+    /// legacy binding cannot encode whether receiver inference would produce a hint today.
+    legacy_fingerprint: Option<String>,
+    /// The lookup matched the compatibility fingerprint rather than the current versioned
+    /// identity. Validation must demote this to relocated: legacy identity cannot prove the
+    /// receiver owner stayed unchanged.
+    matched_legacy_fingerprint: bool,
     path: String,
     start_line: i64,
     end_line: i64,
     source_hash: String,
+    callee_logical_symbol_id: Option<i64>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct EdgeFingerprintParts<'a> {
     path: &'a str,
     start_line: i64,
@@ -549,6 +569,14 @@ pub(crate) struct EdgeFingerprintParts<'a> {
     edge_kind: &'a str,
     target_qualified_name: Option<&'a str>,
     receiver_hint: Option<&'a str>,
+    /// Rust-only conservative receiver type inference (`recv.run()` → `Alpha`/`Beta`, #567):
+    /// deliberately excluded from the loose call-site identity. The resolved callee below is the
+    /// authority for whether that loose match may relocate: changing Alpha::run to Beta::run must
+    /// demote the binding even when this hint remains `Worker`.
+    receiver_type_hint: Option<&'a str>,
+    /// Stable content-derived identity of the resolved callee. `None` is also identity: an
+    /// unresolved edge must fingerprint differently from the same call once it resolves.
+    callee_logical_symbol_id: Option<i64>,
 }
 
 #[cfg(test)]

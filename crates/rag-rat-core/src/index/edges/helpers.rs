@@ -160,7 +160,7 @@ fn containing_symbol(symbols: &[IndexedSymbol], byte: usize) -> Option<&IndexedS
 }
 /// A trailing turbofish (`f::<T>`) wraps the callee path in a `generic_function`; unwrap it so the
 /// type arguments' identifiers / byte ranges aren't mistaken for the callee.
-fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
+pub(crate) fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
     if function.kind() == "generic_function" {
         function.child_by_field_name("function").unwrap_or(function)
     } else {
@@ -600,6 +600,8 @@ pub(crate) fn insert_candidates(
         let target_qualified_name_id =
             intern_edge_string_opt(conn, candidate.target_qualified_name.as_deref())?;
         let receiver_hint_id = intern_edge_string_opt(conn, candidate.receiver_hint.as_deref())?;
+        let receiver_type_hint_id =
+            intern_edge_string_opt(conn, candidate.receiver_type_hint.as_deref())?;
         let edge_kind_id = intern_edge_string(conn, candidate.edge_kind.as_str())?;
         let confidence_id = intern_edge_string(conn, candidate.confidence.as_str())?;
         let resolution_id = intern_edge_string(conn, "unresolved")?;
@@ -608,14 +610,14 @@ pub(crate) fn insert_candidates(
             "
             INSERT INTO edges_data(
                 source_file_id, from_symbol_id, from_name_id, to_name_id,
-                target_qualified_name_id, evidence, receiver_hint_id,
+                target_qualified_name_id, evidence, receiver_hint_id, receiver_type_hint_id,
                 source_start_line, source_end_line, source_start_byte, source_end_byte,
                 callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id, resolution_id, hidden
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20)
+             ?18, ?19, ?20, ?21)
             ",
         )?
         .execute(params![
@@ -626,6 +628,7 @@ pub(crate) fn insert_candidates(
             target_qualified_name_id,
             candidate.evidence,
             receiver_hint_id,
+            receiver_type_hint_id,
             candidate.source_span.start_line,
             candidate.source_span.end_line,
             candidate.source_span.start_byte,

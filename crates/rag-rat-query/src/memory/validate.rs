@@ -331,8 +331,20 @@ pub(crate) fn validate_edge_binding(
     conn: &Connection,
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<String> {
+    // The row id alone is not identity. A graph-version rebuild DELETEs and re-INSERTs every
+    // edge, and SQLite reuses freed rowids, so a stored `edge_id` can come back pointing at a
+    // DIFFERENT call site — and this fast path would then report the binding `current` on the
+    // strength of a file hash that has nothing to do with it. Take the shortcut only when the row
+    // still hashes to the identity the binding was made against.
+    //
+    // The CURRENT fingerprint only. A pre-upgrade digest matching proves that the eight older
+    // fields agree, not that the call still means what it did: the receiver-type hint is not among
+    // them, so a call whose inferred receiver changed which method it reaches carries the same
+    // legacy digest. That binding has to fall through to relocation, which says `relocated` — the
+    // honest answer — instead of `current`.
     if let Some(edge_id) = binding.edge_id
         && let Some(edge) = edge_by_id(conn, edge_id)?
+        && edge.fingerprint == binding.binding_id
     {
         binding.path = Some(edge.path);
         binding.start_line = Some(edge.start_line);
@@ -342,8 +354,15 @@ pub(crate) fn validate_edge_binding(
         return validate_bound_edge_source_hash(conn, binding, &edge.source_hash);
     }
     let Some(edge) = edge_by_fingerprint(conn, &binding.binding_id)? else {
+        // A row id may survive an in-place re-resolution or be reused after rebuild. Once the
+        // stable fingerprint no longer exists, retaining that id would surface this memory on the
+        // replacement edge through edge-id lookups.
+        binding.edge_id = None;
         return Ok("gone".to_string());
     };
+    // Compatibility matches return the live current fingerprint. Converge the binding identity so
+    // the next validation takes the current fast path instead of reporting `relocated` forever.
+    binding.binding_id = edge.fingerprint.clone();
     binding.edge_id = Some(edge.edge_id);
     binding.path = Some(edge.path);
     binding.start_line = Some(edge.start_line);
@@ -361,7 +380,8 @@ pub(crate) fn validate_call_path_binding(
     // that edge is gone.
     let mut stmt = conn.prepare(
         "
-        SELECT edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name
+        SELECT ordinal, edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name,
+               callee_logical_symbol_id, callee_identity_known
         FROM repo_memory_call_path_edges
         WHERE memory_id = ?1 AND edge_sequence_hash = ?2
         ORDER BY ordinal
@@ -370,11 +390,14 @@ pub(crate) fn validate_call_path_binding(
     let edges = stmt
         .query_map(params![binding.memory_id, binding.binding_id], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -394,21 +417,50 @@ pub(crate) fn validate_call_path_binding(
     let total = edges.len();
     let mut relocated = 0usize;
     let mut gone = 0usize;
-    for (fingerprint, from_name, to_name, edge_kind, target) in &edges {
-        if edge_by_fingerprint(conn, fingerprint)?.is_some() {
+    // The live v2 identity of every edge that matched one, in `ordinal` order. Complete ⇔ the
+    // whole path still resolves edge-for-edge, which is the only state the upgrade below may act
+    // on: an edge that matched only its loose identity has no live fingerprint to converge to.
+    let mut live_fingerprints = Vec::with_capacity(total);
+    let mut matched_legacy = false;
+    for (
+        ordinal,
+        fingerprint,
+        from_name,
+        to_name,
+        edge_kind,
+        target,
+        callee_logical_symbol_id,
+        callee_identity_known,
+    ) in &edges
+    {
+        if let Some(edge) = edge_by_fingerprint(conn, fingerprint)? {
+            if edge.matched_legacy_fingerprint {
+                // The v1 identity has no receiver type. It proves the call site survived, but not
+                // that receiver-aware resolution still targets the same owner, so this validation
+                // reports relocated — once. The convergence below then rewrites the stored
+                // identity so later validations compare the full receiver-aware fingerprint.
+                relocated += 1;
+                matched_legacy = true;
+            }
+            live_fingerprints.push((*ordinal, edge.fingerprint, edge.callee_logical_symbol_id));
             continue;
         }
-        if call_path_edge_relocatable(
-            conn,
-            from_name.as_deref(),
-            to_name.as_deref(),
-            edge_kind,
-            target.as_deref(),
-        )? {
+        let loose_identity = EdgeLooseIdentity {
+            from_name: from_name.clone(),
+            to_name: to_name.clone().unwrap_or_default(),
+            edge_kind: edge_kind.clone(),
+            target_qualified_name: target.clone(),
+            callee_logical_symbol_id: *callee_logical_symbol_id,
+        };
+        if call_path_edge_relocatable(conn, &loose_identity, *callee_identity_known)? {
             relocated += 1;
         } else {
             gone += 1;
         }
+    }
+
+    if matched_legacy && live_fingerprints.len() == total {
+        converge_call_path_identity(conn, binding, &live_fingerprints)?;
     }
 
     Ok(if gone == total {
@@ -423,6 +475,67 @@ pub(crate) fn validate_call_path_binding(
     .to_string())
 }
 
+/// Migrate one pre-versioned call-path binding onto the current edge identity, in full.
+///
+/// A binding is keyed by `edge_sequence_hash` — the hash OF its ordered edge fingerprints — so
+/// rewriting the member fingerprints without rewriting the key would leave a row that no longer
+/// re-derives its own id, and `call_path_memories_for_crossed` (which looks memories up by the
+/// hash it computes from LIVE fingerprints) would keep missing it: the memory would validate
+/// `current` yet never surface on the traversal it was recorded for. So both move together, and
+/// `binding.binding_id` is re-pointed as well — `stamp_validated_binding` writes it back, the
+/// same mechanism a relocated symbol binding uses.
+///
+/// Runs only when every edge of the path matched a live edge, so the recomputed hash describes
+/// the same call path the binding already named.
+fn converge_call_path_identity(
+    conn: &Connection,
+    binding: &mut RepoMemoryBinding,
+    live_fingerprints: &[(i64, String, Option<i64>)],
+) -> anyhow::Result<()> {
+    let converged =
+        compute_edge_sequence_hash(live_fingerprints.iter().map(|(_, value, _)| value.as_str()));
+    if converged == binding.binding_id {
+        return Ok(());
+    }
+    // Both tables are keyed `(memory_id, edge_sequence_hash)`. If the memory already carries a
+    // binding under the converged hash — the same path re-bound after the upgrade — re-keying
+    // would collide with it, so leave the legacy row alone rather than trade one broken identity
+    // for a constraint failure. Rebinding is the way out of that (rare) duplicate.
+    let taken: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM repo_memory_call_paths WHERE memory_id = ?1 AND edge_sequence_hash \
+         = ?2",
+        params![binding.memory_id, converged],
+        |row| row.get(0),
+    )?;
+    if taken > 0 {
+        return Ok(());
+    }
+    for (ordinal, fingerprint, callee_logical_symbol_id) in live_fingerprints {
+        conn.execute(
+            "UPDATE repo_memory_call_path_edges
+             SET edge_fingerprint = ?1, edge_sequence_hash = ?2,
+                 callee_logical_symbol_id = ?3, callee_identity_known = 1
+             WHERE memory_id = ?4 AND edge_sequence_hash = ?5 AND ordinal = ?6",
+            params![
+                fingerprint,
+                converged,
+                callee_logical_symbol_id,
+                binding.memory_id,
+                binding.binding_id,
+                ordinal
+            ],
+        )?;
+    }
+    conn.execute(
+        "UPDATE repo_memory_call_paths
+         SET edge_sequence_hash = ?1
+         WHERE memory_id = ?2 AND edge_sequence_hash = ?3",
+        params![converged, binding.memory_id, binding.binding_id],
+    )?;
+    binding.binding_id = converged;
+    Ok(())
+}
+
 /// Is there still an edge matching this one's loose identity (names/kind/target), ignoring line
 /// numbers? Used to call a call-path edge `relocated` (moved) rather than `gone` (#38). The
 /// `JOIN files` is load-bearing (A6): `edges`/`edges_data` are NOT generation-scoped, so without it
@@ -433,11 +546,12 @@ pub(crate) fn validate_call_path_binding(
 /// `call_path_edge_by_id`.
 pub(crate) fn call_path_edge_relocatable(
     conn: &Connection,
-    from_name: Option<&str>,
-    to_name: Option<&str>,
-    edge_kind: &str,
-    target_qualified_name: Option<&str>,
+    identity: &EdgeLooseIdentity,
+    callee_identity_known: bool,
 ) -> anyhow::Result<bool> {
+    if !callee_identity_known {
+        return Ok(false);
+    }
     let count: i64 = conn.query_row(
         "
         SELECT COUNT(*)
@@ -447,8 +561,18 @@ pub(crate) fn call_path_edge_relocatable(
           AND COALESCE(from_name, '') = COALESCE(?1, '')
           AND COALESCE(to_name, '') = COALESCE(?2, '')
           AND COALESCE(target_qualified_name, '') = COALESCE(?4, '')
+          AND ((?5 IS NULL AND to_symbol_id IS NULL) OR EXISTS(
+              SELECT 1 FROM logical_symbol_members members
+              WHERE members.symbol_id = edges.to_symbol_id AND members.logical_symbol_id = ?5
+          ))
         ",
-        params![from_name, to_name, edge_kind, target_qualified_name],
+        params![
+            identity.from_name,
+            identity.to_name,
+            identity.edge_kind,
+            identity.target_qualified_name,
+            identity.callee_logical_symbol_id
+        ],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -1019,6 +1143,558 @@ mod content_hash_tests {
         assert_eq!(
             content_hash("title", "body", Some(r#"{"schema_version":1,"status":"todo"}"#)),
             "5a07a01d8bc81c1dc9a80a2ea8707fc9d3f3bcfac5a6c31761deb3d2be2107b2"
+        );
+    }
+}
+
+#[cfg(test)]
+mod call_path_receiver_type_hint_tests {
+    use super::*;
+
+    fn mem_db() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&c, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        c
+    }
+
+    fn set_repo(c: &Connection, repo_id: &str) {
+        c.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS connection_context(key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', ?1)",
+            [repo_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_file(c: &Connection, path: &str, repo_id: &str) -> i64 {
+        c.execute(
+            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
+             commit_sha, worktree_id, repo_id, generation) VALUES \
+             (?1,'rust','source',?2,0,0,'','',?3,0)",
+            rusqlite::params![path, format!("sha-{path}"), repo_id],
+        )
+        .unwrap();
+        c.last_insert_rowid()
+    }
+
+    fn seed_memory(c: &Connection, id: &str, repo_id: &str) {
+        c.execute(
+            "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
+             created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
+             (?1,'Invariant','t','b','high','active','agent',1,1,'agent','v1',?2)",
+            rusqlite::params![id, repo_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_target(c: &Connection, file_id: i64, name: &str, logical_id: i64) -> i64 {
+        let qualified = format!("src/lib.rs::{name}");
+        c.execute("INSERT OR IGNORE INTO name_strings(value) VALUES (?1)", [&qualified]).unwrap();
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind, \
+             start_byte, end_byte, start_line, end_line) VALUES (?1, 'rust', ?2, (SELECT id FROM \
+             name_strings WHERE value = ?3), ?2, 'function', 0, 1, 1, 1)",
+            rusqlite::params![file_id, name, qualified],
+        )
+        .unwrap();
+        let symbol_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO logical_symbols(id, language, path, logical_name, qualified_name_id, \
+             kind, variant_count, group_reason) VALUES (?1, 'rust', 'src/lib.rs', ?2, (SELECT id \
+             FROM name_strings WHERE value = ?3), 'function', 1, 'exact')",
+            rusqlite::params![logical_id, name, qualified],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO logical_symbol_members(logical_symbol_id, symbol_id, start_line, \
+             end_line) VALUES (?1, ?2, 1, 1)",
+            rusqlite::params![logical_id, symbol_id],
+        )
+        .unwrap();
+        symbol_id
+    }
+
+    fn call_path_binding(memory_id: &str, edge_sequence_hash: &str) -> RepoMemoryBinding {
+        RepoMemoryBinding {
+            memory_id: memory_id.to_string(),
+            binding_kind: "call_path".to_string(),
+            binding_id: edge_sequence_hash.to_string(),
+            path: None,
+            start_line: None,
+            end_line: None,
+            logical_symbol_id: None,
+            symbol_id: None,
+            chunk_id: None,
+            edge_id: None,
+            commit_hash: None,
+            tracker: None,
+            project: None,
+            item_key: None,
+            symbol_kind: None,
+            signature_hash: None,
+            moniker_tool: None,
+            moniker_tool_version: None,
+            relocation_reason: None,
+            anchor_status: "current".to_string(),
+            created_at_ms: 0,
+        }
+    }
+
+    /// The row-id fast path answers `current` off a file hash, so it may only be taken when the row
+    /// still hashes to the identity the binding was made against — under the CURRENT fingerprint.
+    /// A pre-upgrade digest agreeing proves only that the eight older fields match; the receiver
+    /// type is not among them, so the call may now reach a different method. Row-id reuse during
+    /// the graph rebuild is what puts a legacy binding in front of this branch, and the honest
+    /// answer for it is `relocated`.
+    #[test]
+    fn a_legacy_fingerprint_does_not_take_the_edge_id_fast_path() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id = c.last_insert_rowid();
+
+        let legacy =
+            crate::memory::resolve::legacy_edge_fingerprint(crate::memory::EdgeFingerprintParts {
+                path: "src/lib.rs",
+                start_line: 10,
+                end_line: 10,
+                from_name: Some("caller"),
+                to_name: Some("run"),
+                edge_kind: "calls_name",
+                target_qualified_name: None,
+                receiver_hint: Some("recv"),
+                receiver_type_hint: None,
+                callee_logical_symbol_id: None,
+            });
+
+        seed_memory(&c, "m1", "r");
+        let mut binding = RepoMemoryBinding {
+            binding_kind: "edge".to_string(),
+            binding_id: legacy,
+            // The reused row id the rebuild handed back.
+            edge_id: Some(edge_id),
+            ..call_path_binding("m1", "unused")
+        };
+        binding.memory_id = "m1".to_string();
+
+        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
+    }
+
+    #[test]
+    fn edge_binding_with_pre_upgrade_fingerprint_relocates_after_hint_gain() {
+        // A binding persisted BEFORE receiver_type_hint existed holds the 8-field fingerprint and
+        // a now-dead row id (GRAPH_INDEX_VERSION 12 re-extracts every edge). The re-extracted,
+        // source-unchanged call site gained a hint, so its current fingerprint differs — the
+        // legacy-format fallback must still find it and relocate, not report `gone`.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+
+        let legacy =
+            crate::memory::resolve::legacy_edge_fingerprint(crate::memory::EdgeFingerprintParts {
+                path: "src/lib.rs",
+                start_line: 10,
+                end_line: 10,
+                from_name: Some("caller"),
+                to_name: Some("run"),
+                edge_kind: "calls_name",
+                target_qualified_name: None,
+                receiver_hint: Some("recv"),
+                receiver_type_hint: None,
+                callee_logical_symbol_id: None,
+            });
+
+        seed_memory(&c, "m1", "r");
+        let mut binding = RepoMemoryBinding {
+            binding_kind: "edge".to_string(),
+            binding_id: legacy.clone(),
+            ..call_path_binding("m1", "unused")
+        };
+        binding.memory_id = "m1".to_string();
+
+        assert_eq!(validate_edge_binding(&c, &mut binding).unwrap(), "relocated");
+        assert!(binding.edge_id.is_some(), "the relocated binding adopts the live edge row");
+        assert_ne!(binding.binding_id, legacy, "the binding converges to the current fingerprint");
+        assert_eq!(
+            validate_edge_binding(&c, &mut binding).unwrap(),
+            "current",
+            "a compatibility relocation converges instead of repeating forever"
+        );
+
+        let mut missing = RepoMemoryBinding {
+            binding_kind: "edge".to_string(),
+            binding_id: "not-a-fingerprint".to_string(),
+            ..call_path_binding("m1", "unused")
+        };
+        assert_eq!(validate_edge_binding(&c, &mut missing).unwrap(), "gone");
+
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', 'legacy-path', 'caller -> run', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint) VALUES ('m1', \
+             'legacy-path', 0, ?1, 'caller', 'run', 'calls_name', 'recv')",
+            [legacy.as_str()],
+        )
+        .unwrap();
+        let mut call_path = call_path_binding("m1", "legacy-path");
+        assert_eq!(
+            validate_call_path_binding(&c, &mut call_path).unwrap(),
+            "relocated",
+            "legacy identity proves the site survived but cannot prove its receiver owner"
+        );
+        // Convergence moves the WHOLE binding, not just its member fingerprints: the key is the
+        // hash OF those fingerprints, so a half-migrated row would no longer re-derive its own id,
+        // and `call_path_memories_for_crossed` — which looks memories up by the hash it computes
+        // from LIVE fingerprints — would never surface this memory again.
+        assert_ne!(call_path.binding_id, "legacy-path", "the binding id re-points to the v3 hash");
+        let (upgraded, key): (String, String) = c
+            .query_row(
+                "SELECT edge_fingerprint, edge_sequence_hash FROM repo_memory_call_path_edges
+                 WHERE memory_id = 'm1' AND ordinal = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(upgraded, legacy, "validation converges the stored identity to v3");
+        assert_eq!(key, call_path.binding_id, "the edge rows follow the binding to its new key");
+        assert_eq!(
+            compute_edge_sequence_hash([upgraded.as_str()]),
+            call_path.binding_id,
+            "the converged binding re-derives its own id from its stored fingerprints"
+        );
+        let reachable: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM repo_memory_call_paths
+                 WHERE memory_id = 'm1' AND edge_sequence_hash = ?1",
+                [call_path.binding_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reachable, 1, "the call-path row is re-keyed too, so nothing is orphaned");
+        assert_eq!(
+            validate_call_path_binding(&c, &mut call_path).unwrap(),
+            "current",
+            "the converged v3 identity is no longer permanently hint-blind"
+        );
+    }
+
+    #[test]
+    fn callee_retarget_invalidates_edge_and_call_path_bindings() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        let alpha = seed_target(&c, file_id, "Alpha", 11);
+        let beta = seed_target(&c, file_id, "Beta", 22);
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line, \
+             to_symbol_id) VALUES \
+             ('caller','run','calls_name','exact','recv','Worker',?1,10,10,?2)",
+            rusqlite::params![file_id, alpha],
+        )
+        .unwrap();
+        let edge_id: i64 =
+            c.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+        let original = edge_by_id(&c, edge_id).unwrap().unwrap();
+
+        seed_memory(&c, "m1", "r");
+        let mut edge_binding = RepoMemoryBinding {
+            memory_id: "m1".to_string(),
+            binding_kind: "edge".to_string(),
+            binding_id: original.fingerprint.clone(),
+            edge_id: Some(edge_id),
+            ..call_path_binding("m1", "unused")
+        };
+        let path_hash = compute_edge_sequence_hash([original.fingerprint.as_str()]);
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', ?1, 'caller -> run', 0)",
+            [path_hash.as_str()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint, \
+             callee_logical_symbol_id, callee_identity_known) VALUES ('m1', ?1, 0, ?2, 'caller', \
+             'run', 'calls_name', 'recv', 11, 1)",
+            rusqlite::params![path_hash, original.fingerprint],
+        )
+        .unwrap();
+
+        c.execute("UPDATE edges_data SET to_symbol_id = ?1 WHERE id = ?2", [beta, edge_id])
+            .unwrap();
+
+        assert_eq!(validate_edge_binding(&c, &mut edge_binding).unwrap(), "gone");
+        assert_eq!(edge_binding.edge_id, None, "a retargeted row id must not remain attached");
+        let mut call_path = call_path_binding("m1", &path_hash);
+        assert_eq!(
+            validate_call_path_binding(&c, &mut call_path).unwrap(),
+            "gone",
+            "loose relocation must reject a different stable callee"
+        );
+    }
+
+    #[test]
+    fn first_gone_validation_detaches_the_persisted_edge_before_status_downgrades() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id = c.last_insert_rowid();
+        let fingerprint = edge_by_id(&c, edge_id).unwrap().unwrap().fingerprint;
+
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             start_line, end_line, edge_id, anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','edge',?1,'src/lib.rs',10,10,?2,'current',0,'r')",
+            rusqlite::params![fingerprint, edge_id],
+        )
+        .unwrap();
+        assert_eq!(memories_for_edges(&c, &[edge_id], 10).unwrap().len(), 1);
+
+        // Reusing the row for a semantically different receiver invalidates the stored fingerprint
+        // while preserving the numeric id that edge recall would otherwise follow.
+        c.execute("UPDATE edges SET receiver_type_hint = 'Beta' WHERE id = ?1", [edge_id]).unwrap();
+
+        let report = validate_memories(&c, None).unwrap();
+        assert_eq!(report.gone, 1);
+        let persisted: (String, Option<i64>, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms, edge_id
+                 FROM repo_memory_bindings WHERE memory_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted.0, "current", "the first observation must not downgrade status");
+        assert!(persisted.1.is_some(), "the first observation arms status hysteresis");
+        assert_eq!(persisted.2, None, "the invalid edge identity detaches immediately");
+        assert!(
+            memories_for_edges(&c, &[edge_id], 10).unwrap().is_empty(),
+            "edge recall must not surface the memory on the replacement edge"
+        );
+
+        validate_memories(&c, None).unwrap();
+        let confirmed: (String, Option<i64>, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms, edge_id
+                 FROM repo_memory_bindings WHERE memory_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(confirmed, ("gone".to_string(), None, None));
+    }
+
+    #[test]
+    fn active_scope_validation_preserves_a_linked_worktree_edge_id_as_pending() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/branch.rs", "r");
+        c.execute("UPDATE main.files SET worktree_id = 'linked' WHERE id = ?1", [file_id]).unwrap();
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, source_file_id,
+                    source_start_line, source_end_line)
+             VALUES ('caller', 'branch_only', 'calls_name', 'exact', ?1, 10, 10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id: i64 =
+            c.query_row("SELECT MAX(id) FROM edges_data", [], |row| row.get(0)).unwrap();
+        let fingerprint = edge_by_id(&c, edge_id).unwrap().unwrap().fingerprint;
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
+                    start_line, end_line, edge_id, anchor_status, created_at_ms, repo_id)
+             VALUES ('m1', 'edge', ?1, 'src/branch.rs', 10, 10, ?2, 'current', 0, 'r')",
+            rusqlite::params![fingerprint, edge_id],
+        )
+        .unwrap();
+
+        // Model a main-checkout connection: the raw store retains the linked row, while the scoped
+        // view used by validation cannot see it.
+        c.execute_batch(
+            "CREATE TEMP VIEW files AS
+                 SELECT * FROM main.files WHERE worktree_id = '';",
+        )
+        .unwrap();
+
+        let report = validate_memories(&c, None).unwrap();
+        assert_eq!((report.pending, report.gone), (1, 0));
+        let persisted: (String, Option<i64>, Option<i64>) = c
+            .query_row(
+                "SELECT anchor_status, downgrade_pending_at_ms, edge_id
+                   FROM repo_memory_bindings WHERE memory_id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("pending".to_string(), None, Some(edge_id)));
+        assert_eq!(
+            memories_for_edges(&c, &[edge_id], 10).unwrap().len(),
+            1,
+            "the linked checkout retains its direct edge recall mapping"
+        );
+    }
+
+    /// Convergence rewrites the binding's identity, so it may only run when the recomputed hash
+    /// describes the SAME call path: every edge must have matched a live edge. An edge that
+    /// survives only by its loose identity has no live fingerprint to fold in, and re-keying on
+    /// the remainder would silently redefine which path the memory names.
+    #[test]
+    fn a_partly_gone_call_path_keeps_its_legacy_identity() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, receiver_hint, \
+             receiver_type_hint, source_file_id, source_start_line, source_end_line) VALUES \
+             ('caller','run','calls_name','exact','recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let legacy =
+            crate::memory::resolve::legacy_edge_fingerprint(crate::memory::EdgeFingerprintParts {
+                path: "src/lib.rs",
+                start_line: 10,
+                end_line: 10,
+                from_name: Some("caller"),
+                to_name: Some("run"),
+                edge_kind: "calls_name",
+                target_qualified_name: None,
+                receiver_hint: Some("recv"),
+                receiver_type_hint: None,
+                callee_logical_symbol_id: None,
+            });
+
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_call_paths(memory_id, edge_sequence_hash, path_summary, \
+             created_at_ms) VALUES ('m1', 'legacy-path', 'caller -> run -> vanished', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, receiver_hint) VALUES ('m1', \
+             'legacy-path', 0, ?1, 'caller', 'run', 'calls_name', 'recv')",
+            [legacy.as_str()],
+        )
+        .unwrap();
+        // A second hop whose edge no longer exists in any form.
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind) VALUES ('m1', 'legacy-path', 1, \
+             'no-such-fingerprint', 'run', 'vanished', 'calls_name')",
+            [],
+        )
+        .unwrap();
+
+        let mut binding = call_path_binding("m1", "legacy-path");
+        assert_eq!(validate_call_path_binding(&c, &mut binding).unwrap(), "stale");
+        assert_eq!(binding.binding_id, "legacy-path", "a partial path keeps its stored identity");
+        let stored: String = c
+            .query_row(
+                "SELECT edge_fingerprint FROM repo_memory_call_path_edges
+                 WHERE memory_id = 'm1' AND edge_sequence_hash = 'legacy-path' AND ordinal = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, legacy, "no member is converged while the path is incomplete");
+    }
+
+    #[test]
+    fn call_path_binding_stops_reading_current_after_receiver_type_hint_repoint() {
+        // End-to-end (#567): `recv.run()` starts resolved against `Alpha` (`receiver_type_hint =
+        // 'Alpha'`). A memory anchors the call path with the fingerprint captured at that moment.
+        // Reindexing then re-points the SAME call site's Rust receiver-type inference to `Beta` —
+        // path, span, from_name, to_name, edge_kind, target_qualified_name, and receiver_hint all
+        // stay identical, only `receiver_type_hint` changes. Before #567 the fingerprint ignored
+        // `receiver_type_hint`, so `validate_call_path_binding` kept reporting `current` against a
+        // target it no longer actually resolved to. It must not anymore.
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/lib.rs", "r");
+        c.execute(
+            "INSERT INTO edges(from_name, to_name, edge_kind, confidence, target_qualified_name, \
+             receiver_hint, receiver_type_hint, source_file_id, source_start_line, \
+             source_end_line) VALUES \
+             ('caller','run','calls_name','exact',NULL,'recv','Alpha',?1,10,10)",
+            [file_id],
+        )
+        .unwrap();
+        let edge_id: i64 = c
+            .query_row("SELECT id FROM edges WHERE to_name = 'run'", [], |row| row.get(0))
+            .unwrap();
+        let edge = call_path_edge_by_id(&c, edge_id).unwrap().unwrap();
+
+        seed_memory(&c, "m1", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','call_path','hash1',NULL,'current',0,'r')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO repo_memory_call_path_edges(memory_id, edge_sequence_hash, ordinal, \
+             edge_fingerprint, from_name, to_name, edge_kind, target_qualified_name, \
+             receiver_hint) VALUES ('m1','hash1',0,?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                edge.fingerprint,
+                edge.from_name,
+                edge.to_name,
+                edge.edge_kind,
+                edge.target_qualified_name,
+                edge.receiver_hint,
+            ],
+        )
+        .unwrap();
+
+        let mut binding = call_path_binding("m1", "hash1");
+        assert_eq!(
+            validate_call_path_binding(&c, &mut binding).unwrap(),
+            "current",
+            "unchanged edge validates current"
+        );
+
+        c.execute("UPDATE edges SET receiver_type_hint = 'Beta' WHERE id = ?1", [edge_id]).unwrap();
+
+        assert_ne!(
+            validate_call_path_binding(&c, &mut binding).unwrap(),
+            "current",
+            "a receiver-type-driven re-resolution must not keep validating current against the \
+             stale method target"
         );
     }
 }
