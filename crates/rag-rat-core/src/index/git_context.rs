@@ -470,6 +470,42 @@ mod worktree_scope_tests {
         }
     }
 
+    /// The wildcard half of the same class, and the direction a per-path spec does NOT survive by
+    /// accident. `*` is legal in a Unix file name and a wildcard in gix's shell-glob mode, so the
+    /// spec `a*b.rs` also matches `axb.rs`: an untouched file is reported dirty because a SIBLING
+    /// has uncommitted edits, and blame then refuses the committed attribution it should have used.
+    /// The literal byte compare that rescues an exact spelling cannot help here — the extra match
+    /// is a different path, not the same one spelled oddly.
+    ///
+    /// Escaping the spec as a GLOB (`globset::escape`, which brackets `? * [ ] { }`) would cover
+    /// only this case: it leaves `\` and a leading `:` untouched, and neither is glob syntax —
+    /// they are an escape and a magic signature, parsed before globbing. `:(literal)` is what
+    /// covers all three, which is why the spec is built that way rather than escaped.
+    ///
+    /// Unix-only: Windows forbids `*` in a name, so the fixture cannot exist there.
+    #[cfg(unix)]
+    #[test]
+    fn a_wildcard_named_file_is_not_dirty_because_a_sibling_is() {
+        let dir = temp_dir("pathspec-wildcard-clean");
+        git(&dir, &["init", "-q"]);
+        // `a*b.rs` is the file under test; `axb.rs` is what its name matches read as a pattern.
+        for name in ["a*b.rs", "axb.rs"] {
+            std::fs::write(dir.join(name), "pub fn a() {}\n").unwrap();
+        }
+        git(&dir, &["add", "-A", "."]);
+        git(&dir, &["commit", "-q", "-m", "seed"]);
+
+        // Only the sibling is edited.
+        std::fs::write(dir.join("axb.rs"), "pub fn a2() {}\n").unwrap();
+
+        let repo = discover_repo(&dir).unwrap();
+        assert!(path_is_dirty(&repo, Path::new("axb.rs")), "the sibling really is dirty");
+        assert!(
+            !path_is_dirty(&repo, Path::new("a*b.rs")),
+            "a wildcard in the NAME must not let a sibling's edits report this file as dirty",
+        );
+    }
+
     #[test]
     fn linked_worktree_selects_its_overlay_on_the_base_commit() {
         let (_scratch, main) = init_repo("linked-main");

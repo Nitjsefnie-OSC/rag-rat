@@ -3359,3 +3359,113 @@ fn a_directory_include_glob_does_not_claim_a_backslash_named_sibling() {
     assert!(!target.globs_claim("foo\\bar.rs"), "a file NAMED `foo\\bar.rs` is not under foo/");
     assert!(!target.globs_claim("foobar.rs"), "a prefix of the NAME is not a directory boundary");
 }
+
+/// A target carrying exactly the given patterns; the language/kind are irrelevant to
+/// [`ResolvedTarget::globs_claim`], which reads only `include` and `exclude`.
+fn glob_target(include: &[&str], exclude: &[&str]) -> ResolvedTarget {
+    ResolvedTarget {
+        name: "globs".to_string(),
+        language: Language::Rust,
+        directories: vec![PathBuf::from(".")],
+        include: include.iter().map(|pattern| (*pattern).to_string()).collect(),
+        exclude: exclude.iter().map(|pattern| (*pattern).to_string()).collect(),
+        kind: TargetKind::Source,
+    }
+}
+
+/// A `*` is a WILDCARD over one path component, not a substring probe. The matcher used to fall
+/// through to `path.contains(pattern.trim_matches('*'))`, so `*.rs` asked only whether `.rs`
+/// appeared anywhere in the path — claiming a backup (`notes.rs.bak`) and a conflict leftover
+/// (`src/lib.rs.orig`) as Rust sources, and a wrong answer about what gets indexed.
+#[test]
+fn a_star_glob_matches_a_name_instead_of_containing_a_substring() {
+    let target = glob_target(&["*.rs"], &[]);
+
+    assert!(target.globs_claim("lib.rs"), "a root-level `.rs` file is claimed");
+    assert!(!target.globs_claim("notes.rs.bak"), "`.rs` inside the NAME is not a `.rs` file");
+    assert!(!target.globs_claim("src/lib.rs.orig"), "nor is a conflict leftover");
+    // A single `*` stops at a separator, so an unanchored `*.rs` is root-level only. `**/*.rs` (the
+    // shipped default) is the pattern that reaches every depth.
+    assert!(!target.globs_claim("src/lib.rs"), "one `*` does not cross a separator");
+    assert!(glob_target(&["**/*.rs"], &[]).globs_claim("src/lib.rs"), "`**/` does");
+}
+
+/// The same fallthrough made a bare `*` claim the entire tree: `"*".trim_matches('*')` is the empty
+/// string, and every path contains it. `*` is one component's worth of wildcard.
+#[test]
+fn a_bare_star_claims_one_component_not_the_whole_tree() {
+    let target = glob_target(&["*"], &[]);
+
+    assert!(target.globs_claim("README.md"), "a root-level file is claimed");
+    assert!(!target.globs_claim("src/lib.rs"), "a nested file is not");
+    assert!(!target.globs_claim("docs/deep/guide.md"), "nor a deeper one");
+    assert!(glob_target(&["**"], &[]).globs_claim("docs/deep/guide.md"), "`**` is the tree");
+}
+
+/// A pattern with no wildcard names a PATH, not a substring of one — on both sides. The old
+/// fallthrough let a literal claim any path it appeared inside, so an `exclude` of `vendor` also
+/// excluded `x/vendor/dep.rs` while an `include` of `src/lib.rs` also claimed `src/lib.rs.orig`.
+#[test]
+fn a_literal_pattern_names_a_path_not_a_substring_of_one() {
+    let include = glob_target(&["src/lib.rs", "README.md"], &[]);
+    assert!(include.globs_claim("src/lib.rs"), "the literal path itself is claimed");
+    assert!(!include.globs_claim("src/lib.rs.orig"), "a longer name is not that path");
+    assert!(!include.globs_claim("a/src/lib.rs"), "nor is the same tail deeper in the tree");
+    assert!(include.globs_claim("README.md"), "a root-level literal is claimed");
+    assert!(!include.globs_claim("docs/README.md"), "a same-named file elsewhere is not");
+
+    let exclude = glob_target(&["**/*.rs"], &["vendor"]);
+    assert!(
+        exclude.globs_claim("vendor/dep.rs"),
+        "`vendor` excludes the FILE `vendor`, not a tree"
+    );
+    assert!(exclude.globs_claim("x/vendor/dep.rs"), "and certainly not one nested elsewhere");
+    assert!(
+        !glob_target(&["**/*.rs"], &["vendor/**"]).globs_claim("vendor/dep.rs"),
+        "`vendor/**` is how a subtree is excluded",
+    );
+}
+
+/// The vocabulary is now real glob syntax, not the three hand-recognized shapes. Character classes,
+/// alternates, `?`, and a `**` in the MIDDLE of a pattern all used to fall through to substring
+/// containment over the pattern with its outer `*`s trimmed.
+#[test]
+fn the_full_glob_vocabulary_is_available() {
+    assert!(glob_target(&["**/*.[ch]"], &[]).globs_claim("include/lib.h"), "character class");
+    assert!(!glob_target(&["**/*.[ch]"], &[]).globs_claim("include/lib.hpp"), "and it is bounded");
+    assert!(glob_target(&["{lib,main}.rs"], &[]).globs_claim("main.rs"), "alternates");
+    assert!(!glob_target(&["{lib,main}.rs"], &[]).globs_claim("other.rs"), "and they are bounded");
+    assert!(glob_target(&["a?c.rs"], &[]).globs_claim("abc.rs"), "single-character wildcard");
+    assert!(!glob_target(&["a?c.rs"], &[]).globs_claim("ac.rs"), "which matches exactly one");
+    assert!(glob_target(&["src/**/*.rs"], &[]).globs_claim("src/a/b/deep.rs"), "interior `**`");
+    assert!(glob_target(&["src/**/*.rs"], &[]).globs_claim("src/lib.rs"), "which spans zero dirs");
+    assert!(
+        !glob_target(&["**/*.rs"], &["**/generated/**"]).globs_claim("src/generated/api.rs"),
+        "an interior `**` on the exclude side excludes a generated subtree at any depth",
+    );
+}
+
+/// Every shipped default is a `**/*.ext` suffix ([`Language::default_include_globs`]), the one
+/// shape the old cascade got right. Replacing the matcher must not move a single one of them.
+#[test]
+fn the_shipped_default_globs_claim_exactly_what_they_did() {
+    let target = glob_target(&["**/*.rs"], &[]);
+
+    for claimed in ["lib.rs", "src/lib.rs", "src/a/b/deep.rs", "foo\\bar.rs", ".rs"] {
+        assert!(target.globs_claim(claimed), "`**/*.rs` claims {claimed}");
+    }
+    for unclaimed in ["lib.h", "notes.rs.bak", "src/lib.rs.orig", "my.rs.template"] {
+        assert!(!target.globs_claim(unclaimed), "`**/*.rs` does not claim {unclaimed}");
+    }
+}
+
+/// Config load does not reject a malformed pattern, so the matcher has to answer something for one.
+/// It claims NOTHING: a typo that silently widened an `include` to the whole tree, or narrowed an
+/// `exclude` away, is the failure this whole function exists to stop.
+#[test]
+fn a_pattern_that_is_not_a_legal_glob_claims_nothing() {
+    // A dangling escape — `\` with nothing after it — is a globset compile error.
+    assert!(!glob_target(&["src/lib.rs\\"], &[]).globs_claim("src/lib.rs"));
+    // On the exclude side an uncompilable pattern excludes nothing, so the include still stands.
+    assert!(glob_target(&["**/*.rs"], &["oops\\"]).globs_claim("src/lib.rs"));
+}
