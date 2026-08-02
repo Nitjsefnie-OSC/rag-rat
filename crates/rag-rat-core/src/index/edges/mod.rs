@@ -558,6 +558,11 @@ impl IndexedSymbol {
 
 /// Drop generic ARGUMENTS from a path — see [`scope_grammar::degeneric`], which owns the parsing
 /// rules every consumer of these strings shares.
+///
+/// This is the ONE normalizer: the def side (a symbol's scope path) and the call side
+/// ([`target_qualified_name`], [`scoped_receiver_name`], the Rust dispatch classifier) all reach
+/// the scanner through here, so a definition and a call written the same way cannot normalize
+/// apart (#1094).
 pub(crate) fn degeneric_path(path: &str) -> String {
     scope_grammar::degeneric(path)
 }
@@ -565,11 +570,9 @@ pub(crate) fn degeneric_path(path: &str) -> String {
 #[cfg(test)]
 mod degeneric_tests {
     use super::degeneric_path;
-    use crate::index::edges::helpers::strip_generics;
 
     /// A const-generic block holds an expression, so its `<`/`>` are operators. Getting this wrong
-    /// swallows everything after the block — and the call side (`strip_generics`) already treats
-    /// braces this way, so the two must agree or the definition and the call never meet.
+    /// swallows everything after the block, on the def side and the call side alike.
     #[test]
     fn a_const_generic_block_is_not_a_generic_delimiter() {
         for path in ["Foo<{ 1 < 2 }>::run", "Foo<{ 2 > 1 }>::run", "Foo<[u8; { 1 < 2 }]>::run"] {
@@ -579,37 +582,51 @@ mod degeneric_tests {
         assert_eq!(degeneric_path("[u8; { 1 < 2 }] as Tr::f"), "[u8; { 1 < 2 }] as Tr::f");
     }
 
-    /// The def-side (`degeneric_path`, a full scan) and the call-side (`strip_generics`, a lighter
-    /// brace/angle counter) normalizer meet on the shapes a real path takes.
+    /// The shapes a real path takes normalize to the key both sides look each other up by.
     #[test]
-    fn degeneric_path_agrees_with_the_call_side_stripper() {
-        for path in ["Foo<T>::run", "Foo<{ 1 < 2 }>::run", "A<B<C>>::run", "plain::run"] {
-            assert_eq!(degeneric_path(path), strip_generics(path), "{path}");
+    fn the_normalizer_pins_the_key_a_call_and_a_definition_meet_on() {
+        for (path, want) in [
+            ("Foo<T>::run", "Foo::run"),
+            ("Foo<{ 1 < 2 }>::run", "Foo::run"),
+            ("A<B<C>>::run", "A::run"),
+            ("plain::run", "plain::run"),
+            ("Vec::<u8>::new", "Vec::new"),
+            // A LEADING `<…>` is a UFCS qualifier, not an argument list; stripping it would drop
+            // the type and the trait and leave a bare `::default` (#208 review round 10).
+            ("<Resp as Default>::default", "<Resp as Default>::default"),
+        ] {
+            assert_eq!(degeneric_path(path), want, "{path}");
         }
     }
 
-    /// Where they DIVERGE, the divergence is one-sided: the call side is string- and comment-blind,
-    /// so a `{`/`}`/`<`/`>` inside a literal unbalances its counter and it drops the whole tail —
-    /// yielding a form with no `::`, which resolution treats as a bare name and declines. The def
-    /// side keeps the real qualified key. So the two never disagree into a DIFFERENT qualified key
-    /// (which would let a call meet the wrong definition); the worst case is a missed edge that
-    /// falls back to bare-name matching. This pins that safe direction so a future change to either
-    /// side that turned a divergence into a colliding key would fail here. Full unification of the
-    /// two onto the scanner is #1094.
+    /// The shapes a brace/angle counter gets wrong, pinned to the key the definition is indexed
+    /// under — so a second parser reintroduced on the call side fails here (#1094).
+    ///
+    /// A counter blind to literals and comments reads the `{` in `"{"` or `/* { */` as structure,
+    /// never unwinds its brace stack, suppresses the closing `>` and drops the whole tail: the
+    /// call becomes a bare name and resolution declines a match the definition side had. Blind to
+    /// `->`, it reads the arrow's `>` as a closing angle and splices a generic argument's text
+    /// into the path — `Foo::<fn()->Bar>::run` becoming `FooBar::run`, a DIFFERENT `::`-bearing
+    /// key that can meet the WRONG definition, so the divergence is not merely a recall gap.
     #[test]
-    fn a_divergence_between_the_normalizers_only_ever_declines() {
+    fn literals_comments_and_arrows_do_not_derail_the_call_key() {
         for path in [
             r#"Foo<{ "{".len() }>::run"#,
             r#"Foo<{ "}".len() }>::run"#,
-            r##"Bar<{ r#"<"#.len() }>::run"##,
+            r##"Foo<{ r#"<"#.len() }>::run"##,
+            r##"Foo<{ r#"{"#.len() }>::run"##,
+            r#"Foo<{ /* { */ 1 }>::run"#,
+            "Foo<{ // {\n1 }>::run",
+            "Foo<{ '{' as u8 }>::run",
+            "Foo::<fn()->Bar>::run",
+            "Foo::<fn(&T) -> U>::run",
         ] {
-            let call = strip_generics(path);
-            let def = degeneric_path(path);
-            assert!(
-                call == def || !call.contains("::"),
-                "{path}: call `{call}` must equal def `{def}` or carry no `::`"
-            );
+            assert_eq!(degeneric_path(path), "Foo::run", "{path}");
         }
+        // A group is an expression, so an inner generic and an arrow inside it are text, not
+        // structure: they survive rather than being mangled into `[Wrapper; 4]` / `fn(&T) - U`.
+        assert_eq!(degeneric_path("[Wrapper<X>; 4]::run"), "[Wrapper<X>; 4]::run");
+        assert_eq!(degeneric_path("fn(&T) -> U::run"), "fn(&T) -> U::run");
     }
 }
 

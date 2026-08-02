@@ -258,12 +258,12 @@ pub(crate) fn strip_trait_marker(segment: &str) -> &str {
 
 /// Drop generic ARGUMENTS from a path: `Foo<T>::run` → `Foo::run`, `Foo::<T>::run` → `Foo::run`.
 ///
-/// The turbofish's `::` goes with the arguments it introduces — a definition scope and a call
-/// target must normalize to the same string, and the call side has always dropped it.
+/// The turbofish's `::` goes with the arguments it introduces, so it is dropped with them: a
+/// definition scope and a call target must normalize to the same string, and only one of the two
+/// ever spells the turbofish.
 pub(crate) fn degeneric(path: &str) -> String {
     // A LEADING `<…>` is a UFCS qualifier (`<W as a::Runs>::run`), not an argument list — dropping
-    // it would erase the type and the trait and leave a bare `::run`. The call side has always
-    // returned such a path unchanged, and the whole point of this module is that the two agree.
+    // it would erase the type and the trait and leave a bare `::run` (#208 review round 10).
     if path.trim_start().starts_with('<') {
         return path.to_string();
     }

@@ -585,7 +585,7 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     if raw.starts_with('<') {
         return CallRole::Skip;
     }
-    let stripped = strip_generics(raw);
+    let stripped = degeneric_path(raw);
     let segments: Vec<&str> =
         stripped.split("::").map(str::trim).filter(|segment| !segment.is_empty()).collect();
     let Some(tail) = segments.last() else {

@@ -2,43 +2,9 @@ use std::collections::BTreeSet;
 
 use super::*;
 
-/// Remove balanced `<...>` generic-argument regions from a call path — and the turbofish's leading
-/// `::` (`f::<a::B>` → `f`, `Vec::<u8>::new` → `Vec::new`) — so a generic argument's `::` /
-/// identifiers don't corrupt path-based call name / receiver / qualified-name extraction. `<`/`>`
-/// inside a `{...}` const-generic block (`Foo::<{ 1 << 2 }>`) are shift/comparison operators, not
-/// generic delimiters, so brace regions suppress angle counting.
-///
-/// A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default`), NOT a generic argument —
-/// stripping it would drop the type/receiver and mangle the qualified name (#208 review round 10),
-/// so a path that starts with `<` is returned unchanged.
-pub(crate) fn strip_generics(path: &str) -> String {
-    if path.trim_start().starts_with('<') {
-        return path.to_string();
-    }
-    let mut out = String::new();
-    let mut angle: u32 = 0;
-    let mut brace: u32 = 0;
-    for ch in path.chars() {
-        match ch {
-            '{' => brace += 1,
-            '}' => brace = brace.saturating_sub(1),
-            '<' if brace == 0 => {
-                if angle == 0 && out.ends_with("::") {
-                    out.truncate(out.len() - 2);
-                }
-                angle += 1;
-            },
-            '>' if brace == 0 => angle = angle.saturating_sub(1),
-            _ if angle == 0 => out.push(ch),
-            _ => {},
-        }
-    }
-    out
-}
-
 pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let value = strip_generics(&node_text(function, text));
+    let value = degeneric_path(&node_text(function, text));
     (value.contains("::") || value.contains('.')).then(|| value.replace('.', "::"))
 }
 
@@ -189,7 +155,7 @@ pub(crate) fn call_target_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 pub(crate) fn scoped_receiver_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let value = strip_generics(&node_text(function, text));
+    let value = degeneric_path(&node_text(function, text));
     let separator = if value.contains("::") {
         "::"
     } else if value.contains('.') {
