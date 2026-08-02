@@ -173,7 +173,7 @@ pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
     push_interval_secs.saturating_mul(2).clamp(MIN_TTL, MAX_TTL) as u32
 }
 
-/// How often [`advertise`] wakes, as a divisor of the TTL.
+/// How long a refused publish waits before retrying, as a divisor of the TTL.
 ///
 /// Only ticks where a renewal is actually due cost anything — the rest compare two local values and
 /// go back to sleep — so this is free to be fine, and being fine is what buys retry attempts. The
@@ -184,6 +184,15 @@ pub fn publish_ttl_seconds(push_interval_secs: u64) -> u32 {
 /// It was NOT free while liveness came from a fetch, when every tick was a full round trip. That
 /// coupling is gone.
 const TICKS_PER_TTL: u64 = 8;
+
+/// The retry delay after a publish the service definitely did not store.
+///
+/// Serving-host controllers may check their local state more frequently for roster changes, but
+/// must retain this pacing for repeated network attempts against the same envelope.
+pub fn retry_after_refusal(ttl_seconds: u32) -> Duration {
+    // `.max(1)` keeps the duration positive if a future service permits a sub-second TTL.
+    Duration::from_millis((u64::from(ttl_seconds) * 1000 / TICKS_PER_TTL).max(1))
+}
 
 /// Renew once half the TTL has elapsed.
 ///
@@ -410,8 +419,15 @@ async fn exchange_inner(
 /// The cost of treating a genuinely-failed `Uncertain` as live is one renewal interval of
 /// undiscoverability before the next republish; the cost of the other error is unbounded slot
 /// churn. This trades the bounded harm for the unbounded one.
-fn records_liveness(state: PublishState) -> bool {
+pub fn records_liveness(state: PublishState) -> bool {
     matches!(state, PublishState::Published | PublishState::Uncertain)
+}
+
+/// How long a locally recorded publication remains live before it is renewed.
+///
+/// Kept beside [`advertise`] so every host uses the same slot-budget policy.
+pub fn renew_after(ttl_seconds: u32) -> Duration {
+    Duration::from_millis(u64::from(ttl_seconds * RENEW_AFTER_NUM / RENEW_AFTER_DEN) * 1000)
 }
 
 /// A long-running host's standing advertisement — see [`advertise`].
@@ -460,21 +476,16 @@ pub struct Advertise {
 /// the other way round.
 pub async fn advertise(params: Advertise) {
     let Advertise { endpoint, service, tag, mut announcement, ttl_seconds } = params;
-    // Milliseconds, and `.max(1)`, so the period stays positive for any TTL the service's floor
-    // could ever permit — `interval` panics on a zero period.
-    let period = Duration::from_millis((u64::from(ttl_seconds) * 1000 / TICKS_PER_TTL).max(1));
-    let renew_after =
-        Duration::from_millis(u64::from(ttl_seconds * RENEW_AFTER_NUM / RENEW_AFTER_DEN) * 1000);
+    let period = retry_after_refusal(ttl_seconds);
+    let renew_after = renew_after(ttl_seconds);
     let mut ticks = tokio::time::interval(period);
     // What the service last accepted from this host, and when. A MONOTONIC instant, not the wall
     // clock and not the service's `expires_at_ms`: this is a pure "how long since we published"
     // question, so it needs neither a clock that can step backwards nor a comparison across two
     // machines' clocks.
     //
-    // In memory only, so a restart forgets it — and because a fresh seal is byte-distinct, the
-    // restarted host cannot recognise its still-live announcement and appends another. Bounded and
-    // self-healing after one restart; a crash loop or rapid redeploy is the case that bites.
-    // Persisting or reusing the envelope across restart is #1086.
+    // This low-level task deliberately knows only its watch channel. A serving host that survives
+    // restarts persists this same pair through its controller instead.
     let mut published: Option<(Vec<u8>, tokio::time::Instant)> = None;
     loop {
         ticks.tick().await;
