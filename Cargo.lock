@@ -4972,6 +4972,7 @@ dependencies = [
  "dunce",
  "filetime",
  "gix",
+ "globset",
  "libc",
  "minicbor",
  "path-slash",

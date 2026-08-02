@@ -35,6 +35,35 @@ include = ["**/*.ts"]
 exclude = ["**/*.map"]
 ```
 
+## `include` / `exclude` pattern syntax
+
+Both lists are globs, matched against the `/`-separated repo-relative path. `exclude` is applied
+first, so an excluded path is never claimed back by a broader `include`.
+
+| Pattern | Matches |
+| --- | --- |
+| `**/*.ts` | that extension at any depth (this is what every default binding uses) |
+| `*.ts` | that extension at the repo root only — one `*` does not cross a `/` |
+| `src/**` | everything inside `src/`, and nothing whose name merely starts with `src` |
+| `src/` | the same subtree; a trailing `/` is shorthand for `/**` |
+| `src/*.ts` | direct children of `src/` only |
+| `src/**/*.ts` | that extension anywhere under `src/` |
+| `**/generated/**` | any `generated/` directory's contents, at any depth |
+| `README.md` | that exact path, at the repo root — not `docs/README.md` |
+| `{lib,main}.rs`, `a?c.rs`, `**/*.[ch]` | alternates, single-character wildcard, character class |
+
+A pattern that is not a legal glob (an unclosed `[`, a dangling `\`) claims no files and is logged
+at `warn`.
+
+**Behaviour change.** These were previously matched by a small hand-written cascade that recognized
+`**/*.ext` and `dir/**` and fell back to *substring containment* for everything else. Patterns of
+those two shapes are unaffected — including every shipped default — but a pattern that relied on the
+fallback now means what a glob says it means. Notably `*.rs` matched any path *containing* `.rs`
+(claiming `notes.rs.bak` and `src/lib.rs.orig`) and now matches a root-level `.rs` file; a bare `*`
+matched the whole tree and now matches root-level files only; and a literal such as `README.md` or
+`vendor` matched any path containing it (`docs/README.md`, `x/vendor/dep.rs`) and now names one
+path. A target `include` that relied on the old containment should be spelled with `**/`.
+
 Supported languages are `rust`, `typescript`, `kotlin`, `c`, `cpp`, `python`, `swift`, `go`, and
 `markdown`. Rust, TypeScript/TSX, Kotlin, C, C++, Python, Swift, and Go source use tree-sitter
 structural indexing when files are under the parser size cap.

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, globs};
 use crate::embedding_models::{
     Backend, EmbeddingModelSpec, FASTEMBED_MODEL_ID, MODEL2VEC_MODEL_ID, spec,
 };
@@ -1101,30 +1101,21 @@ impl ResolvedTarget {
     ///
     /// The single definition of that matching, deliberately: the walk decides what to index and
     /// the per-path resolver decides what an already-known path belongs to, and a second copy of
-    /// the rules lets those two answers drift.
+    /// the rules lets those two answers drift. The patterns are real globs, matched by
+    /// [`globs::pattern_claims`] — the only place a target pattern is interpreted, and the only
+    /// place the glob dialect (see that module for the three pinned `globset` options) is decided.
+    ///
+    /// The boundary a `dir/**` prefix needs — it claims what is INSIDE `dir/`, so it must end at a
+    /// separator, never at a prefix of a NAME (`drafts/**` is not `draftsman.md`, and not the Unix
+    /// file named `drafts\secret.md`) — is now correct by construction: `globset` compiles a
+    /// trailing `/**` to a regex that requires the separator, and `*` cannot cross one at all.
+    /// Pinned by `a_directory_glob_needs_a_separator_after_its_prefix` and
+    /// `a_directory_include_glob_does_not_claim_a_backslash_named_sibling`, not by a hand-written
+    /// prefix check.
     pub fn globs_claim(&self, relative_path: &str) -> bool {
-        !self.exclude.iter().any(|pattern| glob_claims(relative_path, pattern))
-            && self.include.iter().any(|pattern| glob_claims(relative_path, pattern))
+        !self.exclude.iter().any(|pattern| globs::pattern_claims(relative_path, pattern))
+            && self.include.iter().any(|pattern| globs::pattern_claims(relative_path, pattern))
     }
-}
-
-/// Whether one config glob claims `path` (a `/`-separated repo-relative rendering). Three shapes:
-/// a `**/*.ext` suffix, a `dir/**` subtree, and a literal (exact or substring).
-///
-/// A `dir/**` subtree requires the prefix to END AT A SEPARATOR. A bare `starts_with` reads a
-/// PREFIX OF A NAME as a directory boundary, so `drafts/**` also claimed the Unix file
-/// `drafts\secret.md` (and `draftsman.md`), excluding a file that is not in `drafts/` at all —
-/// which is exactly what preserving a literal backslash in the rendering exists to prevent.
-fn glob_claims(path: &str, pattern: &str) -> bool {
-    if let Some(extension) = pattern.strip_prefix("**/*.") {
-        return path.ends_with(&format!(".{extension}"));
-    }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
-    }
-    path == pattern || path.contains(pattern.trim_matches('*'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

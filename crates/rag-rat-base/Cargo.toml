@@ -17,6 +17,7 @@ unicode-normalization.workspace = true
 anyhow.workspace = true
 dunce.workspace = true
 gix.workspace = true
+globset.workspace = true
 libc.workspace = true
 path-slash.workspace = true
 serde.workspace = true

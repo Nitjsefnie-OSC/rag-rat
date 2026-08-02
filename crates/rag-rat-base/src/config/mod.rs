@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::language::LanguageError;
 
 mod discovery;
+mod globs;
 mod load;
 mod raw;
 mod types;

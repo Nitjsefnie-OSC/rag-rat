@@ -94,6 +94,10 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # `rand`/`rand_core` pulled in for this), keeping `from_seed` the sole key constructor.
 getrandom = "0.4"
 gix = { version = "0.86.0", default-features = false, features = ["status", "parallel", "sha1", "sha256", "revision", "blob-diff", "blame"] }
+# The glob matcher behind a target's include/exclude patterns. Already compiled on every build as
+# `ignore`'s own matching layer (the same one ripgrep uses), so depending on it directly adds
+# nothing to the lock file, the audit gate or the deny gate.
+globset = "0.4.19"
 httpdate = "1.0"
 libc = "0.2"
 # Win32 bindings for the Lens discovery credential's owner-only DACL. Unix keeps the token private
