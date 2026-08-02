@@ -1,6 +1,7 @@
 name: plugin-test
 
 # Exercises the plugin install/run surfaces that unit tests can't:
+#   * each shipped skill still byte-matches its .agents/skills source
 #   * launcher × Linux glibc/musl matrix (does the binary run + does the launcher wire MCP stdio?)
 #   * Claude Code non-interactive plugin install + manifest validation
 #   * Codex marketplace-add manifest validation
@@ -11,6 +12,9 @@ on:
   pull_request:
     paths:
       - "plugin/**"
+      # The skill sources: drift between a source and its shipped copy can be introduced from
+      # either side, and a .agents-only edit touches nothing under plugin/ (#1075).
+      - ".agents/skills/**"
       - ".cursor-plugin/**"
       - ".github/workflows/plugin-test.yml"
   workflow_dispatch:
@@ -28,6 +32,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── plugin/skills/<name> is a hand-maintained copy of .agents/skills/<name>; diff every pair ─────
+  # ── No build, so no `if:` guard — it costs seconds and is worth running in the dispatch mode too. ─
+  skill-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash plugin/test/verify-skill-parity.sh
+
   # ── Build a rag-rat once so the launcher matrix can drive a real MCP handshake ──────────────────
   build-binary:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}

@@ -4,6 +4,7 @@ Layered so each layer is as cheap and un-flaky as possible. Driven by `.github/w
 
 | Layer | What it proves | Auth? | Runner |
 |---|---|---|---|
+| **L0 skill parity** | every `plugin/skills/<name>` still byte-matches its `.agents/skills/<name>` source | none | plain checkout |
 | **L1 launcher × glibc/musl** | the binary runs on a distro **and** the launcher wires MCP stdio | none | Docker matrix |
 | **L2 Claude install** | manifests validate; MCP + skills + **hooks** register (asserts `Hooks (≥1)`) | none | `npm i -g @anthropic-ai/claude-code` |
 | **L2 Codex install** | `plugin add`/`list` install + enable; components stage into cache | none | `npm i -g @openai/codex` |
@@ -16,6 +17,9 @@ session would need an API key and is **deliberately out of scope** — see the n
 ## Run locally
 
 ```bash
+# L0 — no dependencies at all, just the checkout:
+bash plugin/test/verify-skill-parity.sh
+
 # L1 — launcher against a local build (full handshake):
 RAG_RAT_BIN="$(command -v rag-rat)" sh plugin/test/verify-launcher.sh
 # L1 — logic only (no binary): syntax + --no-install no-op; handshake skipped
