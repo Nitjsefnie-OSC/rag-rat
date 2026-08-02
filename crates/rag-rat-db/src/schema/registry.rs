@@ -665,10 +665,14 @@ fn acquire_dual_repo_locks(
 }
 
 /// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
-/// id (its DERIVED data): the A5 periphery list MINUS the three memory tables, which are AUTHORED
-/// and are MOVED onto the target id instead. Children fall via `ON DELETE CASCADE`
-/// (`clone_edges`/`clone_subblock_postings` off `clone_graph_generations`,
-/// `logical_symbol_members` off `logical_symbols` — deleted via [`DIRECT_SCOPED_ADOPTION_TABLES`]).
+/// id (its DERIVED data): the A5 periphery list minus 7 entries. Four are AUTHORED and are MOVED
+/// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`, and
+/// `repo_node_edges`. The remaining three are the dream-v2 verification siblings
+/// (`memory_reality`, `memory_summaries`, `memory_model_failures`): this merge neither moves nor
+/// deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
+/// Children fall via `ON DELETE CASCADE` (`clone_edges`/`clone_subblock_postings` off
+/// `clone_graph_generations`, `logical_symbol_members` off `logical_symbols` — deleted via
+/// [`DIRECT_SCOPED_ADOPTION_TABLES`]).
 const LATE_MERGE_DERIVED_PERIPHERY_TABLES: &[&str] = &[
     "clone_graph_generations",
     "clone_token_df",
@@ -1385,4 +1389,258 @@ pub fn is_root_already_indexed_conn(
         return repo_indexed_at_this_root(conn, &sole, config);
     }
     Ok(false)
+}
+
+/// TRIPWIRE (#571): the adoption coverage lists in this module are HAND-AUDITED against every
+/// `repo_id`-carrying table, and the audit note dates the last full pass to V044. V056
+/// (`git_change_couplings`) shipped absent from both lists with the full suite green: no test
+/// could see the omission. These tests turn the audit into a gate.
+///
+/// The enumeration comes from the FRESHLY BOOTSTRAPPED SCHEMA ITSELF —
+/// [`super::repo_scoped_table_names`], the same `sqlite_master` × `PRAGMA table_info` sweep the
+/// purge runs on — never from a roster restated here. A restated roster would pin nothing: the
+/// defect this guards against IS an omission from a hand-written list, and a second hand-written
+/// list reproduces it exactly (the new table would be forgotten in both places at once).
+///
+/// A new `repo_id`-scoped table therefore fails these tests until its disposition is declared on
+/// BOTH re-point paths — the in-place LocalOnly→Portable adoption in [`register_repo`] and the
+/// late-merge retirement in [`merge_local_incumbent_into_registered`].
+#[cfg(test)]
+mod repo_id_scope_coverage {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    /// `(table, why)` — a `repo_id` table whose adoption disposition is settled somewhere OTHER
+    /// than the two loops: an explicit statement in [`register_repo`], or an FK that carries it.
+    const ADOPTION_HANDLED_ELSEWHERE: &[(&str, &str)] = &[
+        (
+            "repos",
+            "the registry table itself — `repo_id` is its primary key, not a scope column; \
+             adoption INSERTs the new row and DELETEs the source one",
+        ),
+        (
+            "repo_meta",
+            "explicit UPDATE in the adoption transaction, every key except the shallow boundary \
+             (deliberately left behind so the source row's cascade drops it)",
+        ),
+        (
+            "repo_roots",
+            "explicit UPDATE, ordered BEFORE the source `repos` row is deleted — its FK would \
+             otherwise cascade the roots away",
+        ),
+        (
+            "git_file_changes",
+            "deliberately NOT updated: its `(repo_id, commit_hash)` FK to `git_commits` is `ON \
+             UPDATE CASCADE`, so re-pointing `git_commits` carries it, and an explicit UPDATE \
+             would trip the FK (child before parent)",
+        ),
+    ];
+
+    /// `(table, why)` — a `repo_id` table whose disposition is settled somewhere OTHER than the
+    /// two DELETE loops of [`merge_local_incumbent_into_registered`]: an AUTHORED move onto the
+    /// target id, or an FK that drops it with a deleted parent.
+    const LATE_MERGE_HANDLED_ELSEWHERE: &[(&str, &str)] = &[
+        ("repos", "the retiring owner's row is DELETEd outright"),
+        (
+            "repo_meta",
+            "falls with the owner's `repos` row via `ON DELETE CASCADE`, the now-meaningless \
+             shallow boundary included",
+        ),
+        ("repo_roots", "explicitly moved onto the target id before the owner's `repos` row falls"),
+        (
+            "git_file_changes",
+            "falls via `ON DELETE CASCADE` from the `git_commits` rows the direct-scoped DELETE \
+             loop removes",
+        ),
+        (
+            "repo_memories",
+            "AUTHORED: explicitly moved onto the target id — the memory `id` is the bare PK, so a \
+             re-point can never collide",
+        ),
+        (
+            "repo_memory_bindings",
+            "AUTHORED: moved with its memories, local rowid references NULLed for the validate \
+             loop to re-resolve from the portable anchor",
+        ),
+        ("repo_memory_fts", "AUTHORED: the memories' FTS mirror, moved with them"),
+        (
+            "repo_node_edges",
+            "AUTHORED: explicitly moved — owner `repo_id` plus any SAME-repo `target_repo_id` (a \
+             cross-repo target names a sibling and stays)",
+        ),
+    ];
+
+    /// `(table, what is unresolved)` — the table-sync bookkeeping. These carry `repo_id`, are
+    /// swept by the purge's class-level backstop, and are re-pointed by NEITHER path here; no FK
+    /// reaches them either. Their `repo_id` sits beside a derived `stream_id` (itself bound to an
+    /// account-authorized repository incarnation), so whether an id move must re-point them or
+    /// must deliberately abandon them with the retired stream is a sync-layer ruling, not one
+    /// this test makes. Parked — not settled — so the tripwire stays armed for the NEXT table
+    /// instead of being deleted, and so the open question is visible in the source.
+    const TABLE_SYNC_UNRESOLVED: &[(&str, &str)] = &[
+        (
+            "table_sync_streams",
+            "the stream directory row records the `repo_id` it was derived under",
+        ),
+        (
+            "sync_published_rows",
+            "post-apply anti-echo records, keyed `(stream_id, table_name, row_pk)`",
+        ),
+        ("sync_row_clocks", "per-row last-writer-wins clocks, same keying"),
+        ("sync_row_tombstones", "per-row delete clocks, same keying"),
+    ];
+
+    /// `(table, what is unresolved)` — the dream-v2 verification siblings on the LATE-MERGE path
+    /// only. They are in [`A5_PERIPHERY_DIRECT_SCOPED_TABLES`], so the in-place adoption re-points
+    /// them; the merge neither moves nor deletes them, and no FK reaches them. Since the memories
+    /// they annotate DO move onto the target id, their verdicts/summaries are left behind under
+    /// the retiring id — where a per-active-repo gc sweep never reaches. Parked pending a ruling
+    /// (move with the memories, or drop as derived like `dream_findings`).
+    const LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED: &[(&str, &str)] = &[
+        ("memory_reality", "keyed `(repo_id, memory_id)`; neither moved nor deleted"),
+        (
+            "memory_summaries",
+            "keyed `(repo_id, memory_id, content_hash)`; neither moved nor deleted",
+        ),
+        ("memory_model_failures", "keyed `(repo_id, memory_id, pass)`; neither moved nor deleted"),
+    ];
+
+    /// A connection carrying the full shipped schema — in-memory, because the enumeration reads
+    /// `sqlite_master` and needs no durability.
+    fn latest_schema() -> Connection {
+        let conn = Connection::open_in_memory().expect("an in-memory store opens");
+        super::super::apply(&conn, &MigrationHooks::noop()).expect("the shipped schema applies");
+        conn
+    }
+
+    /// Floor on the number of `repo_id`-scoped tables [`scoped_tables`] must see — a bootstrap that
+    /// produced a near-empty schema would enumerate nothing, and "every enumerated table is
+    /// declared" is vacuously true over an empty set: the coverage tests would go green precisely
+    /// when they check nothing. The live count is 50, so the floor leaves room for a retired table
+    /// without going soft.
+    const MIN_REPO_SCOPED_TABLES: usize = 40;
+
+    /// Every `repo_id`-scoped table the live schema carries — the input set BOTH coverage
+    /// assertions range over, with a floor on its breadth ([`MIN_REPO_SCOPED_TABLES`]).
+    fn scoped_tables() -> Vec<String> {
+        let conn = latest_schema();
+        let repo_id_tables = super::super::repo_scoped_table_names(&conn)
+            .expect("the repo_id sweep reads sqlite_master");
+        assert!(
+            repo_id_tables.len() >= MIN_REPO_SCOPED_TABLES,
+            "expected the sweep to see the whole schema (>= {MIN_REPO_SCOPED_TABLES} repo_id \
+             tables), saw {} — the coverage assertions would pass vacuously over an enumeration \
+             this narrow",
+            repo_id_tables.len()
+        );
+        repo_id_tables
+    }
+
+    fn table_names(entries: &[(&'static str, &'static str)]) -> Vec<&'static str> {
+        entries.iter().map(|(table, _)| *table).collect()
+    }
+
+    /// The declared tables for one re-point `path`, asserting no table is declared TWICE: a
+    /// disposition is one choice, so a name in two sets means two of them disagree about it.
+    fn declared_for(path: &str, sets: &[(&str, Vec<&'static str>)]) -> Vec<&'static str> {
+        let mut seen: BTreeMap<&'static str, &str> = BTreeMap::new();
+        for (set, tables) in sets {
+            for table in tables {
+                if let Some(first) = seen.insert(table, set) {
+                    panic!(
+                        "`{table}` is declared in both `{first}` and `{set}` on the {path} path — \
+                         a table has exactly ONE disposition, so two entries mean two of them are \
+                         acting on it"
+                    );
+                }
+            }
+        }
+        seen.into_keys().collect()
+    }
+
+    fn adoption_sets() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            ("DIRECT_SCOPED_ADOPTION_TABLES", DIRECT_SCOPED_ADOPTION_TABLES.to_vec()),
+            ("A5_PERIPHERY_DIRECT_SCOPED_TABLES", A5_PERIPHERY_DIRECT_SCOPED_TABLES.to_vec()),
+            ("ADOPTION_HANDLED_ELSEWHERE", table_names(ADOPTION_HANDLED_ELSEWHERE)),
+            ("TABLE_SYNC_UNRESOLVED", table_names(TABLE_SYNC_UNRESOLVED)),
+        ]
+    }
+
+    fn late_merge_sets() -> Vec<(&'static str, Vec<&'static str>)> {
+        vec![
+            ("DIRECT_SCOPED_ADOPTION_TABLES", DIRECT_SCOPED_ADOPTION_TABLES.to_vec()),
+            ("LATE_MERGE_DERIVED_PERIPHERY_TABLES", LATE_MERGE_DERIVED_PERIPHERY_TABLES.to_vec()),
+            ("LATE_MERGE_HANDLED_ELSEWHERE", table_names(LATE_MERGE_HANDLED_ELSEWHERE)),
+            (
+                "LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED",
+                table_names(LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED),
+            ),
+            ("TABLE_SYNC_UNRESOLVED", table_names(TABLE_SYNC_UNRESOLVED)),
+        ]
+    }
+
+    /// Every `repo_id` table the live schema carries that `sets` does not account for.
+    fn undeclared(sets: &[(&str, Vec<&'static str>)], path: &str) -> Vec<String> {
+        let declared = declared_for(path, sets);
+        scoped_tables().into_iter().filter(|table| !declared.contains(&table.as_str())).collect()
+    }
+
+    fn set_names(sets: &[(&str, Vec<&'static str>)]) -> String {
+        sets.iter().map(|(set, _)| format!("`{set}`")).collect::<Vec<_>>().join(", ")
+    }
+
+    #[test]
+    fn every_repo_id_table_declares_an_in_place_adoption_disposition() {
+        let sets = adoption_sets();
+        let missing = undeclared(&sets, "in-place adoption");
+        assert!(
+            missing.is_empty(),
+            "{missing:?} carry a `repo_id` column but appear in none of {}. A LocalOnly→Portable \
+             in-place upgrade re-points the `repos` row and every listed table; rows in an \
+             unlisted one STRAND under the retired id, invisible to every per-repo read and to \
+             the per-active-repo gc. Add each table to the list matching its disposition (or, if \
+             an FK or an explicit statement already carries it, to `ADOPTION_HANDLED_ELSEWHERE` \
+             with that reason).",
+            set_names(&sets),
+        );
+    }
+
+    #[test]
+    fn every_repo_id_table_declares_a_late_merge_disposition() {
+        let sets = late_merge_sets();
+        let missing = undeclared(&sets, "late merge");
+        assert!(
+            missing.is_empty(),
+            "{missing:?} carry a `repo_id` column but appear in none of {}. The late-merge \
+             retirement MOVES authored rows onto the target id and DELETEs derived ones under the \
+             retiring id; rows in an unlisted table survive their `repos` row as permanent \
+             invisible garbage (gc sweeps are per ACTIVE repo). Add each table to the list \
+             matching its disposition (or, if an FK or an explicit statement already carries it, \
+             to `LATE_MERGE_HANDLED_ELSEWHERE` with that reason).",
+            set_names(&sets),
+        );
+    }
+
+    /// The reverse direction: both re-point loops SKIP a table they cannot find (the adoption
+    /// loop guards on table presence, the periphery loop on column presence — both for the
+    /// partial-schema bootstrap fixtures), so a misspelled or renamed entry is a silent no-op
+    /// that no coverage assertion above can see.
+    #[test]
+    fn every_declared_table_is_a_live_repo_id_table() {
+        let scoped = scoped_tables();
+        let mut sets = adoption_sets();
+        sets.extend(late_merge_sets());
+        for (set, tables) in &sets {
+            for table in tables {
+                assert!(
+                    scoped.iter().any(|live| live == table),
+                    "`{table}` is listed in `{set}`, but no table of that name carries a \
+                     `repo_id` column at the latest schema. Both re-point loops skip what they \
+                     cannot find, so a renamed or misspelled entry is a silent no-op.",
+                );
+            }
+        }
+    }
 }
