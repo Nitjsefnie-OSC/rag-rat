@@ -585,9 +585,17 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     if raw.starts_with('<') {
         return CallRole::Skip;
     }
-    let stripped = strip_generics(raw);
-    let segments: Vec<&str> =
-        stripped.split("::").map(str::trim).filter(|segment| !segment.is_empty()).collect();
+    let stripped = degeneric_path(raw);
+    // TOP-LEVEL segments only. A `::` inside a `(…)`/`[…]` group is argument text, which
+    // `degeneric_path` keeps, so splitting on every `::` would read a longer path than the source
+    // wrote and take the tail from the arguments: `Transaction::new_unchecked(&conn,
+    // TransactionBehavior::Immediate).unwrap` is a `Type::assoc(..)` constructor, not a call whose
+    // tail is the PascalCase `Immediate).unwrap`.
+    let segments: Vec<&str> = scope_grammar::segments(&stripped)
+        .into_iter()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect();
     let Some(tail) = segments.last() else {
         return CallRole::Delegate;
     };
@@ -704,5 +712,60 @@ pub(super) fn rust_dispatch_handle_facts(
                 Some(key.clone()),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod classify_call_tests {
+    use super::*;
+
+    /// Breadth-first, so the shallowest match is the outermost call, and iterative so it is not a
+    /// recursive tree descender (#543).
+    fn outermost_call<'tree>(root: Node<'tree>) -> Option<Node<'tree>> {
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(node) = queue.pop_front() {
+            if node.kind() == "call_expression" {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            queue.extend(node.children(&mut cursor));
+        }
+        None
+    }
+
+    fn role_of(expression: &str) -> CallRole {
+        let source = format!("fn probe() {{ {expression}; }}");
+        let parsed = crate::index::parser::parse_file(
+            std::path::Path::new("probe.rs"),
+            rag_rat_base::language::Language::Rust,
+            &source,
+        )
+        .expect("probe parses");
+        classify_call(outermost_call(parsed.root()).expect("a call expression"), &source)
+    }
+
+    /// A `::` inside the ARGUMENT list is not a path separator, so the classified TAIL is the real
+    /// callee rather than the last argument fragment. `Transaction::new_unchecked(..)` is a
+    /// `Type::assoc(..)` constructor (Skip); reading its tail as the PascalCase `Immediate).unwrap`
+    /// would bill it as a transparent variant wrapper instead.
+    #[test]
+    fn a_nested_separator_does_not_move_the_callee_into_the_arguments() {
+        assert!(matches!(
+            role_of("Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap()"),
+            CallRole::Skip
+        ));
+        // The handler is `handle`; `Resp::Embedded` is its argument, not its callee.
+        assert!(matches!(role_of("handle(Resp::Embedded(payload))"), CallRole::Delegate));
+    }
+
+    /// The ordinary shapes keep their roles.
+    #[test]
+    fn top_level_paths_keep_their_roles() {
+        assert!(matches!(role_of("Resp::Embedded(body)"), CallRole::Wrapper));
+        assert!(matches!(role_of("Ok(body)"), CallRole::Wrapper));
+        assert!(matches!(role_of("Err(problem)"), CallRole::Skip));
+        assert!(matches!(role_of("Config::from_env(path)"), CallRole::Skip));
+        assert!(matches!(role_of("render_page(body)"), CallRole::Delegate));
+        assert!(matches!(role_of("<Resp as Default>::default()"), CallRole::Skip));
     }
 }

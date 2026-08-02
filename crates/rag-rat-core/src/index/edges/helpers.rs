@@ -2,43 +2,9 @@ use std::collections::BTreeSet;
 
 use super::*;
 
-/// Remove balanced `<...>` generic-argument regions from a call path — and the turbofish's leading
-/// `::` (`f::<a::B>` → `f`, `Vec::<u8>::new` → `Vec::new`) — so a generic argument's `::` /
-/// identifiers don't corrupt path-based call name / receiver / qualified-name extraction. `<`/`>`
-/// inside a `{...}` const-generic block (`Foo::<{ 1 << 2 }>`) are shift/comparison operators, not
-/// generic delimiters, so brace regions suppress angle counting.
-///
-/// A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default`), NOT a generic argument —
-/// stripping it would drop the type/receiver and mangle the qualified name (#208 review round 10),
-/// so a path that starts with `<` is returned unchanged.
-pub(crate) fn strip_generics(path: &str) -> String {
-    if path.trim_start().starts_with('<') {
-        return path.to_string();
-    }
-    let mut out = String::new();
-    let mut angle: u32 = 0;
-    let mut brace: u32 = 0;
-    for ch in path.chars() {
-        match ch {
-            '{' => brace += 1,
-            '}' => brace = brace.saturating_sub(1),
-            '<' if brace == 0 => {
-                if angle == 0 && out.ends_with("::") {
-                    out.truncate(out.len() - 2);
-                }
-                angle += 1;
-            },
-            '>' if brace == 0 => angle = angle.saturating_sub(1),
-            _ if angle == 0 => out.push(ch),
-            _ => {},
-        }
-    }
-    out
-}
-
 pub(crate) fn target_qualified_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let value = strip_generics(&node_text(function, text));
+    let value = degeneric_path(&node_text(function, text));
     (value.contains("::") || value.contains('.')).then(|| value.replace('.', "::"))
 }
 
@@ -187,21 +153,23 @@ pub(crate) fn call_target_node(node: Node<'_>) -> Option<Node<'_>> {
         .or_else(|| first_identifier_node(node))
         .map(final_segment_node)
 }
+/// The name a call hangs off — the head of `Type::method` / `receiver.method`.
+///
+/// The `::` split is [`scope_grammar::segments`]' TOP-LEVEL one. `degeneric_path` deliberately
+/// keeps a `::` that sits inside a `(…)`/`[…]` group, because there it is argument text rather
+/// than a path separator, so splitting on every `::` would take the head from the arguments:
+/// `conn.execute("…", rusqlite::params![…]).unwrap` hangs off `conn`, not off the `rusqlite` in
+/// its argument list, and `stmt.query_map(.., |row| row.get::<_, String>(0)).unwrap` hangs off
+/// `stmt`, not off the `get` buried in the closure.
 pub(crate) fn scoped_receiver_name(node: Node<'_>, text: &str) -> Option<String> {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let value = strip_generics(&node_text(function, text));
-    let separator = if value.contains("::") {
-        "::"
-    } else if value.contains('.') {
-        "."
-    } else {
-        return None;
+    let value = degeneric_path(&node_text(function, text));
+    let head = match scope_grammar::segments(&value).as_slice() {
+        [head, _, ..] => head,
+        _ if value.contains('.') => value.split('.').next()?,
+        _ => return None,
     };
-    value
-        .split(separator)
-        .next()
-        .map(|name| short_name(name.trim()).to_string())
-        .filter(|name| !name.is_empty())
+    Some(short_name(head.trim()).to_string()).filter(|name| !name.is_empty())
 }
 pub(crate) fn child_name_text(node: Node<'_>, text: &str) -> Option<String> {
     node.child_by_field_name("name")
@@ -797,5 +765,71 @@ mod containing_symbol_tests {
         let selected = locator.find_index_by(8_190, || probes += 1);
         assert_eq!(selected.map(|index| symbols[index].id), Some(4_095));
         assert!(probes <= 14, "{probes} probes for {} symbols", symbols.len());
+    }
+}
+
+#[cfg(test)]
+mod scoped_receiver_name_tests {
+    use super::*;
+
+    /// The outermost `call_expression` in a parsed snippet — the one whose `function` field spans
+    /// a whole method chain, which is where a nested `::` can appear.
+    ///
+    /// Breadth-first, so the shallowest match is the outermost one, and iterative so it is not a
+    /// recursive tree descender (#543).
+    fn outermost_call<'tree>(root: Node<'tree>) -> Option<Node<'tree>> {
+        let mut queue = std::collections::VecDeque::from([root]);
+        while let Some(node) = queue.pop_front() {
+            if node.kind() == "call_expression" {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            queue.extend(node.children(&mut cursor));
+        }
+        None
+    }
+
+    fn receiver_of(expression: &str) -> Option<String> {
+        let source = format!("fn probe() {{ {expression}; }}");
+        let parsed = crate::index::parser::parse_file(
+            std::path::Path::new("probe.rs"),
+            Language::Rust,
+            &source,
+        )?;
+        scoped_receiver_name(outermost_call(parsed.root())?, &source)
+    }
+
+    /// A `::` inside the ARGUMENT list is not a path separator, so the head of the path — the name
+    /// the call hangs off — is never taken from the arguments.
+    #[test]
+    fn a_nested_separator_does_not_move_the_receiver_into_the_arguments() {
+        assert_eq!(
+            receiver_of(
+                r#"conn.execute("INSERT INTO t VALUES (?1)", rusqlite::params![x]).unwrap()"#
+            )
+            .as_deref(),
+            Some("conn"),
+            "a `::` path spelled in the arguments"
+        );
+        assert_eq!(
+            receiver_of("stmt.query_map([], |row| row.get::<_, String>(0)).unwrap()").as_deref(),
+            Some("stmt"),
+            "a turbofish inside a closure inside the arguments"
+        );
+        assert_eq!(
+            receiver_of("items.iter().map(|v| v.parse::<i64>()).collect::<Vec<_>>()").as_deref(),
+            Some("items"),
+            "a turbofish in the arguments AND one on the outermost callee"
+        );
+    }
+
+    /// A TOP-LEVEL `::` still separates, and still outranks a later `.`.
+    #[test]
+    fn a_top_level_separator_still_names_the_owner() {
+        assert_eq!(receiver_of("Worker::spawn(cfg).run()").as_deref(), Some("Worker"));
+        assert_eq!(receiver_of("a::b::Worker::spawn()").as_deref(), Some("a"));
+        assert_eq!(receiver_of("Vec::<u8>::new()").as_deref(), Some("Vec"));
+        assert_eq!(receiver_of("worker.run()").as_deref(), Some("worker"));
+        assert_eq!(receiver_of("bare()").as_deref(), None, "no separator at all");
     }
 }
