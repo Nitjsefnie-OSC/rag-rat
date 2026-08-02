@@ -665,10 +665,14 @@ fn acquire_dual_repo_locks(
 }
 
 /// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
-/// id (its DERIVED data): the A5 periphery list MINUS the three memory tables, which are AUTHORED
-/// and are MOVED onto the target id instead. Children fall via `ON DELETE CASCADE`
-/// (`clone_edges`/`clone_subblock_postings` off `clone_graph_generations`,
-/// `logical_symbol_members` off `logical_symbols` — deleted via [`DIRECT_SCOPED_ADOPTION_TABLES`]).
+/// id (its DERIVED data): the A5 periphery list minus 7 entries. Four are AUTHORED and are MOVED
+/// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`, and
+/// `repo_node_edges`. The remaining three are the dream-v2 verification siblings
+/// (`memory_reality`, `memory_summaries`, `memory_model_failures`): this merge neither moves nor
+/// deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
+/// Children fall via `ON DELETE CASCADE` (`clone_edges`/`clone_subblock_postings` off
+/// `clone_graph_generations`, `logical_symbol_members` off `logical_symbols` — deleted via
+/// [`DIRECT_SCOPED_ADOPTION_TABLES`]).
 const LATE_MERGE_DERIVED_PERIPHERY_TABLES: &[&str] = &[
     "clone_graph_generations",
     "clone_token_df",
@@ -1510,19 +1514,24 @@ mod repo_id_scope_coverage {
         conn
     }
 
+    /// Floor on the number of `repo_id`-scoped tables [`scoped_tables`] must see — a bootstrap that
+    /// produced a near-empty schema would enumerate nothing, and "every enumerated table is
+    /// declared" is vacuously true over an empty set: the coverage tests would go green precisely
+    /// when they check nothing. The live count is 50, so the floor leaves room for a retired table
+    /// without going soft.
+    const MIN_REPO_SCOPED_TABLES: usize = 40;
+
     /// Every `repo_id`-scoped table the live schema carries — the input set BOTH coverage
-    /// assertions range over, with a floor on its breadth. A bootstrap that produced a near-empty
-    /// schema would enumerate nothing, and "every enumerated table is declared" is vacuously true
-    /// over an empty set: the coverage tests would go green precisely when they check nothing. The
-    /// live count is 50, so the floor leaves room for a retired table without going soft.
+    /// assertions range over, with a floor on its breadth ([`MIN_REPO_SCOPED_TABLES`]).
     fn scoped_tables() -> Vec<String> {
         let conn = latest_schema();
         let repo_id_tables = super::super::repo_scoped_table_names(&conn)
             .expect("the repo_id sweep reads sqlite_master");
         assert!(
-            repo_id_tables.len() >= 40,
-            "expected the sweep to see the whole schema (>= 40 repo_id tables), saw {} — the \
-             coverage assertions would pass vacuously over an enumeration this narrow",
+            repo_id_tables.len() >= MIN_REPO_SCOPED_TABLES,
+            "expected the sweep to see the whole schema (>= {MIN_REPO_SCOPED_TABLES} repo_id \
+             tables), saw {} — the coverage assertions would pass vacuously over an enumeration \
+             this narrow",
             repo_id_tables.len()
         );
         repo_id_tables
