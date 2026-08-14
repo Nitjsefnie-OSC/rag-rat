@@ -9,10 +9,18 @@ use tree_sitter::Node;
 use crate::index::edges::extract::EdgeEmitter;
 use crate::index::edges::*;
 
-/// PascalCase test for the enum/variant convention (#200): first char uppercase AND at least one
-/// lowercase — so `MlReq`/`Upsert` qualify but `new`, a SCREAMING `CONST`, and a bare `T` do not.
+/// PascalCase test for the enum/variant convention (#200): the segment's LEADING IDENTIFIER starts
+/// with an uppercase char AND carries at least one lowercase — so `MlReq`/`Upsert` qualify but
+/// `new`, a SCREAMING `CONST`, and a bare `T` do not.
+///
+/// Only that leading identifier is weighed because a segment can carry a method chain glued onto
+/// its head (`TOOL_NAMES.iter().map`, `NOW.elapsed`). The appended method names supply the very
+/// lowercase the test looks for, so reading the whole segment takes a constant for a variant
+/// constructor and bills the call as a transparent wrapper instead of the delegation it is (#1124).
 fn is_pascal_case(name: &str) -> bool {
-    name.chars().next().is_some_and(char::is_uppercase) && name.chars().any(char::is_lowercase)
+    let mut head =
+        name.chars().take_while(|&character| character.is_alphanumeric() || character == '_');
+    head.next().is_some_and(char::is_uppercase) && head.any(char::is_lowercase)
 }
 
 /// The `Enum::Variant` dispatch key from a scoped path node — its last two `::`-segments when BOTH
@@ -767,5 +775,34 @@ mod classify_call_tests {
         assert!(matches!(role_of("Config::from_env(path)"), CallRole::Skip));
         assert!(matches!(role_of("render_page(body)"), CallRole::Delegate));
         assert!(matches!(role_of("<Resp as Default>::default()"), CallRole::Skip));
+    }
+
+    /// A `SCREAMING_CONST` head carrying a method chain is a plain delegation, not a transparent
+    /// variant constructor (#1124). The chain's method names supply the lowercase the case test
+    /// looks for, so reading the whole segment bills `TOOL_NAMES.iter().map(..)` as a wrapper and
+    /// traces through the constant instead of recording the call as the handler.
+    #[test]
+    fn a_screaming_const_with_a_method_chain_is_not_a_wrapper() {
+        assert!(matches!(
+            role_of("crate::tools::TOOL_NAMES.iter().map(|name| describe(name))"),
+            CallRole::Delegate
+        ));
+        // A single-word constant has no underscore to give it away and reads the same way.
+        assert!(matches!(role_of("NOW.elapsed()"), CallRole::Delegate));
+    }
+
+    /// The case test reads the segment's leading IDENTIFIER, so a glued-on method chain cannot lend
+    /// its lowercase to a constant head, while an acronym-led type keeps its leading uppercase run.
+    /// A head that is genuinely PascalCase stays a constructor however the rest of the segment is
+    /// spelled — including a trailing method name carrying an underscore, which is the conservative
+    /// reading for the false-edge contract.
+    #[test]
+    fn the_case_test_reads_the_segments_leading_identifier() {
+        for name in ["TOOL_NAMES", "TOOL_NAMES.iter().map", "NOW", "NOW.elapsed", "T", "run"] {
+            assert!(!is_pascal_case(name), "{name}");
+        }
+        for name in ["MlReq", "Upsert", "HTTPResponse", "Wrapped(payload).to_string"] {
+            assert!(is_pascal_case(name), "{name}");
+        }
     }
 }
