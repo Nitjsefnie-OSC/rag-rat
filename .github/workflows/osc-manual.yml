@@ -39,7 +39,8 @@ jobs:
       # A dispatch run always reports head_branch/head_sha of the DEFAULT branch this file
       # lives on, never the tree it checked out. This line is the only proof of what ran.
       - name: Show checked-out ref
-        run: 'echo "checked-out SHA: $(git rev-parse HEAD)"'
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
       # rustfmt.toml uses nightly-only options, so the format check must run on nightly.
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -54,7 +55,8 @@ jobs:
         with:
           ref: ${{ inputs.target_ref }}
       - name: Show checked-out ref
-        run: 'echo "checked-out SHA: $(git rev-parse HEAD)"'
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -71,7 +73,8 @@ jobs:
         with:
           ref: ${{ inputs.target_ref }}
       - name: Show checked-out ref
-        run: 'echo "checked-out SHA: $(git rev-parse HEAD)"'
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
