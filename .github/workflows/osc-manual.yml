@@ -1,0 +1,80 @@
+# Manual dispatch wrapper for fork-side verification.
+#
+# Lives on the fork's DEFAULT branch only: GitHub reads `workflow_dispatch` from the
+# default branch, so this file must never be committed to a feature branch. It carries
+# upstream CI's own job steps behind an input-driven checkout, so a feature branch can be
+# verified on a runner before any pull request exists.
+#
+# Mirrors the `fmt`, `clippy` and `test` jobs of upstream `.github/workflows/ci.yml`.
+# The feature-gated jobs (`clippy-all-features`, `build-full`) are deliberately not
+# mirrored: they compile ort/fastembed and download the ONNX runtime, while this project's
+# fork-side verification runs the `--no-default-features --locked` hash-only configuration.
+#
+# Shared by every branch dispatched through it — never add a branch-specific step here.
+name: osc-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch, tag or SHA to check out and verify
+        required: true
+
+# Least privilege, matching upstream CI.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      # A dispatch run always reports head_branch/head_sha of the DEFAULT branch this file
+      # lives on, never the tree it checked out. This line is the only proof of what ran.
+      - name: Show checked-out ref
+        run: 'echo "checked-out SHA: $(git rev-parse HEAD)"'
+      # rustfmt.toml uses nightly-only options, so the format check must run on nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: 'echo "checked-out SHA: $(git rev-parse HEAD)"'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --no-default-features = hash-only build: no ONNX/model downloads, fast and network-free.
+      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: 'echo "checked-out SHA: $(git rev-parse HEAD)"'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      # Hash embedder only (no model downloads), matching upstream's `test` job.
+      - name: Run tests (nextest)
+        run: cargo nextest run --workspace --no-default-features --locked --profile ci
