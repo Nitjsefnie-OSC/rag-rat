@@ -295,7 +295,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let overlay_worktree = worktree_id_of(&linked);
     let overlay_id = scoped_file_id(&db, "src/lib.rs", &overlay_worktree);
     let sibling_resolution =
-        edges::intern_edge_string(&db.storage.connection(), "sibling_resolution").unwrap();
+        edges::intern_edge_string(db.storage.connection(), "sibling_resolution").unwrap();
     db.storage
         .connection()
         .execute(
