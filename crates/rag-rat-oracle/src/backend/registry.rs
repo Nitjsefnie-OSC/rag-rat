@@ -353,13 +353,24 @@ impl LiveBackend {
             ReadinessPolicy::ServerStatus => None,
             ReadinessPolicy::WorkDoneProgress =>
                 self.project_model.and_then(|model| match model.scope {
-                    ProjectScope::Enclosing => documents::find_document_in_project(
-                        checkout,
-                        checkout.root(),
-                        self.languages,
-                        model.files(),
-                        false,
-                    ),
+                    ProjectScope::Enclosing => {
+                        // `enclosing_project_dir` accepts a file path and starts at its parent;
+                        // the synthetic child makes the checkout root the first directory it
+                        // probes while preserving the helper's file-oriented semantics.
+                        let inside_project = documents::enclosing_project_dir(
+                            checkout,
+                            &checkout.root().join("__warmup_document__"),
+                            model.files(),
+                        )
+                        .is_some();
+                        documents::find_document_in_project(
+                            checkout,
+                            checkout.root(),
+                            self.languages,
+                            model.files(),
+                            inside_project,
+                        )
+                    },
                     // The marker can sit anywhere, so the two halves are searched independently
                     // and a document only counts once the marker has been found somewhere.
                     // The warm-up must pick a document the session can actually configure, or it
