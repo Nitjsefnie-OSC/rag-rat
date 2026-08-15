@@ -73,6 +73,7 @@ tree-sitter-rust.workspace = true
 tree-sitter-swift.workspace = true
 tree-sitter-typescript.workspace = true
 minicbor.workspace = true
+unicode-ident.workspace = true
 unicode-normalization.workspace = true
 zeroize.workspace = true
 
