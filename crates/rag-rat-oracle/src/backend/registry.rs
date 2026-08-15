@@ -354,9 +354,10 @@ impl LiveBackend {
             ReadinessPolicy::WorkDoneProgress =>
                 self.project_model.and_then(|model| match model.scope {
                     ProjectScope::Enclosing => {
-                        // `enclosing_project_dir` accepts a file path and starts at its parent;
-                        // the synthetic child makes the checkout root the first directory it
-                        // probes while preserving the helper's file-oriented semantics.
+                        // `enclosing_project_dir` takes a file path and starts at its parent, so
+                        // the synthetic child makes the configured index root the first directory
+                        // it probes. Its checkout ceiling check bounds the ancestor walk to the
+                        // checkout while preserving the helper's file-oriented semantics.
                         let inside_project = documents::enclosing_project_dir(
                             checkout,
                             &checkout.root().join("__warmup_document__"),
