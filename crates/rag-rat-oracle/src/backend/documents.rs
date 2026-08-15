@@ -89,7 +89,9 @@ pub(super) fn find_document_in_project(
     markers: &[&str],
     inside_project: bool,
 ) -> Option<PathBuf> {
-    let inside_project = inside_project || markers.iter().any(|marker| dir.join(marker).exists());
+    let inside_project = inside_project
+        || enclosing_project_dir(checkout, dir, markers).is_some()
+        || markers.iter().any(|marker| dir.join(marker).exists());
     let mut subdirectories = Vec::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let Ok(kind) = entry.file_type() else {

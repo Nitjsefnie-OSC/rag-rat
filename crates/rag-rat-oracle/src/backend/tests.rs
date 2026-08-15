@@ -876,6 +876,30 @@ fn a_warmup_document_is_found_at_any_depth_and_only_inside_a_project() {
 }
 
 #[test]
+fn a_warmup_document_is_found_when_the_project_marker_is_above_the_index_root() {
+    let ts = LiveBackend::for_tool(OracleTool::TsLsp).unwrap();
+    let (_dir_guard, dir) = checkout("ts-lsp-warmup-ancestor-marker");
+    let checkout = dir.join("repo");
+    std::fs::create_dir_all(checkout.join("packages/app/src")).unwrap();
+    rag_rat_base::test_git::run(&checkout, &["init"]);
+    std::fs::write(checkout.join("tsconfig.json"), "{}").unwrap();
+    std::fs::write(checkout.join("packages/app/src/main.ts"), "export function greet() {}\n")
+        .unwrap();
+    let scope = scope(&checkout.join("packages/app"));
+    let layout = ts.resolve_layout(&scope);
+
+    assert_eq!(
+        ts.warmup_document(&scope, &layout),
+        Some(checkout.join("packages/app/src/main.ts")),
+        "a project marker above the index root still makes its indexed descendants warmable",
+    );
+    assert!(
+        ts.checkout_can_signal_readiness(&scope, &layout),
+        "the ancestor project marker must keep the checkout from being blocked",
+    );
+}
+
+#[test]
 fn the_warmup_search_refuses_a_document_the_checkout_does_not_index() {
     // `node_modules` ships thousands of tsconfigs describing DEPENDENCIES. Warming on one would
     // report the checkout usable while none of ITS files ever resolve.
