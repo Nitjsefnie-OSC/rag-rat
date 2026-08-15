@@ -820,4 +820,40 @@ mod classify_call_tests {
         // allowing the nested handler call to be traced.
         assert!(matches!(role_of("A\u{301}ccent(handle())"), CallRole::Wrapper));
     }
+
+    #[test]
+    fn the_case_test_distinguishes_unicode_identifier_boundaries() {
+        // U+203F UNDERTIE is XID_Continue but not alphanumeric: connector punctuation must stay
+        // in the leading identifier so its lowercase suffix still makes this PascalCase.
+        assert!(is_pascal_case("A\u{203F}bc"));
+
+        // U+00B2 SUPERSCRIPT TWO is alphanumeric but not XID_Continue: the Rust identifier rule
+        // must stop before it rather than inheriting the old alphanumeric predicate's suffix.
+        assert!(!is_pascal_case("A\u{00B2}bc"));
+
+        // U+05B0 HEBREW POINT SHEVA is both alphanumeric and XID_Continue: retain the ordinary
+        // alphanumeric case as a no-regression anchor while using the XID_Continue scan.
+        assert!(is_pascal_case("A\u{05B0}bc"));
+    }
+
+    #[test]
+    fn enum_variant_key_keeps_decomposed_xid_identifiers() {
+        for (expression, expected) in [
+            ("A\u{301}bc::Upsert(payload)", "A\u{301}bc::Upsert"),
+            ("Msg::A\u{301}bc(payload)", "Msg::A\u{301}bc"),
+        ] {
+            let source = format!("fn probe() {{ {expression}; }}");
+            let parsed = crate::index::parser::parse_file(
+                std::path::Path::new("probe.rs"),
+                rag_rat_base::language::Language::Rust,
+                &source,
+            )
+            .expect("probe parses");
+            let function = outermost_call(parsed.root())
+                .and_then(|call| call.child_by_field_name("function"))
+                .expect("the expression has a callable path");
+
+            assert_eq!(enum_variant_key(function, &source).as_deref(), Some(expected));
+        }
+    }
 }
