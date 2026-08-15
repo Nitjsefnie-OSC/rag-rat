@@ -6,10 +6,14 @@
 //!
 //! REPO ATTRIBUTION BY FORWARD DERIVATION. Content `/3` is one stream per `(repo_id, account_id)`,
 //! and every device of one account shares the account id, so the owner stream id is identical on
-//! every device. Given a local `repo_id` the drain therefore FORWARD-derives the stream
-//! (`owned_stream_v2_id`) and mirrors exactly that stream's projection — the same input the local
-//! reconcile takes. Cross-*account* sibling streams for the same repo (the public-subscription
-//! case) are out of scope here.
+//! every device. Given a local `repo_id` the drain therefore FORWARD-derives the stream and mirrors
+//! exactly that stream's projection — the same input the local reconcile takes.
+//!
+//! ONE AUTHORITATIVE STREAM PER REPO. Which stream that is comes from
+//! [`authoritative_content_stream`] and there is never more than one: the removal anti-joins read
+//! "absent from this stream's projection" as "condemned", so a second stream materializing into the
+//! same repo would delete the first's rows. A granted contributor (#1164) therefore REPLACES its
+//! local derivation with the configured owner's stream rather than draining both.
 //!
 //! CONVERGE, DON'T FREEZE. The accepted `/3` projection is the LWW-merged content across ALL of the
 //! account's devices, INCLUDING this one — so when another device updates or removes a memory/edge
@@ -84,23 +88,51 @@ impl DrainOutcome {
     }
 }
 
-/// Mirror a repo's accepted synced `/3` content into its local memory tables. Scope-EXPLICIT (the
-/// `repo_id` is passed) and scope-gated the same way the reconcile is — a LEGACY placeholder or a
-/// `local:` shallow-clone id can never root an owner stream, so it no-ops. Opens its own
-/// `IMMEDIATE` transaction, settles the owner stream's pending refold inside it (fail-closed), then
-/// drains.
-pub(crate) fn drain_synced_stream_for_repo(
+/// The ONE stream that materializes `repo_id`'s synced rows. EXACTLY ONE — every removal anti-join
+/// below reads "absent from this stream's projection" as "condemned", and the drain watermark is
+/// per-stream, so two streams materializing into the same repo would delete each other's rows and
+/// then not restore them (each stream's watermark says it is up to date). So contribution mode
+/// (#1164) does not ADD the owner's stream to this repo's drain, it REPLACES the local one: a
+/// granted contributor authors nothing onto its own owner stream, which would sit empty and
+/// condemn everything the owner's stream materialized.
+///
+/// Scope-gated the same way the reconcile is — a LEGACY placeholder or a `local:` shallow-clone id
+/// can never root an owner stream, so both yield `None`.
+fn authoritative_content_stream(
     conn: &Connection,
     repo_id: &str,
-    now_ms: i64,
-) -> anyhow::Result<DrainOutcome> {
+) -> anyhow::Result<Option<StreamId>> {
     // Only a STABLE id derives an immutable owner stream (mirrors `sync_owner_stream`): the legacy
     // `__unassigned__` placeholder and a `local:` shallow-clone id both get re-pointed later, so a
     // stream derived under them would strand. No synced content can exist for such an id anyway.
     if repo_id == rag_rat_base::repo_identity::LEGACY_REPO_ID
         || repo_id.starts_with(rag_rat_base::repo_identity::LOCAL_ONLY_ID_PREFIX)
     {
-        return Ok(DrainOutcome::default());
+        return Ok(None);
+    }
+    // A granted CONTRIBUTOR reads back the CONFIGURED owner's stream — where its own writes went
+    // and where the owner's and other contributors' memories live. A configured owner that IS this
+    // store is not contribution mode; fall through to the local derivation.
+    if let Some(owner) = super::authoring::contribution_owner_account(conn, repo_id)?
+        && rag_rat_oplog::read_local_account(conn)? != Some(owner)
+    {
+        // Contribution targets the owner's PublicRead stream (v1 public only).
+        let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+            repo_id,
+            owner,
+            rag_rat_oplog::AccessMode::PublicRead,
+        )?;
+        // A DERIVED stream id is not yet an authority. `sync contribute` deliberately succeeds
+        // before the owner's log is synced (configure, then sync), and a mistyped owner id derives
+        // a stream that will never exist at all — in both cases the projection is EMPTY, and
+        // handing that to the drain would make the removal anti-joins condemn every synced row the
+        // repo currently reads. So authority begins only once the ownership fact has folded here.
+        // Until then this repo drains NOTHING: `None` rather than falling through to the local
+        // stream, whose own empty projection would condemn exactly the same rows.
+        if rag_rat_oplog::stream_owner_account(conn, stream)? != Some(owner) {
+            return Ok(None);
+        }
+        return Ok(Some(stream));
     }
     // Forward-derive the owner stream under the repo's access-mode intent — the SAME stream id the
     // live-write authored onto, so a published (PublicRead) repo drains its own public stream
@@ -108,10 +140,21 @@ pub(crate) fn drain_synced_stream_for_repo(
     // have been authored/ingested onto this stream ⇒ nothing to drain (the analog of an
     // unstable scope).
     let mode = super::authoring::owner_stream_access_mode(conn, repo_id)?;
-    let Some(stream) = rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)? else {
+    rag_rat_oplog::owned_stream_v2_id_with_mode(conn, repo_id, mode)
+}
+
+/// Mirror a repo's accepted synced `/3` content into its local memory tables, from the one stream
+/// [`authoritative_content_stream`] names. Scope-EXPLICIT (the `repo_id` is passed). Opens its own
+/// `IMMEDIATE` transaction, settles that stream's pending refold inside it (fail-closed), then
+/// drains.
+pub(crate) fn drain_synced_stream_for_repo(
+    conn: &Connection,
+    repo_id: &str,
+    now_ms: i64,
+) -> anyhow::Result<DrainOutcome> {
+    let Some(stream) = authoritative_content_stream(conn, repo_id)? else {
         return Ok(DrainOutcome::default());
     };
-
     // Cheap read-only gate: skip the write txn + O(projection) scan entirely when the projection is
     // unchanged since this stream was last drained and nothing is pending. Every drain seam routes
     // through here (open, consolidate, and the long-running watcher pass), so all three go O(1)

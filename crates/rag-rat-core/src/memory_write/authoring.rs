@@ -173,13 +173,27 @@ impl PreparedOwnerAuthoring {
     }
 }
 
+// A granted contributor's rows stay `origin='local'`, which is their AUTHORSHIP: this store wrote
+// them, and `origin` is what `ImportMode::SeedPublic` reads to decide whose memories a public seed
+// carries. It is deliberately NOT re-purposed to mean "under the drain's removal authority" — those
+// two meanings diverge for exactly these rows (locally authored, yet projected on another account's
+// stream), and one column cannot carry both.
+//
+// The consequence is bounded and accepted: when an authority refold condemns a contribution (a
+// revoked grant, a device cut ordered before it), the owner's stream stops accepting and serving
+// it, but the contributor keeps its own copy of its own writing. Content this store RECEIVED is
+// `origin='synced'` and the drain's anti-join does remove it, so a revoke never leaves another
+// account's condemned content readable here. Separating the two would need a third `origin` value
+// (a CHECK rewrite on both tables) — worth it only once a case appears where a contributor must
+// forget what it authored itself.
+
 /// The `repo_meta` key holding the account this repo contributes memories to (the paste-flow owner
 /// id, set by `sync contribute`). Absent = this store authors its own owner stream.
 pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner";
 
 /// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
 /// id.
-fn contribution_owner_account(
+pub(super) fn contribution_owner_account(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<rag_rat_oplog::AccountId>> {
@@ -198,6 +212,27 @@ fn is_contribution_mode(conn: &Connection, repo_id: &str) -> anyhow::Result<bool
         return Ok(false);
     };
     Ok(rag_rat_oplog::read_local_account(conn)? != Some(owner))
+}
+
+/// Refuse `operation` when `repo_id` is configured to contribute to another account. Both
+/// operations that reconcile IMPORTED rows (legacy consolidation, `sync publish --seed`) need a
+/// stream this store owns, which a contributor does not have — and both are irreversible enough
+/// that continuing on a half-applied import is worse than stopping.
+pub(crate) fn ensure_not_contributing(
+    conn: &Connection,
+    repo_id: &str,
+    operation: &str,
+) -> anyhow::Result<()> {
+    if let Some(owner) = contribution_owner_account(conn, repo_id)?
+        && rag_rat_oplog::read_local_account(conn)? != Some(owner)
+    {
+        anyhow::bail!(
+            "repo `{repo_id}` is configured to contribute memories to account {}, so it owns no \
+             memory stream of its own — {operation} is not supported in contribution mode",
+            rag_rat_base::hash::hex_lower(&owner.to_bytes()),
+        );
+    }
+    Ok(())
 }
 
 struct GranteeContext {
@@ -289,6 +324,18 @@ pub(crate) fn set_contribution_owner(
         "active repo scope changed while starting sync contribute; retry"
     );
     rag_rat_db::meta::set_repo_meta(&tx, &repo_id, CONTRIBUTION_OWNER_META_KEY, &canonical)?;
+    // This repo's AUTHORITATIVE content stream just changed (see
+    // `drain::authoritative_content_stream` — exactly one materializes the repo). Forget the
+    // incoming stream's drain watermark so the next drain makes a FULL pass: only that runs the
+    // removal anti-joins that clear whatever the OUTGOING stream materialized. Re-pointing back
+    // at a previously-drained owner would otherwise short-circuit on a watermark that is still
+    // current and leave the other owner's memories in place.
+    let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+        &repo_id,
+        owner,
+        rag_rat_oplog::AccessMode::PublicRead,
+    )?;
+    rag_rat_oplog::clear_content_drain_watermark(&tx, stream)?;
     tx.commit()?;
     Ok(())
 }
@@ -1009,6 +1056,24 @@ pub(crate) fn reconcile_owner_stream_for_repo(
     repo_id: &str,
     now_ms: i64,
 ) -> anyhow::Result<()> {
+    // A granted contributor owns no stream for this repo, so this reconcile cannot run: it would
+    // establish one and author the imported rows onto a stream nobody reads, while the configured
+    // owner — where this repo's memories actually live — never receives them.
+    //
+    // FAIL, do not skip. Both callers (legacy consolidation, `sync publish --seed`) call this
+    // specifically to author freshly-IMPORTED rows. Reporting success without authoring would
+    // strand them with no `NodeCreate`, leaving every later update or status op on them inert.
+    // Authoring them as a grantee is the real feature; until it exists, say so.
+    //
+    // This is the BACKSTOP, not the gate. By the time control reaches here the import has already
+    // committed, so failing leaves the very half-applied state the refusal exists to prevent —
+    // which is why both callers refuse BEFORE their irreversible step (`consolidate::run_inner`
+    // before importing, `sync_publish_seed` before publishing). Keep this arm so a future third
+    // caller fails loudly instead of silently skipping, and give it the same pre-check.
+    //
+    // (The live-write path skips silently instead, and correctly: `backfill_memory_oplog` has
+    // nothing to reconcile because each mutation already authors onto the owner's stream.)
+    ensure_not_contributing(conn, repo_id, "importing memories into this repo")?;
     sync_owner_stream(conn, repo_id, now_ms)
 }
 

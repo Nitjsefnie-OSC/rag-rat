@@ -52,6 +52,16 @@ fn concept(title: &str) -> RepoMemoryCreate {
     }
 }
 
+/// The memory titles this store holds for the repo, sorted.
+fn memory_titles(conn: &Connection) -> Vec<String> {
+    let mut stmt =
+        conn.prepare("SELECT title FROM repo_memories WHERE repo_id = ?1 ORDER BY title").unwrap();
+    stmt.query_map([REPO], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
 /// Replicate `src`'s account log (roster/ownership/grant) + content into `dst` — the state a
 /// contributor gains by syncing the owner's log.
 fn sync_account_into(dst: &Connection, src: &Connection, account: rag_rat_oplog::AccountId) {
@@ -64,8 +74,10 @@ fn sync_account_into(dst: &Connection, src: &Connection, account: rag_rat_oplog:
     settle_pending_content_refolds(dst, &ContentRefoldBudget::unbounded(), NOW).unwrap();
 }
 
-#[test]
-fn a_configured_contributor_authors_onto_the_owners_stream() {
+/// An owner that published + authored `owner-note` and granted a SEPARATE contributor identity
+/// Writer, with the owner's log synced in and contribution configured on the contributor side.
+/// Returns `(owner, contributor, owner_account)`.
+fn contribution_pair() -> (Connection, Connection, rag_rat_oplog::AccountId) {
     // OWNER: publish, author, and mint its account.
     let owner = scoped_conn();
     let owner_account = local_account(&owner, NOW).unwrap();
@@ -81,9 +93,16 @@ fn a_configured_contributor_authors_onto_the_owners_stream() {
     grant_repo_writer(&owner, contributor_account, NOW).unwrap();
     sync_account_into(&contributor, &owner, owner_account);
 
-    // Configure contribution (paste flow) and author.
+    // Configure contribution (the paste flow).
     let owner_hex = rag_rat_base::hash::hex_lower(&owner_account.to_bytes());
     crate::memory_write::set_contribution_owner(&contributor, &owner_hex, NOW).unwrap();
+    (owner, contributor, owner_account)
+}
+
+#[test]
+fn a_configured_contributor_authors_onto_the_owners_stream() {
+    let (_owner, contributor, owner_account) = contribution_pair();
+    let contributor_account = local_account(&contributor, NOW).unwrap();
     create_memory(&contributor, concept("contributor-note")).unwrap();
 
     // The contributor's memory is an ACCEPTED entry on the OWNER's stream, authored under the
@@ -114,6 +133,143 @@ fn a_configured_contributor_authors_onto_the_owners_stream() {
         )
         .unwrap();
     assert_eq!(contributor_owned, 0, "a contributor owns no stream of its own");
+
+    // Read-back (#1164): draining the OWNER's synced stream materializes the owner's memory into
+    // the contributor's own tables — while its own memory (a direct table write) stays. So the
+    // contributor reads the union, not just what it wrote.
+    crate::drain_synced_memory(&contributor).unwrap();
+    let titles = memory_titles(&contributor);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "the contributor reads back the owner's memory after draining the owner's stream: \
+         {titles:?}",
+    );
+    assert!(titles.contains(&"contributor-note".to_string()), "and still sees its own: {titles:?}",);
+}
+
+/// EXACTLY ONE stream materializes a repo. A contributor's own owned stream is NOT it — nothing is
+/// ever authored there, so its projection is a rival authority whose removal anti-join reads every
+/// row the owner's stream materialized as condemned. Draining both would delete the owner's
+/// memories (and, on the next pass with a moved epoch, restore them and delete the contributor's) —
+/// a ping-pong the per-stream watermarks then freeze. Poison the local stream's projection and
+/// assert the drain never reads it.
+#[test]
+fn the_contributors_own_stream_is_not_a_rival_authority_over_the_repo() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    crate::drain_synced_memory(&contributor).unwrap();
+    assert!(memory_titles(&contributor).contains(&"owner-note".to_string()));
+
+    // Plant a row on the contributor's OWN owned stream and make that stream look freshly changed.
+    // If the drain still treated it as an authority it would materialize `local-stream-ghost` and
+    // condemn `owner-note` (absent from this projection) on the very next pass.
+    let own_stream = rag_rat_oplog::owned_stream_v2_id(&contributor, REPO).unwrap().unwrap();
+    contributor
+        .execute(
+            "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+             VALUES (?1, 'ghost', ?2, 'active')",
+            params![
+                own_stream.to_bytes().as_slice(),
+                serde_json::json!({
+                    "kind": "Concept", "title": "local-stream-ghost", "body": "b",
+                    "confidence": "high", "source": "agent", "tags": [], "payload": null,
+                })
+                .to_string(),
+            ],
+        )
+        .unwrap();
+    let tx = contributor.unchecked_transaction().unwrap();
+    rag_rat_oplog::clear_content_drain_watermark(&tx, own_stream).unwrap();
+    tx.commit().unwrap();
+
+    crate::drain_synced_memory(&contributor).unwrap();
+    let titles = memory_titles(&contributor);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "the owner's stream stays authoritative: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"local-stream-ghost".to_string()),
+        "the contributor's own stream is not drained into the repo: {titles:?}",
+    );
+}
+
+/// `origin` is AUTHORSHIP, not drain authority. A contribution is written by THIS store, so it
+/// stays `'local'` — that is what a public seed (`origin='local'` only) reads to decide whose
+/// memories it carries, and re-purposing the column to mean "removable by the drain" would silently
+/// drop every grantee write from a seed. The accepted consequence: a condemned contribution stays
+/// readable HERE (this store's own writing), while content it RECEIVED is `'synced'` and the
+/// drain's anti-join does remove it — a revoke never leaves another account's condemned content
+/// behind.
+#[test]
+fn a_contribution_keeps_its_local_authorship_while_received_content_stays_removable() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    crate::drain_synced_memory(&contributor).unwrap();
+
+    let origin = |title: &str| -> String {
+        contributor
+            .query_row("SELECT origin FROM repo_memories WHERE title = ?1", [title], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        origin("contributor-note"),
+        "local",
+        "this store authored it, so a public seed must still carry it",
+    );
+    assert_eq!(
+        origin("owner-note"),
+        "synced",
+        "content received from the owner's stream stays under the drain's removal authority",
+    );
+}
+
+/// The import reconcile FAILS in contribution mode rather than establishing a stream the
+/// contributor does not own. Its callers author freshly-IMPORTED rows and then move on (legacy
+/// consolidation renames the source database away), so silently reporting success would strand
+/// those rows with no `NodeCreate` and leave every later op on them inert.
+#[test]
+fn the_import_reconcile_refuses_in_contribution_mode_instead_of_half_applying() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+    let err = crate::memory_write::reconcile_owner_stream_for_repo(&contributor, REPO, NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("contribution mode"), "refuses with an actionable message: {err}");
+
+    // And it established nothing on the way out. Scoped to the CONTRIBUTOR's account — the table
+    // also holds the owner's record, ingested with the owner's log.
+    let contributor_account = local_account(&contributor, NOW).unwrap();
+    let owned: i64 = contributor
+        .query_row(
+            "SELECT COUNT(*) FROM account_stream_ownership WHERE account_id = ?1",
+            [contributor_account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owned, 0, "no stream established for the contributor");
+}
+
+/// A configured owner is not yet an AUTHORITY. `sync contribute` succeeds before the owner's log
+/// is synced (configure, then sync), and a mistyped owner id derives a stream that never exists —
+/// both leave an EMPTY projection. Draining it would let the removal anti-joins condemn every
+/// synced row the repo currently reads, so the drain does nothing until ownership has folded.
+#[test]
+fn an_unsynced_or_mistyped_owner_never_becomes_removal_authority() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    crate::drain_synced_memory(&contributor).unwrap();
+    assert!(memory_titles(&contributor).contains(&"owner-note".to_string()));
+
+    // Re-point at an owner whose log was never synced (the mistyped-id / configure-before-sync
+    // case): `set_contribution_owner` clears the incoming stream's watermark, so the next drain
+    // would otherwise make a FULL pass over an empty projection.
+    crate::memory_write::set_contribution_owner(&contributor, &"ab".repeat(32), NOW).unwrap();
+    crate::drain_synced_memory(&contributor).unwrap();
+
+    let titles = memory_titles(&contributor);
+    assert!(
+        titles.contains(&"owner-note".to_string()),
+        "an unverified owner stream removes nothing: {titles:?}",
+    );
 }
 
 #[test]
