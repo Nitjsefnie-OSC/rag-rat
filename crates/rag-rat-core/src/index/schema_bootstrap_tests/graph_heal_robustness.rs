@@ -194,8 +194,8 @@ fn delete_dispatch_handle_facts(db: &IndexDatabase, file_id: i64) {
 }
 
 /// Stage the graph-only part of the version upgrade while leaving the logical-key derivation at
-/// its current value. Version 16 is the stamp carried by the commit under test; version 17 is the
-/// first build that must re-extract the changed dispatch classifier.
+/// its current value. Version 16 is the persisted stamp immediately before this classifier change;
+/// version 17 is the first graph version that must re-extract it.
 fn stage_graph_version_16(db: &IndexDatabase) {
     db.set_repo_meta("graph_index_version", "16").unwrap();
     db.storage
@@ -237,7 +237,7 @@ fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
         &dispatch_fixture_body("TOOL_NAMES.iter().map(|name| name.len())"),
     )]);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    let file_id = scoped_file_id(&db, "src/lib.rs", &db.active_worktree_id.clone());
+    let file_id = scoped_file_id(&db, "src/lib.rs", &db.active_worktree_id);
 
     // Simulate the deployed v16 row after the old classifier omitted this handle fact.
     let initial_handles = edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle");
