@@ -5149,6 +5149,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "unicase",
+ "unicode-ident",
  "unicode-normalization",
  "ureq 3.3.0",
  "x25519-dalek",

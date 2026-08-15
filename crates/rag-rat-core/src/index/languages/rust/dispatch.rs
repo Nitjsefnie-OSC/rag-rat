@@ -5,6 +5,7 @@
 //! CLOSED conservative handler-call recognizer (`result_handler_calls` & friends) whose
 //! false-edge-is-a-bug contract is documented in the repo memories bound here and on the parent.
 use tree_sitter::Node;
+use unicode_ident::is_xid_continue;
 
 use crate::index::edges::extract::EdgeEmitter;
 use crate::index::edges::*;
@@ -12,6 +13,8 @@ use crate::index::edges::*;
 /// PascalCase test for the enum/variant convention (#200): the segment's LEADING IDENTIFIER starts
 /// with an uppercase char AND carries at least one lowercase — so `MlReq`/`Upsert` qualify but
 /// `new`, a SCREAMING `CONST`, and a bare `T` do not.
+/// The leading scan follows Rust's `XID_Continue` rule, so decomposed identifiers keep their
+/// combining marks instead of being truncated at the first non-alphanumeric code point.
 ///
 /// Only that leading identifier is weighed because a segment can carry a method chain glued onto
 /// its head (`TOOL_NAMES.iter().map`, `NOW.elapsed`). The appended method names supply the very
@@ -19,7 +22,7 @@ use crate::index::edges::*;
 /// constructor and bills the call as a transparent wrapper instead of the delegation it is (#1124).
 fn is_pascal_case(name: &str) -> bool {
     let mut head =
-        name.chars().take_while(|&character| character.is_alphanumeric() || character == '_');
+        name.chars().take_while(|&character| is_xid_continue(character) || character == '_');
     head.next().is_some_and(char::is_uppercase) && head.any(char::is_lowercase)
 }
 
@@ -801,8 +804,20 @@ mod classify_call_tests {
         for name in ["TOOL_NAMES", "TOOL_NAMES.iter().map", "NOW", "NOW.elapsed", "T", "run"] {
             assert!(!is_pascal_case(name), "{name}");
         }
-        for name in ["MlReq", "Upsert", "HTTPResponse", "Wrapped(payload).to_string"] {
+        for name in [
+            "MlReq",
+            "Upsert",
+            "HTTPResponse",
+            "Wrapped(payload).to_string",
+            "A\u{301}bc",
+            "A\u{301}bc.iter().map",
+        ] {
             assert!(is_pascal_case(name), "{name}");
         }
+
+        // A decomposed combining mark is a valid XID_Continue character even though it is not
+        // alphanumeric. The full call must therefore remain a transparent constructor wrapper,
+        // allowing the nested handler call to be traced.
+        assert!(matches!(role_of("A\u{301}ccent(handle())"), CallRole::Wrapper));
     }
 }
