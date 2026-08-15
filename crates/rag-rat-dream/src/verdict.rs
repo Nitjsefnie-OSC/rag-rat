@@ -1171,6 +1171,7 @@ mod tests {
                 kind: verify::ResolutionKind::Symbol,
             }],
             excerpts: Vec::new(),
+            has_live_binding: false,
         });
         let cited = |frag: &str| ParsedVerdict {
             verdict: Verdict::Current,
@@ -1227,6 +1228,7 @@ mod tests {
                 ),
             ],
             excerpts: Vec::new(),
+            has_live_binding: false,
         });
         assert!(pack.contains("`real`"), "a symbol row is shown: {pack}");
         assert!(pack.contains("`gone_symbol`"), "a NOT-FOUND (absence) row is shown: {pack}");
@@ -1247,6 +1249,7 @@ mod tests {
                 end_line: 12,
                 text: "let handle = spawn();".to_string(),
             }],
+            has_live_binding: false,
         });
         let cited = |frag: &str| ParsedVerdict {
             verdict: Verdict::Diverged,

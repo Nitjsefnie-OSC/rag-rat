@@ -146,12 +146,16 @@ pub struct EvidencePack {
     pub memory_id: String,
     pub identifiers: Vec<IdentifierResolution>,
     pub excerpts: Vec<FileExcerpt>,
+    /// Whether this memory still has a live, non-`scip_moniker` binding in the active scope.
+    #[serde(skip_serializing)]
+    pub has_live_binding: bool,
 }
 
 impl EvidencePack {
     /// Whether the pack has any SUBSTANTIVE content a verdict could cite — at least one bound-file
-    /// excerpt, or at least one identifier that RESOLVED (not [`NOT_FOUND`]). Two memories look
-    /// uncitable and must stay out of the model pass:
+    /// excerpt, at least one identifier that resolves to presence, or a live binding with an
+    /// authoritative [`ResolutionKind::Absent`] identifier. Two memories look uncitable and must
+    /// stay out of the model pass:
     ///   - a prose-only / conceptual note with no identifiers and no excerpts (only boilerplate);
     ///   - a note whose EVERY identifier resolves to `NOT_FOUND` and has no live binding — pass 0
     ///     already decides this `memory_unverifiable`, and counting those NOT_FOUND rows as citable
@@ -164,13 +168,18 @@ impl EvidencePack {
     ///
     /// "Citable" = carries at least one piece of PRESENCE evidence: a bound-file excerpt, or an
     /// identifier that resolved to a symbol / file / verbatim source text
-    /// ([`ResolutionKind::is_present`]). A pack whose every identifier is
-    /// [`ResolutionKind::Absent`] (a real gone-symbol) or [`ResolutionKind::Unresolvable`] (a
-    /// paraphrase / non-code span) carries no positive evidence — pass 0 already decides such a
-    /// memory `memory_unverifiable`, so it must not be asked of the model (asking would invite
-    /// a `diverged` verdict cited off a bare NOT-FOUND / unresolvable row).
+    /// ([`ResolutionKind::is_present`]). A live-bound pack with an authoritative
+    /// [`ResolutionKind::Absent`] identifier is also citable: it is the `note_ahead` candidate
+    /// whose bound file exists but whose named code entity is gone. A pack whose every identifier
+    /// is [`ResolutionKind::Absent`] with no live binding, or whose rows are all
+    /// [`ResolutionKind::Unresolvable`] (a paraphrase / non-code span), carries no evidence — pass
+    /// 0 already decides the former `memory_unverifiable`, so neither case must be asked of the
+    /// model.
     pub fn is_citable(&self) -> bool {
-        !self.excerpts.is_empty() || self.identifiers.iter().any(|id| id.kind.is_present())
+        !self.excerpts.is_empty()
+            || self.identifiers.iter().any(|id| id.kind.is_present())
+            || (self.has_live_binding
+                && self.identifiers.iter().any(|id| id.kind == ResolutionKind::Absent))
     }
 }
 
@@ -441,7 +450,7 @@ pub fn note_content_hash(title: &str, body: &str) -> String {
 
 /// sha256 fingerprint of a memory's ENTIRE deterministic evidence pack — the churn comparator that
 /// beats a commit-ancestry walk. Named `checked_inputs_hash` after the column it is stamped into;
-/// it covers BOTH halves of what the verdict model is shown:
+/// it covers all evidence dimensions that affect the verdict pass:
 ///   - the memory's bound-file inputs, as the sorted `(path, sha)` MULTISET (not bare shas: a set
 ///     of shas is blind to a rebind that keeps identical content — a same-sha rebind, or a
 ///     duplicate-content child add/remove under a directory binding, would leave the hash unchanged
@@ -455,7 +464,12 @@ pub fn note_content_hash(title: &str, body: &str) -> String {
 ///     skipping after the code later adds the symbol, and an identifier-only `current` verdict
 ///     would survive that evidence disappearing). The excerpt TEXT is a pure function of these two
 ///     inputs (bound-file content by sha + identifier positions in the unchanged body), so hashing
-///     them fingerprints the whole pack without rebuilding excerpts.
+///     them fingerprints the whole pack without rebuilding excerpts;
+///   - a live-binding marker ONLY for the newly citable shape: at least one authoritative absent
+///     identifier, no presence evidence, no bound-file excerpt, and a live binding. The excerpt set
+///     is checked directly because an indeterminate identifier probe can still have a bound source
+///     excerpt. Every other shape uses the exact legacy files/identifiers preimage for upgrade
+///     compatibility.
 ///
 /// `pub(crate)` so the phase-B verdict pass (`verdict`) recomputes it EXACTLY as the queue's
 /// comparator does when it stamps `memory_reality.checked_inputs_hash` — same function, so the next
@@ -472,26 +486,49 @@ pub fn checked_inputs_hash(
         .into_iter()
         .map(|(path, _, sha)| format!("{path}\u{1f}{sha}"))
         .collect();
-    let ident_pairs: BTreeSet<String> = identifier_resolution_pairs(conn, memory_id, scope)?
-        .into_iter()
-        .map(|(ident, res)| format!("{ident}\u{1f}{res}"))
-        .collect();
+    let ident_details = identifier_resolution_details(conn, memory_id, scope)?;
+    let ident_pairs: BTreeSet<String> =
+        ident_details.iter().map(|(ident, res, _)| format!("{ident}\u{1f}{res}")).collect();
     let files = file_pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
     let idents = ident_pairs.into_iter().collect::<Vec<_>>().join("\u{1e}");
-    // `\u{1d}` (group separator) splits the two sections so a path can never collide with an
-    // identifier pair.
-    Ok(rag_rat_base::hash::hex_sha256(format!("{files}\u{1d}{idents}").as_bytes()))
+    let excerpt_idents: Vec<String> = ident_details
+        .iter()
+        .filter(|(ident, _, kind)| {
+            !(*kind == ResolutionKind::Unresolvable && is_memory_id_shaped(ident))
+        })
+        .map(|(ident, _, _)| ident.clone())
+        .collect();
+    // A live binding changes citability only for a pack with at least one authoritative absence,
+    // no presence evidence, and no bound-file excerpt. Keep the legacy preimage for every other
+    // shape so upgrading does not churn unrelated terminal rows.
+    let binding_state_changes_citability = !ident_details.is_empty()
+        && ident_details.iter().any(|(_, _, kind)| *kind == ResolutionKind::Absent)
+        && ident_details.iter().all(|(_, _, kind)| !kind.is_present())
+        && memory_has_live_binding(conn, memory_id, scope)?
+        && bound_file_excerpts(conn, memory_id, scope, &excerpt_idents)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+            .is_empty();
+    let preimage = if binding_state_changes_citability {
+        // `\u{1d}` (group separator) splits the legacy files/identifiers sections from the
+        // selective binding marker; a marker is present only for the live-bound absent-only pack.
+        format!("{files}\u{1d}{idents}\u{1d}live")
+    } else {
+        // This is the byte-for-byte legacy encoding. Do not append a not-live marker: it would
+        // invalidate every pre-upgrade row whose citability cannot depend on binding state.
+        format!("{files}\u{1d}{idents}")
+    };
+    Ok(rag_rat_base::hash::hex_sha256(preimage.as_bytes()))
 }
 
-/// The `(identifier, resolution)` half of the evidence-pack fingerprint — the memory's identifiers
-/// (from title+body) each resolved against the whole-tree index EXACTLY as [`evidence_pack`] does,
-/// so the churn key matches what the model is actually shown. Empty when the memory is not visible
-/// in scope or carries no identifiers.
-fn identifier_resolution_pairs(
+/// The `(identifier, rendered resolution, kind)` rows of the evidence-pack fingerprint — the
+/// memory's identifiers (from title+body) each resolved against the whole-tree index EXACTLY as
+/// [`evidence_pack`] does, so the churn key matches what the model is actually shown. Empty when
+/// the memory is not visible in scope or carries no identifiers.
+fn identifier_resolution_details(
     conn: &Connection,
     memory_id: &str,
     scope: &Option<String>,
-) -> rusqlite::Result<Vec<(String, String)>> {
+) -> rusqlite::Result<Vec<(String, String, ResolutionKind)>> {
     let mem_clause = schema::periphery_repo_scope_clause(scope, "repo_memories");
     let row: Option<(String, String)> = conn
         .query_row(
@@ -517,10 +554,9 @@ fn identifier_resolution_pairs(
         // are fixed — so the churn key re-verifies on a genuine tier flip or a symbol/file identity
         // change but stays stable against unrelated repo churn (adding a file carrying a cited
         // common token no longer re-queues the paid verdict).
-        out.push((
-            ident.clone(),
-            resolve_memory_identifier(conn, ident, &file_paths, absence_is_authoritative)?.0,
-        ));
+        let (resolution, kind) =
+            resolve_memory_identifier(conn, ident, &file_paths, absence_is_authoritative)?;
+        out.push((ident.clone(), resolution, kind));
     }
     Ok(out)
 }
@@ -542,8 +578,10 @@ pub fn evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<Evide
             memory_id: memory_id.to_string(),
             identifiers: Vec::new(),
             excerpts: Vec::new(),
+            has_live_binding: false,
         });
     };
+    let has_live_binding = memory_has_live_binding(conn, memory_id, &scope)?;
     let identifiers = extract_identifiers(&title, &body);
     let file_paths = indexed_file_paths(conn)?;
     let absence_is_authoritative = memory_binding_is_index_covered(conn, memory_id, &scope)?;
@@ -563,7 +601,12 @@ pub fn evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<Evide
         .map(|r| r.identifier.clone())
         .collect();
     let excerpts = bound_file_excerpts(conn, memory_id, &scope, &excerpt_idents)?;
-    Ok(EvidencePack { memory_id: memory_id.to_string(), identifiers: resolutions, excerpts })
+    Ok(EvidencePack {
+        memory_id: memory_id.to_string(),
+        identifiers: resolutions,
+        excerpts,
+        has_live_binding,
+    })
 }
 
 /// The deterministic `memory_unverifiable` findings: active memories that WERE anchored but whose
@@ -1777,11 +1820,9 @@ mod tests {
     }
 
     #[test]
-    fn a_memory_whose_identifiers_all_resolve_nowhere_is_not_citable() {
-        // Regression (PR #428): a note whose every identifier resolves to NOT_FOUND and
-        // has no bound-file excerpts is the pass-0 unverifiable case and must NOT be
-        // citable, or the model would be asked and could open a divergence citing the
-        // NOT_FOUND rows.
+    fn a_memory_with_no_live_binding_absent_evidence_is_not_citable() {
+        // A note whose every identifier resolves to NOT_FOUND, has no bound-file excerpts,
+        // and has no live binding is the pass-0 unverifiable case and must NOT be citable.
         let c = mem_db();
         set_repo(&c, "r");
         // One unrelated indexed file, bound: the exact file declares the note's source domain.
@@ -1790,14 +1831,244 @@ mod tests {
         c.execute(
             "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
              anchor_status, created_at_ms, repo_id) VALUES \
-             ('m1','path','src/lib.rs','src/lib.rs','current',0,'r')",
+             ('m1','path','src/lib.rs','src/lib.rs','gone',0,'r')",
             [],
         )
         .unwrap();
         let pack = evidence_pack(&c, "m1").unwrap();
+        assert!(!pack.has_live_binding, "a gone binding is not live");
         assert!(!pack.identifiers.is_empty(), "the identifier was extracted");
         assert!(pack.identifiers.iter().all(|id| id.resolution == NOT_FOUND));
         assert!(!pack.is_citable(), "an all-NOT_FOUND, no-excerpt pack is uncitable");
+    }
+
+    #[test]
+    fn evidence_pack_is_citable_truth_table_for_live_binding_absence_and_evidence_anchors() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn unrelated() {}\n", "r");
+
+        seed_memory(&c, "m-live-absent", "t", "a note about `never_defined_symbol`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m-live-absent','path','src/lib.rs','src/lib.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let live_absent = evidence_pack(&c, "m-live-absent").unwrap();
+        assert!(live_absent.has_live_binding, "the current binding is live");
+        assert!(
+            live_absent.identifiers.iter().all(|id| id.kind == ResolutionKind::Absent),
+            "the live-bound regression case must resolve every identifier as absent"
+        );
+        assert!(live_absent.excerpts.is_empty(), "the unrelated bound file has no identifier hit");
+        assert!(
+            live_absent.is_citable(),
+            "a live-bound all-absent identifier pack is citable for note_ahead"
+        );
+
+        let id = |kind| IdentifierResolution {
+            identifier: "i".to_string(),
+            resolution: "r".to_string(),
+            kind,
+        };
+        let pack = |identifiers, excerpts| EvidencePack {
+            memory_id: "m".to_string(),
+            identifiers,
+            excerpts,
+            has_live_binding: false,
+        };
+        assert!(
+            !pack(vec![id(ResolutionKind::Absent)], Vec::new()).is_citable(),
+            "an unbound all-absent pack remains uncitable"
+        );
+        seed_memory(&c, "m-prose-only", "t", "a prose-only note with no code identifiers", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m-prose-only','path','src/lib.rs','src/lib.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        let prose_only = evidence_pack(&c, "m-prose-only").unwrap();
+        assert!(prose_only.has_live_binding, "the prose-only note still has a live binding");
+        assert!(!prose_only.is_citable(), "a prose-only live-bound pack remains uncitable");
+        assert!(
+            pack(vec![id(ResolutionKind::Symbol)], Vec::new()).is_citable(),
+            "a present identifier remains citable"
+        );
+        assert!(
+            pack(Vec::new(), vec![FileExcerpt {
+                path: "src/lib.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                text: "fn unrelated() {}".to_string(),
+            }])
+            .is_citable(),
+            "a non-empty excerpt remains citable"
+        );
+    }
+
+    #[test]
+    fn checked_inputs_hash_changes_with_binding_state_for_absent_only_pack_without_excerpts() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn unrelated() {}\n", "r");
+        seed_memory(&c, "m1", "t", "a note about `never_defined_symbol`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/lib.rs','src/lib.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let live = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "UPDATE repo_memory_bindings SET anchor_status = 'gone' WHERE memory_id = 'm1'",
+            [],
+        )
+        .unwrap();
+        let gone = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        assert_ne!(live, gone, "live-binding state changes citability and must move the hash");
+    }
+
+    #[test]
+    fn checked_inputs_hash_stays_legacy_when_capped_probe_has_bound_excerpt() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        for index in 0..2000 {
+            seed_file(&c, &format!("src/decoy-{index:04}.rs"), "foo bar\n", "r");
+        }
+        seed_file(&c, "src/bound.rs", "fn foo::bar() {}\n", "r");
+        seed_memory(&c, "m1", "t", "a note about `never_defined_symbol` and `foo::bar()`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/bound.rs','src/bound.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+
+        let pack = evidence_pack(&c, "m1").unwrap();
+        assert!(pack.is_citable(), "the bound-file excerpt makes the pack citable");
+        assert!(
+            pack.excerpts.iter().any(|excerpt| excerpt.path == "src/bound.rs"),
+            "the bound file contains an excerpt for the capped probe target"
+        );
+        assert!(
+            pack.identifiers
+                .iter()
+                .any(|id| id.identifier == "foo::bar()" && id.kind == ResolutionKind::Unresolvable),
+            "the probe must be capped rather than resolving the lower-ranked exact target"
+        );
+
+        assert_eq!(
+            checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap(),
+            "f19579362b7c6c90ecb6942590d4ebd76eb3b592b4a0a3d67f02ea23730894c5",
+            "binding state cannot change this already-citable pack's legacy hash"
+        );
+    }
+
+    #[test]
+    fn legacy_hashes_for_unrelated_packs_do_not_requeue() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        let file_id = seed_file(&c, "src/present.rs", "fn present_symbol() {}\n", "r");
+        c.execute(
+            "INSERT INTO symbols(file_id, language, name, kind, start_byte, end_byte) VALUES \
+             (?1,'rust','present_symbol','function',0,0)",
+            [file_id],
+        )
+        .unwrap();
+        seed_memory(&c, "m-present", "t", "a note about `present_symbol`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m-present','path','src/present.rs','src/present.rs','current',0,'r')",
+            [],
+        )
+        .unwrap();
+        seed_memory(&c, "m-prose", "t", "a plain prose note with no code identifiers", "r");
+        let scope = Some("r".to_string());
+        // Historical preimage fixtures: do not derive these through the production resolver, or
+        // a future rendered-resolution drift would move both sides of the assertion together.
+        let legacy_hashes = [
+            (
+                "m-present",
+                "a note about `present_symbol`",
+                "cdc9c457ac8c6757535f121cc577afcbf15bc8bc21f0450199890a4a3ffe4d1e",
+            ),
+            (
+                "m-prose",
+                "a plain prose note with no code identifiers",
+                "1f18d650d205d71d934c3646ff5fac1c096ba52eba4cf758b865364f4167d3cd",
+            ),
+        ];
+        for &(memory_id, body, legacy_hash) in &legacy_hashes {
+            c.execute(
+                "INSERT INTO memory_reality(memory_id, repo_id, content_hash, \
+                 checked_inputs_hash, prompt_version, checked_at_ms) VALUES (?1,'r',?2,?3,?4,1000)",
+                rusqlite::params![
+                    memory_id,
+                    content_hash("t", body),
+                    legacy_hash,
+                    VERDICT_PROMPT_VERSION
+                ],
+            )
+            .unwrap();
+        }
+
+        let queue = verification_queue(&c, 2000, 10).unwrap();
+        assert!(
+            queue.is_empty(),
+            "unrelated legacy rows requeued (m-present, m-prose): {:?}",
+            queue.iter().map(|entry| (&entry.memory_id, entry.reason)).collect::<Vec<_>>()
+        );
+        for &(memory_id, _, legacy_hash) in &legacy_hashes {
+            assert_eq!(
+                checked_inputs_hash(&c, memory_id, &scope).unwrap(),
+                legacy_hash,
+                "{memory_id} keeps the byte-identical legacy hash"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_re_enqueues_when_a_gone_binding_becomes_live_for_absent_evidence() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        seed_file(&c, "src/lib.rs", "fn unrelated() {}\n", "r");
+        seed_memory(&c, "m1", "t", "a note about `never_defined_symbol`", "r");
+        c.execute(
+            "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
+             anchor_status, created_at_ms, repo_id) VALUES \
+             ('m1','path','src/lib.rs','src/lib.rs','gone',0,'r')",
+            [],
+        )
+        .unwrap();
+        let gone_hash = checked_inputs_hash(&c, "m1", &Some("r".to_string())).unwrap();
+        c.execute(
+            "INSERT INTO memory_reality(memory_id, repo_id, content_hash, checked_inputs_hash, \
+             prompt_version, checked_at_ms) VALUES ('m1','r',?1,?2,?3,1000)",
+            rusqlite::params![
+                content_hash("t", "a note about `never_defined_symbol`"),
+                gone_hash,
+                VERDICT_PROMPT_VERSION
+            ],
+        )
+        .unwrap();
+        assert!(verification_queue(&c, 2000, 10).unwrap().is_empty(), "baseline row is current");
+
+        c.execute(
+            "UPDATE repo_memory_bindings SET anchor_status = 'current' WHERE memory_id = 'm1'",
+            [],
+        )
+        .unwrap();
+        let queue = verification_queue(&c, 2000, 10).unwrap();
+        assert_eq!(queue.len(), 1, "a live-bound absence pack must be re-evaluated");
+        assert_eq!(queue[0].reason, VerificationReason::InputsChanged);
     }
 
     #[test]
@@ -2646,7 +2917,8 @@ mod tests {
     }
 
     #[test]
-    fn is_citable_requires_presence_evidence_not_bare_absence_or_unresolvable() {
+    fn is_citable_requires_presence_evidence_not_bare_absence_or_unresolvable_without_live_binding()
+    {
         let id = |kind| IdentifierResolution {
             identifier: "i".to_string(),
             resolution: "r".to_string(),
@@ -2656,6 +2928,7 @@ mod tests {
             memory_id: "m".to_string(),
             identifiers: ids,
             excerpts: Vec::new(),
+            has_live_binding: false,
         };
         assert!(
             !pack(vec![id(ResolutionKind::Absent), id(ResolutionKind::Unresolvable)]).is_citable(),
