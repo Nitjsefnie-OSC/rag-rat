@@ -355,8 +355,52 @@ pub fn account_is_public_kb(
     conn: &Connection,
     account: rag_rat_oplog::AccountId,
 ) -> anyhow::Result<bool> {
-    Ok(rag_rat_oplog::account_is_fully_public(conn, account)?
-        && !rag_rat_oplog::owned_streams_for_account(conn, account)?.is_empty())
+    if !rag_rat_oplog::account_is_fully_public(conn, account)? {
+        return Ok(false);
+    }
+    if !rag_rat_oplog::owned_streams_for_account(conn, account)?.is_empty() {
+        return Ok(true);
+    }
+    // A granted CONTRIBUTOR owns no stream at all (#1164) — it authors onto the owner's — so the
+    // owns-a-stream test alone would serve it `Closed` and nothing could ever pull its account log.
+    // That breaks the very direction contribution needs: content is offered by AUTHOR, so the owner
+    // collects a contributor's memories by syncing the CONTRIBUTOR's account.
+    //
+    // Ask the NARROW question — "is there a live grant for a stream this store actually contributes
+    // to" — not "does this account hold any grant anywhere". Two reasons, and both matter:
+    //
+    // * COST. This runs per inbound connection, BEFORE authentication. A grantee-leading scan of
+    //   `account_stream_grants` is unindexed (the index is `(owner, stream, grantee)`), so a store
+    //   that has synced many account logs would do unbounded work for every unauthenticated dial.
+    //   Resolving the owner and stream first makes each lookup an indexed point query, and the
+    //   number of them is the number of contributing repos — a handful.
+    // * PRECISION. A stale grant this store never uses should not expose it.
+    //
+    // The grant's stream must be PublicRead, checked here and not assumed: the fold does not yet
+    // require it (#1178), and `account_is_fully_public` above inspects only streams this account
+    // OWNS, so it says nothing about the foreign stream a grant points at. Contribution targets
+    // `PublicRead` by construction, and `stream_access_mode` fails closed to `Private` when the
+    // ownership fact has not been synced, so an unverifiable grant does not qualify either.
+    //
+    // The exposure is stated rather than implied: a qualifying contributor's account log becomes
+    // readable by ANY dialer, since public admission is anonymous. Its authored content is on a
+    // public stream by the check below; what this adds is the contributor's own roster metadata.
+    for (repo_id, owner) in crate::memory_write::contribution_targets(conn)? {
+        let stream = rag_rat_oplog::owner_stream_v2_id_for_account(
+            &repo_id,
+            owner,
+            rag_rat_oplog::AccessMode::PublicRead,
+        )?;
+        if rag_rat_oplog::stream_access_mode(conn, owner, stream)?
+            != rag_rat_oplog::AccessMode::PublicRead
+        {
+            continue;
+        }
+        if rag_rat_oplog::effective_writer_grant(conn, owner, stream, account)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Maintain a serving host's discovery announcement independently of its inbound session loop.
@@ -982,6 +1026,91 @@ mod tests {
         own_stream(&public, rag_rat_oplog::AccessMode::PublicRead);
         let public_account = rag_rat_oplog::local_account(&public, 1_000).unwrap();
         assert!(account_is_public_kb(&public, public_account).unwrap());
+    }
+
+    /// A granted CONTRIBUTOR owns no stream (#1164), so the owns-a-stream test alone would serve it
+    /// `Closed` and nothing could pull its account log — breaking the direction contribution needs,
+    /// since content is offered by AUTHOR and the owner collects a contributor's memories by
+    /// syncing the CONTRIBUTOR's account.
+    ///
+    /// The evidence is deliberately narrow: a live grant on a stream this store is CONFIGURED to
+    /// contribute to. A grant alone is not enough — a stale one this store never uses must not
+    /// expose it — and the narrow question is also the cheap one, since it resolves to indexed
+    /// point lookups instead of an unindexed grantee scan on every pre-auth connection.
+    #[test]
+    fn only_a_configured_contribution_grant_makes_a_stream_less_account_servable() {
+        use rusqlite::{Transaction, TransactionBehavior};
+
+        // A real owner with a real PublicRead stream for `repo-a`, granting the contributor.
+        let owner = schema_conn();
+        let owner_account = rag_rat_oplog::local_account(&owner, 1_000).unwrap();
+        let public_stream = {
+            let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+            let s = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+                &tx,
+                "repo-a",
+                rag_rat_oplog::AccessMode::PublicRead,
+                1_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            s
+        };
+
+        let contributor = schema_conn();
+        let account = rag_rat_oplog::local_account(&contributor, 1_000).unwrap();
+        contributor
+            .execute(
+                "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES \
+                 ('repo-a','a',0)",
+                [],
+            )
+            .unwrap();
+        // Owns nothing and contributes nowhere: refused, as a vacuously-public account must be.
+        assert!(!account_is_public_kb(&contributor, account).unwrap());
+
+        {
+            let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+            rag_rat_oplog::author_stream_grant_in_tx(
+                &tx,
+                public_stream,
+                account,
+                rag_rat_oplog::GrantRole::Writer,
+                1_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        for entry in rag_rat_oplog::account_entries_for_sync(&owner, owner_account).unwrap() {
+            rag_rat_oplog::account_ingest(&contributor, &entry.signed_bytes, 1_000).unwrap();
+        }
+
+        // The grant is held and verifiable — but this store does not contribute anywhere, so it is
+        // still not servable. A grant it never uses is not a reason to expose it.
+        assert!(
+            !account_is_public_kb(&contributor, account).unwrap(),
+            "an unused grant does not expose the account",
+        );
+
+        // Configure the contribution, and NOW it is servable.
+        rag_rat_db::meta::set_repo_meta(
+            &contributor,
+            "repo-a",
+            "memory_contribution_owner",
+            &rag_rat_base::hash::hex_lower(&owner_account.to_bytes()),
+        )
+        .unwrap();
+        assert!(
+            account_is_public_kb(&contributor, account).unwrap(),
+            "a live grant on the stream this store contributes to makes it servable",
+        );
+
+        // Revoking closes the door again.
+        contributor.execute("UPDATE account_stream_grants SET closed_at = 2000", []).unwrap();
+        assert!(
+            !account_is_public_kb(&contributor, account).unwrap(),
+            "a revoked grant no longer makes the account servable",
+        );
     }
 
     #[test]

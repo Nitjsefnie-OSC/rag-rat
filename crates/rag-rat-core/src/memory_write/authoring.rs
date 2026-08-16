@@ -193,6 +193,21 @@ pub(crate) const CONTRIBUTION_OWNER_META_KEY: &str = "memory_contribution_owner"
 
 /// The configured contribution-owner account for `repo_id`, or `None`. Stored as a 64-hex account
 /// id.
+/// Every `(repo_id, owner)` this store is configured to contribute to. Small by construction — one
+/// entry per contributing repo — and the input to both the serve predicate (which grant matters)
+/// and the private-stream guard (whether ANY repo is contributing).
+pub(crate) fn contribution_targets(
+    conn: &Connection,
+) -> anyhow::Result<Vec<(String, rag_rat_oplog::AccountId)>> {
+    let mut out = Vec::new();
+    for repo_id in rag_rat_db::schema::real_repo_ids(conn)? {
+        if let Some(owner) = contribution_owner_account(conn, &repo_id)? {
+            out.push((repo_id, owner));
+        }
+    }
+    Ok(out)
+}
+
 pub(super) fn contribution_owner_account(
     conn: &Connection,
     repo_id: &str,
@@ -200,7 +215,7 @@ pub(super) fn contribution_owner_account(
     let Some(hex) = rag_rat_db::meta::repo_meta(conn, repo_id, CONTRIBUTION_OWNER_META_KEY)? else {
         return Ok(None);
     };
-    Ok(Some(parse_account_id_hex(&hex)?))
+    Ok(Some(rag_rat_oplog::AccountId::from_hex(&hex)?))
 }
 
 /// Whether this repo authors as a granted CONTRIBUTOR — an owner is configured and it is not this
@@ -273,24 +288,6 @@ fn grantee_context(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<Gr
     Ok(Some(GranteeContext { owner_account, stream, grant_id }))
 }
 
-/// Decode a 64-hex account id into an [`rag_rat_oplog::AccountId`].
-fn parse_account_id_hex(value: &str) -> anyhow::Result<rag_rat_oplog::AccountId> {
-    anyhow::ensure!(
-        value.len() == 64,
-        "account id must be 64 hex characters (got {})",
-        value.len()
-    );
-    let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        let high = rag_rat_base::hash::hex_nibble(pair[0])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2))?;
-        let low = rag_rat_base::hash::hex_nibble(pair[1])
-            .with_context(|| format!("account id has invalid hex at position {}", index * 2 + 1))?;
-        bytes[index] = high << 4 | low;
-    }
-    Ok(rag_rat_oplog::AccountId::from_bytes(bytes))
-}
-
 /// Configure the ACTIVE repo to contribute memories to `owner_account_hex` (paste flow, #1164):
 /// record the owner id so subsequent memory authoring targets the owner's stream via this account's
 /// Writer grant. Mints this store's local account (the identity the owner grants). Requires a
@@ -308,13 +305,32 @@ pub(crate) fn set_contribution_owner(
     {
         anyhow::bail!("sync contribute requires a stable repo identity (not legacy or local-only)");
     }
-    let owner = parse_account_id_hex(owner_account_hex)?;
+    let owner = rag_rat_oplog::AccountId::from_hex(owner_account_hex)?;
     let local = rag_rat_oplog::local_account(conn, now_ms)?;
     anyhow::ensure!(
         owner != local,
         "cannot contribute to your own account — the owner is a SEPARATE identity (its id from \
          the owner's `sync whoami`)"
     );
+    // A contributor is reachable only while its account is publicly servable: content is served by
+    // its AUTHOR account and the owner is not enrolled here, so if this account holds ANY private
+    // stream the owner can never pull what this store authors — the contributions would be
+    // authored, accepted on the owner's stream, and permanently unreachable.
+    //
+    // Refuse at configure time rather than let it fail invisibly later. A control log cannot be
+    // served as a subset (it is one hash chain), so there is no way to expose the roster while
+    // withholding the private stream metadata; a dedicated store is the only correct answer.
+    // `sync publish` guards the same property for OWNERS, but a contributor never publishes, so
+    // that check never runs on this path.
+    anyhow::ensure!(
+        rag_rat_oplog::account_is_fully_public(conn, local)?,
+        "this account owns private memory streams (from other repos in this index), so a granted \
+         owner could never fetch what you contribute — an account is servable to a peer only when \
+         all of its streams are public, and a control log cannot be served in part. Contribute \
+         from a dedicated index instead: `rag-rat init --database <path-to-a-fresh-index>` in \
+         this checkout, then run `sync contribute` there"
+    );
+
     let canonical = rag_rat_base::hash::hex_lower(&owner.to_bytes());
 
     let _durability = AuthoredDurability::begin(conn)?;
@@ -750,6 +766,31 @@ fn ensure_owner_stream(conn: &Connection, repo_id: &str, now_ms: i64) -> anyhow:
     }
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Establishing a PRIVATE stream here would silently un-serve every repo this store contributes
+    // to: an account is servable to a peer only when ALL of its streams are public, content is
+    // served by its AUTHOR, and the owner is not enrolled here — so the contributions this store
+    // has already authored, and any it authors later, become permanently unreachable.
+    //
+    // The configure-time check in `set_contribution_owner` cannot cover this: it runs once, and the
+    // conflicting stream is created later by ordinary authoring in a DIFFERENT repo. Enforce it
+    // where the conflict is actually created, inside the same transaction that would create it.
+    //
+    // Yes, this means memory authoring in an unrelated private repo fails while this index
+    // contributes. That is the honest ordering: the alternative is authoring memories nobody can
+    // ever fetch and discovering it much later. The error names both escapes.
+    if mode != rag_rat_oplog::AccessMode::PublicRead {
+        let contributing = contribution_targets(&tx)?;
+        if let Some((contributing_repo, owner)) = contributing.first() {
+            anyhow::bail!(
+                "repo `{repo_id}` would need a PRIVATE memory stream, but this index contributes \
+                 repo `{contributing_repo}`'s memories to account {} — and an account is \
+                 fetchable by a peer only while all of its streams are public, so this would \
+                 strand those contributions unreachable. Index `{repo_id}` in a separate \
+                 database, or publish it with `rag-rat sync publish`",
+                rag_rat_base::hash::hex_lower(&owner.to_bytes()),
+            );
+        }
+    }
     let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(&tx, repo_id, mode, now_ms)?;
     tx.commit()?;
     Ok(stream)

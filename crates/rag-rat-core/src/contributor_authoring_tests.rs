@@ -283,3 +283,68 @@ fn contributing_without_a_synced_grant_fails_loud() {
     let err = create_memory(&contributor, concept("x")).unwrap_err().to_string();
     assert!(err.contains("writer grant"), "missing grant is a loud failure: {err}");
 }
+
+/// A store that owns a PRIVATE stream cannot be a contributor: content is served by its AUTHOR
+/// account, the owner is not enrolled here, and an account is servable only when every stream it
+/// owns is public — so the owner could never fetch what this store authored. Refuse while the
+/// operator can still act on it, rather than authoring contributions into permanent unreachability.
+#[test]
+fn contributing_from_a_store_with_a_private_stream_is_refused() {
+    let contributor = scoped_conn();
+    local_account(&contributor, NOW).unwrap();
+    // A second repo in the same index, synced privately — the ordinary way this arises.
+    contributor
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-b', 'b', 0)",
+            [],
+        )
+        .unwrap();
+    {
+        use rusqlite::{Transaction, TransactionBehavior};
+        let tx = Transaction::new_unchecked(&contributor, TransactionBehavior::Immediate).unwrap();
+        rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+            &tx,
+            "repo-b",
+            AccessMode::Private,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    let err = crate::memory_write::set_contribution_owner(&contributor, &"ab".repeat(32), NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("private memory streams"), "the refusal names the cause: {err}");
+    assert!(err.contains("dedicated index"), "and hands over the escape: {err}");
+}
+
+/// The configure-time refusal is a ONE-TIME check, so it cannot be the only one: ordinary authoring
+/// in a SECOND repo would later establish that repo's default PRIVATE stream, and an account is
+/// fetchable by a peer only while every stream it owns is public. The contributions this store has
+/// already authored would silently become unreachable. Enforce it where the conflict is created.
+#[test]
+fn a_contributing_store_refuses_to_establish_a_private_stream_later() {
+    let (_owner, contributor, _owner_account) = contribution_pair();
+    create_memory(&contributor, concept("contributor-note")).unwrap();
+
+    // A second repo in the same index, authored the ordinary way — no sync configuration at all.
+    contributor
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-b', 'b', 0)",
+            [],
+        )
+        .unwrap();
+    contributor
+        .execute(
+            "INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES ('repo_id', \
+             'repo-b')",
+            [],
+        )
+        .unwrap();
+
+    let err = create_memory(&contributor, concept("private-repo-note")).unwrap_err().to_string();
+    assert!(err.contains("PRIVATE memory stream"), "the refusal names the conflict: {err}");
+    assert!(err.contains("separate database"), "and hands over an escape: {err}");
+    assert!(err.contains("sync publish"), "and the other escape: {err}");
+}

@@ -35,6 +35,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 ttl: Duration::from_secs(*ttl_secs),
             }),
         SyncCommand::Join { ticket } => return join(config, ticket),
+        SyncCommand::Pull { account, peer } => return pull(config, account, peer.as_deref()),
         SyncCommand::Enable
         | SyncCommand::Publish { .. }
         | SyncCommand::CatchUp { .. }
@@ -116,7 +117,10 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account and this store must sync the owner's log before authoring succeeds",
             }))
         },
-        SyncCommand::Serve { .. } | SyncCommand::Init { .. } | SyncCommand::Join { .. } =>
+        SyncCommand::Serve { .. }
+        | SyncCommand::Init { .. }
+        | SyncCommand::Join { .. }
+        | SyncCommand::Pull { .. } =>
             unreachable!("the network commands are dispatched before the write lock"),
     }
 }
@@ -532,6 +536,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             entries_newly_stored: 0,
             entries_sent: 0,
             converged: false,
+            peer_capability: PeerCapability::ReadOnly,
         };
         for pass in 0..3 {
             let mut store = OplogSyncStore::new(conn, account_id, time::now_ms);
@@ -611,6 +616,245 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             "inviter_relay": ticket.relay_url,
             "note": "to keep syncing, add inviter_node_id to [sync] server_peers and set [sync] \
                      relay_url (or RAG_RAT_SYNC_RELAY) to inviter_relay",
+        }))?;
+        anyhow::Ok(())
+    })
+}
+
+/// Fetch a DIFFERENT account's log and content from a peer, then materialize them locally.
+///
+/// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
+/// HEAD change, and an operator reaches for the command when automation is off. Cross-account
+/// contribution needs it in both directions — a contributor fetches the owner's memories, and an
+/// owner collects a contributor's — because content is offered by AUTHOR
+/// (`content_entries_for_sync` filters `author_account_id`), so each side must sync the OTHER's
+/// account to see what that side wrote.
+///
+/// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
+/// private account data, pinned `Closed`), and no founder-incarnation repair.
+fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
+    let target = rag_rat_oplog::AccountId::from_hex(account_hex)?;
+    let relay = effective_relay_url(config);
+
+    // The per-database SESSION lock, held for the whole pull. Any process that opens an iroh
+    // endpoint for a database must hold it: the endpoint identity comes from the persisted
+    // `sync_node_secret`, so a second endpoint binds the SAME node id and the two race relay
+    // registration and inbound sessions. A resident MCP host or `sync serve` holds this for its
+    // lifetime, which is exactly the common case here — an operator reaching for `pull` while the
+    // resident is up.
+    let _session = locks::WriteLock::acquire_sync_session_timeout(
+        &config.database,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "another sync session already holds this database's node identity (a resident MCP \
+             host, a `serve` peer, or a device sync is running); stop it and retry — it cannot \
+             pull a foreign account on your behalf"
+        )
+    })?;
+
+    let lock_repo = locks::write_lock_repo_id(config);
+    let repo_lock = locks::WriteLock::acquire_timeout(
+        &config.database,
+        &lock_repo,
+        SERVE_SESSION_LOCK_TIMEOUT,
+    )?
+    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
+    let db = crate::open_index(config)?;
+    let node_key = {
+        let conn = db.connection();
+        // Pulling your OWN account is device sync, not a cross-account fetch — say so rather than
+        // opening a session that would work but confuse the mental model.
+        if rag_rat_oplog::read_local_account(conn)? == Some(target) {
+            bail!(
+                "that is this store's own account — use `rag-rat sync serve` on the other device \
+                 and let device sync run, or `sync join` to enroll a new one"
+            );
+        }
+        rag_rat_oplog::local_device(conn, time::now_ms())?;
+        node_secret(conn)?
+    };
+    drop(repo_lock);
+
+    let peers: Vec<String> = match peer_override {
+        Some(peer) => vec![peer.to_string()],
+        None => config.sync.server_peers.clone(),
+    };
+    if peers.is_empty() {
+        bail!(
+            "no peer to pull from: pass --peer <NODE_ID> or set [sync] server_peers. Discovery \
+             cannot find a FOREIGN account's host — its discovery tag derives from that account's \
+             own secret, which only its own devices hold"
+        );
+    }
+
+    let runtime =
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    runtime.block_on(async move {
+        let conn = db.connection();
+        let endpoint = rag_rat_sync::build_endpoint(*node_key, &relay)
+            .await
+            .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
+
+        let mut last_error: Option<String> = None;
+        // Durable across attempts: a peer can store entries and then fail to converge, and those
+        // bytes stay. Reporting only the final peer's tally would undercount — sometimes to zero.
+        let mut account_entries = 0usize;
+        let mut content_entries = 0usize;
+        let mut reached: Option<(String, bool)> = None;
+        for peer_id in &peers {
+            let addr = match rag_rat_sync::peer_addr(peer_id, &relay) {
+                Ok(addr) => addr,
+                Err(error) => {
+                    last_error = Some(format!("peer `{peer_id}` is not a valid node id: {error}"));
+                    continue;
+                },
+            };
+            // ACCOUNT LOG FIRST, then content: content acceptance re-derives authority from the
+            // account log, so a content session run first would park every candidate until a later
+            // settle. One command, correct order, nothing parked in the normal case.
+            //
+            // `PublicRead`, never `Closed`: on first contact this store holds ZERO roster facts for
+            // the foreign account, so `authorize` returns `Unavailable` — which `Closed` maps to
+            // `Unauthorized`, failing every first pull. `PublicRead` maps `Unavailable` + dialer to
+            // the ReadWrite bootstrap fallback built for exactly this. Admission is not trust:
+            // `account_ingest` / `content_ingest` re-verify every entry from scratch.
+            let mut account_store = OplogSyncStore::new(conn, target, time::now_ms);
+            let account_report = match rag_rat_sync::connect_and_reconcile(
+                &endpoint,
+                addr.clone(),
+                rag_rat_sync::SYNC_ALPN,
+                &mut account_store,
+                AuthPolicy::PublicRead,
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    last_error = Some(format!("{peer_id}: account log: {error}"));
+                    continue;
+                },
+            };
+            // A non-converged account leg means the round cap was hit with the store still possibly
+            // incomplete. Content acceptance re-derives authority from that log, so proceeding
+            // would silently leave valid entries unaccepted — and a cross-account pull has no
+            // automatic retry to repair it later. Treat the peer as unusable and try the next.
+            account_entries += account_report.entries_newly_stored;
+            // A pull exists to RECEIVE. If this side granted the peer only `ReadOnly`, its entries
+            // are rejected on arrival, so an all-quiet round means "structurally unable to receive"
+            // rather than "in sync" — and `converged` would report success on an incomplete
+            // account. This is the resumed-bootstrap wedge: once a partial pull leaves
+            // `account_effective_count > 0` for the target, a serving device whose `DeviceAdd` has
+            // not arrived folds `Rejected` (not `Unavailable`), which loses the bootstrap fallback.
+            if account_report.peer_capability != PeerCapability::ReadWrite {
+                last_error = Some(format!(
+                    "{peer_id}: this store holds a PARTIAL roster for that account, so it could \
+                     not authorize this peer to serve — the peer was admitted read-only and sent \
+                     nothing. Pull from the peer whose device is already in the roster you hold \
+                     (usually the account's own host), or start from a store with no entries for \
+                     it"
+                ));
+                continue;
+            }
+            // A quiet round can also mean the peer simply had nothing: an EMPTY account store
+            // completes the PublicRead protocol, and `Unavailable` hands the dialer the bootstrap
+            // ReadWrite capability, so round one is quiet and `converged` is true without this
+            // store ever learning the account. Require the target to actually be known here.
+            if rag_rat_oplog::account_effective_count(conn, target)? == 0 {
+                last_error = Some(format!(
+                    "{peer_id}: completed the exchange without sending account {}'s log — it does \
+                     not hold that account. Check the id, or point --peer at a machine that does",
+                    hash::hex_lower(&target.to_bytes())
+                ));
+                continue;
+            }
+            if !account_report.converged {
+                last_error = Some(format!(
+                    "{peer_id}: the account log did not converge before the round limit; its \
+                     content would be judged against incomplete authority"
+                ));
+                continue;
+            }
+            let mut content_store = OplogContentSyncStore::new(conn, target, time::now_ms);
+            let content_report = match rag_rat_sync::connect_and_reconcile(
+                &endpoint,
+                addr,
+                rag_rat_sync::CONTENT_SYNC_ALPN,
+                &mut content_store,
+                AuthPolicy::PublicRead,
+                time::now_ms,
+                rag_rat_sync::MAX_RECONCILE_ROUNDS,
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    last_error = Some(format!("{peer_id}: content: {error}"));
+                    continue;
+                },
+            };
+            content_entries += content_report.entries_newly_stored;
+            if !content_report.converged {
+                // Same treatment as the account leg: a healthy later peer may finish the job, and
+                // breaking here would pin every re-run on the same non-converging first peer. The
+                // entries this peer did store are durable and stay counted.
+                last_error =
+                    Some(format!("{peer_id}: content did not converge before the round limit"));
+                continue;
+            }
+            reached = Some((peer_id.clone(), true));
+            break;
+        }
+
+        let Some((peer_id, converged)) = reached else {
+            bail!(
+                "could not pull account {} from any configured peer: {}",
+                hash::hex_lower(&target.to_bytes()),
+                last_error.unwrap_or_else(|| "no peer reachable".to_string())
+            );
+        };
+
+        // Materialize what landed, and MEASURE the result rather than asserting it. The drain
+        // mirrors exactly ONE authoritative stream per repo: the configured contribution owner's,
+        // or this store's own. Those cover the two directions contribution needs — a contributor
+        // pulling its owner, and an owner pulling a contributor (whose entries sit on the owner's
+        // own stream). A standalone reader pulling some third account it neither owns nor
+        // contributes to has nowhere to put the content, and must not be told otherwise.
+        let effects = rag_rat_core::drain_synced_memory(conn)?;
+        rag_rat_core::resolve_synced_distill_anchors(conn)?;
+        db.fold_wal();
+
+        let note = if !converged {
+            "the round limit was reached before this account converged — re-run to finish; what \
+             arrived is durable"
+        } else if effects.nodes_written > 0 || effects.edges_written > 0 {
+            "these memories are searchable locally; their code anchors do not cross an account \
+             boundary, so they will not attach as drive-by context"
+        } else if !effects.is_empty() {
+            "the authority this pull brought RETRACTED memories here — the drain removed what the \
+             owner's log no longer accepts; nothing new was added"
+        } else if content_entries > 0 {
+            "content arrived but nothing materialized into this repo's memories: a repo mirrors \
+             ONE stream — its own, or a configured contribution owner's. Run `sync contribute \
+             <this account>` to mirror it, or pull from a store that owns or contributes to it"
+        } else {
+            "already up to date with this account"
+        };
+        crate::print_output(&serde_json::json!({
+            "status": if converged { "pulled" } else { "incomplete" },
+            "account_id": hash::hex_lower(&target.to_bytes()),
+            "peer": peer_id,
+            "account_entries_stored": account_entries,
+            "content_entries_stored": content_entries,
+            "memories_written": effects.nodes_written,
+            "memories_removed": effects.nodes_removed,
+            "edges_written": effects.edges_written,
+            "edges_removed": effects.edges_removed,
+            "converged": converged,
+            "note": note,
         }))?;
         anyhow::Ok(())
     })
@@ -888,18 +1132,21 @@ mod tests {
             entries_newly_stored: 3,
             entries_sent: 5,
             converged: false,
+            peer_capability: rag_rat_sync::PeerCapability::ReadWrite,
         };
         accumulate_reconcile_report(&mut total, rag_rat_sync::ReconcileReport {
             rounds: 7,
             entries_newly_stored: 11,
             entries_sent: 13,
             converged: true,
+            peer_capability: rag_rat_sync::PeerCapability::ReadWrite,
         });
         assert_eq!(total, rag_rat_sync::ReconcileReport {
             rounds: 9,
             entries_newly_stored: 14,
             entries_sent: 18,
             converged: true,
+            peer_capability: rag_rat_sync::PeerCapability::ReadWrite,
         });
     }
 

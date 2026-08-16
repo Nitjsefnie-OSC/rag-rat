@@ -875,6 +875,51 @@ pub fn effective_writer_grant(
     grant_id.map(|bytes| fixed(&bytes)).transpose()
 }
 
+/// Whether `grantee_account_id` holds an effective (not-closed) Writer grant on a stream that
+/// resolves **`PublicRead`**. Unlike [`effective_writer_grant`], which answers "may this account
+/// write to THIS stream", this answers "is this account a public contributor at all" — the question
+/// the serve policy asks when deciding whether an account owning no stream of its own is
+/// nonetheless a deliberately-participating identity worth serving (#1164), rather than a fresh
+/// empty account that must stay unexposed.
+///
+/// AVAILABILITY CAVEAT. Servability tracks CURRENT grant effectiveness, so closing a contributor's
+/// last public grant also closes the only door through which its account is reachable — content is
+/// served by its AUTHOR account, and the owner is not enrolled in the contributor's account. Cut
+/// semantics deliberately keep entries at or below the cut accepted, so a pre-revocation
+/// contribution that was never replicated stays VALID but becomes UNREACHABLE. Automatic
+/// cross-account sync (#1175) shrinks that window to "unreplicated at the moment of revocation";
+/// closing it properly is revoke's problem (#1177) — replicate before closing, or serve a bounded
+/// tail afterwards.
+///
+/// The access-mode check is load-bearing and cannot be assumed away: the fold does not yet require
+/// `PublicRead` for a `StreamGrant` (#1178), so a grant on a PRIVATE stream is representable, and
+/// counting it would let a private relationship justify exposing an account log to anonymous
+/// readers. [`stream_access_mode`] fails closed to `Private` when the ownership fact is missing, so
+/// a grant this store cannot verify does not qualify.
+pub fn account_holds_effective_public_writer_grant(
+    conn: &Connection,
+    grantee_account_id: AccountId,
+) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(
+        "SELECT owner_account_id, stream_id FROM account_stream_grants
+         WHERE grantee_account_id = ?1 AND role = ?2 AND closed_at IS NULL",
+    )?;
+    let grants = stmt
+        .query_map(
+            params![grantee_account_id.to_bytes().as_slice(), GrantRole::Writer.as_db_str()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (owner, stream) in grants {
+        let owner = AccountId::from_bytes(fixed(&owner)?);
+        let stream = StreamId::from_bytes(fixed(&stream)?);
+        if stream_access_mode(conn, owner, stream)? == crate::stream::AccessMode::PublicRead {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Resolve a grant and the requesting device's revoke cut as ONE authorization decision. C2 must
 /// use this combined seam when admitting content: two independent calls could otherwise straddle
 /// a refold and combine an old effective grant with a new (or absent) cut projection.

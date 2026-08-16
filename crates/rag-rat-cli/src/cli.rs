@@ -347,6 +347,27 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "OWNER_ACCOUNT_ID")]
         account: String,
     },
+    /// Fetch ANOTHER account's memories from a peer that serves them.
+    #[command(long_about = "Syncs a DIFFERENT account's log and memories from a peer, then \
+                            materializes them locally. This is how a contributor gets the \
+                            owner's memories, and how an owner collects a contributor's — each \
+                            side syncs the other's account, because memories are offered by \
+                            whoever AUTHORED them, not by the stream they live on. Run it \
+                            whenever you want those memories: automatic sync currently covers \
+                            only this store's OWN account, so cross-account memories move when \
+                            you run this and not before. The peer must be serving (`rag-rat sync \
+                            serve`) and reachable via --peer or [sync] server_peers, and no \
+                            other sync session (a resident MCP host, `serve`, or a device sync) \
+                            may be running — they share this database's node identity.")]
+    Pull {
+        /// The 64-hex account id to fetch, from that side's `rag-rat sync whoami`.
+        #[arg(value_name = "ACCOUNT_ID")]
+        account: String,
+        /// Node id of the peer serving that account. Defaults to the configured
+        /// `[sync] server_peers`.
+        #[arg(long, value_name = "NODE_ID")]
+        peer: Option<String>,
+    },
 }
 
 /// Roster role an operator grants a joining device at `sync init` time. Mirrors
