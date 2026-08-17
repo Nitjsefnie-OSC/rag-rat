@@ -4050,8 +4050,12 @@ mod tests {
     fn adopt_local_account_adopts_an_accepted_genesis_and_refuses_conflicts() {
         let fixture = interleaved_promoted_device_bootstrap();
         let conn = db();
-        // Ingest the genesis as an ordinary accepted candidate, then adopt it directly.
-        account_ingest(&conn, &fixture.account_entries[0], NOW).unwrap();
+        // Ingest the bootstrap as ordinary candidates (the genesis folds accepted among them —
+        // `account_entries` is (seq, hash)-sorted, so no fixed index names the genesis), then
+        // adopt it directly.
+        for bytes in &fixture.account_entries {
+            account_ingest(&conn, bytes, NOW).unwrap();
+        }
         super::super::bootstrap::adopt_local_account(
             &conn,
             fixture.account,
@@ -4268,7 +4272,9 @@ mod tests {
     }
 
     fn stream_own(account_id: AccountId) -> (crate::stream::StreamId, AccountOp) {
-        stream_own_mode(account_id, crate::stream::AccessMode::Private, "repo-a")
+        // Grants fold only on PublicRead streams, so the grant-exercising tests default to it;
+        // the access-mode reader test picks its modes explicitly.
+        stream_own_mode(account_id, crate::stream::AccessMode::PublicRead, "repo-a")
     }
 
     fn stream_own_mode(
@@ -4723,6 +4729,72 @@ mod tests {
             error.to_string().contains("open grant unexpectedly has a persisted device cut"),
             "unexpected corrupt-projection error: {error:#}",
         );
+    }
+
+    #[test]
+    fn the_authority_backfill_purges_a_grant_a_pre_gate_binary_folded_on_a_private_stream() {
+        // Simulates the V115 upgrade input: a binary predating the grants-require-PublicRead
+        // fold gate ingested a hand-crafted private-stream grant and projected it effective. The
+        // all-account backfill must re-judge it — the projected row would otherwise keep
+        // answering Effective until some unrelated ingest refolds this account.
+        let conn = db();
+        let founder = Dev::new(1);
+        let grantee = AccountId::from_bytes([0x44; 32]);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let (stream_id, own_op) =
+            stream_own_mode(account_id, crate::stream::AccessMode::Private, "repo-a");
+        let (own_bytes, own_hash) =
+            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
+        let grant_op = AccountOp::StreamGrant {
+            stream_id,
+            grantee_account_id: grantee,
+            grant_role: GrantRole::Writer,
+        };
+        let (grant_bytes, grant_id) =
+            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &grant_op);
+        // The CURRENT fold rejects this at ingest; overwrite its verdict and plant the projected
+        // row exactly as the pre-gate fold left them.
+        account_ingest(&conn, &grant_bytes, NOW + 2).unwrap();
+        conn.execute("UPDATE account_entries SET accepted = 1 WHERE entry_hash = ?1", [
+            grant_id.as_slice()
+        ])
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_stream_grants(
+                 grant_id, owner_account_id, stream_id, grantee_account_id, role,
+                 effective_at, closed_at)
+             VALUES(?1, ?2, ?3, ?4, 'writer', 3, NULL)",
+            params![
+                grant_id.as_slice(),
+                account_id.to_bytes().as_slice(),
+                stream_id.to_bytes().as_slice(),
+                grantee.to_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            open_writer_grants(&conn, account_id, stream_id, grantee).unwrap(),
+            vec![grant_id],
+            "the planted legacy projection answers Effective before the backfill",
+        );
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        backfill_authority_projection(&tx).unwrap();
+        tx.commit().unwrap();
+        assert!(
+            open_writer_grants(&conn, account_id, stream_id, grantee).unwrap().is_empty(),
+            "the backfill re-judges the private-stream grant out of the projection",
+        );
+        let accepted: bool = conn
+            .query_row(
+                "SELECT accepted FROM account_entries WHERE entry_hash = ?1",
+                [grant_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!accepted, "the grant entry itself is re-judged rejected");
     }
 
     #[test]
