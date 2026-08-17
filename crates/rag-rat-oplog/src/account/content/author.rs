@@ -181,8 +181,7 @@ pub fn author_content_batch_in_tx(
             ),
             None => (0, None),
         };
-        let lamport =
-            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let lamport = batch_lamport(lamport_base, index)?;
         let header = ContentEntryHeader {
             stream_id,
             author_account_id: account_id,
@@ -287,8 +286,7 @@ pub fn author_grantee_content_batch_in_tx(
             ),
             None => (0, None),
         };
-        let lamport =
-            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let lamport = batch_lamport(lamport_base, index)?;
         let header = ContentEntryHeader {
             stream_id,
             author_account_id: account_id,
@@ -652,8 +650,7 @@ fn seal_and_author_in_tx(
             ),
             None => (0, None),
         };
-        let lamport =
-            lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+        let lamport = batch_lamport(lamport_base, index)?;
         // `crypto_suite`/`key_id` stay 0/None here — `seal_and_sign_content_entry` finalizes them
         // to suite 1 + the key's id, so a suite-1-over-plaintext header is unconstructible.
         let header = ContentEntryHeader {
@@ -810,25 +807,48 @@ fn content_chain_tail(
 /// the `(lamport, device)` projection LWW causal across authors; a per-author chain-tail lamport
 /// would let a short-chain writer's later edit lose.
 ///
-/// ponytail: O(accepted entries) — `lamport` lives only in the signed envelope (not a
-/// `content_entries` column), so this decodes each. Fine at the current authoring cadence; if a
-/// large stream's per-write latency ever matters, denormalize `content_entries.lamport` and read
-/// `MAX(lamport)` (the `/5` table-sync layer already stores it that way).
-fn stream_max_content_lamport(
-    tx: &Transaction<'_>,
+/// The primary read is the refold-persisted `content_stream_clocks` floor, which also counts the
+/// in-bound CONDEMNED basis — so a writer's revocation does not deflate the clock below what
+/// honest dependents already minted against (the wedge that would defeat revocation as the repair
+/// path). A stream the refold has not yet clocked falls back to an indexed `MAX` over the V114
+/// denormalized column (`idx_content_entries_stream_accepted_lamport`). Neither path decodes an
+/// envelope: the ingest-time bounded-advance gate reads this clock for any authenticated envelope
+/// claiming a high lamport, so a per-read O(stream) decode was a remote CPU/writer-lock burn for
+/// a hostile roster device re-sending one envelope. A NULL column value (an undecodable legacy
+/// blob the backfill skipped) is invisible to `MAX`, exactly as the decoding scan treated rows it
+/// could not decode.
+pub(super) fn stream_max_content_lamport(
+    conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<Option<u64>> {
-    let mut stmt = tx.prepare(
-        "SELECT signed_bytes FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
-    )?;
-    let rows =
-        stmt.query_map(params![stream_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut max: Option<u64> = None;
-    for row in rows {
-        let signed = envelope::decode_content_signed(&row?)?;
-        max = Some(max.map_or(signed.header.lamport, |m| m.max(signed.header.lamport)));
+    let clock: Option<i64> = conn
+        .query_row(
+            "SELECT clock FROM content_stream_clocks WHERE stream_id = ?1",
+            params![stream_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(clock) = clock {
+        return Ok(Some(u64::try_from(clock).unwrap_or(0)));
     }
-    Ok(max)
+    let max: Option<i64> = conn.query_row(
+        "SELECT MAX(lamport) FROM content_entries WHERE stream_id = ?1 AND accepted = 1",
+        params![stream_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    Ok(max.map(|value| u64::try_from(value).unwrap_or(0)))
+}
+
+/// The lamport for the `index`-th entry of an authoring batch: `base + index`, kept strictly
+/// below the protocol ceiling. Reserving the ceiling on the authoring side (as `/5`'s
+/// `next_stream_lamport` does) means no locally authored entry can ever trip a peer's
+/// ingest-time ceiling reject — the honest path never approaches it, so hitting this means the
+/// stream's accepted clock was poisoned and needs the offending entry retro-condemned.
+fn batch_lamport(lamport_base: u64, index: usize) -> anyhow::Result<u64> {
+    let lamport =
+        lamport_base.checked_add(index as u64).context("/3 stream lamport clock overflow")?;
+    anyhow::ensure!(lamport < crate::entry::MAX_ENTRY_LAMPORT, "/3 stream lamport ceiling reached");
+    Ok(lamport)
 }
 
 /// The current `/3` status of one entry, or `None` if the refold wrote no status row for it.
@@ -1135,9 +1155,9 @@ mod tests {
         conn.execute(
             "INSERT INTO content_entries(
                  entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
-                 grant_id, roster_ref, owner_auth_len, author_auth_len, accepted, signed_bytes,
-                 received_at_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, 0)",
+                 grant_id, roster_ref, owner_auth_len, author_auth_len, lamport, accepted,
+                 signed_bytes, received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, 0)",
             params![
                 signed.entry_hash.as_slice(),
                 header.stream_id.to_bytes().as_slice(),
@@ -1149,6 +1169,7 @@ mod tests {
                 header.roster_ref.as_slice(),
                 header.owner_auth_len.to_be_bytes().as_slice(),
                 header.author_auth_len.to_be_bytes().as_slice(),
+                i64::try_from(header.lamport).unwrap_or(i64::MAX),
                 signed.signed_bytes.as_slice(),
             ],
         )

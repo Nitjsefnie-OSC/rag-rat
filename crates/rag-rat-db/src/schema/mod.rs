@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 112;
+pub const LATEST_SCHEMA_VERSION: u32 = 114;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -838,6 +838,20 @@ const MIGRATION_112_DESCRIPTION: &str =
      device-local AUTOINCREMENT id and its Lens revision triggers, so the distill anchors child \
      replicates on the distill/1 table-sync scope under whole-row LWW; logical_symbol_id and \
      resolved stay checkout-local and never replicate (#1139)";
+const MIGRATION_113_ID: &str = "113_refold_content_streams_for_lamport_clamp";
+const MIGRATION_113_CHECKSUM: &str = "sha256:rag-rat-refold-content-streams-for-lamport-clamp-v113";
+const MIGRATION_113_DESCRIPTION: &str =
+    "Queue every /3 content stream for an acceptance refold so entries accepted before the \
+     lamport clamp existed are re-judged under it; a stale accepted near-ceiling lamport would \
+     otherwise keep dominating LWW and blocking authoring on an upgraded store while a fresh \
+     replica parks the same entry and diverges (#1176)";
+const MIGRATION_114_ID: &str = "114_content_entries_lamport_column";
+const MIGRATION_114_CHECKSUM: &str = "sha256:rag-rat-content-entries-lamport-column-v114";
+const MIGRATION_114_DESCRIPTION: &str =
+    "Denormalize the /3 header lamport into a content_entries column (backfilled from the signed \
+     envelopes) with a partial (stream_id, lamport) accepted-rows index, so the accepted stream \
+     clock is an indexed MAX instead of a per-read decode of every accepted envelope — the \
+     ingest-time bounded-advance gate and the authoring mint both read it (#1176)";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1072,6 +1086,8 @@ const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
     MIGRATION_110_ID,
     MIGRATION_111_ID,
     MIGRATION_112_ID,
+    MIGRATION_113_ID,
+    MIGRATION_114_ID,
 ];
 
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
@@ -1765,6 +1781,18 @@ const ADDITIVE_MIGRATIONS: &[Migration] = &[
         description: MIGRATION_112_DESCRIPTION,
         apply: MigrationFn::Plain(migrations::apply_syncable_distill_anchors),
     },
+    Migration {
+        id: MIGRATION_113_ID,
+        checksum: MIGRATION_113_CHECKSUM,
+        description: MIGRATION_113_DESCRIPTION,
+        apply: MigrationFn::WithHooks(migrations::apply_refold_content_streams_for_lamport_clamp),
+    },
+    Migration {
+        id: MIGRATION_114_ID,
+        checksum: MIGRATION_114_CHECKSUM,
+        description: MIGRATION_114_DESCRIPTION,
+        apply: MigrationFn::WithHooks(migrations::apply_content_entries_lamport_column),
+    },
 ];
 
 /// Apply ONLY the additive migrations not already recorded, in order — the forward-only path for an
@@ -1997,6 +2025,8 @@ mod ledger_atomicity {
         MIGRATION_110_ID,
         MIGRATION_111_ID,
         MIGRATION_112_ID,
+        MIGRATION_113_ID,
+        MIGRATION_114_ID,
     ];
 
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.

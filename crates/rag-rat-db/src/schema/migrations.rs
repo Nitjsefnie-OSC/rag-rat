@@ -6670,6 +6670,93 @@ mod syncable_overlay_migration_tests {
         assert_eq!(rows, vec![(0, "first".to_string()), (1, "second".to_string())]);
     }
 
+    /// V113 queues every stream holding `/3` content for a refold (so pre-clamp accepted lamports
+    /// get re-judged), merges into an existing queue row instead of clobbering it, and is
+    /// idempotent on replay.
+    #[test]
+    fn v113_queues_every_content_stream_for_refold_and_merges_existing_queue_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        for (stream, entry) in [([0x41_u8; 32], [0x01_u8; 32]), ([0x42; 32], [0x02; 32])] {
+            conn.execute(
+                "INSERT INTO content_entries(
+                     entry_hash, stream_id, author_account_id, device_fingerprint, seq,
+                     prev_hash, grant_id, roster_ref, owner_auth_len, author_auth_len,
+                     accepted, signed_bytes, received_at_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?5, ?5, 1, x'00', 0)",
+                rusqlite::params![
+                    entry.as_slice(),
+                    stream.as_slice(),
+                    [0x11_u8; 32].as_slice(),
+                    [0x12_u8; 32].as_slice(),
+                    0_u64.to_be_bytes().as_slice(),
+                    [0x13_u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        }
+        // Stream 0x41 is already queued for an account change (mask 2) with live timestamps: the
+        // migration must OR the content bit in, not replace the row.
+        conn.execute(
+            "INSERT INTO content_streams_pending_refold(
+                 stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+             VALUES(?1, 2, 7, 7)",
+            [[0x41_u8; 32].as_slice()],
+        )
+        .unwrap();
+        let hooks = crate::hooks::MigrationHooks::noop();
+        super::apply_refold_content_streams_for_lamport_clamp(&conn, &hooks).unwrap();
+        super::apply_refold_content_streams_for_lamport_clamp(&conn, &hooks).unwrap();
+        let rows: Vec<(Vec<u8>, i64, i64)> = conn
+            .prepare(
+                "SELECT stream_id, reason_mask, first_enqueued_at_ms
+                 FROM content_streams_pending_refold ORDER BY stream_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
+    }
+
+    /// V114 adds the nullable denormalized lamport column and its partial accepted-rows index,
+    /// and is idempotent on replay. The backfill itself is a hook (the lamport lives in the
+    /// signed CBOR envelope), exercised in the op-log crate; with noop hooks the column simply
+    /// stays NULL.
+    #[test]
+    fn v114_adds_the_lamport_column_and_its_accepted_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        let has_column: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('content_entries') WHERE name = 'lamport'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1, "content_entries carries the lamport column");
+        let has_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name = 'idx_content_entries_stream_accepted_lamport'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1, "the partial accepted-rows lamport index exists");
+        let has_clocks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+                 AND name = 'content_stream_clocks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_clocks, 1, "the refold-persisted stream clock table exists");
+    }
+
     /// The full ladder re-keys anchors onto the natural key, drops the AUTOINCREMENT id, and is
     /// idempotent on a second apply. V078's index names survive (non-unique) so its replay guard
     /// and the drive-by `selected = 1` lookups stay indexed.
@@ -8238,6 +8325,85 @@ pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()>
              ON papertrail_distill_anchors(repo_id, tracker, project, item_kind, item_key,
                                            candidate_ordinal) WHERE selected = 1;",
     )
+}
+
+/// V113 (#1176): re-judge already-accepted `/3` content under the lamport clamp, and purge what
+/// the clamp can never re-admit.
+///
+/// The `/3` acceptance verdict is only re-derived while a stream sits in the refold queue, so a
+/// store that accepted a near-ceiling lamport under a binary predating the clamp would keep the
+/// stale accepted bit — and the poisoned projection LWW, and the blocked authoring clock —
+/// forever, while a freshly-synced replica parks the same entry and the two diverge. Queue every
+/// stream that holds content; the next settle (every index pass and sync drain runs one) re-folds
+/// it under the current rules and reprojects.
+///
+/// Queueing alone is not enough: the hook then DELETES the violating candidates outright, because
+/// (a) a merely-parked local chain tail wedges all future authoring on that chain, and (b) a
+/// merely-parked over-ceiling envelope is re-advertised to peers that refuse it before storage,
+/// retransmitting forever. The lamport sits inside the signed CBOR envelope, which SQL cannot
+/// decode — hence the hook. Queue BEFORE purging, so a stream whose every entry is deleted still
+/// refolds and clears its stale projection.
+///
+/// Reason mask 1 is the content-candidate refold bit; the zero timestamps sort these oldest, so
+/// they settle ahead of newly-dirtied streams. The upsert ORs into an existing queue row, and a
+/// replay is idempotent by the same shape (the hook is idempotent too — a purged store has
+/// nothing left to purge).
+///
+/// Listed in `LEDGER_ATOMIC_MIGRATIONS`: the queue rows, the deletions, and the ledger stamp
+/// commit together, so an old writer racing the upgrade cannot slip poison into a half-purged
+/// store that still answers V112-compatible, and a crash cannot leave a partial purge behind an
+/// unstamped ledger. Neither statement below opens a transaction of its own — the ladder owns it.
+pub(crate) fn apply_refold_content_streams_for_lamport_clamp(
+    conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
+) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "INSERT INTO content_streams_pending_refold(
+             stream_id, reason_mask, first_enqueued_at_ms, last_enqueued_at_ms)
+         SELECT DISTINCT stream_id, 1, 0, 0 FROM content_entries WHERE true
+         ON CONFLICT(stream_id) DO UPDATE SET
+             reason_mask = content_streams_pending_refold.reason_mask | 1;",
+    )?;
+    (hooks.purge_legacy_lamport_violators)(conn)
+}
+
+/// V114 (#1176): denormalize the `/3` header lamport into a `content_entries` column.
+///
+/// The accepted stream clock (`MAX(lamport)` over a stream's accepted rows) used to be derived by
+/// decoding every accepted envelope — O(stream) per read. That was tolerable for the authoring
+/// mint's cadence, but the ingest-time bounded-advance gate reads the clock for any authenticated
+/// envelope claiming a high lamport, and a hostile roster device re-sending one such envelope
+/// bought the full scan under the writer lock every time, with nothing stored for the candidate
+/// budgets to throttle. The column plus the partial accepted-rows index make the clock an indexed
+/// `MAX`.
+///
+/// The lamport is part of the signed envelope, so the column is immutable per row and written at
+/// every insert site; the hook backfills existing rows by decoding them once. The column stays
+/// nullable: a NULL (an undecodable legacy blob) is simply invisible to `MAX`, which is the same
+/// treatment the decoding scan gave rows it could not decode. Guarded on the shape so a
+/// full-ladder replay over an already-migrated store is a no-op.
+pub(crate) fn apply_content_entries_lamport_column(
+    conn: &Connection,
+    hooks: &crate::hooks::MigrationHooks,
+) -> rusqlite::Result<()> {
+    if !column_exists(conn, "content_entries", "lamport")? {
+        conn.execute_batch("ALTER TABLE content_entries ADD COLUMN lamport INTEGER;")?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_content_entries_stream_accepted_lamport
+             ON content_entries(stream_id, lamport) WHERE accepted = 1;
+         -- The refold-persisted lamport clock floor per /3 stream: max over the accepted lamports
+         -- AND the in-bound condemned basis, so revoking a writer cannot deflate the clock below
+         -- what honest dependents minted against. Invariant: only positive floors are stored
+         -- (absence = no clock yet, readers fall back to the accepted-rows MAX); written only by
+         -- the acceptance refold. V113 queues every content stream, so the first settle after
+         -- this upgrade populates it.
+         CREATE TABLE IF NOT EXISTS content_stream_clocks(
+             stream_id BLOB PRIMARY KEY CHECK(length(stream_id) = 32),
+             clock     INTEGER NOT NULL CHECK(clock > 0)
+         ) STRICT;",
+    )?;
+    (hooks.backfill_content_lamport)(conn)
 }
 
 fn primary_key_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
