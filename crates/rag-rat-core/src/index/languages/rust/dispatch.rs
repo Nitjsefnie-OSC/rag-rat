@@ -914,7 +914,7 @@ mod classify_call_tests {
              run::<u8>(input)"
                 .to_string(),
             "Handler::r#DEFAULT.r#build::<u8>().r#run(input)".to_string(),
-            format!("Handler::A\u{203F}DEFAULT.build().r\u{203F}un::<u8>(input)"),
+            "Handler::A\u{203F}DEFAULT.build().r\u{203F}un::<u8>(input)".to_string(),
         ]);
 
         let skip_forms = [
