@@ -26,22 +26,70 @@ fn is_pascal_case(name: &str) -> bool {
     head.next().is_some_and(char::is_uppercase) && head.any(char::is_lowercase)
 }
 
-/// Associated-constant method-chain test (#1124 held feedback): the segment is a SCREAMING_CASE
-/// constant head glued to at least one chained method call — `DEFAULT.run`, `DEFAULT.build.ship`.
-/// The constant is the RECEIVER of the chained method, never a constructor, so the call delegates
-/// however the constant was qualified (`Handler::DEFAULT.run(..)`,
-/// `<Handler as Runner>::DEFAULT.run(..)`). The head must be ONE whole identifier (uppercase
-/// start, no lowercase, every char an `XID_Continue` identifier char — the same scan rule as
-/// [`is_pascal_case`]), and the chained call must start lowercase (a method, not a tuple index or
-/// a UPPERCASE field/const segment).
-fn is_associated_const_method_chain(segment: &str) -> bool {
-    let Some((head, chained)) = segment.split_once('.') else {
+/// A whole Rust identifier is SCREAMING_SNAKE_CASE when its non-underscore portion starts with an
+/// uppercase character, contains no lowercase characters, and every character follows the same
+/// `XID_Continue` boundary used by [`is_pascal_case`]. Leading underscores are permitted: names
+/// such as `_DEFAULT` are conventional associated constants too.
+fn is_screaming_const_identifier(name: &str) -> bool {
+    let name = name.strip_prefix("r#").unwrap_or(name).trim_start_matches('_');
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
         return false;
     };
-    let screaming_const_head = head.chars().next().is_some_and(char::is_uppercase)
-        && head.chars().all(|character| is_xid_continue(character) || character == '_')
-        && !head.chars().any(char::is_lowercase);
-    screaming_const_head && chained.chars().next().is_some_and(char::is_lowercase)
+    first.is_uppercase()
+        && is_xid_continue(first)
+        && characters.all(|character| {
+            (is_xid_continue(character) || character == '_') && !character.is_lowercase()
+        })
+}
+
+/// A method identifier must start lowercase and otherwise remain within Rust's identifier
+/// boundaries. The field token comes directly from tree-sitter, so comments/whitespace around the
+/// member-access dot never affect this check.
+fn is_lowercase_method_identifier(name: &str) -> bool {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    let mut characters = name.chars();
+    characters.next().is_some_and(char::is_lowercase)
+        && characters.all(|character| is_xid_continue(character) || character == '_')
+}
+
+/// Associated-constant method-chain test (#1124 held feedback). Walk the Rust AST's nested
+/// `field_expression` nodes from the call's callee inward, requiring every field to be a
+/// lowercase method and the innermost receiver to be a scoped identifier whose final name is a
+/// SCREAMING_SNAKE associated constant. This preserves the distinction between a constant receiver
+/// (`Handler::DEFAULT.run(..)`, `<Handler as Runner>::_DEFAULT.run(..)`) and a constructor or a
+/// PascalCase method, while remaining insensitive to trivia and turbofish wrappers.
+fn is_associated_const_method_chain(function: Node<'_>, text: &str) -> bool {
+    let mut current = unwrap_generic_function(function);
+    let mut saw_method = false;
+
+    while current.kind() == "field_expression" {
+        let Some(field) = current.child_by_field_name("field") else {
+            return false;
+        };
+        let Ok(field_name) = field.utf8_text(text.as_bytes()) else {
+            return false;
+        };
+        if !is_lowercase_method_identifier(field_name) {
+            return false;
+        }
+        saw_method = true;
+        let Some(value) = current.child_by_field_name("value") else {
+            return false;
+        };
+        current = unwrap_generic_function(value);
+    }
+
+    if !saw_method || current.kind() != "scoped_identifier" {
+        return false;
+    }
+    let Some(name) = current.child_by_field_name("name") else {
+        return false;
+    };
+    let Ok(name) = name.utf8_text(text.as_bytes()) else {
+        return false;
+    };
+    is_screaming_const_identifier(name)
 }
 
 /// The `Enum::Variant` dispatch key from a scoped path node — its last two `::`-segments when BOTH
@@ -629,7 +677,7 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     // the leading-`<` UFCS early return and the PascalCase-receiver `Skip` below would otherwise
     // bill `Handler::DEFAULT.run(..)` / `<Handler as Runner>::DEFAULT.run(..)` as an
     // associated/constructor call (#1124 held feedback).
-    if is_associated_const_method_chain(tail) {
+    if is_associated_const_method_chain(function, text) {
         return CallRole::Delegate;
     }
     // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
@@ -858,6 +906,7 @@ mod classify_call_tests {
             "<Resp as Default>::default()",
             "Handler::default.run(input)",
             "Handler::DEFAULT.Run(input)",
+            "Handler::DEFAULT.build.Run(input)",
             "Handler::DEFAULT(input)",
             "Err(problem)",
             "None()",
