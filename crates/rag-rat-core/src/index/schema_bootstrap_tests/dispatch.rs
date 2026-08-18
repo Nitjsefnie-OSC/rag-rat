@@ -1471,23 +1471,57 @@ fn dispatch_persists_handle_facts_for_associated_constant_method_chains() {
     fs::write(
         root.join("src/lib.rs"),
         r#"
-pub enum Msg { AssocConst { input: u8 }, UfcsConst { input: u8 } }
+pub enum Msg {
+    AssocConst { input: u8 },
+    AssocConstSpaced { input: u8 },
+    AssocConstCommented { input: u8 },
+    AssocConstUnderscore { input: u8 },
+    UfcsConst { input: u8 },
+    UfcsConstCommented { input: u8 },
+    UfcsConstUnderscore { input: u8 },
+}
 
 pub struct Handler;
-pub trait Runner { fn run(&self, input: u8); }
-impl Runner for Handler { fn run(&self, _input: u8) {} }
-impl Handler { pub const DEFAULT: Handler = Handler; }
+pub trait Runner {
+    const DEFAULT: Handler;
+    const _DEFAULT: Handler;
+    fn run(&self, input: u8);
+}
+impl Runner for Handler {
+    const DEFAULT: Handler = Handler;
+    const _DEFAULT: Handler = Handler;
+    fn run(&self, _input: u8) {}
+}
+impl Handler {
+    pub const DEFAULT: Handler = Handler;
+    pub const _DEFAULT: Handler = Handler;
+}
 
 pub fn enqueue() {
     send(Msg::AssocConst { input: 1 });
-    send(Msg::UfcsConst { input: 2 });
+    send(Msg::AssocConstSpaced { input: 2 });
+    send(Msg::AssocConstCommented { input: 3 });
+    send(Msg::AssocConstUnderscore { input: 4 });
+    send(Msg::UfcsConst { input: 5 });
+    send(Msg::UfcsConstCommented { input: 6 });
+    send(Msg::UfcsConstUnderscore { input: 7 });
 }
 fn send(_m: Msg) {}
 
 pub fn handle(m: Msg) {
     match m {
         Msg::AssocConst { input } => Handler::DEFAULT.run(input),
+        Msg::AssocConstSpaced { input } => Handler::DEFAULT
+            .run(input),
+        Msg::AssocConstCommented { input } => Handler::DEFAULT /* receiver */
+            .run(input),
+        Msg::AssocConstUnderscore { input } => Handler::_DEFAULT
+            .run(input),
         Msg::UfcsConst { input } => <Handler as Runner>::DEFAULT.run(input),
+        Msg::UfcsConstCommented { input } => <Handler as Runner>::DEFAULT /* receiver */
+            .run(input),
+        Msg::UfcsConstUnderscore { input } => <Handler as Runner>::_DEFAULT /* receiver */
+            .run(input),
     }
 }
 "#,
@@ -1513,7 +1547,15 @@ pub fn handle(m: Msg) {
 
     // Each associated-constant method-chain form persists a `dispatch_handle` edge to `run`,
     // keyed by its own variant.
-    for variant in ["Msg::AssocConst", "Msg::UfcsConst"] {
+    for variant in [
+        "Msg::AssocConst",
+        "Msg::AssocConstSpaced",
+        "Msg::AssocConstCommented",
+        "Msg::AssocConstUnderscore",
+        "Msg::UfcsConst",
+        "Msg::UfcsConstCommented",
+        "Msg::UfcsConstUnderscore",
+    ] {
         assert!(
             handle_facts
                 .iter()
