@@ -830,18 +830,52 @@ mod classify_call_tests {
     /// verdicts are collected before asserting, so one failure names EVERY misclassified form.
     #[test]
     fn an_associated_constant_method_chain_delegates_to_the_chained_method() {
-        let delegate_forms =
-            ["Handler::DEFAULT.run(input)", "<Handler as Runner>::DEFAULT.run(input)"];
-        let skip_forms = ["Handler::new(input)", "<Resp as Default>::default()"];
-        let misclassified: Vec<&str> = delegate_forms
-            .into_iter()
-            .filter(|expression| !matches!(role_of(expression), CallRole::Delegate))
-            .chain(
-                skip_forms
-                    .into_iter()
-                    .filter(|expression| !matches!(role_of(expression), CallRole::Skip)),
-            )
-            .collect();
+        // Trivia is not part of Rust's token identity. Generate the same four semantic forms
+        // through several legal spellings around the member-access dot, including comments and a
+        // line break. The leading underscore is part of the SCREAMING_SNAKE convention, not a
+        // reason to fall back to the PascalCase receiver guard.
+        let qualifiers = [
+            "Handler::DEFAULT",
+            "Handler::_DEFAULT",
+            "<Handler as Runner>::DEFAULT",
+            "<Handler as Runner>::_DEFAULT",
+        ];
+        let trivia = [".", " . ", "\n .\n", " /* receiver */ . ", "\n /* receiver */\n .\t"];
+        let mut delegate_forms = Vec::new();
+        for qualifier in qualifiers {
+            for separator in trivia {
+                delegate_forms.push(format!("{qualifier}{separator}run(input)"));
+            }
+        }
+        // A nested field chain and a turbofish must use the same token structure, too.
+        delegate_forms.extend([
+            "Handler::DEFAULT . build.ship(input)".to_string(),
+            "<Handler as Runner>::_DEFAULT /* receiver */ . run::<u8>(input)".to_string(),
+        ]);
+
+        let skip_forms = [
+            "Handler::new(input)",
+            "<Resp as Default>::default()",
+            "Handler::default.run(input)",
+            "Handler::DEFAULT.Run(input)",
+            "Handler::DEFAULT(input)",
+            "Ok(body)",
+            "Some(body)",
+            "Err(problem)",
+            "None()",
+        ];
+        let mut misclassified = Vec::new();
+        misclassified.extend(
+            delegate_forms
+                .iter()
+                .filter(|expression| !matches!(role_of(expression), CallRole::Delegate))
+                .map(String::as_str),
+        );
+        misclassified.extend(
+            skip_forms
+                .into_iter()
+                .filter(|expression| !matches!(role_of(expression), CallRole::Skip)),
+        );
         assert!(misclassified.is_empty(), "misclassified forms: {misclassified:?}");
     }
 
