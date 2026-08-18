@@ -899,6 +899,22 @@ mod classify_call_tests {
         delegate_forms.extend([
             "Handler::DEFAULT . build.ship(input)".to_string(),
             "<Handler as Runner>::_DEFAULT /* receiver */ . run::<u8>(input)".to_string(),
+            // A leading underscore is valid on a lowercase method as well as on the associated
+            // constant.  Ordinary and qualified UFCS forms must both retain delegation.
+            "Handler::DEFAULT._run(input)".to_string(),
+            "<Handler as Runner>::_DEFAULT._run::<u8>(input)".to_string(),
+            // Actual method calls interrupt the field-expression chain.  The final method still
+            // delegates through the associated-constant receiver, including turbofish calls,
+            // another associated constant in an argument, comments/trivia, and multiple levels.
+            "Handler::DEFAULT.build().run(input)".to_string(),
+            "Handler::DEFAULT.build::<u8>().run::<u8>(input)".to_string(),
+            "Handler::DEFAULT.combine(Other::DEFAULT).run(input)".to_string(),
+            "<Handler as Runner>::DEFAULT.build().configure()._run::<u8>(input)".to_string(),
+            "<Handler as Runner>::_DEFAULT /* receiver */ . build /* call */ () /* between */ . \
+             run::<u8>(input)"
+                .to_string(),
+            "Handler::r#DEFAULT.r#build::<u8>().r#run(input)".to_string(),
+            format!("Handler::A\u{203F}DEFAULT.build().r\u{203F}un::<u8>(input)"),
         ]);
 
         let skip_forms = [
@@ -907,7 +923,10 @@ mod classify_call_tests {
             "Handler::default.run(input)",
             "Handler::DEFAULT.Run(input)",
             "Handler::DEFAULT.build.Run(input)",
+            "Handler::DEFAULT._Run(input)",
             "Handler::DEFAULT(input)",
+            "Handler::new(input).run(input)",
+            "Handler::new(input).configure().run(input)",
             "Err(problem)",
             "None()",
         ];
