@@ -1557,14 +1557,12 @@ pub fn handle(m: Msg) {
         "Msg::UfcsConstCommented",
         "Msg::UfcsConstUnderscore",
     ];
-    let run_facts = handle_facts
-        .iter()
-        .filter(|(target, _)| target == "run")
-        .count();
+    let run_facts = handle_facts.iter().filter(|(target, _)| target == "run").count();
     assert_eq!(
         run_facts,
         expected_variants.len(),
-        "every associated-constant form must persist exactly one dispatch_handle edge: {handle_facts:?}"
+        "every associated-constant form must persist exactly one dispatch_handle edge: \
+         {handle_facts:?}"
     );
     for variant in expected_variants {
         assert!(
