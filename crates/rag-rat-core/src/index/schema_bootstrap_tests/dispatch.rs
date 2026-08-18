@@ -1476,6 +1476,8 @@ pub enum Msg {
     AssocConstSpaced { input: u8 },
     AssocConstCommented { input: u8 },
     AssocConstUnderscore { input: u8 },
+    AssocConstLeadingMethod { input: u8 },
+    AssocConstCallInterrupted { input: u8 },
     UfcsConst { input: u8 },
     UfcsConstCommented { input: u8 },
     UfcsConstUnderscore { input: u8 },
@@ -1486,15 +1488,19 @@ pub trait Runner {
     const DEFAULT: Handler;
     const _DEFAULT: Handler;
     fn run(&self, input: u8);
+    fn _run(&self, input: u8);
 }
 impl Runner for Handler {
     const DEFAULT: Handler = Handler;
     const _DEFAULT: Handler = Handler;
     fn run(&self, _input: u8) {}
+    fn _run(&self, _input: u8) {}
 }
 impl Handler {
     pub const DEFAULT: Handler = Handler;
     pub const _DEFAULT: Handler = Handler;
+    fn build(&self) -> Self { Self }
+    fn combine(&self, _other: Handler) -> Self { Self }
 }
 
 pub fn enqueue() {
@@ -1502,9 +1508,11 @@ pub fn enqueue() {
     send(Msg::AssocConstSpaced { input: 2 });
     send(Msg::AssocConstCommented { input: 3 });
     send(Msg::AssocConstUnderscore { input: 4 });
+    send(Msg::AssocConstLeadingMethod { input: 5 });
+    send(Msg::AssocConstCallInterrupted { input: 6 });
     send(Msg::UfcsConst { input: 5 });
-    send(Msg::UfcsConstCommented { input: 6 });
-    send(Msg::UfcsConstUnderscore { input: 7 });
+    send(Msg::UfcsConstCommented { input: 7 });
+    send(Msg::UfcsConstUnderscore { input: 8 });
 }
 fn send(_m: Msg) {}
 
@@ -1516,6 +1524,10 @@ pub fn handle(m: Msg) {
         Msg::AssocConstCommented { input } => Handler::DEFAULT /* receiver */
             .run(input),
         Msg::AssocConstUnderscore { input } => Handler::_DEFAULT
+            .run(input),
+        Msg::AssocConstLeadingMethod { input } => Handler::DEFAULT._run(input),
+        Msg::AssocConstCallInterrupted { input } => Handler::DEFAULT
+            .build()
             .run(input),
         Msg::UfcsConst { input } => <Handler as Runner>::DEFAULT.run(input),
         Msg::UfcsConstCommented { input } => <Handler as Runner>::DEFAULT /* receiver */
@@ -1553,6 +1565,8 @@ pub fn handle(m: Msg) {
         "Msg::AssocConstSpaced",
         "Msg::AssocConstCommented",
         "Msg::AssocConstUnderscore",
+        "Msg::AssocConstLeadingMethod",
+        "Msg::AssocConstCallInterrupted",
         "Msg::UfcsConst",
         "Msg::UfcsConstCommented",
         "Msg::UfcsConstUnderscore",
