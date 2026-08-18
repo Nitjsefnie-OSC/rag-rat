@@ -794,6 +794,30 @@ mod classify_call_tests {
         assert!(matches!(role_of("NOW.elapsed()"), CallRole::Delegate));
     }
 
+    /// A method chain glued onto an ASSOCIATED CONSTANT delegates to the chained method (#1124
+    /// held feedback): `Handler::DEFAULT.run(input)` calls `run` on the `DEFAULT` constant — the
+    /// constant is the receiver, not a constructor — so neither the PascalCase receiver (`Handler`)
+    /// nor a UFCS qualifier (`<Handler as Runner>`) may bill the call as an associated/constructor
+    /// call. The guards stay: an associated FN (`Handler::new`) configures rather than responds,
+    /// and a bare UFCS associated call (`<Resp as Default>::default()`) is a constructor. The
+    /// verdicts are collected before asserting, so one failure names EVERY misclassified form.
+    #[test]
+    fn an_associated_constant_method_chain_delegates_to_the_chained_method() {
+        let delegate_forms =
+            ["Handler::DEFAULT.run(input)", "<Handler as Runner>::DEFAULT.run(input)"];
+        let skip_forms = ["Handler::new(input)", "<Resp as Default>::default()"];
+        let misclassified: Vec<&str> = delegate_forms
+            .into_iter()
+            .filter(|expression| !matches!(role_of(expression), CallRole::Delegate))
+            .chain(
+                skip_forms
+                    .into_iter()
+                    .filter(|expression| !matches!(role_of(expression), CallRole::Skip)),
+            )
+            .collect();
+        assert!(misclassified.is_empty(), "misclassified forms: {misclassified:?}");
+    }
+
     /// The case test reads the segment's leading IDENTIFIER, so a glued-on method chain cannot lend
     /// its lowercase to a constant head, while an acronym-led type keeps its leading uppercase run.
     /// A head that is genuinely PascalCase stays a constructor however the rest of the segment is
