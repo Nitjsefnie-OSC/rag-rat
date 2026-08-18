@@ -1459,6 +1459,73 @@ pub mod b {
 }
 
 #[test]
+fn dispatch_persists_handle_facts_for_associated_constant_method_chains() {
+    // #1124 held feedback: a match arm delegating through an ASSOCIATED CONSTANT's method chain —
+    // `Handler::DEFAULT.run(input)` or the UFCS `<Handler as Runner>::DEFAULT.run(input)` — calls
+    // the chained METHOD: the constant is the receiver, not a constructor. Each form must persist
+    // a `dispatch_handle` fact to `run`; previously the first read as a PascalCase-receiver
+    // constructor and the second as a UFCS associated call, so neither fact existed.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Msg { AssocConst { input: u8 }, UfcsConst { input: u8 } }
+
+pub struct Handler;
+pub trait Runner { fn run(&self, input: u8); }
+impl Runner for Handler { fn run(&self, _input: u8) {} }
+impl Handler { pub const DEFAULT: Handler = Handler; }
+
+pub fn enqueue() {
+    send(Msg::AssocConst { input: 1 });
+    send(Msg::UfcsConst { input: 2 });
+}
+fn send(_m: Msg) {}
+
+pub fn handle(m: Msg) {
+    match m {
+        Msg::AssocConst { input } => Handler::DEFAULT.run(input),
+        Msg::UfcsConst { input } => <Handler as Runner>::DEFAULT.run(input),
+    }
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let mut statement = conn
+        .prepare(
+            "SELECT tn.value, d.evidence FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings tn ON tn.id = d.to_name_id
+             WHERE ek.value = 'dispatch_handle'",
+        )
+        .unwrap();
+    let handle_facts: Vec<(String, Option<String>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    // Each associated-constant method-chain form persists a `dispatch_handle` edge to `run`,
+    // keyed by its own variant.
+    for variant in ["Msg::AssocConst", "Msg::UfcsConst"] {
+        assert!(
+            handle_facts
+                .iter()
+                .any(|(target, evidence)| target == "run" && evidence.as_deref() == Some(variant)),
+            "{variant} must persist a dispatch_handle edge to `run`: {handle_facts:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     // #202: a name/symbol_path search drowns in generated bindings (ubrn FFI output, codegen) that
     // shadow the hand-written source symbol. The real-world case is codegen living UNDER a source
