@@ -43,22 +43,26 @@ fn is_screaming_const_identifier(name: &str) -> bool {
         })
 }
 
-/// A method identifier must start lowercase and otherwise remain within Rust's identifier
-/// boundaries. The field token comes directly from tree-sitter, so comments/whitespace around the
-/// member-access dot never affect this check.
+/// A method identifier may carry leading underscores, but its first non-underscore character must
+/// be lowercase and the rest must remain within Rust's identifier boundaries. The field token
+/// comes directly from tree-sitter, so comments/whitespace around the member-access dot never
+/// affect this check.
 fn is_lowercase_method_identifier(name: &str) -> bool {
-    let name = name.strip_prefix("r#").unwrap_or(name);
+    let name = name.strip_prefix("r#").unwrap_or(name).trim_start_matches('_');
     let mut characters = name.chars();
     characters.next().is_some_and(char::is_lowercase)
         && characters.all(|character| is_xid_continue(character) || character == '_')
 }
 
 /// Associated-constant method-chain test (#1124 held feedback). Walk the Rust AST's nested
-/// `field_expression` nodes from the call's callee inward, requiring every field to be a
-/// lowercase method and the innermost receiver to be a scoped identifier whose final name is a
+/// `field_expression` nodes from the call's callee inward, following an intermediate
+/// `call_expression` only when its own callee is another field expression. Every field must be a
+/// lowercase method and the final receiver must be a scoped identifier whose name is a
 /// SCREAMING_SNAKE associated constant. This preserves the distinction between a constant receiver
 /// (`Handler::DEFAULT.run(..)`, `<Handler as Runner>::_DEFAULT.run(..)`) and a constructor or a
-/// PascalCase method, while remaining insensitive to trivia and turbofish wrappers.
+/// PascalCase method, while remaining insensitive to trivia and turbofish wrappers. In particular,
+/// a constructor/function-call root is never treated as an associated-constant receiver, and
+/// associated constants appearing only in arguments are not traversed.
 fn is_associated_const_method_chain(function: Node<'_>, text: &str) -> bool {
     let mut current = unwrap_generic_function(function);
     let mut saw_method = false;
@@ -77,7 +81,21 @@ fn is_associated_const_method_chain(function: Node<'_>, text: &str) -> bool {
         let Some(value) = current.child_by_field_name("value") else {
             return false;
         };
-        current = unwrap_generic_function(value);
+        let value = unwrap_generic_function(value);
+        current = if value.kind() == "call_expression" {
+            let Some(inner_function) = value.child_by_field_name("function") else {
+                return false;
+            };
+            let inner_function = unwrap_generic_function(inner_function);
+            // Only another method field can continue the associated-constant chain. A scoped
+            // constructor/function call here is a separate root, even when its name is screaming.
+            if inner_function.kind() != "field_expression" {
+                return false;
+            }
+            inner_function
+        } else {
+            value
+        };
     }
 
     if !saw_method || current.kind() != "scoped_identifier" {
@@ -925,6 +943,7 @@ mod classify_call_tests {
             "Handler::DEFAULT.build.Run(input)",
             "Handler::DEFAULT._Run(input)",
             "Handler::DEFAULT(input)",
+            "Handler::DEFAULT(input).run(input)",
             "Handler::new(input).run(input)",
             "Handler::new(input).configure().run(input)",
             "Err(problem)",
