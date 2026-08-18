@@ -1010,3 +1010,229 @@ fn clone_substrate_has_token_bag_blob_and_no_postings_on_fresh_and_migrated_dbs(
         .expect("query3");
     assert_eq!(df, 1, "clone_token_df must exist after migrate_forward");
 }
+
+/// #1217: an overlay tombstone for a path that is present on disk is an orphan — the scoped view
+/// hides the path (the worktree leg drops `kind = 'deleted'` rows, and the base leg's shadow
+/// sub-select does not), so every pass rediscovers the file, re-indexes it into the commit scope,
+/// and the next pass sees the same hole. The heal owns the repair: the tombstone falls exactly
+/// like a stale content overlay, and the pass converges.
+#[test]
+fn incremental_pass_heals_an_orphaned_overlay_tombstone() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let worktree_id = db.active_worktree_id.clone();
+    insert_overlay_tombstone_row(&db, "src/lib.rs", &worktree_id);
+    // The orphan's signature: the committed row is shadowed out of the scoped view even though
+    // the file is on disk and unchanged.
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "fixture precondition: the tombstone hides the committed row"
+    );
+    drop(db);
+
+    let db = IndexDatabase::index_discover_with_progress(&config, |_| {}).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/lib.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "the orphaned tombstone is healed away"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "the committed row is visible again"
+    );
+    drop(db);
+
+    // Convergence is the point: without it a pass that rewrites the same rows forever looks
+    // exactly like a pass doing real work. `content_changed` is the instrument, not the
+    // discovered-file count — a re-tombstone/re-heal cycle writes rows while discovering nothing.
+    let (_db, report) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!report.content_changed, "the follow-up pass is idle — the loop is closed");
+    assert_eq!(
+        report.clone_delta_hint,
+        Some(std::collections::BTreeSet::new()),
+        "and it touched no base path, so the clone delta needs no full scan"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #1217 counterpart: a tombstone for a file the working tree has ACTUALLY deleted is doing its
+/// job — the heal must leave it alone, or the pass resurrects the committed version the checkout
+/// just removed.
+#[test]
+fn a_heal_keeps_the_tombstone_of_a_file_deleted_in_the_working_tree() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let worktree_id = db.active_worktree_id.clone();
+    insert_overlay_tombstone_row(&db, "src/lib.rs", &worktree_id);
+    drop(db);
+    fs::remove_file(root.join("src/lib.rs")).unwrap();
+
+    let db = IndexDatabase::index_discover_with_progress(&config, |_| {}).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/lib.rs' AND kind = 'deleted' \
+                 AND worktree_id = ?1",
+                [&worktree_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the tombstone of a genuinely deleted file survives"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/lib.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "and the deleted file stays out of the scoped view"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #1217 review: a quiet `git status` does not prove a tombstone is an orphan. A tracked file that
+/// becomes gitignored leaves the walk, so discovery tombstones it while its committed row lives on
+/// — and git reports nothing about it, ever. Healing on silence would un-hide content this
+/// checkout no longer serves and would re-tombstone/re-heal it on every pass.
+#[test]
+fn a_heal_keeps_the_tombstone_of_a_tracked_file_that_became_gitignored() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+    fs::write(root.join(".gitignore"), "src/extra.rs\n").unwrap();
+
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/extra.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "leaving the walk tombstones the path"
+    );
+    drop(db);
+
+    let (db, report) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!report.content_changed, "the follow-up pass is idle — no re-tombstone/re-heal churn");
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/extra.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the tombstone of an ignored-but-tracked file is load-bearing and stands"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/extra.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "and the ignored file stays out of the scoped view"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #1217 review, the same class through the target config: a path an `exclude` glob drops is off
+/// the walk while present on disk and clean in git. Its tombstone is the index's record of that
+/// exclusion, not a leftover.
+#[test]
+fn a_heal_keeps_the_tombstone_of_a_target_excluded_file() {
+    let (root, mut config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+    config.targets[0].exclude = vec!["src/extra.rs".to_string()];
+
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    drop(db);
+    let (db, report) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert!(!report.content_changed, "the follow-up pass is idle");
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM main.files WHERE path = 'src/extra.rs' AND kind = 'deleted'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "an excluded path's tombstone stands"
+    );
+    assert_eq!(
+        db.storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM files WHERE path = 'src/extra.rs'", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "and the excluded file stays out of the scoped view"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// #63 + #1217: a permanent tombstone must not become a permanent reason to walk. The tombstones
+/// this fix deliberately keeps forever — gitignored, target-excluded, submodule-internal — are
+/// unhealable by construction, so they are filtered out of the heal's candidate set before the
+/// walk-free check. Otherwise every pass of every repo holding one pays a `git status` inside the
+/// write transaction, which is the idle-pass cost the whole issue is about. The counter is the
+/// IN-TRANSACTION walk only; a Discover pass always walks once off the lock at prepare.
+#[test]
+fn a_permanent_tombstone_keeps_the_idle_passs_write_txn_walk_free() {
+    let walks =
+        |db: &IndexDatabase| db.overlay_status_walks.load(std::sync::atomic::Ordering::Relaxed);
+    let (root, config) = git_fixture_for_overlay_tests();
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    drop(db);
+    fs::write(root.join(".gitignore"), "src/extra.rs\n").unwrap();
+
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(walks(&db), 0, "tombstoning a path that left the walk needs no status walk");
+    drop(db);
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(walks(&db), 0, "and the idle pass that follows stays walk-free, forever");
+    drop(db);
+
+    // Control: a real content overlay is a healable candidate, so the walk DOES run — without
+    // this the assertions above would also pass if the heal never ran at all.
+    fs::write(root.join("src/lib.rs"), "pub fn dirty() -> i32 { 9 }\n").unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    drop(db);
+    let (db, _) = IndexDatabase::index_discover_reporting(&config).unwrap();
+    assert_eq!(walks(&db), 1, "a dirty file's overlay row is healable, so its pass walks");
+
+    let _ = fs::remove_dir_all(&root);
+}

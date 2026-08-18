@@ -41,6 +41,28 @@ struct PreparedIncrementalPass {
 }
 
 impl PreparedIncrementalPass {
+    /// The repo-relative paths this pass INDEXES. Every mode builds it the same way — the pass's
+    /// own file set, whatever produced it (a Discover walk, the git-dirty set in Changed, the
+    /// caller's list in Paths) — which is what makes it usable as proof: a path here is one this
+    /// pass DERIVED, so a deletion tombstone shadowing it contradicts a derivation that just
+    /// happened. Derived, not written: a file whose parse failed is listed here and records a
+    /// parser failure instead of a `files` row, so a caller that needs a row must probe for one.
+    /// A path absent from the set is simply not proven, and the overlay heal leaves its tombstone
+    /// alone. Re-deriving that claim from the target set plus the ignore rules would be a second
+    /// copy of discovery's inclusion logic, free to drift from it.
+    ///
+    /// The set is derived off the write lock with everything else the pass prepared, so it can be
+    /// one editor-keystroke stale (a `.gitignore` edit landing before `BEGIN IMMEDIATE` makes a
+    /// tracked path ignored without moving its git status). The cost is bounded and self-healing:
+    /// the same stale plan already wrote the committed row, and the next discover pass
+    /// re-tombstones the path — one extra pass of churn, never a lost row.
+    fn reindexed_base_paths(&self) -> BTreeSet<String> {
+        self.prepared_files
+            .iter()
+            .map(|prepared| rag_rat_base::paths::path_string(&prepared.file.relative_path))
+            .collect()
+    }
+
     /// The repo-relative base paths this pass will reindex or delete — the clone-delta changed-set
     /// hint (#830). Uses the SAME `path_string` normalization the file writes use, so the strings
     /// match `files.path` / `clone_subblock_postings.path` byte-for-byte. A superset of the paths
@@ -414,7 +436,8 @@ impl IndexDatabase {
             // any destructive decision, so a path dirtied/restored/deleted during the off-lock
             // window or the BEGIN wait cannot be mis-healed (#561). Read-only +
             // walk-free when there are no overlay candidates (#63).
-            let healed = db.heal_stale_overlay_rows(&config.root)?;
+            let healed =
+                db.heal_stale_overlay_rows(&config.root, &prepared.reindexed_base_paths())?;
             let mut mutated = indexed > 0
                 || healed > 0
                 || carried > 0
@@ -957,14 +980,26 @@ impl IndexDatabase {
     ///   the next discover pass reindexes the path at the commit scope (sha mismatch), and the pass
     ///   after that takes the first branch.
     ///
+    /// A DELETION TOMBSTONE (`kind = 'deleted'`) is healed only when this pass re-indexed its path
+    /// (#1217): it then shadows a file the checkout demonstrably has, and the committed row takes
+    /// over as above. Absent that proof the tombstone stands — it is the index's record that the
+    /// checkout does not serve the path, and git status cannot tell the two apart (it is silent
+    /// about a gitignored-but-tracked path, one a target `exclude` drops, and one inside a
+    /// submodule). Such a tombstone is permanent by design, so it is filtered out of the candidate
+    /// set rather than carried into the walk. A tombstone is never re-stamped to the commit scope.
+    ///
     /// Returns the number of rows healed. Purely a read when nothing is stale, so an idle pass
     /// stays write-free (#63). Non-git contexts (`active_commit_sha` empty) are untouched —
     /// overlay rows ARE their canonical scope.
-    pub(super) fn heal_stale_overlay_rows(&self, root: &Path) -> anyhow::Result<usize> {
+    pub(super) fn heal_stale_overlay_rows(
+        &self,
+        root: &Path,
+        reindexed: &BTreeSet<String>,
+    ) -> anyhow::Result<usize> {
         if self.active_commit_sha.is_empty() {
             return Ok(0);
         }
-        let overlays: Vec<(i64, String, String)> = {
+        let mut overlays: Vec<(i64, String, String, String)> = {
             let conn = self.storage.connection();
             // Direct `main.files` probes bypass the repo-scoped `files` view, so they carry the
             // `repo_id` predicate explicitly (A3): in a consolidated DB two forks at the same
@@ -974,22 +1009,38 @@ impl IndexDatabase {
             // Also generation-qualified (A6): the heal operates on THIS connection's live
             // generation only — a staged or superseded generation's overlay rows are the
             // rebuild's / gc's business.
+            // DELETION TOMBSTONES ARE CANDIDATES TOO (#1217). A `kind = 'deleted'` overlay row
+            // shadows its committed counterpart out of the scoped view, so a tombstone the
+            // checkout has outgrown hides a file it HAS: discovery re-indexes that path into the
+            // commit scope on EVERY pass while the view keeps hiding it. Nothing else reaps it —
+            // the overlay refresh prunes only the scopes it visits, and it skips the active
+            // checkout — so excluding tombstones here left that loop with no owner. `reindexed`
+            // is what separates an outgrown tombstone from a load-bearing one; see the branch.
             let mut stmt = conn.prepare(
-                "SELECT id, path, sha256 FROM main.files
-                 WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != '' AND kind != \
-                 'deleted' AND generation = ?3",
+                "SELECT id, path, sha256, kind FROM main.files
+                 WHERE repo_id = ?1 AND worktree_id = ?2 AND worktree_id != '' AND generation = ?3",
             )?;
             let rows = stmt.query_map(
                 params![self.active_repo_id, self.active_worktree_id, self.active_generation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
+        // Drop the tombstones this pass could not heal anyway BEFORE the walk-free check below.
+        // The deliberate outcome of the tombstone rule is that some tombstones are PERMANENT — a
+        // gitignored-but-tracked path, one a target `exclude` drops, one inside a submodule —
+        // and a permanent candidate would be a permanent reason to walk: every pass of every repo
+        // holding one would run a `git status` inside `BEGIN IMMEDIATE`, forever, which is the
+        // idle-pass cost #63 exists to keep at zero. Filtering here also keeps the rule in ONE
+        // place: below, a surviving tombstone is healable by construction.
+        overlays.retain(|(_, path, _, kind)| kind != "deleted" || reindexed.contains(path));
         // No overlay candidates → nothing to heal and NO walk under the lock (the common clean-tree
         // / idle pass pays nothing).
         if overlays.is_empty() {
             return Ok(0);
         }
+        #[cfg(test)]
+        self.overlay_status_walks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Authoritative dirty set, walked INSIDE the write txn (#561). The off-lock discovery
         // snapshot CANNOT soundly pre-filter these: the flock excludes rag-rat writers but NOT the
         // user's editor, so between prepare and now a file dirty-at-prepare may have been restored
@@ -1004,7 +1055,7 @@ impl IndexDatabase {
             Err(_) => return Ok(0),
         };
         let mut healed = 0usize;
-        for (file_id, path, sha) in overlays {
+        for (file_id, path, sha, kind) in overlays {
             let p = Path::new(&path);
             if changes.changed.contains(p) || changes.deleted.contains(p) {
                 // Dirtied OR deleted since the snapshot — the overlay is NOT stale-clean. Skipping
@@ -1013,17 +1064,21 @@ impl IndexDatabase {
                 // deleted (#561).
                 continue;
             }
-            let committed_exists: bool = self.storage.connection().query_row(
-                // Generation-qualified (A6): only a committed row at THIS connection's live
-                // generation can take over from the overlay — a staged or superseded generation's
-                // committed row must not trigger deleting a live overlay.
-                "SELECT EXISTS(SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ''
-                   AND generation = ?4)",
-                params![self.active_repo_id, path, self.active_commit_sha, self.active_generation],
-                |row| row.get(0),
-            )?;
-            if committed_exists {
+            // Every surviving tombstone is one this pass re-indexed (the `retain` above), so it
+            // contradicts a derivation that just happened — the orphan case. `reindexed` proves
+            // the path was claimed, not where its row landed (a dirty path's write goes to the
+            // overlay scope), so the committed-row probe is what establishes there is something
+            // to hand the path back to; with none, the tombstone shadows nothing. It is never
+            // re-stamped into the commit scope below: that would publish a deletion marker as the
+            // file's committed row.
+            if kind == "deleted" {
+                if self.committed_row_exists(&path)? {
+                    self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
+                    healed += 1;
+                }
+                continue;
+            }
+            if self.committed_row_exists(&path)? {
                 self.remove_file_in_scope(Path::new(&path), "", &self.active_worktree_id)?;
                 healed += 1;
                 continue;
@@ -1043,6 +1098,19 @@ impl IndexDatabase {
             }
         }
         Ok(healed)
+    }
+
+    /// Does a committed row for `path` exist in THIS connection's live scope? Generation-qualified
+    /// (A6): only a committed row at the live generation can take over from an overlay row — a
+    /// staged or superseded generation's committed row must not trigger deleting a live overlay.
+    fn committed_row_exists(&self, path: &str) -> anyhow::Result<bool> {
+        Ok(self.storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.files
+             WHERE repo_id = ?1 AND path = ?2 AND commit_sha = ?3 AND worktree_id = ''
+               AND generation = ?4)",
+            params![self.active_repo_id, path, self.active_commit_sha, self.active_generation],
+            |row| row.get(0),
+        )?)
     }
 
     /// Prepare + apply a file plan in one shot, parsing INSIDE the caller's transaction. Retained
@@ -1106,10 +1174,11 @@ impl IndexDatabase {
         for path in deleted {
             // A git-deleted path may have been RESTORED on disk during the off-lock window (#561).
             // Tombstoning it would HIDE it — and a file restored to HEAD-clean content is in no
-            // later CHANGED set and the stale-overlay heal skips `kind='deleted'` rows,
-            // so it would not self-heal until a discover pass. Skip the tombstone only when the
-            // path is a regular FILE on disk again — via `symlink_metadata` (does NOT follow), so a
-            // SYMLINK or a directory recreated at that path is NOT treated as a restored source
+            // later CHANGED set, while the stale-overlay heal reaps a tombstone only for a path
+            // the pass re-indexed, so it would not self-heal until a discover pass walks it. Skip
+            // the tombstone only when the path is a regular FILE on disk again — via
+            // `symlink_metadata` (does NOT follow), so a SYMLINK or a directory
+            // recreated at that path is NOT treated as a restored source
             // file (the walker skips both and would never re-index them), and its stale
             // row still tombstones (#659 review).
             if revalidate_fs_deletions
