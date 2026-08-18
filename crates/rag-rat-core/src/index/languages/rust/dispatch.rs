@@ -859,11 +859,10 @@ mod classify_call_tests {
             "Handler::default.run(input)",
             "Handler::DEFAULT.Run(input)",
             "Handler::DEFAULT(input)",
-            "Ok(body)",
-            "Some(body)",
             "Err(problem)",
             "None()",
         ];
+        let wrapper_forms = ["Ok(body)", "Some(body)"];
         let mut misclassified = Vec::new();
         misclassified.extend(
             delegate_forms
@@ -875,6 +874,11 @@ mod classify_call_tests {
             skip_forms
                 .into_iter()
                 .filter(|expression| !matches!(role_of(expression), CallRole::Skip)),
+        );
+        misclassified.extend(
+            wrapper_forms
+                .into_iter()
+                .filter(|expression| !matches!(role_of(expression), CallRole::Wrapper)),
         );
         assert!(misclassified.is_empty(), "misclassified forms: {misclassified:?}");
     }
