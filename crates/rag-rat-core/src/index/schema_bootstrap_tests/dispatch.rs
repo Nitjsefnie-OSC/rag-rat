@@ -1560,30 +1560,32 @@ pub fn handle(m: Msg) {
     // Each associated-constant method-chain form persists a `dispatch_handle` edge to `run`,
     // keyed by its own variant. Keep the row count independent from the per-variant assertions so
     // deleting one assertion cannot make the regression test vacuously pass.
-    let expected_variants = [
-        "Msg::AssocConst",
-        "Msg::AssocConstSpaced",
-        "Msg::AssocConstCommented",
-        "Msg::AssocConstUnderscore",
-        "Msg::AssocConstLeadingMethod",
-        "Msg::AssocConstCallInterrupted",
-        "Msg::UfcsConst",
-        "Msg::UfcsConstCommented",
-        "Msg::UfcsConstUnderscore",
+    let expected_facts = [
+        ("Msg::AssocConst", "run"),
+        ("Msg::AssocConstSpaced", "run"),
+        ("Msg::AssocConstCommented", "run"),
+        ("Msg::AssocConstUnderscore", "run"),
+        ("Msg::AssocConstLeadingMethod", "_run"),
+        ("Msg::AssocConstCallInterrupted", "run"),
+        ("Msg::UfcsConst", "run"),
+        ("Msg::UfcsConstCommented", "run"),
+        ("Msg::UfcsConstUnderscore", "run"),
     ];
-    let run_facts = handle_facts.iter().filter(|(target, _)| target == "run").count();
+    let associated_chain_facts = handle_facts
+        .iter()
+        .filter(|(target, _)| expected_facts.iter().any(|(_, expected)| target == expected))
+        .count();
     assert_eq!(
-        run_facts,
-        expected_variants.len(),
+        associated_chain_facts,
+        expected_facts.len(),
         "every associated-constant form must persist exactly one dispatch_handle edge: \
          {handle_facts:?}"
     );
-    for variant in expected_variants {
+    for (variant, target) in expected_facts {
         assert!(
-            handle_facts
-                .iter()
-                .any(|(target, evidence)| target == "run" && evidence.as_deref() == Some(variant)),
-            "{variant} must persist a dispatch_handle edge to `run`: {handle_facts:?}"
+            handle_facts.iter().any(|(actual_target, evidence)| actual_target == target
+                && evidence.as_deref() == Some(variant)),
+            "{variant} must persist a dispatch_handle edge to `{target}`: {handle_facts:?}"
         );
     }
 
