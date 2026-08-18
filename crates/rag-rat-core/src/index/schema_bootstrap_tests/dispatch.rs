@@ -1546,8 +1546,9 @@ pub fn handle(m: Msg) {
         .unwrap();
 
     // Each associated-constant method-chain form persists a `dispatch_handle` edge to `run`,
-    // keyed by its own variant.
-    for variant in [
+    // keyed by its own variant. Keep the row count independent from the per-variant assertions so
+    // deleting one assertion cannot make the regression test vacuously pass.
+    let expected_variants = [
         "Msg::AssocConst",
         "Msg::AssocConstSpaced",
         "Msg::AssocConstCommented",
@@ -1555,7 +1556,17 @@ pub fn handle(m: Msg) {
         "Msg::UfcsConst",
         "Msg::UfcsConstCommented",
         "Msg::UfcsConstUnderscore",
-    ] {
+    ];
+    let run_facts = handle_facts
+        .iter()
+        .filter(|(target, _)| target == "run")
+        .count();
+    assert_eq!(
+        run_facts,
+        expected_variants.len(),
+        "every associated-constant form must persist exactly one dispatch_handle edge: {handle_facts:?}"
+    );
+    for variant in expected_variants {
         assert!(
             handle_facts
                 .iter()
