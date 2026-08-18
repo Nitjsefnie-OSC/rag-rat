@@ -26,6 +26,24 @@ fn is_pascal_case(name: &str) -> bool {
     head.next().is_some_and(char::is_uppercase) && head.any(char::is_lowercase)
 }
 
+/// Associated-constant method-chain test (#1124 held feedback): the segment is a SCREAMING_CASE
+/// constant head glued to at least one chained method call — `DEFAULT.run`, `DEFAULT.build.ship`.
+/// The constant is the RECEIVER of the chained method, never a constructor, so the call delegates
+/// however the constant was qualified (`Handler::DEFAULT.run(..)`,
+/// `<Handler as Runner>::DEFAULT.run(..)`). The head must be ONE whole identifier (uppercase
+/// start, no lowercase, every char an `XID_Continue` identifier char — the same scan rule as
+/// [`is_pascal_case`]), and the chained call must start lowercase (a method, not a tuple index or
+/// a UPPERCASE field/const segment).
+fn is_associated_const_method_chain(segment: &str) -> bool {
+    let Some((head, chained)) = segment.split_once('.') else {
+        return false;
+    };
+    let screaming_const_head = head.chars().next().is_some_and(char::is_uppercase)
+        && head.chars().all(|character| is_xid_continue(character) || character == '_')
+        && !head.chars().any(char::is_lowercase);
+    screaming_const_head && chained.chars().next().is_some_and(char::is_lowercase)
+}
+
 /// The `Enum::Variant` dispatch key from a scoped path node — its last two `::`-segments when BOTH
 /// are PascalCase, else `None`. Robust to longer paths (`crate::ml::MlReq::Upsert` →
 /// `MlReq::Upsert`) so a construction site and a handler arm produce the SAME key regardless of
@@ -563,7 +581,8 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
 /// How `result_handler_calls` treats a `call_expression` (#200/#208 — one classifier so the
 /// delegate/wrapper decision can't disagree with itself, as it did across review rounds):
 /// - `Delegate`: RECORD it as the handler (a free fn `run`, a method `self.embed`, a module-pathed
-///   fn `crate::ml::embed::embed_text`).
+///   fn `crate::ml::embed::embed_text`, or an associated-constant method chain
+///   `Handler::DEFAULT.run(..)` — the constant is the chained method's receiver).
 /// - `Wrapper`: a TRANSPARENT wrapper / variant constructor whose single argument IS the response —
 ///   `Ok`/`Some` and ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`).
 ///   Trace its lone payload argument.
@@ -591,11 +610,6 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
         return CallRole::Delegate;
     };
     let raw = raw.trim();
-    // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
-    // associated/constructor call — never a handler, and its arg (if any) isn't the response.
-    if raw.starts_with('<') {
-        return CallRole::Skip;
-    }
     let stripped = degeneric_path(raw);
     // TOP-LEVEL segments only. A `::` inside a `(…)`/`[…]` group is argument text, which
     // `degeneric_path` keeps, so splitting on every `::` would read a longer path than the source
@@ -610,6 +624,19 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     let Some(tail) = segments.last() else {
         return CallRole::Delegate;
     };
+    // An associated-constant method chain calls the chained METHOD with the constant as its
+    // receiver, so it delegates like any method call. Consulted before BOTH qualifier fallbacks:
+    // the leading-`<` UFCS early return and the PascalCase-receiver `Skip` below would otherwise
+    // bill `Handler::DEFAULT.run(..)` / `<Handler as Runner>::DEFAULT.run(..)` as an
+    // associated/constructor call (#1124 held feedback).
+    if is_associated_const_method_chain(tail) {
+        return CallRole::Delegate;
+    }
+    // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
+    // associated/constructor call — never a handler, and its arg (if any) isn't the response.
+    if raw.starts_with('<') {
+        return CallRole::Skip;
+    }
     if matches!(*tail, "Err" | "None") {
         return CallRole::Skip;
     }

@@ -419,11 +419,17 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
         )
         .unwrap();
     let future_edges = edge_targets_with_resolution(&db, future_id);
+    // Stamp the row with a genuinely FUTURE graph version — the current `GRAPH_INDEX_VERSION`
+    // plus one — so the fixture stays ahead of the constant however often it moves (#1124 held
+    // feedback: a hard-coded stamp silently became equal to the current version and the test
+    // stopped proving anything).
+    let future_graph_version = GRAPH_INDEX_VERSION.parse::<i64>().unwrap() + 1;
     db.storage
         .connection()
-        .execute("UPDATE main.files SET graph_version = 17, scope_version = 4 WHERE id = ?1", [
-            future_id,
-        ])
+        .execute(
+            "UPDATE main.files SET graph_version = ?2, scope_version = 4 WHERE id = ?1",
+            params![future_id, future_graph_version],
+        )
         .unwrap();
     db.storage
         .connection()
@@ -436,7 +442,7 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
 
     db.ensure_graph_index_current().unwrap();
 
-    assert_eq!(file_graph_version(&db, future_id), 17);
+    assert_eq!(file_graph_version(&db, future_id), future_graph_version);
     assert_eq!(file_scope_version(&db, future_id), 4);
     assert_eq!(
         edge_targets_with_resolution(&db, future_id),
