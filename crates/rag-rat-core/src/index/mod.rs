@@ -408,8 +408,9 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // `new`/`default`, and a declared return carrying generic arguments declines instead of naming
 // itself; re-extract `receiver_type_hint_id` so deployed indexes gain the one and drop the other.
 // Also #1124 — dispatch handler classification reads only a segment's leading identifier with
-// Unicode XID continuation semantics; re-extract facts so existing indexes do not retain the old
-// wrapper/delegate decision.
+// Unicode XID continuation semantics, and an associated-constant method chain
+// (`Handler::DEFAULT.run(..)`, `<Handler as Runner>::DEFAULT.run(..)`) delegates to its chained
+// method; re-extract facts so existing indexes do not retain the old wrapper/delegate decision.
 const GRAPH_INDEX_VERSION: &str = "17";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
