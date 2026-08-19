@@ -14,15 +14,15 @@ use crate::index::edges::*;
 /// with an uppercase char AND carries at least one lowercase — so `MlReq`/`Upsert` qualify but
 /// `new`, a SCREAMING `CONST`, and a bare `T` do not.
 /// The leading scan follows Rust's `XID_Continue` rule, so decomposed identifiers keep their
-/// combining marks instead of being truncated at the first non-alphanumeric code point.
+/// combining marks instead of being truncated at the first non-alphanumeric code point. `_`
+/// needs no special case: it is connector punctuation (Pc), already part of `XID_Continue`.
 ///
 /// Only that leading identifier is weighed because a segment can carry a method chain glued onto
 /// its head (`TOOL_NAMES.iter().map`, `NOW.elapsed`). The appended method names supply the very
 /// lowercase the test looks for, so reading the whole segment takes a constant for a variant
-/// constructor and bills the call as a transparent wrapper instead of the delegation it is (#1124).
+/// constructor and bills the call as a transparent wrapper it is not (#1124).
 fn is_pascal_case(name: &str) -> bool {
-    let mut head =
-        name.chars().take_while(|&character| is_xid_continue(character) || character == '_');
+    let mut head = name.chars().take_while(|&character| is_xid_continue(character));
     head.next().is_some_and(char::is_uppercase) && head.any(char::is_lowercase)
 }
 
@@ -38,9 +38,7 @@ fn is_screaming_const_identifier(name: &str) -> bool {
     };
     first.is_uppercase()
         && is_xid_continue(first)
-        && characters.all(|character| {
-            (is_xid_continue(character) || character == '_') && !character.is_lowercase()
-        })
+        && characters.all(|character| is_xid_continue(character) && !character.is_lowercase())
 }
 
 /// A method identifier may carry leading underscores, but its first non-underscore character must
@@ -50,8 +48,7 @@ fn is_screaming_const_identifier(name: &str) -> bool {
 fn is_lowercase_method_identifier(name: &str) -> bool {
     let name = name.strip_prefix("r#").unwrap_or(name).trim_start_matches('_');
     let mut characters = name.chars();
-    characters.next().is_some_and(char::is_lowercase)
-        && characters.all(|character| is_xid_continue(character) || character == '_')
+    characters.next().is_some_and(char::is_lowercase) && characters.all(is_xid_continue)
 }
 
 /// Associated-constant method-chain test (#1124 held feedback). Walk the Rust AST's nested
@@ -650,11 +647,15 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
 ///   fn `crate::ml::embed::embed_text`, or an associated-constant method chain
 ///   `Handler::DEFAULT.run(..)` — the constant is the chained method's receiver).
 /// - `Wrapper`: a TRANSPARENT wrapper / variant constructor whose single argument IS the response —
-///   `Ok`/`Some` and ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`).
+///   `Ok`/`Some`, ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`), or
+///   an associated-constant BUILDER whose argument nests the producing call
+///   (`Resp::DEFAULT.with_body(handle(cap))` — `handle` is the real handler, not `with_body`).
 ///   Trace its lone payload argument.
 /// - `Skip`: emit nothing — `Err`/`None` (error/absence payload), a snake-tail `Type::assoc`
-///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), or
-///   a UFCS associated call (`<Resp as Default>::default()`).
+///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), a
+///   UFCS associated call (`<Resp as Default>::default()`), or a chained adapter tail glued onto
+///   another call's result (`LIMIT.min(cap).max(..)` — it adapts a value, and recording the
+///   trailing method would bind it to an unrelated same-named symbol, #1124 maintainer feedback).
 ///
 /// Classification is by the path TAIL (constructor names are PascalCase; fns/methods are
 /// snake_case), which is receiver-agnostic — so `dto::Wrapped` and `Resp::Embedded` are both
@@ -691,12 +692,17 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
         return CallRole::Delegate;
     };
     // An associated-constant method chain calls the chained METHOD with the constant as its
-    // receiver, so it delegates like any method call. Consulted before BOTH qualifier fallbacks:
-    // the leading-`<` UFCS early return and the PascalCase-receiver `Skip` below would otherwise
-    // bill `Handler::DEFAULT.run(..)` / `<Handler as Runner>::DEFAULT.run(..)` as an
-    // associated/constructor call (#1124 held feedback).
+    // receiver, so it delegates like any method call — but ONLY when the call consumes plain
+    // data (`Handler::DEFAULT.run(input)`) or a closure transformation
+    // (`TOOL_NAMES.iter().map(|name| ..)`). A chain that WRAPS a produced value is a builder
+    // (`Resp::DEFAULT.with_body(handle(cap))`): the nested argument call is the real handler,
+    // so the builder classifies as a transparent wrapper of its payload and the builder method
+    // itself is never recorded (#1124 maintainer feedback). Consulted before BOTH qualifier
+    // fallbacks: the leading-`<` UFCS early return and the PascalCase-receiver `Skip` below
+    // would otherwise bill `Handler::DEFAULT.run(..)` / `<Handler as Runner>::DEFAULT.run(..)`
+    // as an associated/constructor call (#1124 held feedback).
     if is_associated_const_method_chain(function, text) {
-        return CallRole::Delegate;
+        return if call_carries_nested_call(call) { CallRole::Wrapper } else { CallRole::Delegate };
     }
     // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
     // associated/constructor call — never a handler, and its arg (if any) isn't the response.
@@ -715,7 +721,60 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     // a bare fn / method / module-pathed fn is the handler.
     match segments.as_slice() {
         [.., receiver, _last] if is_pascal_case(receiver) => CallRole::Skip,
+        // The fall-through is reserved for a BARE callee. A method glued onto ANOTHER CALL'S
+        // RESULT is a chained adapter tail (`LIMIT.min(cap).max(..)`,
+        // `list.len().saturating_sub(..)`): it adapts a value into another value — never the
+        // handler, and not a wrapper either, since its argument is adapter input rather than the
+        // response. Recording the trailing method would bind it, via bare-name fallback, to an
+        // unrelated same-named repository symbol — a false persisted edge (#1124 maintainer
+        // feedback).
+        _ if is_chained_adapter_tail(function) => CallRole::Skip,
         _ => CallRole::Delegate,
+    }
+}
+
+/// Whether the call's callee is a method glued onto the RESULT of another call — the structural
+/// shape of a standard-adapter chain (`x.min(cap).max(..)`, `list.len().saturating_sub(..)`).
+/// AST-checked, never textual: the callee is a `field_expression` whose receiver is itself a
+/// `call_expression`. A method on a plain binding/`self`/field receiver (`worker.run`,
+/// `self.embed`) is a bare callee, not a chained tail.
+fn is_chained_adapter_tail(function: Node<'_>) -> bool {
+    let function = unwrap_generic_function(function);
+    if function.kind() != "field_expression" {
+        return false;
+    }
+    let Some(value) = function.child_by_field_name("value") else {
+        return false;
+    };
+    unwrap_generic_function(value).kind() == "call_expression"
+}
+
+/// Whether any ARGUMENT of `call` contains a nested `call_expression` outside a closure — the
+/// structural signal that the call wraps a produced value (`with_body(handle(cap))`) rather than
+/// consuming plain data (`run(input)`) or a transformation (`map(|name| describe(name))`: a
+/// closure is deferred behavior, not a produced response). The call's own callee chain is never
+/// inspected.
+fn call_carries_nested_call(call: Node<'_>) -> bool {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    arguments.named_children(&mut cursor).any(subtree_has_nested_call)
+}
+
+/// Whether `node`'s subtree contains a `call_expression`, never descending into a closure — used
+/// to tell a value-WRAPPING call from a data- or behavior-consuming one (see
+/// [`call_carries_nested_call`]).
+fn subtree_has_nested_call(node: Node<'_>) -> bool {
+    match node.kind() {
+        "call_expression" => true,
+        "closure_expression" => false,
+        // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep
+        // argument (#543).
+        _ => rag_rat_base::stack::grow_stack(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).any(subtree_has_nested_call)
+        }),
     }
 }
 
