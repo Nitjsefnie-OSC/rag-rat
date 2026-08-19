@@ -879,12 +879,55 @@ mod classify_call_tests {
     /// traces through the constant instead of recording the call as the handler.
     #[test]
     fn a_screaming_const_with_a_method_chain_is_not_a_wrapper() {
+        // A chain on a scoped constant carrying a closure transformation keeps its delegation:
+        // the closure is behavior, not a produced value, and the trailing `map` is a std adapter
+        // method that never resolves to an in-corpus symbol, so no edge is synthesized (#1124).
         assert!(matches!(
             role_of("crate::tools::TOOL_NAMES.iter().map(|name| describe(name))"),
             CallRole::Delegate
         ));
         // A single-word constant has no underscore to give it away and reads the same way.
         assert!(matches!(role_of("NOW.elapsed()"), CallRole::Delegate));
+    }
+
+    /// A method whose receiver is ANOTHER CALL'S RESULT is a chained adapter tail
+    /// (`LIMIT.min(cap).max(..)`, `list.len().saturating_sub(..)`): it adapts a value, it is
+    /// never the handler, and it is not a transparent wrapper either — its argument is adapter
+    /// input, not the response. Only a BARE callee (a free function, a path, or a method on a
+    /// plain binding/`self` receiver) may fall through to `Delegate`; otherwise the trailing
+    /// method name is recorded as the handler and bare-name fallback binds it to an unrelated
+    /// same-named repository symbol — a false persisted edge (#1124 maintainer feedback).
+    #[test]
+    fn a_chained_adapter_tail_is_neither_a_delegate_nor_a_wrapper() {
+        assert!(matches!(role_of("LIMIT.min(cap).max(1)"), CallRole::Skip));
+        assert!(matches!(role_of("BACKENDS.len().saturating_sub(1)"), CallRole::Skip));
+        assert!(matches!(role_of("items(count).len().max(1)"), CallRole::Skip));
+        assert!(matches!(role_of("make_worker().run(input)"), CallRole::Skip));
+        // Bare callees keep their delegation: a free function, and a method on a plain
+        // binding/`self`/field receiver (`worker.run` IS the handler — #208 review round 11).
+        assert!(matches!(role_of("run(input)"), CallRole::Delegate));
+        assert!(matches!(role_of("worker.run(input)"), CallRole::Delegate));
+        assert!(matches!(role_of("self.embed(input)"), CallRole::Delegate));
+        assert!(matches!(role_of("self.worker.run(input)"), CallRole::Delegate));
+    }
+
+    /// An associated-constant method chain invoked with PLAIN DATA is the dispatch itself
+    /// (`Handler::DEFAULT.run(input)` — the constant is the chained method's receiver). A chain
+    /// that WRAPS a produced value is a builder (`Resp::DEFAULT.with_body(handle(cap))`): the
+    /// nested call is the real handler, so the builder is a transparent wrapper of its payload
+    /// and the builder method itself is never recorded (#1124 maintainer feedback).
+    #[test]
+    fn an_associated_constant_builder_wraps_a_produced_payload() {
+        assert!(matches!(role_of("Resp::DEFAULT.with_body(handle(cap))"), CallRole::Wrapper));
+        assert!(matches!(
+            role_of("<Resp as Build>::DEFAULT.with_body(handle(cap))"),
+            CallRole::Wrapper
+        ));
+        assert!(matches!(role_of("Handler::DEFAULT.run(input)"), CallRole::Delegate));
+        assert!(matches!(role_of("<Handler as Runner>::DEFAULT.run(input)"), CallRole::Delegate));
+        // An intermediate builder call inside the chain still delegates when the final call is
+        // invoked with plain data.
+        assert!(matches!(role_of("Handler::DEFAULT.build().run(input)"), CallRole::Delegate));
     }
 
     /// A method chain glued onto an ASSOCIATED CONSTANT delegates to the chained method (#1124

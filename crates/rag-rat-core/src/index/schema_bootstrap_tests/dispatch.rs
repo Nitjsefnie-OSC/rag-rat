@@ -1593,6 +1593,202 @@ pub fn handle(m: Msg) {
 }
 
 #[test]
+fn dispatch_suppresses_chained_adapter_tails_end_to_end() {
+    // #1124 maintainer feedback (HIGH): a standard-adapter chain whose trailing method is glued
+    // onto ANOTHER CALL'S RESULT (`LIMIT.min(cap).max(1)`, `items(count).len().max(1)`) computes a
+    // value — it is never the dispatch handler. Recording the trailing method name lets bare-name
+    // fallback bind it to an unrelated same-named in-repo symbol, synthesizing a FALSE
+    // `dispatches` edge. This fixture defines exactly such a helper (`fn max`), so a false edge
+    // cannot hide behind an unresolved name, and a plain delegate arm proves the fixture CAN
+    // synthesize edges — the negative assertions are not vacuous.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Msg { Clamp { cap: usize }, Batch { count: usize }, Direct }
+pub enum Resp { Wrap(usize), Empty }
+const LIMIT: usize = 8;
+
+pub fn enqueue() {
+    send(Msg::Clamp { cap: 3 });
+    send(Msg::Batch { count: 2 });
+    send(Msg::Direct);
+}
+fn send(_m: Msg) {}
+
+pub fn handle(m: Msg) {
+    match m {
+        Msg::Clamp { cap } => Ok(Resp::Wrap(LIMIT.min(cap).max(1))),
+        Msg::Batch { count } => Ok(Resp::Wrap(batch_items(count).len().max(1))),
+        Msg::Direct => Ok(Resp::Wrap(run_direct())),
+    }
+}
+fn batch_items(_count: usize) -> Vec<usize> { Vec::new() }
+fn run_direct() -> usize { 0 }
+// A same-named in-repo helper: a chained-tail fall-through would bind the recorded `max` here.
+fn max(_a: usize, _b: usize) -> usize { 0 }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let dispatches_from_enqueue = |symbol: &str| -> bool {
+        db.find_callers(symbol, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|hop| hop.edge_kind == "dispatches")
+            .filter_map(|hop| hop.from_symbol)
+            .any(|from| from.ends_with("enqueue"))
+    };
+
+    // Positive control: the plain delegate arm synthesizes its resolved edge, so the negative
+    // assertions below exercise a working synthesis pipeline.
+    assert!(dispatches_from_enqueue("run_direct"), "the plain delegate arm must dispatch");
+
+    // Resolved-edge level: the same-named helper and the chain's producer must gain NO
+    // synthesized `dispatches` edge from the adapter arms.
+    for non_handler in ["max", "batch_items"] {
+        assert!(
+            !dispatches_from_enqueue(non_handler),
+            "{non_handler} must NOT be a dispatch handler (false edge from a chained adapter tail)"
+        );
+    }
+
+    // Fact level: no `dispatch_handle` fact may name a chained adapter method or carry the
+    // adapter arms' variants as evidence.
+    let mut statement = conn
+        .prepare(
+            "SELECT tn.value, d.evidence FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings tn ON tn.id = d.to_name_id
+             WHERE ek.value = 'dispatch_handle'",
+        )
+        .unwrap();
+    let handle_facts: Vec<(String, Option<String>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for chained_method in ["max", "min", "len"] {
+        assert!(
+            handle_facts.iter().all(|(target, _)| target != chained_method),
+            "no dispatch_handle fact may name the chained adapter method `{chained_method}`: \
+             {handle_facts:?}"
+        );
+    }
+    for adapter_variant in ["Msg::Clamp", "Msg::Batch"] {
+        assert!(
+            handle_facts.iter().all(|(_, evidence)| evidence.as_deref() != Some(adapter_variant)),
+            "the adapter arm {adapter_variant} must persist no dispatch_handle fact: \
+             {handle_facts:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dispatch_records_the_real_handler_behind_an_associated_constant_builder() {
+    // #1124 maintainer feedback (MEDIUM): `Resp::DEFAULT.with_body(make_body(cap))` is a BUILDER
+    // wrapper — the nested argument call is the real handler — while
+    // `Handler::DEFAULT.run(input)` is the dispatch itself. The builder method (`with_body`,
+    // present in-repo as the impl method) must gain no edge, the payload producer must be traced
+    // through the wrapper, and the true dispatch shape must keep delegating.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Msg { Build { cap: usize }, Run { input: u8 } }
+pub struct Resp;
+impl Resp {
+    pub const DEFAULT: Resp = Resp;
+    fn with_body(&self, _body: usize) -> Resp { Resp }
+}
+pub struct Handler;
+impl Handler {
+    pub const DEFAULT: Handler = Handler;
+    fn run(&self, _input: u8) {}
+}
+
+pub fn enqueue() {
+    send(Msg::Build { cap: 1 });
+    send(Msg::Run { input: 2 });
+}
+fn send(_m: Msg) {}
+
+pub fn handle(m: Msg) {
+    match m {
+        Msg::Build { cap } => Resp::DEFAULT.with_body(make_body(cap)),
+        Msg::Run { input } => Handler::DEFAULT.run(input),
+    }
+}
+fn make_body(_cap: usize) -> usize { 0 }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let dispatches_from_enqueue = |symbol: &str| -> bool {
+        db.find_callers(symbol, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|hop| hop.edge_kind == "dispatches")
+            .filter_map(|hop| hop.from_symbol)
+            .any(|from| from.ends_with("enqueue"))
+    };
+
+    // The wrapper retains nested-argument tracing: the REAL handler is the payload producer.
+    assert!(
+        dispatches_from_enqueue("make_body"),
+        "the builder's payload producer must be the dispatch handler"
+    );
+    // The true dispatch shape still delegates to the chained method.
+    assert!(dispatches_from_enqueue("run"), "the associated-constant dispatch must reach `run`");
+    // The builder METHOD is never the handler — the same-named in-repo impl method must gain no
+    // synthesized edge.
+    assert!(
+        !dispatches_from_enqueue("with_body"),
+        "the builder method must NOT be a dispatch handler (false edge)"
+    );
+
+    // Fact level: the builder arm's fact names the payload producer, never the builder method.
+    let mut statement = conn
+        .prepare(
+            "SELECT tn.value, d.evidence FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings tn ON tn.id = d.to_name_id
+             WHERE ek.value = 'dispatch_handle'",
+        )
+        .unwrap();
+    let handle_facts: Vec<(String, Option<String>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        handle_facts
+            .iter()
+            .any(|(target, evidence)| target == "make_body"
+                && evidence.as_deref() == Some("Msg::Build")),
+        "Msg::Build must persist a dispatch_handle fact to `make_body`: {handle_facts:?}"
+    );
+    assert!(
+        handle_facts.iter().all(|(target, _)| target != "with_body"),
+        "no dispatch_handle fact may name the builder method `with_body`: {handle_facts:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     // #202: a name/symbol_path search drowns in generated bindings (ubrn FFI output, codegen) that
     // shadow the hand-written source symbol. The real-world case is codegen living UNDER a source
