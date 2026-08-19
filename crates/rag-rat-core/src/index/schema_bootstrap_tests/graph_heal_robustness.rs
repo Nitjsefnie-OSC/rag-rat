@@ -213,7 +213,9 @@ fn dispatch_fixture_body(handler_expression: &str) -> String {
     format!(
         r#"
 pub enum Msg {{ Work }}
-pub const TOOL_NAMES: [&str; 1] = ["tool"];
+pub mod tools {{
+    pub const TOOL_NAMES: [&str; 1] = ["tool"];
+}}
 pub static NOW: Now = Now;
 pub struct Now;
 impl Now {{ fn elapsed(&self) -> usize {{ 0 }} }}
@@ -232,9 +234,13 @@ pub fn handle(msg: Msg) {{
 
 #[test]
 fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
+    // The handler vehicle is a SCOPED constant chain: it still delegates (and so still persists
+    // the `map` handle fact) under the bare-callee fall-through gate, which now classifies the
+    // BARE form `TOOL_NAMES.iter().map(..)` as a chained adapter tail with no fact (#1124
+    // maintainer feedback).
     let (root, config) = indexed_root(&[(
         "lib.rs",
-        &dispatch_fixture_body("TOOL_NAMES.iter().map(|name| name.len())"),
+        &dispatch_fixture_body("tools::TOOL_NAMES.iter().map(|name| name.len())"),
     )]);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let file_id = scoped_file_id(&db, "src/lib.rs", &db.active_worktree_id);
@@ -273,7 +279,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     fs::create_dir_all(main.join("src")).unwrap();
     fs::write(
         main.join("src/lib.rs"),
-        dispatch_fixture_body("TOOL_NAMES.iter().map(|name| name.len())"),
+        dispatch_fixture_body("tools::TOOL_NAMES.iter().map(|name| name.len())"),
     )
     .unwrap();
     init_git_repo(&main);
