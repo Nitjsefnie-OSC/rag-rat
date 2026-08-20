@@ -58,7 +58,11 @@ impl IndexDatabase {
         // one-way ratchet, but a contributor's writes target the CONFIGURED owner's stream, so the
         // seeded rows would have nowhere to be authored and the fresh public stream would stay
         // empty while the CLI reported them seeded. Refuse while nothing irreversible has happened.
-        crate::memory_write::ensure_not_contributing(conn, &repo_id, "`sync publish --seed`")?;
+        crate::memory_write::ensure_not_mirroring_another_account(
+            conn,
+            &repo_id,
+            "`sync publish --seed`",
+        )?;
         let published =
             crate::memory_write::enable_public_authoring(conn, rag_rat_base::time::now_ms())?;
         let imported_memories = crate::index::consolidate::seed_from_index(
@@ -146,6 +150,43 @@ impl IndexDatabase {
             owner_account_hex,
             rag_rat_base::time::now_ms(),
         )
+    }
+
+    /// Configure the active repo to MIRROR `owner_account_hex`'s published memories, read-only
+    /// (#1156): this repo's memory tables materialize from the owner's stream instead of its own.
+    /// No Writer grant is involved — a subscriber authors nothing onto the owner's stream — but the
+    /// owner's log must reach this store (automatic sync pulls it once the owner's host is in
+    /// `[sync] server_peers`, or `sync pull <owner>`) before anything materializes.
+    pub fn sync_subscribe(&self, owner_account_hex: &str) -> anyhow::Result<()> {
+        crate::memory_write::set_subscription_owner(
+            self.storage.connection(),
+            owner_account_hex,
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
+    /// Stop mirroring a subscribed owner (`sync unsubscribe`): the active repo's memories
+    /// materialize from its OWN stream again. Returns whether a subscription was configured.
+    ///
+    /// The subscription REMOVED this account's other devices' memories (absent from the owner's
+    /// projection, which the drain reads as condemned); clearing it makes the next drain
+    /// re-materialize them, and removes the owner's in turn.
+    pub fn sync_unsubscribe(&self) -> anyhow::Result<bool> {
+        crate::memory_write::clear_subscription_owner(self.storage.connection())
+    }
+
+    /// Stop contributing to a configured owner (`sync uncontribute`): memory authoring for the
+    /// active repo targets this store's own stream again. Returns whether a contribution was
+    /// configured. The owner's Writer grant and the contributions already authored onto its stream
+    /// are untouched.
+    pub fn sync_uncontribute(&self) -> anyhow::Result<bool> {
+        crate::memory_write::clear_contribution_owner(self.storage.connection())
+    }
+
+    /// The active repo's configured foreign memory owner, if any — what `sync whoami` reports
+    /// alongside this store's account id.
+    pub fn sync_owner_config(&self) -> anyhow::Result<crate::memory_write::RepoOwnerConfig> {
+        crate::memory_write::repo_owner_config(self.storage.connection())
     }
 
     /// Re-wrap the active repo stream's existing live keys to an already-effective enrolled device.

@@ -50,7 +50,10 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         | SyncCommand::Grant { .. }
         | SyncCommand::Revoke { .. }
         | SyncCommand::Grants
-        | SyncCommand::Contribute { .. } => {},
+        | SyncCommand::Contribute { .. }
+        | SyncCommand::Subscribe { .. }
+        | SyncCommand::Unsubscribe
+        | SyncCommand::Uncontribute => {},
     }
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
@@ -100,9 +103,12 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         },
         SyncCommand::Whoami => {
             let account_id = db.sync_whoami()?;
+            let owner = db.sync_owner_config()?;
             print_output(&serde_json::json!({
                 "account_id": account_id,
                 "repo_id": db.active_repo_id,
+                "contribution_owner_account_id": owner.contribution_owner_account_id,
+                "subscription_owner_account_id": owner.subscription_owner_account_id,
                 "note": "share this account id with an owner so they can `sync grant` it write access to their repo's memories",
             }))
         },
@@ -159,13 +165,59 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
                 })).collect::<Vec<_>>(),
             }))
         },
+        // Every arm that RE-POINTS the repo's authoritative stream drains before reporting, the way
+        // `contribute_with_ticket` already does: the re-point is only a configuration write, the
+        // memories move in the drain, and no read path runs one. Reporting the new configuration
+        // while `memory search` still shows the old contents reads as a failed command.
         SyncCommand::Contribute { account } => {
             db.sync_contribute(account)?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
             print_output(&serde_json::json!({
                 "status": "contributing",
                 "repo_id": db.active_repo_id,
                 "owner_account_id": account,
+                "memories_added": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
                 "note": "memory changes for this repo now target the owner's stream; the owner must `sync grant` this account, and this store needs the owner's log — automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+            }))
+        },
+        SyncCommand::Subscribe { account } => {
+            db.sync_subscribe(account)?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
+            print_output(&serde_json::json!({
+                "status": "subscribed",
+                "repo_id": db.active_repo_id,
+                "owner_account_id": account,
+                "read_only": true,
+                "memories_added": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
+                "note": "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log: automatic sync pulls it once the owner's host is in [sync] server_peers, or run `sync pull <owner>` now",
+            }))
+        },
+        SyncCommand::Unsubscribe => {
+            let cleared = db.sync_unsubscribe()?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
+            print_output(&serde_json::json!({
+                "status": if cleared { "unsubscribed" } else { "not_subscribed" },
+                "repo_id": db.active_repo_id,
+                "memories_restored": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
+                "note": "this repo's memories materialize from its own account's stream again: what its other devices had synced here is restored and the owner's goes in turn. Local binding work is not restored — a `memory rebind` made on a memory the subscription removed, and any local edge onto it, went with the row",
+            }))
+        },
+        SyncCommand::Uncontribute => {
+            let cleared = db.sync_uncontribute()?;
+            let effects = rag_rat_core::drain_synced_memory(db.connection())?;
+            db.fold_wal();
+            print_output(&serde_json::json!({
+                "status": if cleared { "uncontributed" } else { "not_contributing" },
+                "repo_id": db.active_repo_id,
+                "memories_restored": effects.nodes_written,
+                "memories_removed": effects.nodes_removed,
+                "note": "memory changes for this repo target this store's own stream again, and its own stream materializes it in the owner's place. Contributions already authored onto the owner's stream stay there, and the owner's grant stays open until it runs `sync revoke` — so until then this index still may not hold a private memory stream in any repo, or those contributions become unfetchable. What that blocks is memory AUTHORING (`memory create`/`update`/`rebind`, and `sync enable`) in any repo of this index that is not published: those refuse, naming the conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo with `sync publish`, re-run `sync contribute`, or index it in a separate database",
             }))
         },
         SyncCommand::Serve { .. }
@@ -747,6 +799,18 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
     )?
     .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
     let db = crate::open_index(config)?;
+    // Refuse a subscribed repo HERE, before the redemption. `sync_contribute` refuses it too, but
+    // that call is the last step of this flow: by then the owner has authored a grant for this
+    // account, and bailing would leave it live for a store that will never contribute. Same
+    // reasoning as the repo-mismatch refusal below — stop while nothing is burned.
+    if let Some(subscribed) = db.sync_owner_config()?.subscription_owner_account_id {
+        bail!(
+            "this repo already subscribes to account {subscribed} — subscription and contribution \
+             both re-point the ONE stream that materializes this repo's memories, so only one can \
+             be configured. Run `sync unsubscribe` first, or redeem this ticket in a separate \
+             index"
+        );
+    }
     let (node_key, contributor) = {
         let conn = db.connection();
         // Mint the contributor identity if absent — a fresh store can redeem an invite as its
@@ -941,11 +1005,12 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         };
 
         // Materialize what landed, and MEASURE the result rather than asserting it. The drain
-        // mirrors exactly ONE authoritative stream per repo: the configured contribution owner's,
-        // or this store's own. Those cover the two directions contribution needs — a contributor
-        // pulling its owner, and an owner pulling a contributor (whose entries sit on the owner's
-        // own stream). A standalone reader pulling some third account it neither owns nor
-        // contributes to has nowhere to put the content, and must not be told otherwise.
+        // mirrors exactly ONE authoritative stream per repo: a configured contribution owner's, a
+        // subscribed owner's, or this store's own. Those cover a contributor pulling its owner, an
+        // owner pulling a contributor (whose entries sit on the owner's own stream), and a
+        // read-only subscriber pulling the owner it mirrors. A pull of some third account this repo
+        // neither owns, contributes to, nor subscribes to has nowhere to put the content, and must
+        // not be told otherwise.
         let effects = rag_rat_core::drain_synced_memory(conn)?;
         rag_rat_core::resolve_synced_distill_anchors(conn)?;
         db.fold_wal();
@@ -953,15 +1018,20 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         // A successful pull implies convergence — the shared helper only reports a peer after
         // both legs converged, so there is no "incomplete success" to describe.
         let note = if effects.nodes_written > 0 || effects.edges_written > 0 {
-            "these memories are searchable locally; their code anchors do not cross an account \
-             boundary, so they will not attach as drive-by context"
+            "these memories are searchable locally, and the code anchors their author published \
+             are seeded here, so they attach as drive-by context wherever they resolve against \
+             this index — a symbol, path, or commit this checkout does not have stays unresolved \
+             and simply attaches nowhere. Call-path and chunk bindings are not carried across an \
+             account boundary, and anchors are seeded only for a memory this store holds none for"
         } else if !effects.is_empty() {
             "the authority this pull brought RETRACTED memories here — the drain removed what the \
              owner's log no longer accepts; nothing new was added"
         } else if content_entries > 0 {
             "content arrived but nothing materialized into this repo's memories: a repo mirrors \
-             ONE stream — its own, or a configured contribution owner's. Run `sync contribute \
-             <this account>` to mirror it, or pull from a store that owns or contributes to it"
+             ONE stream — its own, a subscribed owner's, or a configured contribution owner's. Run \
+             `sync subscribe <this account>` to mirror it read-only, `sync contribute <this \
+             account>` if you also intend to author back (that one needs a Writer grant from the \
+             owner), or pull from a store that already mirrors it"
         } else {
             "already up to date with this account"
         };
