@@ -753,8 +753,7 @@ fn is_adapter_tail(function: Node<'_>, text: &str) -> bool {
     let value = unwrap_generic_function(value);
     match value.kind() {
         "call_expression" => true,
-        "identifier" =>
-            value.utf8_text(text.as_bytes()).is_ok_and(|name| is_screaming_const_identifier(name)),
+        "identifier" => value.utf8_text(text.as_bytes()).is_ok_and(is_screaming_const_identifier),
         _ => false,
     }
 }
