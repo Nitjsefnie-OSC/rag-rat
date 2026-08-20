@@ -921,10 +921,9 @@ impl LiveBackendTail {
                 tool = self.backend.tool.as_db_str(),
                 skipped = report.skipped_unconfigured,
                 "live oracle: this pass sent the server no requests and skipped candidates because \
-                 this checkout's sole compilation database has syntax or entry fields this reader \
-                 cannot accept. Inspect compile_commands.json for unsupported syntax (such as \
-                 clangd's YAML forms) or an unsupported entry key, then adjust it to the supported \
-                 compilation-database schema."
+                 this checkout's sole compilation database could not be used by this reader. \
+                 Inspect compile_commands.json: it may be unreadable, contain unsupported syntax \
+                 (such as clangd's YAML forms), or contain an unsupported entry key."
             );
             return;
         }
@@ -1544,6 +1543,38 @@ mod tests {
         assert!(
             strict_json_unknown_key.contains("unsupported entry key"),
             "the warning must describe the accepted-problem class: {strict_json_unknown_key:?}",
+        );
+
+        // An existing marker path is recorded even when it cannot be opened. A directory with
+        // the marker's name reaches the same Unknown layout fact as a file-open failure, so the
+        // warning must not claim that its contents have either of the reader-level problems.
+        std::fs::remove_file(fixture.path().join("compile_commands.json")).unwrap();
+        std::fs::create_dir(fixture.path().join("compile_commands.json")).unwrap();
+        let unreadable_marker_layout = clangd.resolve_layout(&scope);
+        assert!(
+            unreadable_marker_layout.has_unreadable_database(),
+            "an existing but unopenable marker still reaches the unreadable-database branch",
+        );
+        let unreadable_marker = warning(LivePassReport {
+            skipped_unconfigured: 1,
+            database_unreadable: unreadable_marker_layout.has_unreadable_database(),
+            ..LivePassReport::default()
+        });
+        assert!(
+            unreadable_marker.contains("compile_commands.json"),
+            "the warning must identify an unreadable marker path: {unreadable_marker:?}",
+        );
+        assert!(
+            !unreadable_marker.contains("has syntax or entry fields this reader cannot accept"),
+            "an unopenable marker must not assert a content-level cause: {unreadable_marker:?}",
+        );
+        assert!(
+            unreadable_marker.contains("could not be used"),
+            "the warning must state the reader could not use the marker: {unreadable_marker:?}",
+        );
+        assert!(
+            unreadable_marker.contains("may be unreadable"),
+            "the warning must present unreadability as a possible cause: {unreadable_marker:?}",
         );
     }
 
