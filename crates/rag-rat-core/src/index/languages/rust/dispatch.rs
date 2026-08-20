@@ -647,9 +647,7 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
 ///   fn `crate::ml::embed::embed_text`, or an associated-constant method chain
 ///   `Handler::DEFAULT.run(..)` — the constant is the chained method's receiver).
 /// - `Wrapper`: a TRANSPARENT wrapper / variant constructor whose single argument IS the response —
-///   `Ok`/`Some`, ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`), or
-///   an associated-constant BUILDER whose argument nests the producing call
-///   (`Resp::DEFAULT.with_body(handle(cap))` — `handle` is the real handler, not `with_body`).
+///   `Ok`/`Some`, or ANY PascalCase-tail ctor (`MlResp::Embedded`, `dto::Wrapped`, bare `Wrapped`).
 ///   Trace its lone payload argument.
 /// - `Skip`: emit nothing — `Err`/`None` (error/absence payload), a snake-tail `Type::assoc`
 ///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), a
@@ -693,17 +691,16 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
         return CallRole::Delegate;
     };
     // An associated-constant method chain calls the chained METHOD with the constant as its
-    // receiver, so it delegates like any method call — but ONLY when the call consumes plain
-    // data (`Handler::DEFAULT.run(input)`) or a closure transformation
-    // (`TOOL_NAMES.iter().map(|name| ..)`). A chain that WRAPS a produced value is a builder
-    // (`Resp::DEFAULT.with_body(handle(cap))`): the nested argument call is the real handler,
-    // so the builder classifies as a transparent wrapper of its payload and the builder method
-    // itself is never recorded (#1124 maintainer feedback). Consulted before BOTH qualifier
-    // fallbacks: the leading-`<` UFCS early return and the PascalCase-receiver `Skip` below
-    // would otherwise bill `Handler::DEFAULT.run(..)` / `<Handler as Runner>::DEFAULT.run(..)`
-    // as an associated/constructor call (#1124 held feedback).
+    // receiver, so it delegates like any method call — UNCONDITIONALLY. The argument shape says
+    // nothing: `Resp::DEFAULT.with_body(handle(cap))` and `Handler::DEFAULT.run(normalize(input))`
+    // are the same expression modulo identifier spelling, so a nested-argument test cannot tell a
+    // builder from a dispatch and only picks which of the two loses its handler (#1124 maintainer
+    // feedback). Consulted before BOTH qualifier fallbacks: the leading-`<` UFCS early return and
+    // the PascalCase-receiver `Skip` below would otherwise bill `Handler::DEFAULT.run(..)` /
+    // `<Handler as Runner>::DEFAULT.run(..)` as an associated/constructor call (#1124 held
+    // feedback).
     if is_associated_const_method_chain(function, text) {
-        return if call_carries_nested_call(call) { CallRole::Wrapper } else { CallRole::Delegate };
+        return CallRole::Delegate;
     }
     // A LEADING `<...>` is a UFCS qualifier (`<Resp as Default>::default()`), an
     // associated/constructor call — never a handler, and its arg (if any) isn't the response.
@@ -760,35 +757,6 @@ fn is_adapter_tail(function: Node<'_>, text: &str) -> bool {
             .utf8_text(text.as_bytes())
             .is_ok_and(|name| is_screaming_const_identifier(name)),
         _ => false,
-    }
-}
-
-/// Whether any ARGUMENT of `call` contains a nested `call_expression` outside a closure — the
-/// structural signal that the call wraps a produced value (`with_body(handle(cap))`) rather than
-/// consuming plain data (`run(input)`) or a transformation (`map(|name| describe(name))`: a
-/// closure is deferred behavior, not a produced response). The call's own callee chain is never
-/// inspected.
-fn call_carries_nested_call(call: Node<'_>) -> bool {
-    let Some(arguments) = call.child_by_field_name("arguments") else {
-        return false;
-    };
-    let mut cursor = arguments.walk();
-    arguments.named_children(&mut cursor).any(subtree_has_nested_call)
-}
-
-/// Whether `node`'s subtree contains a `call_expression`, never descending into a closure — used
-/// to tell a value-WRAPPING call from a data- or behavior-consuming one (see
-/// [`call_carries_nested_call`]).
-fn subtree_has_nested_call(node: Node<'_>) -> bool {
-    match node.kind() {
-        "call_expression" => true,
-        "closure_expression" => false,
-        // grow_stack: full-subtree recursion; grow rather than overflow on a hostile deep
-        // argument (#543).
-        _ => rag_rat_base::stack::grow_stack(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor).any(subtree_has_nested_call)
-        }),
     }
 }
 
