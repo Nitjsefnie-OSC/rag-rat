@@ -1839,7 +1839,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 118, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 119, "move this pin with the next schema migration");
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
@@ -2350,39 +2350,74 @@ fn migration_097_covers_every_worktree_id_column_in_the_schema() {
 /// steps AFTER the V115 refold, so a store replaying from below V115 folded into a table without it
 /// and failed to open, on a column its own migration body never mentions (#1229).
 ///
-/// The fixture drops the column as well as truncating the ledger: the ledger decides which steps
-/// replay, but the SHAPE is what the fold hits, and a truncation alone leaves the column standing
-/// from the initial apply.
+/// The fixture drops the columns as well as truncating the ledger: the ledger decides which steps
+/// replay, but the SHAPE is what the fold hits, and a truncation alone leaves them standing from
+/// the initial apply.
+///
+/// Every projected-node column added after the refold step has the same exposure, so the fixture
+/// covers the whole set rather than the one column that first exhibited it. The set is DERIVED from
+/// the tip rather than trusted: a hand-kept list is exactly as blind to a new column as the
+/// migration body is, so the test asserts it equals the tip's columns minus the frozen pre-refold
+/// shape, and a column that skips the list fails here instead of passing silently.
 ///
 /// The real hook folds per account, so on an account-less scratch store it returns without writing
 /// anything and cannot observe the defect. The probe below stands in for it, asserting the shape at
 /// the moment the ladder hands it the transaction — which is the ordering under test.
 #[test]
 fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
+    /// `content_projected_nodes` as V070 created it — the shape the last refold step (V115) could
+    /// rely on. Frozen history, not the current table.
+    const PRE_REFOLD_COLUMNS: &[&str] = &["stream_id", "node_id", "content_json", "status"];
+
+    /// The `content_projected_nodes` columns that arrive AFTER the last refold step, and so are
+    /// the ones the refold can outrun. The probe below is a bare fn pointer, so it needs a const;
+    /// the assertion against the tip is what keeps the const honest.
+    const POST_REFOLD_COLUMNS: &[&str] = &["anchors_json", "source_text_hash"];
+
     fn refold_probe(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
-        let present: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('content_projected_nodes') WHERE name \
-             = 'anchors_json')",
-            [],
-            |row| row.get(0),
-        )?;
-        if present {
-            return Ok(());
+        for column in POST_REFOLD_COLUMNS {
+            let present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('content_projected_nodes') WHERE \
+                 name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    std::io::Error::other(format!(
+                        "the refold ran before content_projected_nodes.{column} existed"
+                    )),
+                )));
+            }
         }
-        Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-            "the refold ran before content_projected_nodes.anchors_json existed",
-        ))))
+        Ok(())
     }
 
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
 
-    conn.execute_batch("ALTER TABLE content_projected_nodes DROP COLUMN anchors_json")
-        .expect("drop the projected-node anchors column");
-    assert!(
-        !conn_table_columns(&conn, "content_projected_nodes").contains(&"anchors_json".to_string()),
-        "the fixture starts without the column the refold needs",
+    let mut post_refold_at_tip: Vec<String> = conn_table_columns(&conn, "content_projected_nodes")
+        .into_iter()
+        .filter(|column| !PRE_REFOLD_COLUMNS.contains(&column.as_str()))
+        .collect();
+    post_refold_at_tip.sort();
+    let mut listed: Vec<String> = POST_REFOLD_COLUMNS.iter().map(|c| (*c).to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        post_refold_at_tip, listed,
+        "every `content_projected_nodes` column added after the V115 refold must be in \
+         POST_REFOLD_COLUMNS — one that is only pinned by its own migration is invisible to this \
+         fixture, and the refold runs the current projector against a table that lacks it",
     );
+
+    for column in POST_REFOLD_COLUMNS {
+        conn.execute_batch(&format!("ALTER TABLE content_projected_nodes DROP COLUMN {column}"))
+            .unwrap_or_else(|err| panic!("drop content_projected_nodes.{column}: {err}"));
+        assert!(
+            !conn_table_columns(&conn, "content_projected_nodes").contains(&(*column).to_string()),
+            "the fixture starts without `{column}`, which the refold needs",
+        );
+    }
     truncate_schema_to(&conn, 114);
 
     let hooks = rag_rat_db::MigrationHooks {
@@ -2397,8 +2432,11 @@ fn a_store_below_the_first_refold_step_migrates_to_the_tip() {
         schema::LATEST_SCHEMA_VERSION,
         "forward migrate reaches the tip",
     );
-    assert!(
-        conn_table_columns(&conn, "content_projected_nodes").contains(&"anchors_json".to_string()),
-        "the refold's shape requirement is satisfied by the tip",
-    );
+    let columns = conn_table_columns(&conn, "content_projected_nodes");
+    for column in POST_REFOLD_COLUMNS {
+        assert!(
+            columns.contains(&(*column).to_string()),
+            "the refold's shape requirement for `{column}` is satisfied by the tip",
+        );
+    }
 }

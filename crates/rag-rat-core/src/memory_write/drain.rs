@@ -289,11 +289,17 @@ fn read_existing_node(conn: &Connection, node_id: &str) -> anyhow::Result<Option
     .map_err(Into::into)
 }
 
-/// Whether a projected node's content passes the SAME validity gates the local create/update path
-/// enforces — kind / confidence closed sets, title / body length caps, source, and the kind↔payload
-/// rule (`validate_payload`). Peer content crosses the wire only SHAPE-validated, and an older or
+/// Whether a projected node passes the SAME validity gates the local create/update path enforces —
+/// kind / confidence closed sets, title / body length caps, source, and the kind↔payload rule
+/// (`validate_payload`). Peer content crosses the wire only SHAPE-validated, and an older or
 /// compromised account device could author content that clears the §18a envelope cap yet violates
 /// these tighter local rules; such a node must not be persisted into the searchable tables.
+///
+/// The published source hash is deliberately NOT gated here. Failing this function quarantines the
+/// whole memory — deleting its row, bindings and FTS shadow — and the projection re-offers the same
+/// value forever, so a peer on a newer digest shape would cost every older peer the memory itself.
+/// Its shape is filtered at the one place that stores it (`stamp_seeded_source_hash`) instead: the
+/// same guarantee that nothing malformed is persisted, without the blast radius.
 fn projected_node_content_is_valid(node: &ProjectedContentNode) -> anyhow::Result<()> {
     memory::validate_kind(&node.content.kind)?;
     memory::validate_confidence(&node.content.confidence)?;
@@ -310,6 +316,12 @@ fn projected_node_content_is_valid(node: &ProjectedContentNode) -> anyhow::Resul
         memory::validate_len("tag", &tag, 64)?;
     }
     Ok(())
+}
+
+/// The exact shape `hex_sha256` produces — the only value the local write path ever stores in
+/// `repo_memories.source_text_hash`.
+fn is_hex_sha256(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// What a node converge did — mirrors [`EdgeEffect`] so the outcome counters stay honest (a
@@ -402,10 +414,13 @@ fn drain_node(
             }
         },
         None => {
-            // First sight of this node — received from a peer. `created_by` / `source_text_hash` /
-            // `input_hash` have no op home and are nullable; `memory_version` is the author-side
-            // constant; the clock is bookkeeping only. `origin='synced'` is what the authoring gate
-            // keys off.
+            // First sight of this node — received from a peer. `created_by` / `input_hash` have no
+            // op home and are nullable; `memory_version` is the author-side constant; the clock is
+            // bookkeeping only. `origin='synced'` is what the authoring gate keys off.
+            //
+            // `source_text_hash` DOES have an op home, but it is not written here: it is a claim
+            // ABOUT an anchor set, so it is stamped with the seed that installs one (see
+            // `stamp_seeded_source_hash`).
             tx.execute(
                 "INSERT INTO repo_memories(
                      id, kind, title, body, confidence, status, created_by, created_at_ms,
@@ -438,6 +453,7 @@ fn drain_node(
     if node.anchors.is_some() && node_in_repo(tx, &node.node_id, repo_id)? {
         let seeded = seed_node_anchors(tx, repo_id, node)?;
         if seeded > 0 {
+            stamp_seeded_source_hash(tx, repo_id, node)?;
             // `anchors/1` declares that a write to this table advances these lanes, and the `/5`
             // applier bumps them for exactly this reason. The seed is a second writer to the same
             // table, and on the converged path no `repo_memories` row is touched — so the row
@@ -552,6 +568,56 @@ fn seed_node_anchors(
         seeded += 1;
     }
     Ok(seeded)
+}
+
+/// Stamp the source hash a node's author published onto a memory whose anchors this drain JUST
+/// seeded — and ONLY then.
+///
+/// The hash is a claim ABOUT an anchor set ("its author anchored to text hashing to this"), so it
+/// inherits the seed's semantics rather than converging on its own. Stamping it on every pass while
+/// the anchors seed once lets the two disagree permanently, in both directions:
+/// - the projection's hash register has no retraction, so an author who rebinds onto a target that
+///   carries no hash (tracker / dir / commit / call path) publishes nothing and leaves the old
+///   value standing for a receiver to re-apply forever;
+/// - a rebind whose `node_anchors` and `node_source_hash` arrive together would take the new hash
+///   while the seed gate keeps the bindings already installed, describing text that binding never
+///   pointed at.
+///
+/// Sharing the seed's gate makes the pair stale together instead of contradictory, which is the
+/// posture already documented for a seeded anchor set. A memory whose bindings this store seeded
+/// before the op existed keeps a NULL hash — that is the honest state, since nothing here can say
+/// the published hash describes those rows, and an absent hash is not evidence of drift.
+///
+/// Scoped to synced rows: a local memory's hash is its own to stamp. That is the one case where the
+/// pair does NOT go stale together — an unbound LOCAL memory rebound on another device takes the
+/// peer's seeded bindings (`seed_node_anchors` has no origin filter) beside a NULL hash.
+///
+/// This is also the only place a peer-supplied hash is stored, so it is where the shape is checked:
+/// a value outside what `hex_sha256` produces is dropped and the memory is left unstamped. The
+/// content gate cannot do it — failing there quarantines the whole memory over a decoration.
+fn stamp_seeded_source_hash(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    node: &ProjectedContentNode,
+) -> anyhow::Result<()> {
+    let Some(hash) = node.source_text_hash.as_deref() else {
+        return Ok(());
+    };
+    if !is_hex_sha256(hash) {
+        tracing::warn!(
+            repo_id,
+            node_id = %node.node_id,
+            "not stamping a published source hash outside the lowercase-hex-sha256 shape; the \
+             memory keeps its seeded bindings and an unstamped hash",
+        );
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE repo_memories SET source_text_hash = ?3
+         WHERE id = ?1 AND repo_id = ?2 AND origin = 'synced'",
+        params![node.node_id, repo_id, hash],
+    )?;
+    Ok(())
 }
 
 /// Whether this store holds ANY binding for `(repo_id, memory_id)` — the per-memory seed gate.
@@ -1174,6 +1240,187 @@ mod tests {
             "symbol".to_string(),
             "src/lib.rs::run".to_string()
         )]);
+    }
+
+    /// Set (or clear) the source hash a projected node's author published, on a node row a
+    /// previous `seed_projected_node_with_anchors` call already wrote.
+    fn set_projected_source_hash(
+        conn: &Connection,
+        stream: StreamId,
+        node_id: &str,
+        hash: Option<&str>,
+    ) {
+        conn.execute(
+            "UPDATE content_projected_nodes SET source_text_hash = ?3
+             WHERE stream_id = ?1 AND node_id = ?2",
+            params![stream.to_bytes().as_slice(), node_id, hash],
+        )
+        .unwrap();
+    }
+
+    fn source_hash_of(conn: &Connection, memory_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT source_text_hash FROM repo_memories WHERE id = ?1",
+            [memory_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// The published hash is a claim about an anchor set, so it lands with the seed that installs
+    /// one — the text the author anchored to, beside the bindings it describes.
+    #[test]
+    fn a_seeded_memory_takes_the_source_hash_its_author_published() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+
+        drain_worker(&conn, stream, 1_000);
+
+        assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
+    }
+
+    /// The hash inherits the seed's once-only semantics. It has to: the op vocabulary has no
+    /// retraction, so an author who rebinds onto a target carrying no hash publishes nothing and
+    /// leaves the register holding the old value. A hash that converged on every pass while the
+    /// anchors it describes seeded once would re-apply that stale claim forever.
+    #[test]
+    fn a_later_hash_does_not_re_stamp_a_memory_whose_anchors_are_already_seeded() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 1_000);
+
+        // A later pass carrying a different hash for the same, already-seeded bindings.
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_B));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            Some(HASH_A.to_string()),
+            "the hash describes the anchor set the drain installed, not the projection's latest",
+        );
+    }
+
+    /// The INSERT that materializes a node on first sight leaves `source_text_hash` NULL even when
+    /// the projection carries one, because a hash with no anchors beside it describes nothing.
+    /// Binding the projected hash in that INSERT — the obvious shortcut — must fail this test;
+    /// every other case in the suite reaches the column through the seed instead.
+    #[test]
+    fn a_first_sight_node_with_no_anchors_takes_no_source_hash() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+
+        drain_worker(&conn, stream, 1_000);
+
+        assert!(
+            bindings_of(&conn, "mem_peer").is_empty(),
+            "nobody published this memory's bindings"
+        );
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            None,
+            "a hash with no anchor set beside it is a claim about nothing",
+        );
+    }
+
+    /// The other direction of the same rule: a memory whose bindings this store already holds is
+    /// never seeded, so it takes no hash either. Stamping one would assert that its author anchored
+    /// to text hashing to X about bindings that never pointed there.
+    #[test]
+    fn a_memory_whose_anchors_are_not_seeded_takes_no_source_hash() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(&conn, stream, "mem_peer", None);
+        drain_worker(&conn, stream, 1_000);
+        conn.execute(
+            "INSERT INTO repo_memory_bindings(
+                 repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
+             VALUES (?1, 'mem_peer', 'symbol', 'src/other.rs::keep', 'src/other.rs', 'current', 1)",
+            [REPO],
+        )
+        .unwrap();
+
+        // The author rebinds: new anchors and a new hash arrive together, but the seed gate holds.
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some(HASH_A));
+        drain_worker(&conn, stream, 2_000);
+
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/other.rs::keep".to_string()
+        )]);
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            None,
+            "nothing was seeded, so there is no anchor set for a hash to describe",
+        );
+    }
+
+    /// The published hash crosses the same untrusted boundary as the content and lands in a column
+    /// nothing downstream re-derives, so a value outside the shape `hex_sha256` produces is never
+    /// stored. It costs the memory NOTHING else: the projection re-offers the same bad value on
+    /// every pass, so quarantining over it would delete the row, its bindings and its FTS shadow
+    /// permanently the moment one peer published a different digest shape.
+    #[test]
+    fn a_malformed_source_hash_leaves_the_memory_intact_and_unstamped() {
+        let conn = scoped_conn();
+        let stream = StreamId::from_bytes([0x44; 32]);
+        seed_projected_node_with_anchors(
+            &conn,
+            stream,
+            "mem_peer",
+            Some(&[("symbol", "src/lib.rs::run")]),
+        );
+        set_projected_source_hash(&conn, stream, "mem_peer", Some("../../etc/passwd"));
+
+        drain_worker(&conn, stream, 1_000);
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM repo_memories WHERE id = 'mem_peer')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "a bad hash must not cost the peer the memory itself");
+        assert_eq!(bindings_of(&conn, "mem_peer"), vec![(
+            "symbol".to_string(),
+            "src/lib.rs::run".to_string()
+        )]);
+        assert_eq!(
+            source_hash_of(&conn, "mem_peer"),
+            None,
+            "an unparseable source hash is not persisted",
+        );
     }
 
     /// Seed one row into `content_projected_edges`. `resolved` is `(target_repo, target_node,

@@ -503,6 +503,11 @@ fn build_reconcile_ops(
         {
             ops.push(op);
         }
+        if let Some(op) = source_hash_op(conn, &row.memory_id)?
+            && content_op_is_authorable(&op, policy)
+        {
+            ops.push(op);
+        }
         if let Some(group) = by_source.remove(row.memory_id.as_str()) {
             for edge in group {
                 ops.push(edge_add_op(edge, owner_repo_id)?);
@@ -678,6 +683,14 @@ const ANCHOR_BACKFILL_SCAN_PER_PASS: i64 = 512;
 /// cannot heal `some -> different`, and the relocation engine does rewrite portable anchor identity
 /// outside any authoring path, so a renamed symbol leaves a peer holding the pre-rename set until
 /// an explicit rebind re-authors it. Republish-on-drift is a separate mechanism, not this one.
+///
+/// The match set is `anchors_json IS NULL` only. A memory whose anchors were published BEFORE the
+/// source-hash op existed has left it for good, so its hash is never swept and the peer holds the
+/// anchors unmarked. Widening this to also select on `source_text_hash IS NULL` would not fix it:
+/// the receiver applies a hash only where it seeds the anchors (`stamp_seeded_source_hash`), and a
+/// peer that already holds them seeds nothing. Healing the pair needs a republish path that
+/// re-seeds both together. No released version authored anchors, so the exposure is stores that ran
+/// an unreleased build of the anchor op.
 fn read_anchor_backfill_ids(
     conn: &Connection,
     repo_id: &str,
@@ -749,14 +762,27 @@ fn read_reconcile_work(
     // `has_authorable_work` implying a non-empty batch.
     let mut anchor_backfill_ops = Vec::new();
     let mut quarantined_anchor_ids = Vec::new();
+    let mut swept = 0;
     for memory_id in read_anchor_backfill_ids(conn, repo_id, stream)? {
         // Stop once the pass has its publish budget. Candidates past this point are simply not this
         // pass's work — they are neither authored nor quarantined, and the next pass reaches them.
-        if anchor_backfill_ops.len() >= ANCHOR_BACKFILL_PER_PASS {
+        // Counted in MEMORIES, not ops, so the source hash riding along below cannot halve it.
+        if swept >= ANCHOR_BACKFILL_PER_PASS {
             break;
         }
         match anchors_op(conn, &memory_id)? {
-            Some(op) if content_op_is_authorable(&op, policy) => anchor_backfill_ops.push(op),
+            Some(op) if content_op_is_authorable(&op, policy) => {
+                anchor_backfill_ops.push(op);
+                swept += 1;
+                // The hash describes exactly the anchors this sweep is publishing, and a receiver
+                // applies it only where it seeds them — so it has to ride the same batch, or every
+                // memory in the corpus this leg exists to reach lands on a peer unmarked forever.
+                if let Some(op) = source_hash_op(conn, &memory_id)?
+                    && content_op_is_authorable(&op, policy)
+                {
+                    anchor_backfill_ops.push(op);
+                }
+            },
             // `None` is unreachable (the query requires a binding), but counting it as quarantined
             // keeps the partition total rather than silently dropping.
             _ => quarantined_anchor_ids.push(memory_id),
@@ -1487,8 +1513,9 @@ fn reject_unauthorable_content_op(op: &MemoryOp, policy: StreamSealPolicy) -> an
             node_id.as_str(),
             anchors.len()
         ),
-        // NodeStatus / EdgeRemove / Rebind carry no unbounded free-form field and cannot exceed the
-        // cap; this arm keeps the guard total over the op vocabulary.
+        // NodeStatus / EdgeRemove / Rebind / NodeSourceHash carry no unbounded free-form field a
+        // caller controls — a source hash is a fixed-width digest — so they cannot exceed the cap;
+        // this arm keeps the guard total over the op vocabulary.
         _ => anyhow::bail!(
             "this memory operation is too large to store: its assembled /3 content envelope \
              exceeds the 256 KiB signed-entry cap"
@@ -1584,6 +1611,7 @@ pub(crate) fn author_create(
     let mut ops =
         vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: content_of(memory) }];
     ops.extend(anchors_op(tx, &memory.memory_id)?);
+    ops.extend(source_hash_op(tx, &memory.memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
 
@@ -1595,8 +1623,34 @@ pub(crate) fn author_anchors(
     prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
+    let mut ops: Vec<MemoryOp> = anchors_op(tx, memory_id)?.into_iter().collect();
+    // A rebind re-stamps `source_text_hash` in the same transaction, so the published hash has to
+    // move with the anchors or a peer keeps comparing against the pre-rebind text.
+    ops.extend(source_hash_op(tx, memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
+}
+
+/// The `NodeSourceHash` op for a memory's stamped source hash, or `None` when it has none.
+///
+/// Like the anchor snapshot, an absent hash authors NOTHING rather than a sentinel: a receiver
+/// treats "nobody published one" as no evidence of drift, so spending a signed entry to say it
+/// would tell that peer nothing it can act on.
+///
+/// That silence has no retraction, so the published register can outlive the hash it was taken
+/// from — an author who rebinds onto a target that carries none (tracker / dir / commit / call
+/// path) nulls the column and publishes nothing. A receiver applies the hash only where it also
+/// installs the anchors it describes, which is what keeps the pair from contradicting each other.
+fn source_hash_op(conn: &Connection, memory_id: &str) -> anyhow::Result<Option<MemoryOp>> {
+    let mut stmt = conn.prepare("SELECT source_text_hash FROM repo_memories WHERE id = ?1")?;
+    let hash: Option<String> = stmt
+        .query_map(params![memory_id], |row| row.get::<_, Option<String>>(0))?
+        .next()
+        .transpose()?
+        .flatten();
+    Ok(hash.map(|source_text_hash| MemoryOp::NodeSourceHash {
+        node_id: NodeId::from(memory_id),
+        source_text_hash,
+    }))
 }
 
 /// The `NodeAnchors` op for a memory's current bindings, or `None` when it has none.
@@ -1800,6 +1854,8 @@ fn read_unauthored_memory_rows(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     const REPO: &str = "repo-a";
@@ -1932,8 +1988,10 @@ mod tests {
             )
             .unwrap();
         }
-        // Newer, and perfectly publishable.
+        // Newer, and perfectly publishable — with a stamped hash, so the sweep emits BOTH of the
+        // ops a swept memory owes.
         insert_memory(&conn, "mem_ok", "active", 2);
+        set_source_hash(&conn, "mem_ok");
         conn.execute(
             "INSERT INTO repo_memory_bindings(
                  repo_id, memory_id, binding_kind, binding_id, path, anchor_status, created_at_ms)
@@ -1952,8 +2010,71 @@ mod tests {
 
         let work = read_reconcile_work(&conn, REPO, stream, StreamSealPolicy::Plaintext).unwrap();
         assert_eq!(work.quarantined_anchor_ids, vec!["mem_fat".to_string()]);
-        assert_eq!(work.anchor_backfill_ops.len(), 1, "the publishable one is still authored");
+        assert_eq!(
+            work.anchor_backfill_ops.len(),
+            2,
+            "the publishable one is still authored, anchors and the hash describing them",
+        );
         assert!(work.has_authorable_work(), "progress is available despite the quarantined head");
+    }
+
+    /// The publish budget counts MEMORIES, not ops. Each swept memory owes up to two ops — its
+    /// anchors and the hash describing them — so counting ops would halve the budget the moment
+    /// hashes exist, and the pass would reach 32 memories instead of 64.
+    #[test]
+    fn the_publish_budget_counts_memories_not_the_ops_they_owe() {
+        let (conn, stream) = conn_with_stream();
+        // One more than the budget, all publishable and all hashed, oldest first.
+        for index in 0..=ANCHOR_BACKFILL_PER_PASS {
+            let id = format!("mem_{index:04}");
+            insert_memory(&conn, &id, "active", index as i64);
+            set_source_hash(&conn, &id);
+            conn.execute(
+                "INSERT INTO repo_memory_bindings(
+                     repo_id, memory_id, binding_kind, binding_id, path, anchor_status,
+                     created_at_ms)
+                 VALUES (?1, ?2, 'path', ?3, 'src/lib.rs', 'current', 1)",
+                params![REPO, id, format!("src/lib.rs:{index:04}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO content_projected_nodes(stream_id, node_id, content_json, status)
+                 VALUES (?1, ?2, '{}', 'active')",
+                params![stream.to_bytes().as_slice(), id],
+            )
+            .unwrap();
+        }
+
+        let work = read_reconcile_work(&conn, REPO, stream, StreamSealPolicy::Plaintext).unwrap();
+
+        let swept: BTreeSet<String> = work
+            .anchor_backfill_ops
+            .iter()
+            .map(|op| match op {
+                MemoryOp::NodeAnchors { node_id, .. }
+                | MemoryOp::NodeSourceHash { node_id, .. } => node_id.as_str().to_string(),
+                other => panic!("the sweep authors anchors and hashes only, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(swept.len(), ANCHOR_BACKFILL_PER_PASS, "a full budget of memories");
+        assert_eq!(
+            work.anchor_backfill_ops.len(),
+            ANCHOR_BACKFILL_PER_PASS * 2,
+            "each swept memory owes its anchors and the hash describing them",
+        );
+        assert!(
+            !swept.contains(&format!("mem_{ANCHOR_BACKFILL_PER_PASS:04}")),
+            "the one past the budget is the next pass's work",
+        );
+    }
+
+    /// Stamp a memory with a source hash of the shape the local write path produces.
+    fn set_source_hash(conn: &Connection, id: &str) {
+        conn.execute("UPDATE repo_memories SET source_text_hash = ?2 WHERE id = ?1", params![
+            id,
+            rag_rat_base::hash::hex_sha256(id.as_bytes())
+        ])
+        .unwrap();
     }
 
     /// The positive control for both gates above: a LOCAL memory with a binding and no snapshot IS
