@@ -209,16 +209,24 @@ fn stage_graph_version_16(db: &IndexDatabase) {
     *db.drift_snapshot.lock().expect("drift snapshot lock") = None;
 }
 
+/// The handler vehicle is an associated-constant method chain owned by a TYPE, which is the shape
+/// that delegates to its chained method. A constant reached through a MODULE path
+/// (`tools::TOOL_NAMES.iter().map(..)`) is an adapter tail and records no handler at all, so it
+/// cannot carry a dispatch fact for these upgrade assertions to watch (#1124 maintainer feedback).
 fn dispatch_fixture_body(handler_expression: &str) -> String {
     format!(
         r#"
 pub enum Msg {{ Work }}
-pub mod tools {{
-    pub const TOOL_NAMES: [&str; 1] = ["tool"];
+pub struct Handler;
+impl Handler {{
+    pub const DEFAULT: Handler = Handler;
+    fn run(&self, _input: usize) -> usize {{ 0 }}
 }}
-pub static NOW: Now = Now;
-pub struct Now;
-impl Now {{ fn elapsed(&self) -> usize {{ 0 }} }}
+pub struct Clock;
+impl Clock {{
+    pub const NOW: Clock = Clock;
+    fn elapsed(&self) -> usize {{ 0 }}
+}}
 
 pub fn enqueue() {{ send(Msg::Work); }}
 fn send(_msg: Msg) {{}}
@@ -234,14 +242,8 @@ pub fn handle(msg: Msg) {{
 
 #[test]
 fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
-    // The handler vehicle is a SCOPED constant chain: it still delegates (and so still persists
-    // the `map` handle fact) under the bare-callee fall-through gate, which now classifies the
-    // BARE form `TOOL_NAMES.iter().map(..)` as an adapter tail with no fact (#1124 maintainer
-    // feedback).
-    let (root, config) = indexed_root(&[(
-        "lib.rs",
-        &dispatch_fixture_body("tools::TOOL_NAMES.iter().map(|name| name.len())"),
-    )]);
+    let (root, config) =
+        indexed_root(&[("lib.rs", &dispatch_fixture_body("Handler::DEFAULT.run(1)"))]);
     let db = IndexDatabase::rebuild(&config).unwrap();
     let file_id = scoped_file_id(&db, "src/lib.rs", &db.active_worktree_id);
 
@@ -249,7 +251,7 @@ fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
     let initial_handles = edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle");
     assert!(
         initial_handles.iter().any(|(name, _, evidence)| {
-            name == "map" && evidence.as_deref() == Some("Msg::Work")
+            name == "run" && evidence.as_deref() == Some("Msg::Work")
         }),
         "the fixture must initially persist the corrected dispatch fact: {initial_handles:?}"
     );
@@ -260,9 +262,13 @@ fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
     db.ensure_graph_index_current().unwrap();
 
     let handles = edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle");
+    // The re-extracted candidate binds to the chained method defined in the same file, so the
+    // upgrade restores a RESOLVED handler rather than a dangling name.
     assert!(
         handles.iter().any(|(name, resolution, evidence)| {
-            name == "map" && resolution == "unresolved" && evidence.as_deref() == Some("Msg::Work")
+            name == "run"
+                && resolution == "target_name_fallback"
+                && evidence.as_deref() == Some("Msg::Work")
         }),
         "the v16 row must be re-extracted with the corrected handle fact: {handles:?}"
     );
@@ -277,11 +283,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
     fs::create_dir_all(main.join("src")).unwrap();
-    fs::write(
-        main.join("src/lib.rs"),
-        dispatch_fixture_body("tools::TOOL_NAMES.iter().map(|name| name.len())"),
-    )
-    .unwrap();
+    fs::write(main.join("src/lib.rs"), dispatch_fixture_body("Handler::DEFAULT.run(1)")).unwrap();
     init_git_repo(&main);
     run_git(&main, &["add", "."]);
     run_git(&main, &["commit", "-q", "-m", "base"]);
@@ -291,10 +293,9 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let linked = unique_temp_root();
     let _ = fs::remove_dir_all(&linked);
     run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    // A SCOPED constant chain, like the active checkout's — a BARE one (`NOW.elapsed()`) is an
-    // adapter tail that records no handler at all (#1124 maintainer feedback), which would leave
-    // the sibling with no fact for the isolation assertions to watch.
-    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("crate::NOW.elapsed()")).unwrap();
+    // A TYPE-owned constant chain like the active checkout's, naming a different method so the
+    // sibling's fact is distinguishable from the active checkout's.
+    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("Clock::NOW.elapsed()")).unwrap();
     run_git(&linked, &["add", "."]);
     run_git(&linked, &["commit", "-q", "-m", "branch body"]);
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
@@ -333,7 +334,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let base_handles = edge_kind_rows_with_resolution(&db, base_id, "dispatch_handle");
     assert!(
         base_handles.iter().any(|(name, _, evidence)| {
-            name == "map" && evidence.as_deref() == Some("Msg::Work")
+            name == "run" && evidence.as_deref() == Some("Msg::Work")
         }),
         "the active checkout receives the corrected dispatch fact: {base_handles:?}"
     );
@@ -357,7 +358,7 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     );
     assert_eq!(file_graph_version(&linked_db, base_id), 17);
     assert_eq!(file_graph_version(&linked_db, overlay_id), 17);
-    assert_eq!(edge_kind_rows_with_resolution(&linked_db, base_id, "dispatch_handle")[0].0, "map");
+    assert_eq!(edge_kind_rows_with_resolution(&linked_db, base_id, "dispatch_handle")[0].0, "run");
     assert_eq!(linked_db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
 
     let _ = fs::remove_dir_all(&main);
