@@ -236,8 +236,8 @@ pub fn handle(msg: Msg) {{
 fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
     // The handler vehicle is a SCOPED constant chain: it still delegates (and so still persists
     // the `map` handle fact) under the bare-callee fall-through gate, which now classifies the
-    // BARE form `TOOL_NAMES.iter().map(..)` as a chained adapter tail with no fact (#1124
-    // maintainer feedback).
+    // BARE form `TOOL_NAMES.iter().map(..)` as an adapter tail with no fact (#1124 maintainer
+    // feedback).
     let (root, config) = indexed_root(&[(
         "lib.rs",
         &dispatch_fixture_body("tools::TOOL_NAMES.iter().map(|name| name.len())"),
@@ -291,7 +291,10 @@ fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
     let linked = unique_temp_root();
     let _ = fs::remove_dir_all(&linked);
     run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
-    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("NOW.elapsed()")).unwrap();
+    // A SCOPED constant chain, like the active checkout's — a BARE one (`NOW.elapsed()`) is an
+    // adapter tail that records no handler at all (#1124 maintainer feedback), which would leave
+    // the sibling with no fact for the isolation assertions to watch.
+    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("crate::NOW.elapsed()")).unwrap();
     run_git(&linked, &["add", "."]);
     run_git(&linked, &["commit", "-q", "-m", "branch body"]);
     db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
