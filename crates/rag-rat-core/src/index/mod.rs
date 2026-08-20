@@ -408,11 +408,12 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // `new`/`default`, and a declared return carrying generic arguments declines instead of naming
 // itself; re-extract `receiver_type_hint_id` so deployed indexes gain the one and drop the other.
 // Also #1124 — dispatch handler classification reads only a segment's leading identifier with
-// Unicode XID continuation semantics, an associated-constant method chain
+// Unicode XID continuation semantics, a method chain on a constant a TYPE owns
 // (`Handler::DEFAULT.run(..)`, `<Handler as Runner>::DEFAULT.run(..)`) delegates to its chained
-// method, and an adapter tail glued onto another call's result or onto a bare constant
-// (`LIMIT.min(cap).max(1)`, `BASE.to_string()`) records no handler at all; re-extract facts so
-// existing indexes do not retain the old wrapper/delegate decision.
+// method, and an adapter tail glued onto another call's result or onto a constant no type owns
+// records no handler at all — `LIMIT.min(cap).max(1)` and `crate::config::BASE.to_string()` alike,
+// since the chain's ROOT decides and its spelling does not; re-extract facts so existing indexes do
+// not retain the old wrapper/delegate decision.
 const GRAPH_INDEX_VERSION: &str = "17";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
