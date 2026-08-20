@@ -652,9 +652,9 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
 /// - `Skip`: emit nothing — `Err`/`None` (error/absence payload), a snake-tail `Type::assoc`
 ///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), a
 ///   UFCS associated call (`<Resp as Default>::default()`), or an adapter tail glued onto another
-///   call's result or onto a bare SCREAMING constant (`LIMIT.min(cap).max(..)`,
-///   `BASE.to_string()` — it adapts a value, and recording the trailing method would bind it to an
-///   unrelated same-named symbol, #1124 maintainer feedback).
+///   call's result or onto a bare SCREAMING constant (`LIMIT.min(cap).max(..)`, `BASE.to_string()`
+///   — it adapts a value, and recording the trailing method would bind it to an unrelated
+///   same-named symbol, #1124 maintainer feedback).
 ///
 /// Classification is by the path TAIL (constructor names are PascalCase; fns/methods are
 /// snake_case), which is receiver-agnostic — so `dto::Wrapped` and `Resp::Embedded` are both
@@ -753,9 +753,8 @@ fn is_adapter_tail(function: Node<'_>, text: &str) -> bool {
     let value = unwrap_generic_function(value);
     match value.kind() {
         "call_expression" => true,
-        "identifier" => value
-            .utf8_text(text.as_bytes())
-            .is_ok_and(|name| is_screaming_const_identifier(name)),
+        "identifier" =>
+            value.utf8_text(text.as_bytes()).is_ok_and(|name| is_screaming_const_identifier(name)),
         _ => false,
     }
 }
