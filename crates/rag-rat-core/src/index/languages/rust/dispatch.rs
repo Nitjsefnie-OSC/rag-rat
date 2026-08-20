@@ -653,9 +653,10 @@ fn pattern_binding_names_impl(pattern: Node<'_>, text: &str, out: &mut Vec<Strin
 ///   Trace its lone payload argument.
 /// - `Skip`: emit nothing — `Err`/`None` (error/absence payload), a snake-tail `Type::assoc`
 ///   constructor (`Vec::with_capacity`, `Resp::empty` — its arg configures, isn't the response), a
-///   UFCS associated call (`<Resp as Default>::default()`), or a chained adapter tail glued onto
-///   another call's result (`LIMIT.min(cap).max(..)` — it adapts a value, and recording the
-///   trailing method would bind it to an unrelated same-named symbol, #1124 maintainer feedback).
+///   UFCS associated call (`<Resp as Default>::default()`), or an adapter tail glued onto another
+///   call's result or onto a bare SCREAMING constant (`LIMIT.min(cap).max(..)`,
+///   `BASE.to_string()` — it adapts a value, and recording the trailing method would bind it to an
+///   unrelated same-named symbol, #1124 maintainer feedback).
 ///
 /// Classification is by the path TAIL (constructor names are PascalCase; fns/methods are
 /// snake_case), which is receiver-agnostic — so `dto::Wrapped` and `Resp::Embedded` are both
@@ -722,23 +723,29 @@ fn classify_call(call: Node<'_>, text: &str) -> CallRole {
     match segments.as_slice() {
         [.., receiver, _last] if is_pascal_case(receiver) => CallRole::Skip,
         // The fall-through is reserved for a BARE callee. A method glued onto ANOTHER CALL'S
-        // RESULT is a chained adapter tail (`LIMIT.min(cap).max(..)`,
-        // `list.len().saturating_sub(..)`): it adapts a value into another value — never the
-        // handler, and not a wrapper either, since its argument is adapter input rather than the
-        // response. Recording the trailing method would bind it, via bare-name fallback, to an
-        // unrelated same-named repository symbol — a false persisted edge (#1124 maintainer
-        // feedback).
-        _ if is_chained_adapter_tail(function) => CallRole::Skip,
+        // RESULT or onto a BARE SCREAMING constant is an adapter tail (`LIMIT.min(cap).max(..)`,
+        // `list.len().saturating_sub(..)`, `BASE.to_string()`): it adapts a value into another
+        // value — never the handler, and not a wrapper either, since its argument is adapter input
+        // rather than the response. Recording the trailing method would bind it, via bare-name
+        // fallback, to an unrelated same-named repository symbol — a false persisted edge (#1124
+        // maintainer feedback).
+        _ if is_adapter_tail(function, text) => CallRole::Skip,
         _ => CallRole::Delegate,
     }
 }
 
-/// Whether the call's callee is a method glued onto the RESULT of another call — the structural
-/// shape of a standard-adapter chain (`x.min(cap).max(..)`, `list.len().saturating_sub(..)`).
-/// AST-checked, never textual: the callee is a `field_expression` whose receiver is itself a
-/// `call_expression`. A method on a plain binding/`self`/field receiver (`worker.run`,
-/// `self.embed`) is a bare callee, not a chained tail.
-fn is_chained_adapter_tail(function: Node<'_>) -> bool {
+/// Whether the call's callee is an adapter tail rather than a bare callee — AST-checked, never
+/// textual. Two receiver shapes qualify, both of which adapt an already-produced value:
+/// - the RESULT of another call, the standard-adapter chain (`x.min(cap).max(..)`,
+///   `list.len().saturating_sub(..)`);
+/// - a BARE SCREAMING constant (`BASE.to_string()`, `SWEEP_FALLBACK_CONCURRENCY.min(cap)`) — a
+///   constant names no owner, so its trailing method reads the constant's value.
+///
+/// A method on a plain binding/`self`/field receiver (`worker.run`, `self.embed`) is a bare
+/// callee: that receiver holds the handler. A SCOPED constant receiver
+/// (`Handler::DEFAULT.run(..)`) never reaches here — [`is_associated_const_method_chain`] claims
+/// it earlier, because naming the owning type is what makes the chained method the dispatch.
+fn is_adapter_tail(function: Node<'_>, text: &str) -> bool {
     let function = unwrap_generic_function(function);
     if function.kind() != "field_expression" {
         return false;
@@ -746,7 +753,14 @@ fn is_chained_adapter_tail(function: Node<'_>) -> bool {
     let Some(value) = function.child_by_field_name("value") else {
         return false;
     };
-    unwrap_generic_function(value).kind() == "call_expression"
+    let value = unwrap_generic_function(value);
+    match value.kind() {
+        "call_expression" => true,
+        "identifier" => value
+            .utf8_text(text.as_bytes())
+            .is_ok_and(|name| is_screaming_const_identifier(name)),
+        _ => false,
+    }
 }
 
 /// Whether any ARGUMENT of `call` contains a nested `call_expression` outside a closure — the
@@ -974,8 +988,6 @@ mod classify_call_tests {
         assert!(matches!(role_of("worker.run(input)"), CallRole::Delegate));
         assert!(matches!(role_of("self.embed(input)"), CallRole::Delegate));
         assert!(matches!(role_of("self.worker.run(input)"), CallRole::Delegate));
-        // A PascalCase receiver is a type, not a constant, and keeps its own `Type::assoc` reading.
-        assert!(matches!(role_of("Worker.run(input)"), CallRole::Delegate));
     }
 
     /// An associated-constant method chain invoked with PLAIN DATA is the dispatch itself
