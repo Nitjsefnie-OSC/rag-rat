@@ -42,6 +42,7 @@ mod tests;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
+use rag_rat_oplog::discovery::WRAP_LEN;
 use sha2::{Digest, Sha256};
 
 use self::wire::{DiscoveryRequest, DiscoveryResponse, TAG_LEN};
@@ -106,11 +107,51 @@ pub const MAX_SEALED_ANNOUNCEMENTS: usize = 64;
 /// a diagnosable message, because the alternative failure is genuinely silent — the refusal looks
 /// like every other transient publish error and the host retries it forever.
 ///
-/// It binds at a smaller roster than it looks. An envelope is one version byte plus 80 bytes per
-/// roster-effective device, so this permits about **25 recipients**; the service's own frame budget
-/// would not bite until several hundred. An account past that ceiling cannot advertise until the
-/// envelope is split across announcements — see [`crate::discovery`] docs.
+/// It binds at a smaller roster than it looks — see [`MAX_PUBLISHABLE_RECIPIENTS`]; the service's
+/// own frame budget would not bite until several hundred.
 pub const MAX_ANNOUNCEMENT_BYTES: usize = 2048;
+
+/// Most roster-effective devices an account can have and still be advertised by one host.
+///
+/// Derived from the envelope's size law rather than written beside it: an envelope is one version
+/// byte plus [`WRAP_LEN`] per recipient, so this ceiling and the wrap layout cannot drift apart. An
+/// account past it cannot advertise at all until the envelope is split across announcements — see
+/// [`crate::discovery`] docs. Today: 25.
+pub const MAX_PUBLISHABLE_RECIPIENTS: usize = (MAX_ANNOUNCEMENT_BYTES - 1) / WRAP_LEN;
+
+/// The ceiling is the LARGEST recipient count that fits, so one more must not.
+///
+/// Non-test code on purpose: a wrap layout that moved the ceiling off the bytes is a wire mistake,
+/// and it should stop `cargo build` rather than wait for whoever runs the tests.
+const _: () = assert!(
+    1 + (MAX_PUBLISHABLE_RECIPIENTS + 1) * WRAP_LEN > MAX_ANNOUNCEMENT_BYTES,
+    "one more recipient than the ceiling must not fit, or the ceiling leaves a wrap of room unused"
+);
+
+/// Whether an announcement fits one publish.
+///
+/// The single place the envelope's size law and the service's byte ceiling meet. It lives on this
+/// side of the crate boundary because the ceiling mirrors the service's limit and the op-log crate,
+/// which owns the sealing, cannot see it. Callers get the verdict rather than two constants to
+/// recombine — recombining them is how the pairing ended up restated per publisher.
+///
+/// Takes BYTES rather than a sealed envelope so it can be asked at the publish boundary, where no
+/// envelope survives: both publish paths carry opaque bytes by then. A verdict only the seal site
+/// can ask is a verdict an envelope from anywhere else evades.
+pub fn fits_publish(announcement: &[u8]) -> bool {
+    announcement.len() <= MAX_ANNOUNCEMENT_BYTES
+}
+
+/// Why an over-size announcement was not published, naming the size.
+///
+/// Written once because both refusal points report it: the pre-dial one and the publish stream a
+/// fetching caller still reaches. Two spellings of the same refusal would have an operator matching
+/// two log lines to one cause.
+fn oversize_reason(bytes: usize) -> String {
+    format!(
+        "publish skipped: {bytes} bytes over the {MAX_ANNOUNCEMENT_BYTES}-byte announcement limit"
+    )
+}
 
 /// The tag an account publishes and fetches under.
 ///
@@ -146,7 +187,7 @@ pub fn account_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
 /// This is still strictly better than the account id, which is broadcast to every dialed host by
 /// design, and it is a bounded exposure — routing advice and denial of service, never data. The fix
 /// is purpose-built discovery key material sealed to roster-effective devices and rotated on
-/// removal (#1080); routing every caller through this one function is what keeps that change from
+/// removal (#1081); routing every caller through this one function is what keeps that change from
 /// touching the wire, the tag domain, the client, or the driver.
 pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u8; 32]>> {
     rag_rat_oplog::read_local_account_genesis(conn)
@@ -299,6 +340,24 @@ async fn exchange_inner(
     deadline: tokio::time::Instant,
 ) -> DiscoveryOutcome {
     let DiscoveryExchange { endpoint, service, tag, fetch, publish, ttl_seconds } = params;
+
+    // BEFORE the dial, because a publish-only pass with an unpublishable envelope has nothing else
+    // to do on that connection. Its caller is a serving host, which retries on a fraction of the
+    // TTL — as little as a few seconds — for as long as the roster stays too large, so dialing to
+    // reach a verdict already known here would spend a full connection against a shared service
+    // forever. A fetching caller still dials: the peers it came for do not depend on its own
+    // envelope, and the same refusal waits at the publish stream below.
+    let oversize = publish.filter(|envelope| !fits_publish(envelope));
+    if let Some(envelope) = oversize
+        && !*fetch
+    {
+        return DiscoveryOutcome {
+            publish: PublishState::Refused,
+            degraded: Some(oversize_reason(envelope.len())),
+            ..Default::default()
+        };
+    }
+
     let connecting = endpoint.connect(service.clone(), PEER_DISCOVERY_ALPN);
     let conn = match tokio::time::timeout_at(deadline, connecting).await {
         Ok(Ok(conn)) => conn,
@@ -344,6 +403,18 @@ async fn exchange_inner(
     // asked for is owed regardless of whether anyone answered the other question.
     let publish_state = match publish {
         None => PublishState::NotAttempted,
+        // Enforced HERE, at the boundary the bytes actually cross, and not only where they are
+        // sealed: the seal site is one publisher among several, and an over-size envelope reaching
+        // the service comes back as a refusal indistinguishable from a transient error, which the
+        // advertiser then retries every tick forever. Refused rather than dropped silently, so the
+        // caller sees the same "nothing is stored" state it would get from the service and the
+        // reason is named in `degraded`. The connection is already open — a fetching caller needed
+        // it — so what is skipped here is the publish stream, not the dial; the publish-only shape
+        // never gets this far.
+        Some(envelope) if !fits_publish(envelope) => {
+            degraded.push(oversize_reason(envelope.len()));
+            PublishState::Refused
+        },
         Some(envelope) => {
             let publish = DiscoveryRequest::Publish {
                 tag: *tag,

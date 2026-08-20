@@ -6,7 +6,8 @@ use iroh::{Endpoint, RelayMode};
 use super::stub::{Behaviour, PER_TAG_CAP, StubService};
 use super::{
     DISCOVERY_TAG_DOMAIN, DISCOVERY_TIMEOUT, DiscoveryExchange, DiscoveryOutcome,
-    PEER_DISCOVERY_ALPN, PublishState, account_tag, exchange, publish_ttl_seconds,
+    MAX_ANNOUNCEMENT_BYTES, MAX_PUBLISHABLE_RECIPIENTS, PEER_DISCOVERY_ALPN, PublishState,
+    WRAP_LEN, account_tag, exchange, fits_publish, publish_ttl_seconds,
 };
 
 /// A fixed instant: the announcement arithmetic under test is about durations, and a real clock
@@ -479,7 +480,7 @@ async fn a_large_account_is_never_refused_and_its_fetches_fit_one_frame() {
 
     let service = StubService::start(NOW_MS, Behaviour::Serve).await;
     let tag = account_tag(&[13; 32]);
-    let realistic_envelope = |seed: u8| vec![seed.wrapping_add(100); 1 + 16 * 80];
+    let realistic_envelope = |seed: u8| vec![seed.wrapping_add(100); 1 + 16 * WRAP_LEN];
 
     let endpoint = client().await;
     for seed in 0..32u8 {
@@ -946,5 +947,120 @@ fn only_possibly_live_publishes_reset_the_renewal_clock() {
     assert!(
         !super::records_liveness(PublishState::NotAttempted),
         "nothing was published, so there is nothing to renew"
+    );
+}
+
+/// The verdict flips between exactly [`MAX_ANNOUNCEMENT_BYTES`] and one byte past it.
+///
+/// Probing at the boundary byte rather than at envelope sizes, because no envelope has a length of
+/// exactly the limit — `1 + WRAP_LEN·n` never lands on it — so recipient-shaped inputs alone leave
+/// the comparator free to be `<` and never say so. The limit is inclusive: it mirrors the largest
+/// payload the service accepts, not the first one it rejects.
+#[test]
+fn the_byte_ceiling_is_inclusive_and_the_next_byte_is_not() {
+    assert!(
+        fits_publish(&vec![0u8; MAX_ANNOUNCEMENT_BYTES]),
+        "{MAX_ANNOUNCEMENT_BYTES} bytes is the limit, not one past it"
+    );
+    assert!(
+        !fits_publish(&vec![0u8; MAX_ANNOUNCEMENT_BYTES + 1]),
+        "one byte past the limit is refused by the service, so it must be refused here"
+    );
+}
+
+/// An over-size announcement is refused HERE, without a publish stream, whoever handed it over.
+///
+/// The stub stores whatever it is given, so a publish that got as far as the wire would land — the
+/// assertion that nothing is stored is what separates the local guard from a service that happened
+/// to accept it. The real service would refuse instead, and that refusal is indistinguishable from
+/// a transient error, so an advertiser would keep republishing the same doomed envelope with
+/// nothing in the log naming the size. This does not stop the retry loop — a refusal is not
+/// liveness, so the next tick tries again — it stops the bytes reaching the service and names the
+/// size in `degraded`.
+#[tokio::test]
+async fn an_announcement_past_the_byte_ceiling_never_reaches_the_service() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[23; 32]);
+    let endpoint = client().await;
+    let oversize = vec![7u8; MAX_ANNOUNCEMENT_BYTES + 1];
+
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: false,
+        publish: Some(&oversize),
+        ttl_seconds: 600,
+    })
+    .await;
+
+    assert_eq!(out.publish, PublishState::Refused, "nothing is stored, so the state is Refused");
+    assert!(service.stored(&tag).is_empty(), "the over-size envelope reached the service anyway");
+    // Publish-only: the connection exists solely to carry this envelope, so opening one is pure
+    // cost. A host in this state retries on a fraction of its TTL for as long as the roster stays
+    // too large, and every one of those dials would be a full handshake against a shared service.
+    assert_eq!(service.dials(), 0, "a doomed publish-only pass must not dial the service");
+    let degraded = out.degraded.expect("an unpublishable announcement must say so");
+    assert!(
+        degraded.contains(&MAX_ANNOUNCEMENT_BYTES.to_string()),
+        "the reason must name the limit, or the operator cannot tell this from a transient \
+         failure: {degraded}"
+    );
+}
+
+/// A caller that also fetches still dials, and still gets its peers.
+///
+/// The pre-dial refusal is scoped to the publish-only shape on purpose: the peers a fetching caller
+/// came for do not depend on its own envelope, so skipping the connection would blind it to every
+/// reachable peer over a defect in what it wanted to advertise. Its publish is refused all the
+/// same, at the stream instead of before the dial.
+#[tokio::test]
+async fn a_fetching_caller_with_an_over_size_announcement_still_gets_its_peers() {
+    let service = StubService::start(NOW_MS, Behaviour::Serve).await;
+    let tag = account_tag(&[29; 32]);
+    let endpoint = client().await;
+    let peer = vec![9u8; 40];
+    let oversize = vec![7u8; MAX_ANNOUNCEMENT_BYTES + 1];
+    service.seed(tag, peer.clone(), NOW_MS + 60_000);
+
+    let out = exchange(DiscoveryExchange {
+        endpoint: &endpoint,
+        service: service.addr(),
+        tag,
+        fetch: true,
+        publish: Some(&oversize),
+        ttl_seconds: 600,
+    })
+    .await;
+
+    assert_eq!(out.announcements, vec![peer.clone()], "the fetch is owed regardless");
+    assert_eq!(out.publish, PublishState::Refused, "the envelope is still unpublishable");
+    assert_eq!(service.stored(&tag), vec![peer], "the seeded entry is all that is stored");
+    let degraded = out.degraded.expect("an unpublishable announcement must say so");
+    assert!(degraded.contains(&MAX_ANNOUNCEMENT_BYTES.to_string()), "{degraded}");
+}
+
+/// Whether a sealed announcement fits one publish is one question with one answer, and the
+/// recipient ceiling is that answer read backwards.
+///
+/// Both are computed from `WRAP_LEN`, so a wrap layout change moves the envelope, the ceiling, and
+/// this boundary together. A publisher holding its own copy of the size law moves only its copy,
+/// and the consequence is a service refusal that looks like every other transient publish error.
+///
+/// Catches an error of a whole wrap in either direction — the ceiling claiming a roster fits that
+/// the service would refuse, or stopping a roster short that it would have taken. The `+ 1` case is
+/// the one that matters in practice: it is the first roster that cannot be advertised at all.
+#[test]
+fn the_recipient_ceiling_is_where_a_sealed_envelope_stops_fitting_one_publish() {
+    // The envelope's size law: one version byte, then one fixed-size wrap per recipient.
+    let announcement = |recipients: usize| vec![0u8; 1 + recipients * WRAP_LEN];
+
+    assert!(
+        fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS)),
+        "the ceiling itself must fit, or it is off by one against {MAX_ANNOUNCEMENT_BYTES} bytes"
+    );
+    assert!(
+        !fits_publish(&announcement(MAX_PUBLISHABLE_RECIPIENTS + 1)),
+        "one recipient past the ceiling must not claim to fit"
     );
 }
