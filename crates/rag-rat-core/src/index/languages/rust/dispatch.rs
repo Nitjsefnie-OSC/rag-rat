@@ -990,22 +990,24 @@ mod classify_call_tests {
         assert!(matches!(role_of("self.worker.run(input)"), CallRole::Delegate));
     }
 
-    /// An associated-constant method chain invoked with PLAIN DATA is the dispatch itself
-    /// (`Handler::DEFAULT.run(input)` — the constant is the chained method's receiver). A chain
-    /// that WRAPS a produced value is a builder (`Resp::DEFAULT.with_body(handle(cap))`): the
-    /// nested call is the real handler, so the builder is a transparent wrapper of its payload
-    /// and the builder method itself is never recorded (#1124 maintainer feedback).
+    /// An associated-constant method chain is the dispatch itself, whatever its arguments hold
+    /// (#1124 maintainer feedback): the constant is the chained method's receiver, so the call
+    /// delegates to that method. Reading the ARGUMENT SHAPE to tell a dispatch from a builder
+    /// cannot work — `Resp::DEFAULT.with_body(handle(cap))` and
+    /// `Handler::DEFAULT.run(normalize(input))` are the same expression modulo spelling — so a
+    /// nested argument call no longer diverts the classification to `Wrapper`.
     #[test]
-    fn an_associated_constant_builder_wraps_a_produced_payload() {
-        assert!(matches!(role_of("Resp::DEFAULT.with_body(handle(cap))"), CallRole::Wrapper));
-        assert!(matches!(
-            role_of("<Resp as Build>::DEFAULT.with_body(handle(cap))"),
-            CallRole::Wrapper
-        ));
+    fn an_associated_constant_method_chain_always_delegates() {
         assert!(matches!(role_of("Handler::DEFAULT.run(input)"), CallRole::Delegate));
         assert!(matches!(role_of("<Handler as Runner>::DEFAULT.run(input)"), CallRole::Delegate));
-        // An intermediate builder call inside the chain still delegates when the final call is
-        // invoked with plain data.
+        // A nested argument call is argument shape, not classification evidence.
+        assert!(matches!(role_of("Handler::DEFAULT.run(normalize(input))"), CallRole::Delegate));
+        assert!(matches!(role_of("Resp::DEFAULT.with_body(handle(cap))"), CallRole::Delegate));
+        assert!(matches!(
+            role_of("<Resp as Build>::DEFAULT.with_body(handle(cap))"),
+            CallRole::Delegate
+        ));
+        // An intermediate call inside the chain still delegates to the final chained method.
         assert!(matches!(role_of("Handler::DEFAULT.build().run(input)"), CallRole::Delegate));
     }
 

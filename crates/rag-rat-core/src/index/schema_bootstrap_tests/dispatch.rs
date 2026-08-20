@@ -1701,19 +1701,21 @@ fn to_string(_value: &str) -> String { String::new() }
 }
 
 #[test]
-fn dispatch_records_the_real_handler_behind_an_associated_constant_builder() {
-    // #1124 maintainer feedback (MEDIUM): `Resp::DEFAULT.with_body(make_body(cap))` is a BUILDER
-    // wrapper — the nested argument call is the real handler — while
-    // `Handler::DEFAULT.run(input)` is the dispatch itself. The builder method (`with_body`,
-    // present in-repo as the impl method) must gain no edge, the payload producer must be traced
-    // through the wrapper, and the true dispatch shape must keep delegating.
+fn dispatch_records_the_chained_method_of_an_associated_constant_chain() {
+    // #1124 maintainer feedback (MEDIUM): `Resp::DEFAULT.with_body(make_body(cap))` and
+    // `Handler::DEFAULT.run(normalize(input))` are the same expression modulo identifier spelling,
+    // so no argument-shape heuristic can tell a builder from a dispatch. An associated-constant
+    // method chain therefore delegates to its chained method unconditionally: the chained method
+    // is recorded even when an argument nests a produced value, and the nested producer is NOT
+    // traced through. Both methods and the nested producer exist in-repo, so every assertion is
+    // about a resolvable name rather than a name that could never bind.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/lib.rs"),
         r#"
-pub enum Msg { Build { cap: usize }, Run { input: u8 } }
+pub enum Msg { Build { cap: usize }, Run { input: u8 }, Plain { input: u8 } }
 pub struct Resp;
 impl Resp {
     pub const DEFAULT: Resp = Resp;
@@ -1728,16 +1730,19 @@ impl Handler {
 pub fn enqueue() {
     send(Msg::Build { cap: 1 });
     send(Msg::Run { input: 2 });
+    send(Msg::Plain { input: 3 });
 }
 fn send(_m: Msg) {}
 
 pub fn handle(m: Msg) {
     match m {
         Msg::Build { cap } => Resp::DEFAULT.with_body(make_body(cap)),
-        Msg::Run { input } => Handler::DEFAULT.run(input),
+        Msg::Run { input } => Handler::DEFAULT.run(normalize(input)),
+        Msg::Plain { input } => Handler::DEFAULT.run(input),
     }
 }
 fn make_body(_cap: usize) -> usize { 0 }
+fn normalize(_input: u8) -> u8 { 0 }
 "#,
     )
     .unwrap();
@@ -1754,21 +1759,23 @@ fn make_body(_cap: usize) -> usize { 0 }
             .any(|from| from.ends_with("enqueue"))
     };
 
-    // The wrapper retains nested-argument tracing: the REAL handler is the payload producer.
-    assert!(
-        dispatches_from_enqueue("make_body"),
-        "the builder's payload producer must be the dispatch handler"
-    );
-    // The true dispatch shape still delegates to the chained method.
-    assert!(dispatches_from_enqueue("run"), "the associated-constant dispatch must reach `run`");
-    // The builder METHOD is never the handler — the same-named in-repo impl method must gain no
-    // synthesized edge.
-    assert!(
-        !dispatches_from_enqueue("with_body"),
-        "the builder method must NOT be a dispatch handler (false edge)"
-    );
+    // Every associated-constant chain reaches its chained method, whether or not an argument
+    // nests a produced value.
+    for chained_method in ["with_body", "run"] {
+        assert!(
+            dispatches_from_enqueue(chained_method),
+            "the associated-constant dispatch must reach `{chained_method}`"
+        );
+    }
+    // A nested argument call is not descended into, so the producer gains no edge of its own.
+    for nested_producer in ["make_body", "normalize"] {
+        assert!(
+            !dispatches_from_enqueue(nested_producer),
+            "{nested_producer} must NOT be a dispatch handler (an argument is not the dispatch)"
+        );
+    }
 
-    // Fact level: the builder arm's fact names the payload producer, never the builder method.
+    // Fact level: each arm's fact names the chained method, never the nested argument call.
     let mut statement = conn
         .prepare(
             "SELECT tn.value, d.evidence FROM edges_data d
@@ -1782,17 +1789,22 @@ fn make_body(_cap: usize) -> usize { 0 }
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert!(
-        handle_facts
-            .iter()
-            .any(|(target, evidence)| target == "make_body"
-                && evidence.as_deref() == Some("Msg::Build")),
-        "Msg::Build must persist a dispatch_handle fact to `make_body`: {handle_facts:?}"
-    );
-    assert!(
-        handle_facts.iter().all(|(target, _)| target != "with_body"),
-        "no dispatch_handle fact may name the builder method `with_body`: {handle_facts:?}"
-    );
+    for (variant, chained_method) in
+        [("Msg::Build", "with_body"), ("Msg::Run", "run"), ("Msg::Plain", "run")]
+    {
+        assert!(
+            handle_facts.iter().any(|(target, evidence)| target == chained_method
+                && evidence.as_deref() == Some(variant)),
+            "{variant} must persist a dispatch_handle fact to `{chained_method}`: {handle_facts:?}"
+        );
+    }
+    for nested_producer in ["make_body", "normalize"] {
+        assert!(
+            handle_facts.iter().all(|(target, _)| target != nested_producer),
+            "no dispatch_handle fact may name the nested argument call `{nested_producer}`: \
+             {handle_facts:?}"
+        );
+    }
 
     let _ = fs::remove_dir_all(&root);
 }
