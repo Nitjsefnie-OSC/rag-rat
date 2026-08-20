@@ -921,9 +921,10 @@ impl LiveBackendTail {
                 tool = self.backend.tool.as_db_str(),
                 skipped = report.skipped_unconfigured,
                 "live oracle: this pass sent the server no requests and skipped candidates because \
-                 this checkout's sole compilation database could not be read as JSON. It may use \
-                 clangd's YAML syntax (such as comments, trailing commas, or block syntax) or be \
-                 malformed; rewrite it as strict JSON so the session can configure its files."
+                 this checkout's sole compilation database has syntax or entry fields this reader \
+                 cannot accept. Inspect compile_commands.json for unsupported syntax (such as \
+                 clangd's YAML forms) or an unsupported entry key, then adjust it to the supported \
+                 compilation-database schema."
             );
             return;
         }
@@ -1507,11 +1508,43 @@ mod tests {
             ..LivePassReport::default()
         });
         assert!(
-            unreadable.contains("could not be read as JSON"),
-            "a sole unreadable database needs a parse/read remedy: {unreadable:?}",
+            unreadable.contains("compile_commands.json"),
+            "a sole unreadable database warning must identify its file: {unreadable:?}",
         );
+        assert!(!unreadable.contains("could not be read as JSON"));
+        assert!(unreadable.contains("unsupported syntax"));
+        assert!(unreadable.contains("unsupported entry key"));
         assert!(!unreadable.contains("leave a single compilation database"));
         assert!(!unreadable.contains("names no file this checkout indexes"));
+
+        std::fs::write(
+            fixture.path().join("compile_commands.json"),
+            r#"[{"directory":"/x","file":"/x/a.c","command":"cc -c a.c","extra":"x"}]"#,
+        )
+        .unwrap();
+        let strict_json_unknown_key_layout = clangd.resolve_layout(&scope);
+        assert!(
+            strict_json_unknown_key_layout.has_unreadable_database(),
+            "a strict-JSON entry with an unknown key still yields the Unknown layout fact",
+        );
+        let strict_json_unknown_key = warning(LivePassReport {
+            skipped_unconfigured: 1,
+            database_unreadable: strict_json_unknown_key_layout.has_unreadable_database(),
+            ..LivePassReport::default()
+        });
+        assert!(
+            !strict_json_unknown_key.contains("could not be read as JSON"),
+            "strict JSON with an unknown key must not be described as unparseable: \
+             {strict_json_unknown_key:?}",
+        );
+        assert!(
+            strict_json_unknown_key.contains("compile_commands.json"),
+            "the warning must identify the database file: {strict_json_unknown_key:?}",
+        );
+        assert!(
+            strict_json_unknown_key.contains("unsupported entry key"),
+            "the warning must describe the accepted-problem class: {strict_json_unknown_key:?}",
+        );
     }
 
     /// A pass that skipped `paths` because the session could not configure their files.
