@@ -932,42 +932,50 @@ mod classify_call_tests {
         assert!(matches!(role_of("<Resp as Default>::default()"), CallRole::Skip));
     }
 
-    /// A `SCREAMING_CONST` head carrying a method chain is a plain delegation, not a transparent
-    /// variant constructor (#1124). The chain's method names supply the lowercase the case test
-    /// looks for, so reading the whole segment bills `TOOL_NAMES.iter().map(..)` as a wrapper and
-    /// traces through the constant instead of recording the call as the handler.
+    /// A `SCREAMING_CONST` head carrying a method chain is not a transparent variant constructor
+    /// (#1124). The chain's method names supply the lowercase the case test looks for, so reading
+    /// the whole segment would bill `TOOL_NAMES.iter().map(..)` as a wrapper and trace through the
+    /// constant instead of classifying the call on its own shape.
     #[test]
     fn a_screaming_const_with_a_method_chain_is_not_a_wrapper() {
-        // A chain on a scoped constant carrying a closure transformation keeps its delegation:
-        // the closure is behavior, not a produced value, and the trailing `map` is a std adapter
-        // method that never resolves to an in-corpus symbol, so no edge is synthesized (#1124).
+        // A chain on a SCOPED associated constant delegates to its chained method: `TOOL_NAMES` is
+        // the receiver named by its owning module, so the call is the dispatch itself (#1124).
         assert!(matches!(
             role_of("crate::tools::TOOL_NAMES.iter().map(|name| describe(name))"),
             CallRole::Delegate
         ));
-        // A single-word constant has no underscore to give it away and reads the same way.
-        assert!(matches!(role_of("NOW.elapsed()"), CallRole::Delegate));
+        // A BARE constant receiver names no owner, so the trailing method is an adapter over the
+        // constant's value rather than a handler — neither a wrapper nor a delegate.
+        assert!(matches!(role_of("NOW.elapsed()"), CallRole::Skip));
     }
 
-    /// A method whose receiver is ANOTHER CALL'S RESULT is a chained adapter tail
-    /// (`LIMIT.min(cap).max(..)`, `list.len().saturating_sub(..)`): it adapts a value, it is
-    /// never the handler, and it is not a transparent wrapper either — its argument is adapter
-    /// input, not the response. Only a BARE callee (a free function, a path, or a method on a
-    /// plain binding/`self` receiver) may fall through to `Delegate`; otherwise the trailing
-    /// method name is recorded as the handler and bare-name fallback binds it to an unrelated
-    /// same-named repository symbol — a false persisted edge (#1124 maintainer feedback).
+    /// A method glued onto ANOTHER CALL'S RESULT (`LIMIT.min(cap).max(..)`,
+    /// `list.len().saturating_sub(..)`) or onto a BARE SCREAMING constant (`BASE.to_string()`) is
+    /// an adapter tail: it adapts a value, it is never the handler, and it is not a transparent
+    /// wrapper either — its argument is adapter input, not the response. Only a BARE callee (a
+    /// free function, a path, or a method on a plain binding/`self` receiver) may fall through to
+    /// `Delegate`; otherwise the trailing method name is recorded as the handler and bare-name
+    /// fallback binds it to an unrelated same-named repository symbol — a false persisted edge
+    /// (#1124 maintainer feedback).
     #[test]
-    fn a_chained_adapter_tail_is_neither_a_delegate_nor_a_wrapper() {
+    fn an_adapter_tail_is_neither_a_delegate_nor_a_wrapper() {
         assert!(matches!(role_of("LIMIT.min(cap).max(1)"), CallRole::Skip));
         assert!(matches!(role_of("BACKENDS.len().saturating_sub(1)"), CallRole::Skip));
         assert!(matches!(role_of("items(count).len().max(1)"), CallRole::Skip));
         assert!(matches!(role_of("make_worker().run(input)"), CallRole::Skip));
+        // A single method on a bare SCREAMING constant is the same adapter shape without the
+        // second link — `BASE.to_string()`, `SWEEP_FALLBACK_CONCURRENCY.min(cap)`.
+        assert!(matches!(role_of("BASE.to_string()"), CallRole::Skip));
+        assert!(matches!(role_of("LIMIT.min(cap)"), CallRole::Skip));
+        assert!(matches!(role_of("_BASE.to_string()"), CallRole::Skip));
         // Bare callees keep their delegation: a free function, and a method on a plain
         // binding/`self`/field receiver (`worker.run` IS the handler — #208 review round 11).
         assert!(matches!(role_of("run(input)"), CallRole::Delegate));
         assert!(matches!(role_of("worker.run(input)"), CallRole::Delegate));
         assert!(matches!(role_of("self.embed(input)"), CallRole::Delegate));
         assert!(matches!(role_of("self.worker.run(input)"), CallRole::Delegate));
+        // A PascalCase receiver is a type, not a constant, and keeps its own `Type::assoc` reading.
+        assert!(matches!(role_of("Worker.run(input)"), CallRole::Delegate));
     }
 
     /// An associated-constant method chain invoked with PLAIN DATA is the dispatch itself

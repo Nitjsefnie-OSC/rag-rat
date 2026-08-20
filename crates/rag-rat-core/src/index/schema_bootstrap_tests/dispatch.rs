@@ -1593,27 +1593,33 @@ pub fn handle(m: Msg) {
 }
 
 #[test]
-fn dispatch_suppresses_chained_adapter_tails_end_to_end() {
-    // #1124 maintainer feedback (HIGH): a standard-adapter chain whose trailing method is glued
-    // onto ANOTHER CALL'S RESULT (`LIMIT.min(cap).max(1)`, `items(count).len().max(1)`) computes a
-    // value — it is never the dispatch handler. Recording the trailing method name lets bare-name
+fn dispatch_suppresses_adapter_tails_end_to_end() {
+    // #1124 maintainer feedback (HIGH): a standard-adapter tail computes a value — it is never the
+    // dispatch handler. That covers a method glued onto ANOTHER CALL'S RESULT
+    // (`LIMIT.min(cap).max(1)`, `items(count).len().max(1)`) and a method glued onto a BARE
+    // SCREAMING constant (`BASE.to_string()`). Recording the trailing method name lets bare-name
     // fallback bind it to an unrelated same-named in-repo symbol, synthesizing a FALSE
-    // `dispatches` edge. This fixture defines exactly such a helper (`fn max`), so a false edge
-    // cannot hide behind an unresolved name, and a plain delegate arm proves the fixture CAN
-    // synthesize edges — the negative assertions are not vacuous.
+    // `dispatches` edge. The three arms mirror the shapes that exist in this repo today
+    // (`rag-rat-llm/src/throughput_tune.rs`, `rag-rat-cli/src/init/wizard/steps/embedding.rs`,
+    // `rag-rat-core/src/index/consolidate.rs`). This fixture defines exactly such same-named
+    // helpers (`fn max`, `fn to_string`), so a false edge cannot hide behind an unresolved name,
+    // and a plain delegate arm proves the fixture CAN synthesize edges — the negative assertions
+    // are not vacuous.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/lib.rs"),
         r#"
-pub enum Msg { Clamp { cap: usize }, Batch { count: usize }, Direct }
-pub enum Resp { Wrap(usize), Empty }
+pub enum Msg { Clamp { cap: usize }, Batch { count: usize }, Legacy, Direct }
+pub enum Resp { Wrap(usize), Text(String), Empty }
 const LIMIT: usize = 8;
+const BASE: &str = "SELECT id FROM repo_memories";
 
 pub fn enqueue() {
     send(Msg::Clamp { cap: 3 });
     send(Msg::Batch { count: 2 });
+    send(Msg::Legacy);
     send(Msg::Direct);
 }
 fn send(_m: Msg) {}
@@ -1622,13 +1628,16 @@ pub fn handle(m: Msg) {
     match m {
         Msg::Clamp { cap } => Ok(Resp::Wrap(LIMIT.min(cap).max(1))),
         Msg::Batch { count } => Ok(Resp::Wrap(batch_items(count).len().max(1))),
+        Msg::Legacy => Ok(Resp::Text(BASE.to_string())),
         Msg::Direct => Ok(Resp::Wrap(run_direct())),
     }
 }
 fn batch_items(_count: usize) -> Vec<usize> { Vec::new() }
 fn run_direct() -> usize { 0 }
-// A same-named in-repo helper: a chained-tail fall-through would bind the recorded `max` here.
+// Same-named in-repo helpers: an adapter-tail fall-through would bind the recorded `max` /
+// `to_string` here.
 fn max(_a: usize, _b: usize) -> usize { 0 }
+fn to_string(_value: &str) -> String { String::new() }
 "#,
     )
     .unwrap();
@@ -1649,12 +1658,12 @@ fn max(_a: usize, _b: usize) -> usize { 0 }
     // assertions below exercise a working synthesis pipeline.
     assert!(dispatches_from_enqueue("run_direct"), "the plain delegate arm must dispatch");
 
-    // Resolved-edge level: the same-named helper and the chain's producer must gain NO
+    // Resolved-edge level: the same-named helpers and the chain's producer must gain NO
     // synthesized `dispatches` edge from the adapter arms.
-    for non_handler in ["max", "batch_items"] {
+    for non_handler in ["max", "to_string", "batch_items"] {
         assert!(
             !dispatches_from_enqueue(non_handler),
-            "{non_handler} must NOT be a dispatch handler (false edge from a chained adapter tail)"
+            "{non_handler} must NOT be a dispatch handler (false edge from an adapter tail)"
         );
     }
 
@@ -1673,14 +1682,14 @@ fn max(_a: usize, _b: usize) -> usize { 0 }
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    for chained_method in ["max", "min", "len"] {
+    for chained_method in ["max", "min", "len", "to_string"] {
         assert!(
             handle_facts.iter().all(|(target, _)| target != chained_method),
-            "no dispatch_handle fact may name the chained adapter method `{chained_method}`: \
+            "no dispatch_handle fact may name the adapter method `{chained_method}`: \
              {handle_facts:?}"
         );
     }
-    for adapter_variant in ["Msg::Clamp", "Msg::Batch"] {
+    for adapter_variant in ["Msg::Clamp", "Msg::Batch", "Msg::Legacy"] {
         assert!(
             handle_facts.iter().all(|(_, evidence)| evidence.as_deref() != Some(adapter_variant)),
             "the adapter arm {adapter_variant} must persist no dispatch_handle fact: \
