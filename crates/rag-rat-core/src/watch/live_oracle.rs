@@ -915,7 +915,19 @@ impl LiveBackendTail {
             return;
         }
         self.unconfigured_reported = true;
-        // The two causes have DIFFERENT remedies, and the generic one sends an operator whose
+        if report.database_unreadable {
+            tracing::warn!(
+                target: "rag_rat_core::watch",
+                tool = self.backend.tool.as_db_str(),
+                skipped = report.skipped_unconfigured,
+                "live oracle: this pass sent the server no requests and skipped candidates because \
+                 this checkout's sole compilation database could not be read as JSON. It may use \
+                 clangd's YAML syntax (such as comments, trailing commas, or block syntax) or be \
+                 malformed; rewrite it as strict JSON so the session can configure its files."
+            );
+            return;
+        }
+        // The three causes have DIFFERENT remedies, and the generic one sends an operator whose
         // database simply does not cover their sources after the wrong problem entirely.
         //
         // A checkout that ALREADY governs nothing at spawn never reaches here — it blocks on the
@@ -1444,10 +1456,8 @@ mod tests {
             captured_warnings(|| tail.note_unconfigured(&report))
         };
 
-        let several_databases = warning(LivePassReport {
-            skipped_unconfigured: 1,
-            ..LivePassReport::default()
-        });
+        let several_databases =
+            warning(LivePassReport { skipped_unconfigured: 1, ..LivePassReport::default() });
         assert!(
             several_databases.contains("leave a single compilation database"),
             "several databases need the consolidation remedy: {several_databases:?}",
@@ -1491,6 +1501,7 @@ mod tests {
 
         let unreadable = warning(LivePassReport {
             skipped_unconfigured: 1,
+            database_unreadable: layout.has_unreadable_database(),
             ..LivePassReport::default()
         });
         assert!(
