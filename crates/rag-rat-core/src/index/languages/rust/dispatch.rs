@@ -918,14 +918,14 @@ mod classify_call_tests {
     /// constant instead of classifying the call on its own shape.
     #[test]
     fn a_screaming_const_with_a_method_chain_is_not_a_wrapper() {
-        // A chain on a SCOPED associated constant delegates to its chained method: `TOOL_NAMES` is
-        // the receiver named by its owning module, so the call is the dispatch itself (#1124).
+        // A MODULE path names where the constant lives, not an owner that could receive the
+        // dispatch, so the chain adapts the constant's value exactly as the bare spelling does.
         assert!(matches!(
             role_of("crate::tools::TOOL_NAMES.iter().map(|name| describe(name))"),
-            CallRole::Delegate
+            CallRole::Skip
         ));
-        // A BARE constant receiver names no owner, so the trailing method is an adapter over the
-        // constant's value rather than a handler — neither a wrapper nor a delegate.
+        // A BARE constant receiver names no owner either — the trailing method is an adapter over
+        // the constant's value rather than a handler, so neither a wrapper nor a delegate.
         assert!(matches!(role_of("NOW.elapsed()"), CallRole::Skip));
     }
 
@@ -954,6 +954,58 @@ mod classify_call_tests {
         assert!(matches!(role_of("worker.run(input)"), CallRole::Delegate));
         assert!(matches!(role_of("self.embed(input)"), CallRole::Delegate));
         assert!(matches!(role_of("self.worker.run(input)"), CallRole::Delegate));
+    }
+
+    /// The role of a chained adapter tail is fixed by the chain's ROOT, never by how that root is
+    /// SPELLED (#1124 maintainer feedback). A constant reached through a module path is the same
+    /// receiver as the bare identifier — `crate::config::LIMIT`, `self::LIMIT`, `super::LIMIT`, an
+    /// aliased `cfg::LIMIT` and an arbitrarily long `crate::a::b::c::LIMIT` all adapt a value, so
+    /// every one of them skips. Only a qualifier that names the OWNING TYPE makes the chained
+    /// method the dispatch, and that stays true however long the path to the type is. The verdicts
+    /// are collected before asserting, so one failure names EVERY misclassified spelling rather
+    /// than stopping at the first.
+    #[test]
+    fn a_chained_adapter_tail_skips_however_its_root_is_spelled() {
+        let skip_forms = [
+            // The maintainer's reproduction: bare and crate-qualified spellings of one expression.
+            "LIMIT.min(cap).max(1)",
+            "crate::config::LIMIT.min(cap).max(1)",
+            // `self::`/`super::`-relative and aliased module paths are the same receiver again.
+            "self::LIMIT.min(cap).max(1)",
+            "super::LIMIT.min(cap).max(1)",
+            "super::config::LIMIT.min(cap).max(1)",
+            "cfg::LIMIT.min(cap).max(1)",
+            "crate::a::b::c::LIMIT.min(cap).max(1)",
+            // A single method glued onto the constant is the same shape without the second link.
+            "BASE.to_string()",
+            "crate::config::BASE.to_string()",
+            "self::BASE.to_string()",
+            "super::consolidate::BASE.to_string()",
+            "crate::a::b::c::BASE.to_string()",
+            "crate::config::_BASE.to_string()",
+            // The iterator-adapter chain the classifier was first written for.
+            "TOOL_NAMES.iter().map(|name| describe(name))",
+            "crate::tools::TOOL_NAMES.iter().map(|name| describe(name))",
+        ];
+        let delegate_forms = [
+            // A qualifier that names the OWNING TYPE is not a module path: the chained method is
+            // the dispatch, at any path depth and through a UFCS qualifier.
+            "Handler::DEFAULT.run(input)",
+            "crate::ml::Handler::DEFAULT.run(input)",
+            "crate::a::b::Handler::DEFAULT.build().run(input)",
+            "<Handler as Runner>::DEFAULT.run(input)",
+            // A bare callee keeps delegating whatever the receiver is called.
+            "worker.run(input)",
+            "self.embed(input)",
+        ];
+        let mut misclassified = Vec::new();
+        misclassified.extend(
+            skip_forms.into_iter().filter(|form| !matches!(role_of(form), CallRole::Skip)),
+        );
+        misclassified.extend(
+            delegate_forms.into_iter().filter(|form| !matches!(role_of(form), CallRole::Delegate)),
+        );
+        assert!(misclassified.is_empty(), "misclassified root spellings: {misclassified:?}");
     }
 
     /// An associated-constant method chain is the dispatch itself, whatever its arguments hold

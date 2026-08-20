@@ -1596,31 +1596,71 @@ pub fn handle(m: Msg) {
 fn dispatch_suppresses_adapter_tails_end_to_end() {
     // #1124 maintainer feedback (HIGH): a standard-adapter tail computes a value — it is never the
     // dispatch handler. That covers a method glued onto ANOTHER CALL'S RESULT
-    // (`LIMIT.min(cap).max(1)`, `items(count).len().max(1)`) and a method glued onto a BARE
-    // SCREAMING constant (`BASE.to_string()`). Recording the trailing method name lets bare-name
-    // fallback bind it to an unrelated same-named in-repo symbol, synthesizing a FALSE
-    // `dispatches` edge. The three arms mirror the shapes that exist in this repo today
+    // (`LIMIT.min(cap).max(1)`, `items(count).len().max(1)`) and a method glued onto a SCREAMING
+    // constant (`BASE.to_string()`). Recording the trailing method name lets bare-name fallback
+    // bind it to an unrelated same-named in-repo symbol, synthesizing a FALSE `dispatches` edge.
+    // The first three arms mirror the shapes that exist in this repo today
     // (`rag-rat-llm/src/throughput_tune.rs`, `rag-rat-cli/src/init/wizard/steps/embedding.rs`,
-    // `rag-rat-core/src/index/consolidate.rs`). This fixture defines exactly such same-named
-    // helpers (`fn max`, `fn to_string`), so a false edge cannot hide behind an unresolved name,
-    // and a plain delegate arm proves the fixture CAN synthesize edges — the negative assertions
-    // are not vacuous.
+    // `rag-rat-core/src/index/consolidate.rs`).
+    //
+    // The role is fixed by the chain's ROOT, so every SPELLING of that root behaves the same: bare,
+    // `crate::`-qualified, `self::`/`super::`-relative, aliased, and an arbitrarily long module
+    // path each get their own arm and their own trailing method. A qualifier that names the OWNING
+    // TYPE is not a module path — `Handler::DEFAULT.run_handler(input)` is a real dispatch and is
+    // the second positive control, so a fix cannot pass by skipping everything.
+    //
+    // This fixture defines a same-named in-repo helper for EVERY adapter method, so a false edge
+    // cannot hide behind an unresolved name, and the two delegate arms prove the fixture CAN
+    // synthesize edges — the negative assertions are not vacuous.
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(
         root.join("src/lib.rs"),
         r#"
-pub enum Msg { Clamp { cap: usize }, Batch { count: usize }, Legacy, Direct }
+pub enum Msg {
+    Clamp { cap: usize },
+    Batch { count: usize },
+    Legacy,
+    Direct,
+    CrateQualified { cap: usize },
+    LongPath,
+    SelfRelative { cap: usize },
+    Aliased { cap: usize },
+    SuperRelative { cap: usize },
+    RelativeDirect,
+    TypeOwned { input: u8 },
+}
 pub enum Resp { Wrap(usize), Text(String), Empty }
 const LIMIT: usize = 8;
 const BASE: &str = "SELECT id FROM repo_memories";
+
+pub mod config {
+    pub const LIMIT: usize = 8;
+    pub mod deep {
+        pub const BASE: &str = "SELECT id FROM repo_memories";
+    }
+}
+use crate::config as cfg;
+
+pub struct Handler;
+impl Handler {
+    pub const DEFAULT: Handler = Handler;
+    fn run_handler(&self, _input: u8) -> usize { 0 }
+}
 
 pub fn enqueue() {
     send(Msg::Clamp { cap: 3 });
     send(Msg::Batch { count: 2 });
     send(Msg::Legacy);
     send(Msg::Direct);
+    send(Msg::CrateQualified { cap: 4 });
+    send(Msg::LongPath);
+    send(Msg::SelfRelative { cap: 5 });
+    send(Msg::Aliased { cap: 6 });
+    send(Msg::SuperRelative { cap: 7 });
+    send(Msg::RelativeDirect);
+    send(Msg::TypeOwned { input: 8 });
 }
 fn send(_m: Msg) {}
 
@@ -1630,14 +1670,39 @@ pub fn handle(m: Msg) {
         Msg::Batch { count } => Ok(Resp::Wrap(batch_items(count).len().max(1))),
         Msg::Legacy => Ok(Resp::Text(BASE.to_string())),
         Msg::Direct => Ok(Resp::Wrap(run_direct())),
+        Msg::CrateQualified { cap } => {
+            Ok(Resp::Wrap(crate::config::LIMIT.min(cap).saturating_add(1)))
+        }
+        Msg::LongPath => Ok(Resp::Text(crate::config::deep::BASE.repeat(2))),
+        Msg::SelfRelative { cap } => Ok(Resp::Wrap(self::LIMIT.wrapping_mul(cap))),
+        Msg::Aliased { cap } => Ok(Resp::Wrap(cfg::LIMIT.pow(cap))),
+        Msg::TypeOwned { input } => Ok(Resp::Wrap(Handler::DEFAULT.run_handler(input))),
+        _ => Ok(Resp::Empty),
     }
 }
+
+pub mod inner {
+    use super::{Msg, Resp};
+    pub fn handle_relative(m: Msg) {
+        match m {
+            Msg::SuperRelative { cap } => Ok(Resp::Wrap(super::LIMIT.rotate_left(cap))),
+            Msg::RelativeDirect => Ok(Resp::Wrap(super::run_relative())),
+            _ => Ok(Resp::Empty),
+        }
+    }
+}
+
 fn batch_items(_count: usize) -> Vec<usize> { Vec::new() }
 fn run_direct() -> usize { 0 }
-// Same-named in-repo helpers: an adapter-tail fall-through would bind the recorded `max` /
-// `to_string` here.
+fn run_relative() -> usize { 0 }
+// Same-named in-repo helpers: an adapter-tail fall-through would bind the recorded method here.
 fn max(_a: usize, _b: usize) -> usize { 0 }
 fn to_string(_value: &str) -> String { String::new() }
+fn saturating_add(_a: usize, _b: usize) -> usize { 0 }
+fn repeat(_value: &str, _times: usize) -> String { String::new() }
+fn wrapping_mul(_a: usize, _b: usize) -> usize { 0 }
+fn pow(_a: usize, _b: usize) -> usize { 0 }
+fn rotate_left(_a: usize, _b: usize) -> usize { 0 }
 "#,
     )
     .unwrap();
@@ -1654,13 +1719,33 @@ fn to_string(_value: &str) -> String { String::new() }
             .any(|from| from.ends_with("enqueue"))
     };
 
-    // Positive control: the plain delegate arm synthesizes its resolved edge, so the negative
-    // assertions below exercise a working synthesis pipeline.
+    // Positive controls: a plain delegate and a TYPE-owned associated-constant chain both
+    // synthesize their resolved edge, so the negative assertions below exercise a working
+    // synthesis pipeline and cannot be satisfied by suppressing every edge.
     assert!(dispatches_from_enqueue("run_direct"), "the plain delegate arm must dispatch");
+    assert!(
+        dispatches_from_enqueue("run_handler"),
+        "a type-owned associated-constant chain must still dispatch"
+    );
+    // The `super::`-relative arm lives in a submodule, so its own match must be proven extracted —
+    // otherwise its negative assertion below would pass vacuously.
+    assert!(
+        dispatches_from_enqueue("run_relative"),
+        "the submodule's delegate arm must dispatch (the super::-relative arm is not vacuous)"
+    );
 
     // Resolved-edge level: the same-named helpers and the chain's producer must gain NO
-    // synthesized `dispatches` edge from the adapter arms.
-    for non_handler in ["max", "to_string", "batch_items"] {
+    // synthesized `dispatches` edge from the adapter arms, whatever spells their root.
+    for non_handler in [
+        "max",
+        "to_string",
+        "batch_items",
+        "saturating_add",
+        "repeat",
+        "wrapping_mul",
+        "pow",
+        "rotate_left",
+    ] {
         assert!(
             !dispatches_from_enqueue(non_handler),
             "{non_handler} must NOT be a dispatch handler (false edge from an adapter tail)"
@@ -1682,14 +1767,33 @@ fn to_string(_value: &str) -> String { String::new() }
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    for chained_method in ["max", "min", "len", "to_string"] {
+    for chained_method in [
+        "max",
+        "min",
+        "len",
+        "to_string",
+        "saturating_add",
+        "repeat",
+        "wrapping_mul",
+        "pow",
+        "rotate_left",
+    ] {
         assert!(
             handle_facts.iter().all(|(target, _)| target != chained_method),
             "no dispatch_handle fact may name the adapter method `{chained_method}`: \
              {handle_facts:?}"
         );
     }
-    for adapter_variant in ["Msg::Clamp", "Msg::Batch", "Msg::Legacy"] {
+    for adapter_variant in [
+        "Msg::Clamp",
+        "Msg::Batch",
+        "Msg::Legacy",
+        "Msg::CrateQualified",
+        "Msg::LongPath",
+        "Msg::SelfRelative",
+        "Msg::Aliased",
+        "Msg::SuperRelative",
+    ] {
         assert!(
             handle_facts.iter().all(|(_, evidence)| evidence.as_deref() != Some(adapter_variant)),
             "the adapter arm {adapter_variant} must persist no dispatch_handle fact: \
