@@ -1459,6 +1459,461 @@ pub mod b {
 }
 
 #[test]
+fn dispatch_persists_handle_facts_for_associated_constant_method_chains() {
+    // #1124 held feedback: a match arm delegating through an ASSOCIATED CONSTANT's method chain —
+    // `Handler::DEFAULT.run(input)` or the UFCS `<Handler as Runner>::DEFAULT.run(input)` — calls
+    // the chained METHOD: the constant is the receiver, not a constructor. Each form must persist
+    // a `dispatch_handle` fact to `run`; previously the first read as a PascalCase-receiver
+    // constructor and the second as a UFCS associated call, so neither fact existed.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Msg {
+    AssocConst { input: u8 },
+    AssocConstSpaced { input: u8 },
+    AssocConstCommented { input: u8 },
+    AssocConstUnderscore { input: u8 },
+    AssocConstLeadingMethod { input: u8 },
+    AssocConstCallInterrupted { input: u8 },
+    UfcsConst { input: u8 },
+    UfcsConstCommented { input: u8 },
+    UfcsConstUnderscore { input: u8 },
+}
+
+pub struct Handler;
+pub trait Runner {
+    const DEFAULT: Handler;
+    const _DEFAULT: Handler;
+    fn run(&self, input: u8);
+    fn _run(&self, input: u8);
+}
+impl Runner for Handler {
+    const DEFAULT: Handler = Handler;
+    const _DEFAULT: Handler = Handler;
+    fn run(&self, _input: u8) {}
+    fn _run(&self, _input: u8) {}
+}
+impl Handler {
+    pub const DEFAULT: Handler = Handler;
+    pub const _DEFAULT: Handler = Handler;
+    fn build(&self) -> Self { Self }
+    fn combine(&self, _other: Handler) -> Self { Self }
+}
+
+pub fn enqueue() {
+    send(Msg::AssocConst { input: 1 });
+    send(Msg::AssocConstSpaced { input: 2 });
+    send(Msg::AssocConstCommented { input: 3 });
+    send(Msg::AssocConstUnderscore { input: 4 });
+    send(Msg::AssocConstLeadingMethod { input: 5 });
+    send(Msg::AssocConstCallInterrupted { input: 6 });
+    send(Msg::UfcsConst { input: 5 });
+    send(Msg::UfcsConstCommented { input: 7 });
+    send(Msg::UfcsConstUnderscore { input: 8 });
+}
+fn send(_m: Msg) {}
+
+pub fn handle(m: Msg) {
+    match m {
+        Msg::AssocConst { input } => Handler::DEFAULT.run(input),
+        Msg::AssocConstSpaced { input } => Handler::DEFAULT
+            .run(input),
+        Msg::AssocConstCommented { input } => Handler::DEFAULT /* receiver */
+            .run(input),
+        Msg::AssocConstUnderscore { input } => Handler::_DEFAULT
+            .run(input),
+        Msg::AssocConstLeadingMethod { input } => Handler::DEFAULT._run(input),
+        Msg::AssocConstCallInterrupted { input } => Handler::DEFAULT
+            .build()
+            .run(input),
+        Msg::UfcsConst { input } => <Handler as Runner>::DEFAULT.run(input),
+        Msg::UfcsConstCommented { input } => <Handler as Runner>::DEFAULT /* receiver */
+            .run(input),
+        Msg::UfcsConstUnderscore { input } => <Handler as Runner>::_DEFAULT /* receiver */
+            .run(input),
+    }
+}
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let mut statement = conn
+        .prepare(
+            "SELECT tn.value, d.evidence FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings tn ON tn.id = d.to_name_id
+             WHERE ek.value = 'dispatch_handle'",
+        )
+        .unwrap();
+    let handle_facts: Vec<(String, Option<String>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    // Each associated-constant method-chain form persists a `dispatch_handle` edge to `run`,
+    // keyed by its own variant. Keep the row count independent from the per-variant assertions so
+    // deleting one assertion cannot make the regression test vacuously pass.
+    let expected_facts = [
+        ("Msg::AssocConst", "run"),
+        ("Msg::AssocConstSpaced", "run"),
+        ("Msg::AssocConstCommented", "run"),
+        ("Msg::AssocConstUnderscore", "run"),
+        ("Msg::AssocConstLeadingMethod", "_run"),
+        ("Msg::AssocConstCallInterrupted", "run"),
+        ("Msg::UfcsConst", "run"),
+        ("Msg::UfcsConstCommented", "run"),
+        ("Msg::UfcsConstUnderscore", "run"),
+    ];
+    let associated_chain_facts = handle_facts
+        .iter()
+        .filter(|(target, _)| expected_facts.iter().any(|(_, expected)| target == expected))
+        .count();
+    assert_eq!(
+        associated_chain_facts,
+        expected_facts.len(),
+        "every associated-constant form must persist exactly one dispatch_handle edge: \
+         {handle_facts:?}"
+    );
+    for (variant, target) in expected_facts {
+        assert!(
+            handle_facts.iter().any(|(actual_target, evidence)| actual_target == target
+                && evidence.as_deref() == Some(variant)),
+            "{variant} must persist a dispatch_handle edge to `{target}`: {handle_facts:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dispatch_suppresses_adapter_tails_end_to_end() {
+    // #1124 maintainer feedback (HIGH): a standard-adapter tail computes a value — it is never the
+    // dispatch handler. That covers a method glued onto ANOTHER CALL'S RESULT
+    // (`LIMIT.min(cap).max(1)`, `items(count).len().max(1)`) and a method glued onto a SCREAMING
+    // constant (`BASE.to_string()`). Recording the trailing method name lets bare-name fallback
+    // bind it to an unrelated same-named in-repo symbol, synthesizing a FALSE `dispatches` edge.
+    // The first three arms mirror the shapes that exist in this repo today
+    // (`rag-rat-llm/src/throughput_tune.rs`, `rag-rat-cli/src/init/wizard/steps/embedding.rs`,
+    // `rag-rat-core/src/index/consolidate.rs`).
+    //
+    // The role is fixed by the chain's ROOT, so every SPELLING of that root behaves the same: bare,
+    // `crate::`-qualified, `self::`/`super::`-relative, aliased, and an arbitrarily long module
+    // path each get their own arm and their own trailing method. A qualifier that names the OWNING
+    // TYPE is not a module path — `Handler::DEFAULT.run_handler(input)` is a real dispatch and is
+    // the second positive control, so a fix cannot pass by skipping everything.
+    //
+    // This fixture defines a same-named in-repo helper for EVERY adapter method, so a false edge
+    // cannot hide behind an unresolved name, and the two delegate arms prove the fixture CAN
+    // synthesize edges — the negative assertions are not vacuous.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Msg {
+    Clamp { cap: usize },
+    Batch { count: usize },
+    Legacy,
+    Direct,
+    CrateQualified { cap: usize },
+    LongPath,
+    SelfRelative { cap: usize },
+    Aliased { cap: usize },
+    SuperRelative { cap: usize },
+    RelativeDirect,
+    TypeOwned { input: u8 },
+}
+pub enum Resp { Wrap(usize), Text(String), Empty }
+const LIMIT: usize = 8;
+const BASE: &str = "SELECT id FROM repo_memories";
+
+pub mod config {
+    pub const LIMIT: usize = 8;
+    pub mod deep {
+        pub const BASE: &str = "SELECT id FROM repo_memories";
+    }
+}
+use crate::config as cfg;
+
+pub struct Handler;
+impl Handler {
+    pub const DEFAULT: Handler = Handler;
+    fn run_handler(&self, _input: u8) -> usize { 0 }
+}
+
+pub fn enqueue() {
+    send(Msg::Clamp { cap: 3 });
+    send(Msg::Batch { count: 2 });
+    send(Msg::Legacy);
+    send(Msg::Direct);
+    send(Msg::CrateQualified { cap: 4 });
+    send(Msg::LongPath);
+    send(Msg::SelfRelative { cap: 5 });
+    send(Msg::Aliased { cap: 6 });
+    send(Msg::SuperRelative { cap: 7 });
+    send(Msg::RelativeDirect);
+    send(Msg::TypeOwned { input: 8 });
+}
+fn send(_m: Msg) {}
+
+pub fn handle(m: Msg) {
+    match m {
+        Msg::Clamp { cap } => Ok(Resp::Wrap(LIMIT.min(cap).max(1))),
+        Msg::Batch { count } => Ok(Resp::Wrap(batch_items(count).len().max(1))),
+        Msg::Legacy => Ok(Resp::Text(BASE.to_string())),
+        Msg::Direct => Ok(Resp::Wrap(run_direct())),
+        Msg::CrateQualified { cap } => {
+            Ok(Resp::Wrap(crate::config::LIMIT.min(cap).saturating_add(1)))
+        }
+        Msg::LongPath => Ok(Resp::Text(crate::config::deep::BASE.repeat(2))),
+        Msg::SelfRelative { cap } => Ok(Resp::Wrap(self::LIMIT.wrapping_mul(cap))),
+        Msg::Aliased { cap } => Ok(Resp::Wrap(cfg::LIMIT.pow(cap))),
+        Msg::TypeOwned { input } => Ok(Resp::Wrap(Handler::DEFAULT.run_handler(input))),
+        _ => Ok(Resp::Empty),
+    }
+}
+
+pub mod inner {
+    use super::{Msg, Resp};
+    pub fn handle_relative(m: Msg) {
+        match m {
+            Msg::SuperRelative { cap } => Ok(Resp::Wrap(super::LIMIT.rotate_left(cap))),
+            Msg::RelativeDirect => Ok(Resp::Wrap(super::run_relative())),
+            _ => Ok(Resp::Empty),
+        }
+    }
+}
+
+fn batch_items(_count: usize) -> Vec<usize> { Vec::new() }
+fn run_direct() -> usize { 0 }
+fn run_relative() -> usize { 0 }
+// Same-named in-repo helpers: an adapter-tail fall-through would bind the recorded method here.
+fn max(_a: usize, _b: usize) -> usize { 0 }
+fn to_string(_value: &str) -> String { String::new() }
+fn saturating_add(_a: usize, _b: usize) -> usize { 0 }
+fn repeat(_value: &str, _times: usize) -> String { String::new() }
+fn wrapping_mul(_a: usize, _b: usize) -> usize { 0 }
+fn pow(_a: usize, _b: usize) -> usize { 0 }
+fn rotate_left(_a: usize, _b: usize) -> usize { 0 }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let dispatches_from_enqueue = |symbol: &str| -> bool {
+        db.find_callers(symbol, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|hop| hop.edge_kind == "dispatches")
+            .filter_map(|hop| hop.from_symbol)
+            .any(|from| from.ends_with("enqueue"))
+    };
+
+    // Positive controls: a plain delegate and a TYPE-owned associated-constant chain both
+    // synthesize their resolved edge, so the negative assertions below exercise a working
+    // synthesis pipeline and cannot be satisfied by suppressing every edge.
+    assert!(dispatches_from_enqueue("run_direct"), "the plain delegate arm must dispatch");
+    assert!(
+        dispatches_from_enqueue("run_handler"),
+        "a type-owned associated-constant chain must still dispatch"
+    );
+    // The `super::`-relative arm lives in a submodule, so its own match must be proven extracted —
+    // otherwise its negative assertion below would pass vacuously.
+    assert!(
+        dispatches_from_enqueue("run_relative"),
+        "the submodule's delegate arm must dispatch (the super::-relative arm is not vacuous)"
+    );
+
+    // Resolved-edge level: the same-named helpers and the chain's producer must gain NO
+    // synthesized `dispatches` edge from the adapter arms, whatever spells their root.
+    for non_handler in [
+        "max",
+        "to_string",
+        "batch_items",
+        "saturating_add",
+        "repeat",
+        "wrapping_mul",
+        "pow",
+        "rotate_left",
+    ] {
+        assert!(
+            !dispatches_from_enqueue(non_handler),
+            "{non_handler} must NOT be a dispatch handler (false edge from an adapter tail)"
+        );
+    }
+
+    // Fact level: no `dispatch_handle` fact may name a chained adapter method or carry the
+    // adapter arms' variants as evidence.
+    let mut statement = conn
+        .prepare(
+            "SELECT tn.value, d.evidence FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings tn ON tn.id = d.to_name_id
+             WHERE ek.value = 'dispatch_handle'",
+        )
+        .unwrap();
+    let handle_facts: Vec<(String, Option<String>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for chained_method in [
+        "max",
+        "min",
+        "len",
+        "to_string",
+        "saturating_add",
+        "repeat",
+        "wrapping_mul",
+        "pow",
+        "rotate_left",
+    ] {
+        assert!(
+            handle_facts.iter().all(|(target, _)| target != chained_method),
+            "no dispatch_handle fact may name the adapter method `{chained_method}`: \
+             {handle_facts:?}"
+        );
+    }
+    for adapter_variant in [
+        "Msg::Clamp",
+        "Msg::Batch",
+        "Msg::Legacy",
+        "Msg::CrateQualified",
+        "Msg::LongPath",
+        "Msg::SelfRelative",
+        "Msg::Aliased",
+        "Msg::SuperRelative",
+    ] {
+        assert!(
+            handle_facts.iter().all(|(_, evidence)| evidence.as_deref() != Some(adapter_variant)),
+            "the adapter arm {adapter_variant} must persist no dispatch_handle fact: \
+             {handle_facts:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dispatch_records_the_chained_method_of_an_associated_constant_chain() {
+    // #1124 maintainer feedback (MEDIUM): `Resp::DEFAULT.with_body(make_body(cap))` and
+    // `Handler::DEFAULT.run(normalize(input))` are the same expression modulo identifier spelling,
+    // so no argument-shape heuristic can tell a builder from a dispatch. An associated-constant
+    // method chain therefore delegates to its chained method unconditionally: the chained method
+    // is recorded even when an argument nests a produced value, and the nested producer is NOT
+    // traced through. Both methods and the nested producer exist in-repo, so every assertion is
+    // about a resolvable name rather than a name that could never bind.
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"
+pub enum Msg { Build { cap: usize }, Run { input: u8 }, Plain { input: u8 } }
+pub struct Resp;
+impl Resp {
+    pub const DEFAULT: Resp = Resp;
+    fn with_body(&self, _body: usize) -> Resp { Resp }
+}
+pub struct Handler;
+impl Handler {
+    pub const DEFAULT: Handler = Handler;
+    fn run(&self, _input: u8) {}
+}
+
+pub fn enqueue() {
+    send(Msg::Build { cap: 1 });
+    send(Msg::Run { input: 2 });
+    send(Msg::Plain { input: 3 });
+}
+fn send(_m: Msg) {}
+
+pub fn handle(m: Msg) {
+    match m {
+        Msg::Build { cap } => Resp::DEFAULT.with_body(make_body(cap)),
+        Msg::Run { input } => Handler::DEFAULT.run(normalize(input)),
+        Msg::Plain { input } => Handler::DEFAULT.run(input),
+    }
+}
+fn make_body(_cap: usize) -> usize { 0 }
+fn normalize(_input: u8) -> u8 { 0 }
+"#,
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+
+    let dispatches_from_enqueue = |symbol: &str| -> bool {
+        db.find_callers(symbol, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|hop| hop.edge_kind == "dispatches")
+            .filter_map(|hop| hop.from_symbol)
+            .any(|from| from.ends_with("enqueue"))
+    };
+
+    // Every associated-constant chain reaches its chained method, whether or not an argument
+    // nests a produced value.
+    for chained_method in ["with_body", "run"] {
+        assert!(
+            dispatches_from_enqueue(chained_method),
+            "the associated-constant dispatch must reach `{chained_method}`"
+        );
+    }
+    // A nested argument call is not descended into, so the producer gains no edge of its own.
+    for nested_producer in ["make_body", "normalize"] {
+        assert!(
+            !dispatches_from_enqueue(nested_producer),
+            "{nested_producer} must NOT be a dispatch handler (an argument is not the dispatch)"
+        );
+    }
+
+    // Fact level: each arm's fact names the chained method, never the nested argument call.
+    let mut statement = conn
+        .prepare(
+            "SELECT tn.value, d.evidence FROM edges_data d
+             JOIN name_strings ek ON ek.id = d.edge_kind_id
+             JOIN name_strings tn ON tn.id = d.to_name_id
+             WHERE ek.value = 'dispatch_handle'",
+        )
+        .unwrap();
+    let handle_facts: Vec<(String, Option<String>)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (variant, chained_method) in
+        [("Msg::Build", "with_body"), ("Msg::Run", "run"), ("Msg::Plain", "run")]
+    {
+        assert!(
+            handle_facts.iter().any(|(target, evidence)| target == chained_method
+                && evidence.as_deref() == Some(variant)),
+            "{variant} must persist a dispatch_handle fact to `{chained_method}`: {handle_facts:?}"
+        );
+    }
+    for nested_producer in ["make_body", "normalize"] {
+        assert!(
+            handle_facts.iter().all(|(target, _)| target != nested_producer),
+            "no dispatch_handle fact may name the nested argument call `{nested_producer}`: \
+             {handle_facts:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn symbol_search_excludes_generated_bindings_unless_opted_in() {
     // #202: a name/symbol_path search drowns in generated bindings (ubrn FFI output, codegen) that
     // shadow the hand-written source symbol. The real-world case is codegen living UNDER a source

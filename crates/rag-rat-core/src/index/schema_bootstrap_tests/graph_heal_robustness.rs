@@ -155,6 +155,216 @@ fn edge_targets_with_resolution(db: &IndexDatabase, file_id: i64) -> Vec<(String
     rows.map(Result::unwrap).collect()
 }
 
+/// The persisted dispatch facts for one file, including the resolution assigned by the graph
+/// resolver. Keeping the kind/evidence in this probe makes an upgrade test assert the actual
+/// hidden fact row rather than only a user-facing synthesized edge.
+fn edge_kind_rows_with_resolution(
+    db: &IndexDatabase,
+    file_id: i64,
+    edge_kind: &str,
+) -> Vec<(String, String, Option<String>)> {
+    let conn = db.storage.connection();
+    let mut stmt = conn
+        .prepare(
+            "SELECT n.value, r.value, d.evidence
+             FROM main.edges_data d
+             JOIN main.name_strings n ON n.id = d.to_name_id
+             JOIN main.name_strings r ON r.id = d.resolution_id
+             JOIN main.name_strings k ON k.id = d.edge_kind_id
+             WHERE d.source_file_id = ?1 AND k.value = ?2
+             ORDER BY d.id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map(params![file_id, edge_kind], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn delete_dispatch_handle_facts(db: &IndexDatabase, file_id: i64) {
+    db.storage
+        .connection()
+        .execute(
+            r#"DELETE FROM main.edges_data
+             WHERE source_file_id = ?1
+               AND edge_kind_id = (SELECT id FROM main.name_strings WHERE value = 'dispatch_handle')"#,
+            [file_id],
+        )
+        .unwrap();
+}
+
+/// Stage the graph-only part of the version upgrade while leaving the logical-key derivation at
+/// its current value. Version 16 is the persisted stamp immediately before this classifier change;
+/// version 17 is the first graph version that must re-extract it.
+fn stage_graph_version_16(db: &IndexDatabase) {
+    db.set_repo_meta("graph_index_version", "16").unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.files SET graph_version = 16
+             WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'",
+            params![&db.active_repo_id, db.active_generation],
+        )
+        .unwrap();
+    *db.drift_snapshot.lock().expect("drift snapshot lock") = None;
+}
+
+/// The handler vehicle is an associated-constant method chain owned by a TYPE, which is the shape
+/// that delegates to its chained method. A constant reached through a MODULE path
+/// (`tools::TOOL_NAMES.iter().map(..)`) is an adapter tail and records no handler at all, so it
+/// cannot carry a dispatch fact for these upgrade assertions to watch (#1124 maintainer feedback).
+fn dispatch_fixture_body(handler_expression: &str) -> String {
+    format!(
+        r#"
+pub enum Msg {{ Work }}
+pub struct Handler;
+impl Handler {{
+    pub const DEFAULT: Handler = Handler;
+    fn run(&self, _input: usize) -> usize {{ 0 }}
+}}
+pub struct Clock;
+impl Clock {{
+    pub const NOW: Clock = Clock;
+    fn elapsed(&self) -> usize {{ 0 }}
+}}
+
+pub fn enqueue() {{ send(Msg::Work); }}
+fn send(_msg: Msg) {{}}
+
+pub fn handle(msg: Msg) {{
+    match msg {{
+        Msg::Work => {handler_expression},
+    }}
+}}
+"#
+    )
+}
+
+#[test]
+fn a_v16_database_reextracts_the_corrected_dispatch_handle_fact() {
+    let (root, config) =
+        indexed_root(&[("lib.rs", &dispatch_fixture_body("Handler::DEFAULT.run(1)"))]);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let file_id = scoped_file_id(&db, "src/lib.rs", &db.active_worktree_id);
+
+    // Simulate the deployed v16 row after the old classifier omitted this handle fact.
+    let initial_handles = edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle");
+    assert!(
+        initial_handles.iter().any(|(name, _, evidence)| {
+            name == "run" && evidence.as_deref() == Some("Msg::Work")
+        }),
+        "the fixture must initially persist the corrected dispatch fact: {initial_handles:?}"
+    );
+    delete_dispatch_handle_facts(&db, file_id);
+    assert!(edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle").is_empty());
+    stage_graph_version_16(&db);
+
+    db.ensure_graph_index_current().unwrap();
+
+    let handles = edge_kind_rows_with_resolution(&db, file_id, "dispatch_handle");
+    // The re-extracted candidate binds to the chained method defined in the same file, so the
+    // upgrade restores a RESOLVED handler rather than a dangling name.
+    assert!(
+        handles.iter().any(|(name, resolution, evidence)| {
+            name == "run"
+                && resolution == "target_name_fallback"
+                && evidence.as_deref() == Some("Msg::Work")
+        }),
+        "the v16 row must be re-extracted with the corrected handle fact: {handles:?}"
+    );
+    assert_eq!(file_graph_version(&db, file_id), 17);
+    assert_eq!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_graph_upgrade_isolated_to_the_active_linked_checkout() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), dispatch_fixture_body("Handler::DEFAULT.run(1)")).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::Rust);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    // A TYPE-owned constant chain like the active checkout's, naming a different method so the
+    // sibling's fact is distinguishable from the active checkout's.
+    fs::write(linked.join("src/lib.rs"), dispatch_fixture_body("Clock::NOW.elapsed()")).unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch body"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    set_base_scope(&mut db, &main);
+    let base_id = scoped_file_id(&db, "src/lib.rs", "");
+    let overlay_worktree = worktree_id_of(&linked);
+    let overlay_id = scoped_file_id(&db, "src/lib.rs", &overlay_worktree);
+    let sibling_resolution =
+        edges::intern_edge_string(db.storage.connection(), "sibling_resolution").unwrap();
+    db.storage
+        .connection()
+        .execute(
+            r#"UPDATE main.edges_data
+             SET resolution_id = ?1
+             WHERE source_file_id = ?2
+               AND edge_kind_id = (SELECT id FROM main.name_strings WHERE value = 'dispatch_handle')"#,
+            params![sibling_resolution, overlay_id],
+        )
+        .unwrap();
+    let overlay_before = edge_kind_rows_with_resolution(&db, overlay_id, "dispatch_handle");
+    assert!(
+        overlay_before.iter().any(|(name, _, evidence)| {
+            name == "elapsed" && evidence.as_deref() == Some("Msg::Work")
+        }),
+        "the linked checkout starts with its own dispatch fact: {overlay_before:?}"
+    );
+    let overlay_all_before = edge_targets_with_resolution(&db, overlay_id);
+    let overlay_edge_ids_before = edge_ids(&db, overlay_id);
+
+    // Remove only the active checkout's corrected fact, then present both rows as v16 data.
+    delete_dispatch_handle_facts(&db, base_id);
+    stage_graph_version_16(&db);
+    db.ensure_graph_index_current().unwrap();
+
+    let base_handles = edge_kind_rows_with_resolution(&db, base_id, "dispatch_handle");
+    assert!(
+        base_handles.iter().any(|(name, _, evidence)| {
+            name == "run" && evidence.as_deref() == Some("Msg::Work")
+        }),
+        "the active checkout receives the corrected dispatch fact: {base_handles:?}"
+    );
+    assert_eq!(file_graph_version(&db, base_id), 17);
+    assert_eq!(file_graph_version(&db, overlay_id), 16);
+    assert_eq!(edge_ids(&db, overlay_id), overlay_edge_ids_before);
+    assert_eq!(edge_targets_with_resolution(&db, overlay_id), overlay_all_before);
+    assert_eq!(edge_kind_rows_with_resolution(&db, overlay_id, "dispatch_handle"), overlay_before);
+    assert_ne!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
+
+    let mut linked_config = source_config(linked.to_path_buf(), Language::Rust);
+    linked_config.database = config.database.clone();
+    drop(db);
+    let linked_db = IndexDatabase::open_config(&linked_config).unwrap();
+    let overlay_handles = edge_kind_rows_with_resolution(&linked_db, overlay_id, "dispatch_handle");
+    assert!(
+        overlay_handles.iter().any(|(name, _, evidence)| {
+            name == "elapsed" && evidence.as_deref() == Some("Msg::Work")
+        }),
+        "the sibling later re-extracts its own fact: {overlay_handles:?}"
+    );
+    assert_eq!(file_graph_version(&linked_db, base_id), 17);
+    assert_eq!(file_graph_version(&linked_db, overlay_id), 17);
+    assert_eq!(edge_kind_rows_with_resolution(&linked_db, base_id, "dispatch_handle")[0].0, "run");
+    assert_eq!(linked_db.repo_meta("graph_index_version").unwrap().as_deref(), Some("17"));
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
+}
+
 /// Every `to_name` on `file_id`'s edges — the file's outgoing graph as EXTRACTED, independent of
 /// which scope is active (edge rows are keyed by `source_file_id`, and base and overlay hold
 /// separate rows for a shadowed path).
@@ -219,11 +429,17 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
         )
         .unwrap();
     let future_edges = edge_targets_with_resolution(&db, future_id);
+    // Stamp the row with a genuinely FUTURE graph version — the current `GRAPH_INDEX_VERSION`
+    // plus one — so the fixture stays ahead of the constant however often it moves (#1124 held
+    // feedback: a hard-coded stamp silently became equal to the current version and the test
+    // stopped proving anything).
+    let future_graph_version = GRAPH_INDEX_VERSION.parse::<i64>().unwrap() + 1;
     db.storage
         .connection()
-        .execute("UPDATE main.files SET graph_version = 17, scope_version = 4 WHERE id = ?1", [
-            future_id,
-        ])
+        .execute(
+            "UPDATE main.files SET graph_version = ?2, scope_version = 4 WHERE id = ?1",
+            params![future_id, future_graph_version],
+        )
         .unwrap();
     db.storage
         .connection()
@@ -236,7 +452,7 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
 
     db.ensure_graph_index_current().unwrap();
 
-    assert_eq!(file_graph_version(&db, future_id), 17);
+    assert_eq!(file_graph_version(&db, future_id), future_graph_version);
     assert_eq!(file_scope_version(&db, future_id), 4);
     assert_eq!(
         edge_targets_with_resolution(&db, future_id),
