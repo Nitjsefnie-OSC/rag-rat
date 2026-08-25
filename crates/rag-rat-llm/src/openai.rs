@@ -750,13 +750,31 @@ mod tests {
     fn spawn_counting_stub(
         max_conns: usize,
     ) -> (String, thread::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        let (url, handle, requests, _) = spawn_parallel_counting_stub(max_conns, Vec::new());
+        let (url, handle, requests, _, _) =
+            spawn_counting_stub_with_release_points(max_conns, Vec::new(), 1);
         (url, handle, requests)
     }
 
-    fn spawn_parallel_counting_stub(
+    fn spawn_parallel_counting_stub_with_waits(
         max_conns: usize,
-        delays: Vec<(usize, Duration)>,
+        wait_for_prior_response: Vec<usize>,
+    ) -> (
+        String,
+        thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        spawn_counting_stub_with_release_points(max_conns, wait_for_prior_response, 1)
+    }
+
+    /// A counting stub that HOLDS every request it has read until `hold_until_in_flight` of them
+    /// are held at once, so "how many requests can overlap" is a released fact rather than a
+    /// timing observation. Returns the URL, the join handle, the request COUNT and the in-flight
+    /// high-water mark.
+    fn spawn_counting_stub_holding_requests(
+        max_conns: usize,
+        hold_until_in_flight: usize,
     ) -> (
         String,
         thread::JoinHandle<()>,
@@ -764,14 +782,81 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let (url, handle, requests, max_in_flight, _) =
-            spawn_parallel_counting_stub_with_waits(max_conns, delays, Vec::new());
+            spawn_counting_stub_with_release_points(max_conns, Vec::new(), hold_until_in_flight);
         (url, handle, requests, max_in_flight)
     }
 
-    fn spawn_parallel_counting_stub_with_waits(
+    /// A one-shot barrier that holds each request the stub has read until `threshold` of them are
+    /// held at once, then stays open for the rest of the run. `threshold <= 1` never holds.
+    ///
+    /// The deadline is a deadlock guard only: a client that never overlaps enough requests opens
+    /// the barrier by timing out ONCE, so the run finishes and the caller's in-flight assertion
+    /// fails on a number instead of hanging CI. On a healthy run the release is immediate, so
+    /// nothing here depends on beating a clock. Keep it comfortably BELOW the caller's HTTP
+    /// request timeout, or a client that stopped overlapping reports a transport timeout instead
+    /// of the in-flight count that explains it.
+    struct HoldUntilInFlight {
+        threshold: usize,
+        state: std::sync::Mutex<HoldState>,
+        released: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct HoldState {
+        held: usize,
+        open: bool,
+    }
+
+    impl HoldUntilInFlight {
+        fn new(threshold: usize) -> Self {
+            Self {
+                threshold,
+                state: std::sync::Mutex::new(HoldState::default()),
+                released: std::sync::Condvar::new(),
+            }
+        }
+
+        fn hold(&self) {
+            if self.threshold <= 1 {
+                return;
+            }
+            let mut state = self.state.lock().unwrap();
+            if state.open {
+                return;
+            }
+            state.held += 1;
+            if state.held >= self.threshold {
+                state.open = true;
+                self.released.notify_all();
+                return;
+            }
+            let started = std::time::Instant::now();
+            let deadline = Duration::from_secs(10);
+            while !state.open {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (guard, timeout) = self.released.wait_timeout(state, remaining).unwrap();
+                state = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            if !state.open {
+                state.open = true;
+                self.released.notify_all();
+            }
+        }
+    }
+
+    /// The counting stub proper. Every point at which a request is held is an EXPLICIT release
+    /// point — `wait_for_prior_response` and `hold_until_in_flight` — never a sleep, so what a
+    /// test observes about overlap is a released fact rather than a timing sample.
+    fn spawn_counting_stub_with_release_points(
         max_conns: usize,
-        delays: Vec<(usize, Duration)>,
         wait_for_prior_response: Vec<usize>,
+        hold_until_in_flight: usize,
     ) -> (
         String,
         thread::JoinHandle<()>,
@@ -792,10 +877,10 @@ mod tests {
         // parked worker is released by an explicit completion signal rather than by polling.
         let completions = Arc::new((Mutex::new(0usize), Condvar::new()));
         let counter = Arc::clone(&requests);
-        let delays = Arc::new(delays);
         let wait_for_prior_response = Arc::new(wait_for_prior_response);
         let max_seen = Arc::clone(&max_in_flight);
         let waits_seen = Arc::clone(&waits_satisfied);
+        let hold = Arc::new(HoldUntilInFlight::new(hold_until_in_flight));
         let handle = thread::spawn(move || {
             let mut workers = Vec::new();
             for _ in 0..max_conns {
@@ -803,20 +888,25 @@ mod tests {
                 let counter = Arc::clone(&counter);
                 let in_flight = Arc::clone(&in_flight);
                 let max_seen = Arc::clone(&max_seen);
-                let delays = Arc::clone(&delays);
                 let wait_for_prior_response = Arc::clone(&wait_for_prior_response);
                 let waits_seen = Arc::clone(&waits_seen);
                 let completions = Arc::clone(&completions);
+                let hold = Arc::clone(&hold);
                 workers.push(thread::spawn(move || {
+                    let body = read_request_body(&mut stream);
+                    // A connection that was accepted but delivered no request is not a request:
+                    // it moves no counter and gets no reply.
+                    if body.is_empty() {
+                        return;
+                    }
+                    // `in_flight` gauges REQUESTS in flight, not connections accepted: it rises
+                    // once the request has been read and falls before the response is written, so
+                    // it is strictly inside the window the client sees as outstanding. A client
+                    // that waits for response N before sending N+1 therefore cannot be observed
+                    // with two in flight, and an overlap the gauge does record is a real one.
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     raise_max(&max_seen, now);
-                    let body = read_request_body(&mut stream);
                     let indices = request_text_indices(&body);
-                    if let Some(first) = indices.first().copied()
-                        && let Some((_, delay)) = delays.iter().find(|(idx, _)| *idx == first)
-                    {
-                        thread::sleep(*delay);
-                    }
                     // Deterministic "later request finishes first" ordering: a request whose first
                     // text index is in `wait_for_prior_response` parks until ANOTHER request has
                     // fully written its response and signalled completion via the condvar — no
@@ -846,6 +936,10 @@ mod tests {
                             waits_seen.fetch_add(1, Ordering::SeqCst);
                         }
                     }
+                    // Explicit release point: hold this request until the configured number are
+                    // in flight together, so the caller's overlap assertion is a released fact.
+                    hold.hold();
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
                     let vector_ids = if indices.is_empty() { vec![0] } else { indices };
                     let vectors: Vec<Vec<f32>> = vector_ids
                         .into_iter()
@@ -871,7 +965,6 @@ mod tests {
                         *lock.lock().unwrap() += 1;
                         cvar.notify_all();
                     }
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
                 }));
             }
             for worker in workers {
@@ -955,43 +1048,56 @@ mod tests {
     fn embed_batch_dispatches_sub_batches_concurrently() {
         use std::sync::atomic::Ordering;
 
-        let delay = Duration::from_millis(120);
-        let all_delayed = (0..8).map(|i| (i, delay)).collect::<Vec<_>>();
+        const CONCURRENCY: u32 = 4;
 
-        let (seq_url, seq_handle, _, seq_max) =
-            spawn_parallel_counting_stub(8, all_delayed.clone());
+        // `concurrency = 1`: the stub releases every request as soon as it has read it, so the
+        // only thing that can put two on the gauge at once is the client dispatching two.
+        let (seq_url, seq_handle, seq_requests, seq_max) =
+            spawn_counting_stub_holding_requests(8, 1);
         let mut seq_cfg = config_for(&seq_url, 5);
         seq_cfg.batch_size = 1;
         seq_cfg.concurrency = 1;
         let seq_embedder = build(&seq_cfg, DIM).unwrap();
-        let started = std::time::Instant::now();
-        seq_embedder.embed_batch(&indexed_texts(8)).expect("sequential delayed embed");
-        let sequential = started.elapsed();
+        seq_embedder.embed_batch(&indexed_texts(8)).expect("sequential embed");
         seq_handle.join().unwrap();
 
-        let (conc_url, conc_handle, _, conc_max) = spawn_parallel_counting_stub(8, all_delayed);
-        let mut conc_cfg = config_for(&conc_url, 5);
+        // `concurrency = 4`: every request is HELD until four are in flight together, so the run
+        // can only complete at all if the client really dispatched four at once. That makes the
+        // overlap a released fact rather than a wall-clock ratio between two runs.
+        let (conc_url, conc_handle, conc_requests, conc_max) =
+            spawn_counting_stub_holding_requests(8, CONCURRENCY as usize);
+        // A generous HTTP timeout so a client that stopped overlapping is reported by the
+        // in-flight assertion below, after the stub's deadlock guard releases it, rather than as
+        // a transport timeout.
+        let mut conc_cfg = config_for(&conc_url, 30);
         conc_cfg.batch_size = 1;
-        conc_cfg.concurrency = 4;
+        conc_cfg.concurrency = CONCURRENCY;
         let conc_embedder = build(&conc_cfg, DIM).unwrap();
-        let started = std::time::Instant::now();
-        conc_embedder.embed_batch(&indexed_texts(8)).expect("concurrent delayed embed");
-        let concurrent = started.elapsed();
+        conc_embedder.embed_batch(&indexed_texts(8)).expect("concurrent embed");
         conc_handle.join().unwrap();
 
+        assert_eq!(
+            seq_requests.load(Ordering::SeqCst),
+            8,
+            "batch_size 1 over 8 texts is 8 requests"
+        );
         assert_eq!(seq_max.load(Ordering::SeqCst), 1, "sequential config has one in flight");
-        assert!(conc_max.load(Ordering::SeqCst) > 1, "concurrent config must overlap requests");
-        assert!(
-            concurrent < sequential,
-            "concurrent dispatch should be faster than sequential: {concurrent:?} vs \
-             {sequential:?}"
+        assert_eq!(
+            conc_requests.load(Ordering::SeqCst),
+            8,
+            "batch_size 1 over 8 texts is 8 requests"
+        );
+        assert_eq!(
+            conc_max.load(Ordering::SeqCst),
+            CONCURRENCY as usize,
+            "concurrent config must hold four requests in flight at once"
         );
     }
 
     #[test]
     fn embed_batch_keeps_output_order_when_later_requests_finish_first() {
         let (url, handle, _, _, delayed_until_later_response) =
-            spawn_parallel_counting_stub_with_waits(2, Vec::new(), vec![0]);
+            spawn_parallel_counting_stub_with_waits(2, vec![0]);
         let mut cfg = config_for(&url, 5);
         cfg.batch_size = 1;
         cfg.concurrency = 2;
@@ -1013,7 +1119,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let (url, handle, requests, _, waits_satisfied) =
-            spawn_parallel_counting_stub_with_waits(2, Vec::new(), vec![0]);
+            spawn_parallel_counting_stub_with_waits(2, vec![0]);
         let first_url = url.clone();
         let first = thread::spawn(move || post_stub_embedding_request(&first_url, "text 0"));
         thread::sleep(Duration::from_millis(20));
@@ -1025,6 +1131,41 @@ mod tests {
 
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(waits_satisfied.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parallel_counting_stub_gauges_requests_in_flight_not_connections_accepted() {
+        use std::sync::atomic::Ordering;
+
+        // An idle connection is opened first and never sends anything, so the stub accepts it
+        // before any request arrives and still holds it when the last one is answered. Then four
+        // requests are sent strictly one at a time: `post_stub_embedding_request` reads each
+        // response to end-of-stream before the next connection is opened, so exactly one request
+        // is ever outstanding. `max_in_flight` is therefore 1 — unless the gauge is counting
+        // accepted connections, in which case the idle one lifts it to 2.
+        let (url, handle, requests, max_in_flight, _) =
+            spawn_parallel_counting_stub_with_waits(5, Vec::new());
+        let addr = url.strip_prefix("http://").expect("stub URL has http scheme");
+        let idle = TcpStream::connect(addr).expect("open a connection that sends no request");
+
+        for i in 0..4 {
+            post_stub_embedding_request(&url, &format!("text {i}"));
+        }
+
+        drop(idle);
+        handle.join().unwrap();
+
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "a client that waits for each response before sending the next never has two requests \
+             in flight, and a connection that sent no request is not one"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            4,
+            "the idle connection carried no request, so it must not be counted as one"
+        );
     }
 
     #[test]
