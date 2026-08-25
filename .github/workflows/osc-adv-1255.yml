@@ -1,0 +1,61 @@
+name: osc-adv-1255
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch, tag, or SHA to check
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: focused core live-oracle test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+          echo "checked-out ref: ${{ inputs.target_ref }}"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Run focused core test
+        run: cargo nextest run --no-default-features --locked -p rag-rat-core a_loadable_database_with_an_unknown_file_path_gets_a_diagnosis_neutral_warning
+
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+          echo "checked-out ref: ${{ inputs.target_ref }}"
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Check formatting
+        run: cargo +nightly fmt --all --check
+
+  clippy:
+    name: affected-package clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+          echo "checked-out ref: ${{ inputs.target_ref }}"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check affected packages
+        run: cargo clippy --no-default-features --locked -p rag-rat-core -p rag-rat-oracle --all-targets -- -D warnings
