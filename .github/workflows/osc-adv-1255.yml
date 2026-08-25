@@ -41,6 +41,8 @@ jobs:
           echo "checked-out SHA: $(git rev-parse HEAD)"
           echo "checked-out ref: ${{ inputs.target_ref }}"
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
       - name: Check formatting
         run: cargo +nightly fmt --all --check
 
