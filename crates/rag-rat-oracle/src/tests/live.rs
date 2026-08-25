@@ -1510,6 +1510,49 @@ mod clangd {
     }
 
     #[test]
+    fn live_pass_reports_database_readability_from_the_session_layout() {
+        let h = Harness::new();
+        add_c_file(&h, "src/main.c", "int main(void) { return 0; }\n");
+        std::fs::write(
+            h.root().join("compile_commands.json"),
+            "[\n  # clangd YAML comment\n  \
+             {\"directory\":\"/x\",\"file\":\"/x/a.c\",\"command\":\"cc -c a.c\"},\n]\n",
+        )
+        .unwrap();
+
+        let unreadable_layout = clangd_layout(&h);
+        assert!(
+            unreadable_layout.has_unreadable_database(),
+            "the real layout must classify the YAML-flavoured marker as unreadable",
+        );
+        let (mut unreadable_session, _) =
+            clangd_session(&h, unreadable_layout, Duration::ZERO, None);
+        let worklist = Vec::new();
+        let unreadable_report =
+            live_oracle_pass(&h.conn, &mut unreadable_session, &pass_input(&h, &worklist, 100))
+                .unwrap();
+        assert!(
+            unreadable_report.database_unreadable,
+            "the pass must copy the unreadable fact from its session layout: {unreadable_report:?}",
+        );
+
+        std::fs::write(h.root().join("compile_commands.json"), COMPDB).unwrap();
+        let readable_layout = clangd_layout(&h);
+        assert!(
+            !readable_layout.has_unreadable_database(),
+            "a valid strict-JSON marker must not carry the unreadable fact",
+        );
+        let (mut readable_session, _) = clangd_session(&h, readable_layout, Duration::ZERO, None);
+        let readable_report =
+            live_oracle_pass(&h.conn, &mut readable_session, &pass_input(&h, &worklist, 100))
+                .unwrap();
+        assert!(
+            !readable_report.database_unreadable,
+            "the pass must leave the flag unset for a readable layout: {readable_report:?}",
+        );
+    }
+
+    #[test]
     fn an_aged_out_layout_pointing_elsewhere_aborts_the_pass_and_requeues_the_worklist() {
         let h = Harness::new();
         let defs = add_c_file(&h, "src/lib.c", C_DEFS_SRC);

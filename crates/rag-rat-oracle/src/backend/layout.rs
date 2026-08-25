@@ -126,9 +126,13 @@ pub(super) enum Trust {
     /// persisted as evidence.
     Proven,
     /// A database that merely might load counts too — for warm-up, where being wrong costs a
-    /// session that reports `Warming` rather than a verdict that is wrong. Reporting the whole
-    /// checkout blocked because a database could not be parsed is the more expensive mistake:
-    /// nothing runs, and the checkout gets no live evidence at all.
+    /// session that reports `Warming` rather than a verdict that is wrong. This gives transient
+    /// resilience while a database is regenerated: a resident session rides through a brief
+    /// unreadable interval instead of a `Proven`-gated readiness check dropping the backend to
+    /// `Blocked` and backoff. It also keeps the message honest for a clangd-compatible YAML
+    /// database this reader rejects: `Blocked` would lie about a working checkout, while
+    /// warm-and-skip is true, and skipped paths are held aside rather than requeued so the
+    /// worklist drains and idle shutdown reaps the session.
     Possible,
 }
 
@@ -209,6 +213,17 @@ impl ProjectLayout {
                 [only]
                     if only.reading.verdict == MarkerVerdict::Loadable
                         && only.reading.governs == Governs::NothingIndexed
+            )
+    }
+
+    /// Whether this complete layout has exactly one compilation database that this crate could
+    /// not read as JSON. An incomplete scan cannot establish that the unreadable marker is the
+    /// sole database, so it does not carry this operator-facing fact.
+    pub fn has_unreadable_database(&self) -> bool {
+        self.complete
+            && matches!(
+                self.markers.as_slice(),
+                [only] if only.reading.verdict == MarkerVerdict::Unknown
             )
     }
 

@@ -343,6 +343,11 @@ impl LiveOracleSession {
         self.layout.has_database_governing_nothing_indexed()
     }
 
+    /// Whether the checkout's sole compilation database could not be read as JSON.
+    fn layout_has_unreadable_database(&self) -> bool {
+        self.layout.has_unreadable_database()
+    }
+
     /// Test barrier: one synchronous round trip. The transport is FIFO, so a returned response
     /// proves the server has processed every fire-and-forget notification sent before it —
     /// without this, a test asserting on the warm-up `didOpen` races the server thread.
@@ -436,6 +441,10 @@ pub struct LivePassReport {
     /// file the checkout indexes. Reported so a pass that skipped everything can say WHY in terms
     /// the operator can act on, rather than leaving them with the generic multi-database advice.
     pub database_governs_nothing: bool,
+    /// Whether this checkout holds exactly one compilation database this crate could not read as
+    /// JSON. Reported so a pass that skipped everything can point at the parse/read failure rather
+    /// than leaving an operator with the generic multi-database advice.
+    pub database_unreadable: bool,
     /// Worklist paths the request budget didn't reach — the caller's backlog into the next pass.
     #[serde(skip)]
     pub unfinished_paths: Vec<String>,
@@ -496,6 +505,7 @@ pub fn live_oracle_pass(
         },
     }
     report.database_governs_nothing = session.layout_governs_nothing_indexed();
+    report.database_unreadable = session.layout_has_unreadable_database();
     let tool = session.tool();
     // The batch tool whose monikers live copies (rust-analyzer for ra-lsp, scip-typescript for
     // ts-lsp) — always `Some` for a live tool; the join is vacuous without it.
