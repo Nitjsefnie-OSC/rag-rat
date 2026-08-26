@@ -133,9 +133,9 @@ fn map_definition_to_symbol_prefers_tightest_span() {
     ];
     // Def 12..16 is contained by both → the tighter (id 2) wins.
     assert_eq!(join::map_definition_to_symbol(&spans, 12, 16), Some(2));
-    // Def 50..50 is past the tight method's end (20) → only the enclosing impl contains it.
-    assert_eq!(join::map_definition_to_symbol(&spans, 50, 50), Some(1));
-    // Def 200..200 is past every span → no containment.
+    // An empty definition has no extent to match, even inside the enclosing impl.
+    assert_eq!(join::map_definition_to_symbol(&spans, 50, 50), None);
+    // Def 200..200 is empty and past every span → no containment either.
     assert_eq!(join::map_definition_to_symbol(&spans, 200, 200), None);
 }
 
