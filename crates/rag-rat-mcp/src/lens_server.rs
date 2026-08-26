@@ -372,19 +372,31 @@ pub async fn serve_standalone(
     election_lock: FileLock,
     shutdown: impl Future<Output = std::io::Result<()>> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(address).await?;
-    serve_standalone_on_listener(config, workspace_root, listener, options, election_lock, shutdown)
-        .await
+    serve_standalone_with_binder(
+        config,
+        workspace_root,
+        address,
+        options,
+        election_lock,
+        shutdown,
+        TcpListener::bind,
+    )
+    .await
 }
 
-async fn serve_standalone_on_listener(
+async fn serve_standalone_with_binder<Bind, BindFuture>(
     config: Config,
     workspace_root: PathBuf,
-    listener: TcpListener,
+    address: SocketAddr,
     options: StandaloneServeOptions,
     election_lock: FileLock,
     shutdown: impl Future<Output = std::io::Result<()>> + Send + 'static,
-) -> anyhow::Result<()> {
+    bind: Bind,
+) -> anyhow::Result<()>
+where
+    Bind: FnOnce(SocketAddr) -> BindFuture,
+    BindFuture: Future<Output = std::io::Result<TcpListener>>,
+{
     let StandaloneServeOptions { auth_token, allowed_origins, advertise_url } = options;
     // The caller acquires the election lock before any side effects (index heal, watcher) so a
     // contended worktree fails fast.
@@ -392,6 +404,7 @@ async fn serve_standalone_on_listener(
     let db = rag_rat_core::IndexDatabase::open_config(&config)?;
     db.materialize_lens_coupling()?;
     drop(db);
+    let listener = bind(address).await?;
     let repo_id = rag_rat_base::repo_identity::resolve_repo_identity(
         &config.root,
         config.repo_id_override.as_deref(),
@@ -1437,10 +1450,10 @@ mod tests {
             let bound_address = listener.local_addr().unwrap();
             let (started, wait_for_start) = tokio::sync::oneshot::channel::<()>();
             let (stop, wait_for_stop) = tokio::sync::oneshot::channel::<()>();
-            let served = tokio::spawn(serve_standalone_on_listener(
+            let served = tokio::spawn(serve_standalone_with_binder(
                 config.clone(),
                 root.clone(),
-                listener,
+                bound_address,
                 StandaloneServeOptions {
                     auth_token: "standalone-token".to_string(),
                     allowed_origins: Vec::new(),
@@ -1451,6 +1464,10 @@ mod tests {
                     let _ = started.send(());
                     let _ = wait_for_stop.await;
                     Ok(())
+                },
+                move |address| {
+                    assert_eq!(address, bound_address);
+                    std::future::ready(Ok(listener))
                 },
             ));
 
