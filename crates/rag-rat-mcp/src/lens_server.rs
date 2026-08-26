@@ -1320,12 +1320,13 @@ mod tests {
     async fn port_scan_falls_back_after_a_busy_candidate() {
         let busy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let busy_port = busy.local_addr().unwrap().port();
-        let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let available_port = available.local_addr().unwrap().port();
-        drop(available);
 
-        let selected = bind_first_free([busy_port, available_port]).await.unwrap();
-        assert_eq!(selected.local_addr().unwrap().port(), available_port);
+        let selected = bind_first_free([busy_port]).await.unwrap();
+        assert_ne!(
+            selected.local_addr().unwrap().port(),
+            busy_port,
+            "fallback must skip a candidate while its listener is held"
+        );
     }
 
     #[tokio::test]
@@ -1337,12 +1338,8 @@ mod tests {
         let conn = rusqlite::Connection::open(&config.database).unwrap();
         conn.execute("DELETE FROM repo_meta WHERE key = 'git_coupling_stamp'", []).unwrap();
         drop(conn);
-        let available = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = available.local_addr().unwrap().port();
-        drop(available);
-
         let control = ServeControl::default();
-        let task = tokio::spawn(run_on_ports(config.clone(), [port], control));
+        let task = tokio::spawn(run_on_ports(config.clone(), [0], control));
         let path = lens_discovery_path(&root);
         for _ in 0..100 {
             if path.is_file() {
@@ -1352,7 +1349,11 @@ mod tests {
         }
         assert!(path.is_file(), "active lens task did not publish discovery");
         let discovery: LensDiscovery = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(discovery.port, port);
+        assert_ne!(discovery.port, 0, "discovery must publish the kernel-selected port");
+        let published_listener =
+            tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, discovery.port)).await;
+        assert!(published_listener.is_ok(), "discovery must name the active listener");
+        drop(published_listener);
         let conn = rusqlite::Connection::open(&config.database).unwrap();
         assert!(
             conn.query_row(
@@ -1390,20 +1391,15 @@ mod tests {
             let mut config = test_config(root.clone());
             config.allow_empty = true;
             drop(rag_rat_core::IndexDatabase::rebuild(&config).unwrap());
-            // Claim a port, then release it so `serve_standalone` binds that exact one — its
-            // chosen address is not otherwise observable from here.
-            let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-
             let election = FileLock::try_acquire(&root.join("election.lock"))
                 .unwrap()
                 .expect("an uncontended election lock");
+            let (started, wait_for_start) = tokio::sync::oneshot::channel::<()>();
             let (stop, wait_for_stop) = tokio::sync::oneshot::channel::<()>();
             let served = tokio::spawn(serve_standalone(
                 config.clone(),
                 root.clone(),
-                SocketAddr::new(bind_ip, port),
+                SocketAddr::new(bind_ip, 0),
                 StandaloneServeOptions {
                     auth_token: "standalone-token".to_string(),
                     allowed_origins: Vec::new(),
@@ -1411,22 +1407,16 @@ mod tests {
                 },
                 election,
                 async move {
+                    let _ = started.send(());
                     let _ = wait_for_stop.await;
                     Ok(())
                 },
             ));
 
-            // Publication happens before the listener is served, so a port that answers means the
-            // decision has already been made either way.
-            let mut serving = false;
-            for _ in 0..200 {
-                if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await.is_ok() {
-                    serving = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(serving, "standalone serve never accepted on {bind_ip}:{port}");
+            tokio::time::timeout(std::time::Duration::from_secs(10), wait_for_start)
+                .await
+                .expect("standalone serve must reach its shutdown future")
+                .expect("standalone serve must not exit before serving");
 
             let discovery_path = lens_discovery_path(&root);
             assert_eq!(
@@ -1437,9 +1427,13 @@ mod tests {
             if publishes {
                 let published: LensDiscovery =
                     serde_json::from_slice(&fs::read(&discovery_path).unwrap()).unwrap();
-                assert_eq!(published.port, port);
+                assert_ne!(published.port, 0, "discovery must publish the kernel-selected port");
                 assert_eq!(published.ownership_token, "standalone-token");
-                assert!(published.url.contains(&port.to_string()));
+                assert!(published.url.contains(&published.port.to_string()));
+                let published_listener =
+                    tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, published.port)).await;
+                assert!(published_listener.is_ok(), "discovery must name the active listener");
+                drop(published_listener);
             }
 
             let _ = stop.send(());
@@ -1461,18 +1455,15 @@ mod tests {
         let mut config = test_config(root.clone());
         config.allow_empty = true;
         drop(rag_rat_core::IndexDatabase::rebuild(&config).unwrap());
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
         let election = FileLock::try_acquire(&root.join("election.lock"))
             .unwrap()
             .expect("an uncontended election lock");
+        let (started, wait_for_start) = tokio::sync::oneshot::channel::<()>();
         let (stop, wait_for_stop) = tokio::sync::oneshot::channel::<()>();
         let served = tokio::spawn(serve_standalone(
             config.clone(),
             root.clone(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             StandaloneServeOptions {
                 auth_token: "standalone-token".to_string(),
                 allowed_origins: Vec::new(),
@@ -1480,18 +1471,17 @@ mod tests {
             },
             election,
             async move {
+                let _ = started.send(());
                 let _ = wait_for_stop.await;
                 Ok(())
             },
         ));
 
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait_for_start)
+            .await
+            .expect("advertise-url serve must reach its shutdown future")
+            .expect("advertise-url serve must not exit before serving");
         let discovery_path = lens_discovery_path(&root);
-        for _ in 0..200 {
-            if discovery_path.is_file() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         let published: LensDiscovery = serde_json::from_slice(
             &fs::read(&discovery_path).expect("an advertise-url serve must publish discovery"),
         )
