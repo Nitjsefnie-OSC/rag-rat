@@ -523,9 +523,7 @@ fn path_has_case_alias(path: &Path) -> bool {
 }
 
 async fn bind_first_free(ports: impl IntoIterator<Item = u16>) -> anyhow::Result<TcpListener> {
-    bind_first_free_with(ports, |address| TcpListener::bind(address))
-        .await
-        .context("binding a loopback lens port")
+    bind_first_free_with(ports, TcpListener::bind).await.context("binding a loopback lens port")
 }
 
 async fn bind_first_free_with<T, Bind, BindFuture>(
