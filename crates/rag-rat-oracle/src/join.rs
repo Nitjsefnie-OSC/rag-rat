@@ -69,6 +69,9 @@ pub(crate) fn classify_edge(input: &JoinInput<'_>) -> Option<EdgeVerdict> {
 
     // Where is this symbol defined?
     let definition = input.index.definitions.get(&scip_symbol);
+    if definition.is_some_and(|def| !definition_has_extent(def.start_byte, def.end_byte)) {
+        return None;
+    }
     let resolved_symbol_id =
         definition.and_then(|def| (input.resolve_symbol)(&def.path, def.start_byte, def.end_byte));
 
@@ -238,7 +241,8 @@ pub fn package_of(scip_symbol: &str) -> Option<String> {
 /// Map a SCIP definition byte-range to one of our symbols in `spans` by REAL containment: the
 /// symbol whose `[start_byte, end_byte]` actually contains the *whole* definition range
 /// (`span.start_byte <= def_start && def_end <= span.end_byte`), preferring the tightest (smallest)
-/// such span (so a method beats its enclosing impl). Returns the symbol id or `None`.
+/// such span (so a method beats its enclosing impl). Empty or inverted definition ranges have no
+/// extent to contain and return `None`, as does a range no symbol contains.
 ///
 /// Containment is over the full def range — NOT just `def_start` — on purpose: a symbol whose span
 /// ends *before* the definition (a short helper preceding the real target) must NOT win. The
@@ -252,6 +256,9 @@ pub(crate) fn map_definition_to_symbol(
     def_start: usize,
     def_end: usize,
 ) -> Option<i64> {
+    if !definition_has_extent(def_start, def_end) {
+        return None;
+    }
     let def_start = i64::try_from(def_start).ok()?;
     let def_end = i64::try_from(def_end).ok()?;
     spans
@@ -259,6 +266,10 @@ pub(crate) fn map_definition_to_symbol(
         .filter(|span| span.start_byte <= def_start && def_end <= span.end_byte)
         .min_by_key(|span| span.end_byte - span.start_byte)
         .map(|span| span.symbol_id)
+}
+
+fn definition_has_extent(start: usize, end: usize) -> bool {
+    start < end
 }
 
 /// Tally one verdict into the report's counters. Returns whether a row should be written

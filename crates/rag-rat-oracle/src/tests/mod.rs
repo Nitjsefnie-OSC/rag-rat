@@ -31,3 +31,4 @@ mod status_tests;
 mod store_io;
 mod surfacing;
 mod tool_defaults;
+mod zero_width_definitions;
