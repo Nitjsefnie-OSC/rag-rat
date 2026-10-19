@@ -677,6 +677,8 @@ fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading 
     // `serde_json`'s reader deserializer pulls ONE BYTE at a time — measured unbuffered, a 2 MB
     // database costs two million `read` syscalls — so the buffer in front of it is what makes this
     // a sequential read.
+    #[cfg(test)]
+    let file = CompilationDatabaseReader(file);
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     if !skip_utf8_bom(&mut reader) {
         return unreadable;
@@ -716,6 +718,43 @@ fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading 
                 MarkerReading { verdict: MarkerVerdict::NotLoadable, governs: Governs::Unknown },
             _ => unreadable,
         },
+    }
+}
+
+// Thread-local because layout validation is synchronous and tests run in parallel.
+#[cfg(test)]
+std::thread_local! {
+    static COMPILATION_DATABASE_WORK: RefCell<CompilationDatabaseWork> = RefCell::default();
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct CompilationDatabaseWork {
+    pub(super) records: usize,
+    pub(super) bytes: usize,
+    pub(super) max_read_ahead: usize,
+    read_ahead: usize,
+}
+
+#[cfg(test)]
+pub(super) fn take_compilation_database_work() -> CompilationDatabaseWork {
+    COMPILATION_DATABASE_WORK.with(RefCell::take)
+}
+
+/// Observe actual file reads below the buffer, including reads before the first record visit.
+#[cfg(test)]
+struct CompilationDatabaseReader(std::fs::File);
+
+#[cfg(test)]
+impl std::io::Read for CompilationDatabaseReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = std::io::Read::read(&mut self.0, buffer)?;
+        COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
+            work.bytes += bytes;
+            work.read_ahead += bytes;
+            work.max_read_ahead = work.max_read_ahead.max(work.read_ahead);
+        });
+        Ok(bytes)
     }
 }
 
@@ -1170,6 +1209,11 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor<'_> {
             let Some(entry) = entry else {
                 break;
             };
+            #[cfg(test)]
+            COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
+                work.records += 1;
+                work.read_ahead = 0;
+            });
             if entry.configures_a_file {
                 entries += 1;
             }
