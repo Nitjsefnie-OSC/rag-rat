@@ -660,7 +660,8 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// about whether the entries describe a loadable project.
 fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading {
     #[cfg(all(test, target_os = "linux"))]
-    let _input_reads = CompilationDatabaseInputReads::new();
+    let _input_reads = COMPILATION_DATABASE_HEAP_START
+        .with(|start| start.get().map(|_| CompilationDatabaseInputReads::new()));
     let unreadable = MarkerReading { verdict: MarkerVerdict::Unknown, governs: Governs::Unknown };
     // Both callers reach here having checked only that the path EXISTS, and a marker path that
     // exists is not necessarily something that can be read: opening a FIFO with no writer blocks
@@ -726,6 +727,9 @@ fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading 
 #[cfg(test)]
 std::thread_local! {
     static COMPILATION_DATABASE_WORK: RefCell<CompilationDatabaseWork> = RefCell::default();
+    static COMPILATION_DATABASE_HEAP_START: std::cell::Cell<Option<isize>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -741,9 +745,32 @@ pub(super) struct CompilationDatabaseWork {
     metadata_heap_bytes: isize,
 }
 
+/// Observe one synchronous validation call, before any of its reader or parser allocations.
+/// Kernel accounting is opt-in with this scope and is required on Linux, not silently skipped.
 #[cfg(test)]
-pub(super) fn take_compilation_database_work() -> CompilationDatabaseWork {
-    COMPILATION_DATABASE_WORK.with(RefCell::take)
+pub(super) fn observe_compilation_database<T>(
+    validate: impl FnOnce() -> T,
+) -> (T, CompilationDatabaseWork) {
+    COMPILATION_DATABASE_HEAP_START.with(|start| {
+        assert!(start.get().is_none(), "compilation database observations must not nest");
+    });
+    COMPILATION_DATABASE_WORK.with(RefCell::take);
+    let heap_start = compilation_database_allocations::live_bytes();
+    COMPILATION_DATABASE_HEAP_START.with(|start| start.set(Some(heap_start)));
+    let _observation = CompilationDatabaseObservation;
+    let result = validate();
+    let work = COMPILATION_DATABASE_WORK.with(RefCell::take);
+    (result, work)
+}
+
+#[cfg(test)]
+struct CompilationDatabaseObservation;
+
+#[cfg(test)]
+impl Drop for CompilationDatabaseObservation {
+    fn drop(&mut self) {
+        COMPILATION_DATABASE_HEAP_START.with(|start| start.set(None));
+    }
 }
 
 /// Observe actual file reads below the buffer, including reads before the first record visit.
@@ -771,7 +798,8 @@ struct CompilationDatabaseInputReads(u64);
 #[cfg(all(test, target_os = "linux"))]
 impl CompilationDatabaseInputReads {
     fn snapshot() -> (u64, u64) {
-        let text = std::fs::read_to_string("/proc/thread-self/io").expect("thread I/O accounting");
+        let text = std::fs::read_to_string("/proc/thread-self/io")
+            .expect("compilation database observation requires Linux thread I/O accounting");
         let bytes = text
             .lines()
             .find_map(|line| line.strip_prefix("rchar: "))
@@ -797,20 +825,21 @@ impl Drop for CompilationDatabaseInputReads {
     }
 }
 
-// Sample retained allocations at record boundaries. Only net growth during the canonical-parent
-// memo update is excluded; allocations retained elsewhere stay charged, including entry payloads.
+// Sample net live heap at record boundaries against the validation-call baseline, including
+// reader and preallocated storage. Only net growth during the canonical-parent memo update is
+// excluded; allocations retained elsewhere stay charged, including entry payloads.
 #[cfg(test)]
-struct CompilationEntryRetention {
-    heap_start: isize,
-    metadata_start: isize,
-}
+struct CompilationEntryRetention;
 
 #[cfg(test)]
 impl Drop for CompilationEntryRetention {
     fn drop(&mut self) {
-        let heap = compilation_database_allocations::live_bytes() - self.heap_start;
+        let Some(heap_start) = COMPILATION_DATABASE_HEAP_START.with(std::cell::Cell::get) else {
+            return;
+        };
+        let heap = compilation_database_allocations::live_bytes() - heap_start;
         COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
-            let retained = heap - (work.metadata_heap_bytes - self.metadata_start);
+            let retained = heap - work.metadata_heap_bytes;
             work.max_retained_bytes = work.max_retained_bytes.max(retained.max(0) as usize);
         });
     }
@@ -1325,10 +1354,6 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor<'_> {
         let mut unmodelled_key = false;
         let mut governs_indexed = false;
         let mut governs_unknown = false;
-        #[cfg(test)]
-        let heap_start = compilation_database_allocations::live_bytes();
-        #[cfg(test)]
-        let metadata_start = COMPILATION_DATABASE_WORK.with_borrow(|work| work.metadata_heap_bytes);
         // Reuse the captured paths; the canonical-parent memo may grow with distinct parents.
         let mut paths = EntryPaths::default();
         // The first entry `CompilationEntry` rejects ends the read: clangd would refuse the
@@ -1350,7 +1375,7 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor<'_> {
                 break;
             };
             #[cfg(test)]
-            let _retention = CompilationEntryRetention { heap_start, metadata_start };
+            let _retention = CompilationEntryRetention;
             #[cfg(test)]
             COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
                 work.records += 1;

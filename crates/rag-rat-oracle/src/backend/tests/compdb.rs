@@ -787,10 +787,11 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     // Validation runs while the maintenance pass holds the repository write lock. Pin one
     // streaming pass over a realistically large database: every record is visited once, every
     // input byte is read once, and read-ahead between records stays within the 64 KiB buffer.
-    // Retained heap growth at record boundaries, excluding only net growth during canonical-parent
-    // memo updates, is bounded by 64 KiB. Linux thread I/O accounting also catches independent
-    // reads. These observations do not impose an absolute runtime budget or bound the memo's
-    // size.
+    // Net live heap at record boundaries is measured from before layout validation, including
+    // storage allocated before the array visitor. Allow 64 KiB for the fixed reader plus 64 KiB
+    // for remaining parser, path, and layout storage; exclude only net memo-update growth.
+    // Linux thread I/O accounting is required within these explicit observation scopes.
+    // These observations do not impose an absolute runtime budget or bound the memo's size.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     let (_dir_guard, dir) = checkout("clangd-large-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -798,6 +799,8 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
 
     // Shaped like a real Ninja/CMake export: absolute paths, one entry per translation unit, and
     // a flag list long enough that the file's size comes from the commands rather than the count.
+    const READER_STORAGE: usize = 64 * 1024;
+    const SCRATCH_STORAGE: usize = 64 * 1024;
     const FLAGS: &str = "-DNDEBUG -DUSE_AURA=1 -DCOMPONENT_BUILD -I../.. -Igen \
                          -I../../third_party/abseil-cpp -I../../third_party/boringssl/src/include \
                          -O2 -std=c++20 -fno-exceptions -fno-rtti -Wall";
@@ -821,9 +824,8 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     std::fs::write(dir.join("compile_commands.json"), &database).unwrap();
     drop(database);
 
-    layout::take_compilation_database_work();
-    let layout = clangd.resolve_layout(&scope(&dir));
-    let work = layout::take_compilation_database_work();
+    let checkout = scope(&dir);
+    let (layout, work) = layout::observe_compilation_database(|| clangd.resolve_layout(&checkout));
     assert!(layout.sole_marker_dir().is_some(), "a large database is still a usable one");
     assert_eq!(work.records, ENTRIES, "usable database must visit each record exactly once");
     assert_eq!(work.bytes, database_bytes, "usable database must read the file exactly once");
@@ -834,7 +836,7 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
         "usable database must not read independent input handles"
     );
     assert!(
-        work.max_retained_bytes <= 64 * 1024,
+        work.max_retained_bytes <= READER_STORAGE + SCRATCH_STORAGE,
         "usable database must not accumulate entries or payloads: {work:?}"
     );
 
@@ -844,8 +846,7 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     // byte just once, with bounded read-ahead, rather than performing a separate governance scan.
     let nothing_indexed = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
     let scope = crate::backend::CheckoutScope::resolve(&dir, &nothing_indexed);
-    let layout = clangd.resolve_layout(&scope);
-    let work = layout::take_compilation_database_work();
+    let (layout, work) = layout::observe_compilation_database(|| clangd.resolve_layout(&scope));
     assert!(
         layout.sole_marker_dir().is_none(),
         "its entries name another machine's tree, so it governs nothing here",
@@ -868,7 +869,7 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
         "governs-nothing database must not read independent input handles"
     );
     assert!(
-        work.max_retained_bytes <= 64 * 1024,
+        work.max_retained_bytes <= READER_STORAGE + SCRATCH_STORAGE,
         "governs-nothing database must not accumulate entries or payloads: {work:?}"
     );
 }
