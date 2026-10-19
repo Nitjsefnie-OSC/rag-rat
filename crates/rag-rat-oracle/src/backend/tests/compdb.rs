@@ -787,7 +787,9 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     // Validation runs while the maintenance pass holds the repository write lock. Pin one
     // streaming pass over a realistically large database: every record is visited once, every
     // input byte is read once, and read-ahead between records stays within the 64 KiB buffer.
-    // These work counts do not impose an absolute runtime budget.
+    // Retained heap growth at record boundaries, excluding the canonical-parent memo, is also
+    // bounded by 64 KiB. On Linux, thread I/O accounting additionally catches independent reads.
+    // These observations do not impose an absolute runtime budget or bound the memo's size.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     let (_dir_guard, dir) = checkout("clangd-large-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -825,6 +827,15 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     assert_eq!(work.records, ENTRIES, "usable database must visit each record exactly once");
     assert_eq!(work.bytes, database_bytes, "usable database must read the file exactly once");
     assert!(work.max_read_ahead <= 64 * 1024, "usable database must stream records: {work:?}");
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        work.input_bytes, database_bytes as u64,
+        "usable database must not read independent input handles"
+    );
+    assert!(
+        work.max_retained_bytes <= 64 * 1024,
+        "usable database must not accumulate entries or payloads: {work:?}"
+    );
 
     // The governance answer comes from the SAME pass — there is no second read of the file — and
     // this is its worst case: a corpus that matches nothing means every entry's paths are captured
@@ -849,6 +860,15 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     assert!(
         work.max_read_ahead <= 64 * 1024,
         "governs-nothing database must stream records: {work:?}"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        work.input_bytes, database_bytes as u64,
+        "governs-nothing database must not read independent input handles"
+    );
+    assert!(
+        work.max_retained_bytes <= 64 * 1024,
+        "governs-nothing database must not accumulate entries or payloads: {work:?}"
     );
 }
 
