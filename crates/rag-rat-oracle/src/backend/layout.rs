@@ -797,8 +797,8 @@ impl Drop for CompilationDatabaseInputReads {
     }
 }
 
-// Sample retained allocations at record boundaries. The canonical-parent memo is metadata,
-// accounted separately; entry values, copied payloads, and collections retaining them are not.
+// Sample retained allocations at record boundaries. Only net growth during the canonical-parent
+// memo update is excluded; allocations retained elsewhere stay charged, including entry payloads.
 #[cfg(test)]
 struct CompilationEntryRetention {
     heap_start: isize,
@@ -1015,9 +1015,6 @@ impl EntryPaths {
     /// syscall per entry, and it fails outright for a file that no longer exists, which is ordinary
     /// for a database written before the last edit.
     fn names_indexed_file(&mut self, corpus: &dyn super::IndexedCorpus) -> bool {
-        #[cfg(test)]
-        let _metadata =
-            CompilationMetadataAllocations(compilation_database_allocations::live_bytes());
         if self.file.is_empty() {
             return false;
         }
@@ -1041,10 +1038,16 @@ impl EntryPaths {
         let (Some(parent), Some(name)) = (lexical.parent(), lexical.file_name()) else {
             return false;
         };
-        let resolved = self
-            .canonical_parents
-            .entry(parent.to_path_buf())
-            .or_insert_with(|| rag_rat_base::paths::canonicalize(parent).ok());
+        let resolved = {
+            // Exclude only net heap growth from the memo update: its table, parent keys, and
+            // resolved-parent values. Lexical work and corpus calls remain outside this scope.
+            #[cfg(test)]
+            let _metadata =
+                CompilationMetadataAllocations(compilation_database_allocations::live_bytes());
+            self.canonical_parents
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| rag_rat_base::paths::canonicalize(parent).ok())
+        };
         resolved.as_ref().is_some_and(|dir| corpus.indexes_file(&dir.join(name)))
     }
 }

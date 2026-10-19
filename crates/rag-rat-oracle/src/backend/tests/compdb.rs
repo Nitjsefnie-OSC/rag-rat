@@ -787,9 +787,10 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     // Validation runs while the maintenance pass holds the repository write lock. Pin one
     // streaming pass over a realistically large database: every record is visited once, every
     // input byte is read once, and read-ahead between records stays within the 64 KiB buffer.
-    // Retained heap growth at record boundaries, excluding the canonical-parent memo, is also
-    // bounded by 64 KiB. On Linux, thread I/O accounting additionally catches independent reads.
-    // These observations do not impose an absolute runtime budget or bound the memo's size.
+    // Retained heap growth at record boundaries, excluding only net growth during canonical-parent
+    // memo updates, is bounded by 64 KiB. Linux thread I/O accounting also catches independent
+    // reads. These observations do not impose an absolute runtime budget or bound the memo's
+    // size.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     let (_dir_guard, dir) = checkout("clangd-large-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
