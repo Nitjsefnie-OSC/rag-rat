@@ -9,6 +9,36 @@ use super::*;
 
 thread_local! {
     static BUSY_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    static FLUSH_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn trace_flush_attempts(conn: &Connection) {
+    unsafe extern "C" fn count_begin(
+        _event: u32,
+        _context: *mut std::ffi::c_void,
+        _statement: *mut std::ffi::c_void,
+        sql: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: SQLITE_TRACE_STMT supplies a valid, nul-terminated SQL string.
+        let sql = unsafe { std::ffi::CStr::from_ptr(sql.cast()) };
+        if sql == c"BEGIN IMMEDIATE" {
+            FLUSH_ATTEMPTS.set(FLUSH_ATTEMPTS.get() + 1);
+        }
+        0
+    }
+
+    FLUSH_ATTEMPTS.set(0);
+    // SAFETY: the connection is live, the callback keeps no pointers, and its thread-local
+    // counter outlives this connection. SQLite invokes it synchronously on this test's thread.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_trace_v2(
+            conn.handle(),
+            rusqlite::ffi::SQLITE_TRACE_STMT,
+            Some(count_begin),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(result, rusqlite::ffi::SQLITE_OK);
 }
 
 struct Fixture {
@@ -239,6 +269,7 @@ fn batch_busy_retry_uses_injected_backoff_before_last_attempt() {
     });
     drop(lock);
     assert!(result.is_ok(), "the last bounded attempt must commit: {result:?}");
+    assert_eq!(result.unwrap(), 1, "only committed edge inserts count");
     assert_eq!(BUSY_ATTEMPTS.get(), 2);
     assert_eq!(elapsed, Duration::from_millis(150));
     let after = read_build_checkpoint(&fixture.writer);
@@ -250,17 +281,25 @@ fn batch_busy_retry_uses_injected_backoff_before_last_attempt() {
 }
 
 #[test]
-fn batch_busy_retry_exercises_default_sleeper_without_wall_clock_wait() {
+fn batch_busy_retry_default_sleeper_waits_for_backoff() {
     let fixture = Fixture::new();
     let before = read_build_checkpoint(&fixture.writer);
     let lock = fixture.lock_writer();
     let (mut batch, mut postings) = pending_batch();
-    // Keep the real default sleeper; zero durations control it without timed waits.
-    let retry = BatchRetry { backoff: [Duration::ZERO; 2], ..BatchRetry::default() };
+    // Observe the real default backend. Only a lower bound is required: scheduler delays
+    // cannot fail this assertion, and lock ownership does not depend on elapsed time.
+    let retry = BatchRetry::default();
+    let minimum_wait: Duration = retry.backoff.into_iter().sum();
+    let started = Instant::now();
     let result = flush(&fixture.conn, &mut batch, &mut postings).flush(retry);
+    let elapsed = started.elapsed();
     drop(lock);
     assert!(result.is_err());
     assert_eq!(BUSY_ATTEMPTS.get(), 3, "the default sleeper must reach the bounded final attempt");
+    assert!(
+        elapsed >= minimum_wait,
+        "default sleeper skipped backoff: {elapsed:?} < {minimum_wait:?}"
+    );
     assert_eq!(read_build_checkpoint(&fixture.writer), before);
     assert_eq!((batch.len(), postings.len()), (1, 1));
 }
@@ -286,7 +325,77 @@ fn batch_busy_retry_rolls_back_failed_commit_before_repeating_batch() {
     });
     drop(reader);
     assert!(result.is_ok(), "retry must recover from a busy COMMIT: {result:?}");
+    assert_eq!(result.unwrap(), 1, "rolled-back edge inserts must not count");
     assert_eq!((BUSY_ATTEMPTS.get(), waits), (1, 1));
+    let after = read_build_checkpoint(&fixture.writer);
+    assert_eq!(
+        (after.edges, after.postings, after.generation.1, after.generation.2),
+        (1, 2, 42, 1)
+    );
+    assert!(batch.is_empty() && postings.is_empty());
+}
+
+#[test]
+fn batch_busy_retry_sqlite_locked_is_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("locked.sqlite");
+    let flags = rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_SHARED_CACHE;
+    let conn = Connection::open_with_flags(&path, flags).unwrap();
+    rag_rat_db::schema::apply(&conn, &rag_rat_db::hooks::MigrationHooks::noop()).unwrap();
+    seed_building_generation(&conn);
+    conn.busy_timeout(Duration::ZERO).unwrap();
+    let writer = Connection::open_with_flags(&path, flags).unwrap();
+    writer.busy_timeout(Duration::ZERO).unwrap();
+    let before = read_build_checkpoint(&writer);
+    let lock = writer.unchecked_transaction().unwrap();
+    writer
+        .execute("UPDATE clone_graph_generations SET cursor_symbol_id = cursor_symbol_id", [])
+        .unwrap();
+    let (mut batch, mut postings) = pending_batch();
+    let mut waits = 0;
+    trace_flush_attempts(&conn);
+    let result = flush(&conn, &mut batch, &mut postings)
+        .flush(BatchRetry { backoff: BatchRetry::default().backoff, sleep: |_| waits += 1 });
+    drop(lock);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DatabaseLocked),
+        "{error:?}"
+    );
+    assert_eq!(waits, 0, "SQLITE_LOCKED is not SQLITE_BUSY: non-BUSY must surface immediately");
+    assert_eq!(FLUSH_ATTEMPTS.get(), 1, "SQLITE_LOCKED must run exactly one attempt");
+    assert_eq!(read_build_checkpoint(&writer), before);
+    assert_eq!((batch.len(), postings.len()), (1, 1));
+    assert!(conn.is_autocommit());
+    assert!(!is_sqlite_busy(&error.context("flushing batch checkpoint")));
+    for extended_code in [
+        rusqlite::ffi::SQLITE_BUSY,
+        rusqlite::ffi::SQLITE_BUSY_RECOVERY,
+        rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+        rusqlite::ffi::SQLITE_BUSY_TIMEOUT,
+    ] {
+        let error = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(extended_code),
+            None,
+        ))
+        .context("flushing batch checkpoint");
+        assert!(is_sqlite_busy(&error), "wrapped SQLite code {extended_code} must retry");
+    }
+
+    // Contrast the terminal LOCKED case with a retryable writer collision, so removing
+    // retries cannot satisfy this negative case merely by rejecting all contention.
+    let fixture = Fixture::new();
+    let mut lock = Some(fixture.lock_writer());
+    let result = flush(&fixture.conn, &mut batch, &mut postings).flush(BatchRetry {
+        backoff: BatchRetry::default().backoff,
+        sleep: |_| lock.take().unwrap().rollback().unwrap(),
+    });
+    drop(lock);
+    assert!(result.is_ok(), "SQLITE_BUSY must still retry: {result:?}");
+    assert_eq!(result.unwrap(), 1);
+    assert_eq!(BUSY_ATTEMPTS.get(), 1);
     let after = read_build_checkpoint(&fixture.writer);
     assert_eq!(
         (after.edges, after.postings, after.generation.1, after.generation.2),

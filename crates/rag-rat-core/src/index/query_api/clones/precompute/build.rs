@@ -340,7 +340,7 @@ pub(in super::super) fn make_edge(
 /// via `INSERT OR IGNORE` on their content-key PKs) and checkpoint the generation's cursor + edge
 /// count — all in ONE transaction, so postings, edges, and the cursor advance atomically together
 /// (review R6: a symbol's postings are durable before its symbol id is checkpointed as done).
-/// Retries the whole transaction at most twice on SQLite BUSY/LOCKED, with 50 ms then 100 ms
+/// Retries the whole transaction at most twice on SQLite BUSY, with 50 ms then 100 ms
 /// backoff in addition to the connection's busy timeout. Failed attempts roll back before waiting.
 /// Returns the EDGE rows actually inserted (dedup-ignored rows don't count).
 fn flush_batch(
@@ -388,7 +388,7 @@ impl BatchFlush<'_> {
                     self.postings.clear();
                     return Ok(inserted);
                 },
-                Err(err) if rag_rat_db::storage::is_busy(&err) => {
+                Err(err) if is_sqlite_busy(&err) => {
                     let Some(delay) = backoff.next() else { return Err(err) };
                     (retry.sleep)(delay);
                 },
@@ -413,6 +413,19 @@ impl BatchFlush<'_> {
         tx.commit()?;
         Ok(inserted)
     }
+}
+
+/// Recognize SQLite BUSY (including extended codes) through error context wrappers.
+/// LOCKED signals a same-connection or shared-cache conflict, rather than the separate
+/// writer contention retried here. Repository connection opens do not request shared cache.
+fn is_sqlite_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    })
 }
 
 #[cfg(test)]
