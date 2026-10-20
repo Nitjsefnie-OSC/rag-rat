@@ -22,7 +22,7 @@ fn trace_flush_attempts(conn: &Connection) {
         // SAFETY: SQLITE_TRACE_STMT supplies a valid, nul-terminated SQL string.
         let sql = unsafe { std::ffi::CStr::from_ptr(sql.cast()) };
         if sql == c"BEGIN IMMEDIATE" {
-            FLUSH_ATTEMPTS.set(FLUSH_ATTEMPTS.get() + 1);
+            FLUSH_ATTEMPTS.set(FLUSH_ATTEMPTS.get().saturating_add(1));
         }
         0
     }
@@ -39,6 +39,72 @@ fn trace_flush_attempts(conn: &Connection) {
         )
     };
     assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+}
+
+struct AttemptLimit<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> AttemptLimit<'a> {
+    fn assert_escape_interrupts_fourth_begin(conn: &'a Connection) {
+        // Exercise the escape with a finite probe while the other connection holds its lock.
+        // This checks the callback wiring before trusting it to stop a retry regression.
+        let limit = Self::new(conn);
+        for attempt in 1..=4 {
+            let error = conn.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+            let expected = if attempt <= 3 {
+                rusqlite::ffi::SQLITE_BUSY
+            } else {
+                rusqlite::ffi::SQLITE_INTERRUPT
+            };
+            assert!(
+                matches!(error, rusqlite::Error::SqliteFailure(code, _) if code.extended_code == expected),
+                "attempt-limit escape returned the wrong error on attempt {attempt}"
+            );
+        }
+        drop(limit);
+        assert!(conn.is_autocommit());
+        BUSY_ATTEMPTS.set(0);
+    }
+
+    fn new(conn: &'a Connection) -> Self {
+        unsafe extern "C" fn interrupt_extra_attempt(_context: *mut std::ffi::c_void) -> i32 {
+            i32::from(FLUSH_ATTEMPTS.get() > 3)
+        }
+
+        trace_flush_attempts(conn);
+        // SAFETY: the live connection owns these synchronous callbacks, which retain no
+        // pointers. Returning nonzero interrupts SQL; assertions run after SQLite returns.
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                conn.handle(),
+                1,
+                Some(interrupt_extra_attempt),
+                std::ptr::null_mut(),
+            );
+        }
+        Self { conn }
+    }
+
+    fn assert_exhausted(self) {
+        assert_eq!(FLUSH_ATTEMPTS.get(), 3, "batch retry must stop after three attempts");
+    }
+}
+
+impl Drop for AttemptLimit<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the connection outlives this guard. Disable callbacks before later queries
+        // or cleanup, including when assert_exhausted unwinds after an interrupted attempt.
+        unsafe {
+            rusqlite::ffi::sqlite3_progress_handler(
+                self.conn.handle(),
+                0,
+                None,
+                std::ptr::null_mut(),
+            );
+            rusqlite::ffi::sqlite3_trace_v2(self.conn.handle(), 0, None, std::ptr::null_mut());
+        }
+    }
 }
 
 struct Fixture {
@@ -59,7 +125,7 @@ impl Fixture {
         writer.busy_timeout(Duration::ZERO).unwrap();
         BUSY_ATTEMPTS.set(0);
         conn.busy_handler(Some(|_| {
-            BUSY_ATTEMPTS.set(BUSY_ATTEMPTS.get() + 1);
+            BUSY_ATTEMPTS.set(BUSY_ATTEMPTS.get().saturating_add(1));
             false
         }))
         .unwrap();
@@ -124,6 +190,30 @@ fn flush<'a>(
     BatchFlush { conn, generation: 1, batch, postings, cursor: 42, cumulative_edges: 0 }
 }
 
+fn assert_retry_exhausts_within_wait_budget(fixture: &Fixture) {
+    // Success after a writer releases does not distinguish a bounded iterator from cycle().
+    // Check exhaustion explicitly, with a test-owned bound that fails inside the Rust sleeper.
+    let before = read_build_checkpoint(&fixture.writer);
+    let lock = fixture.lock_writer();
+    let (mut batch, mut postings) = pending_batch();
+    BUSY_ATTEMPTS.set(0);
+    let mut waits = 0;
+    let result = flush(&fixture.conn, &mut batch, &mut postings).flush(BatchRetry {
+        backoff: BatchRetry::default().backoff,
+        sleep: |_| {
+            waits += 1;
+            assert!(waits <= 2, "batch retry exceeded two permitted waits");
+        },
+    });
+    drop(lock);
+    assert!(result.is_err(), "held writer must exhaust retries");
+    assert!(is_sqlite_busy(&result.unwrap_err()));
+    assert_eq!((BUSY_ATTEMPTS.get(), waits), (3, 2));
+    assert_eq!(read_build_checkpoint(&fixture.writer), before);
+    assert_eq!((batch.len(), postings.len()), (1, 1));
+    assert!(fixture.conn.is_autocommit());
+}
+
 #[test]
 fn batch_busy_retry_commits_once_after_writer_releases() {
     let fixture = Fixture::new();
@@ -145,6 +235,7 @@ fn batch_busy_retry_commits_once_after_writer_releases() {
         backoff: BatchRetry::default().backoff,
         sleep: |delay| {
             waits.push(delay);
+            assert!(waits.len() <= 1, "released-writer flush exceeded one permitted wait");
             assert_eq!(read_build_checkpoint(&fixture.writer), before);
             // Explicit retry/writer handshake; dropping the guard also releases on panic.
             lock.take().unwrap().rollback().unwrap();
@@ -157,6 +248,7 @@ fn batch_busy_retry_commits_once_after_writer_releases() {
     assert_eq!(waits, [Duration::from_millis(50)]);
     assert_eq!(read_build_checkpoint(&fixture.writer), clean);
     assert!(batch.is_empty() && postings.is_empty(), "committed buffers must clear");
+    assert_retry_exhausts_within_wait_budget(&fixture);
 }
 
 #[test]
@@ -168,7 +260,10 @@ fn batch_busy_retry_exhaustion_preserves_checkpoint_and_buffers() {
     let mut waits = Vec::new();
     let result = flush(&fixture.conn, &mut batch, &mut postings).flush(BatchRetry {
         backoff: BatchRetry::default().backoff,
-        sleep: |delay| waits.push(delay),
+        sleep: |delay| {
+            waits.push(delay);
+            assert!(waits.len() <= 2, "batch retry exceeded two permitted waits");
+        },
     });
     drop(lock);
     assert!(result.is_err(), "an exhausted batch must still fail");
@@ -224,6 +319,7 @@ fn batch_busy_retry_returns_first_non_busy_error() {
         backoff: BatchRetry::default().backoff,
         sleep: |_| {
             waits += 1;
+            assert!(waits <= 1, "terminal-error flush exceeded one permitted wait");
             if let Some(lock) = lock.take() {
                 lock.rollback().unwrap();
             }
@@ -245,6 +341,7 @@ fn batch_busy_retry_returns_first_non_busy_error() {
     assert_eq!(read_build_checkpoint(&fixture.writer), before, "earlier inserts must roll back");
     assert_eq!((batch.len(), postings.len()), (1, 1));
     assert!(fixture.conn.is_autocommit());
+    assert_retry_exhausts_within_wait_budget(&fixture);
 }
 
 #[test]
@@ -254,9 +351,12 @@ fn batch_busy_retry_uses_injected_backoff_before_last_attempt() {
     let mut lock = Some(fixture.lock_writer());
     let (mut batch, mut postings) = pending_batch();
     let mut elapsed = Duration::ZERO;
+    let mut waits = 0;
     let result = flush(&fixture.conn, &mut batch, &mut postings).flush(BatchRetry {
         backoff: BatchRetry::default().backoff,
         sleep: |delay| {
+            waits += 1;
+            assert!(waits <= 2, "batch retry exceeded two permitted waits");
             assert!(fixture.conn.is_autocommit(), "a failed attempt must release its transaction");
             assert_eq!(read_build_checkpoint(&fixture.writer), before);
             elapsed += delay;
@@ -278,6 +378,7 @@ fn batch_busy_retry_uses_injected_backoff_before_last_attempt() {
         (1, 2, 42, 1)
     );
     assert!(batch.is_empty() && postings.is_empty());
+    assert_retry_exhausts_within_wait_budget(&fixture);
 }
 
 #[test]
@@ -290,10 +391,13 @@ fn batch_busy_retry_default_sleeper_waits_for_backoff() {
     // cannot fail this assertion, and lock ownership does not depend on elapsed time.
     let retry = BatchRetry::default();
     let minimum_wait: Duration = retry.backoff.into_iter().sum();
+    AttemptLimit::assert_escape_interrupts_fourth_begin(&fixture.conn);
+    let attempt_limit = AttemptLimit::new(&fixture.conn);
     let started = Instant::now();
     let result = flush(&fixture.conn, &mut batch, &mut postings).flush(retry);
     let elapsed = started.elapsed();
     drop(lock);
+    attempt_limit.assert_exhausted();
     assert!(result.is_err());
     assert_eq!(BUSY_ATTEMPTS.get(), 3, "the default sleeper must reach the bounded final attempt");
     assert!(
@@ -302,6 +406,31 @@ fn batch_busy_retry_default_sleeper_waits_for_backoff() {
     );
     assert_eq!(read_build_checkpoint(&fixture.writer), before);
     assert_eq!((batch.len(), postings.len()), (1, 1));
+}
+
+#[test]
+fn batch_busy_retry_production_entrypoint_exhausts_with_default_backoff() {
+    let fixture = Fixture::new();
+    let before = read_build_checkpoint(&fixture.writer);
+    let lock = fixture.lock_writer();
+    let (mut batch, mut postings) = pending_batch();
+    AttemptLimit::assert_escape_interrupts_fourth_begin(&fixture.conn);
+    let attempt_limit = AttemptLimit::new(&fixture.conn);
+    let started = Instant::now();
+    let result = flush_batch(&fixture.conn, 1, &mut batch, &mut postings, 42, 0);
+    let elapsed = started.elapsed();
+    drop(lock);
+    attempt_limit.assert_exhausted();
+    assert!(result.is_err(), "held writer must exhaust production retries");
+    assert!(is_sqlite_busy(&result.unwrap_err()));
+    assert_eq!(BUSY_ATTEMPTS.get(), 3, "production flush must encounter three real BUSYs");
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "production flush skipped default backoff: {elapsed:?} < 150ms"
+    );
+    assert_eq!(read_build_checkpoint(&fixture.writer), before);
+    assert_eq!((batch.len(), postings.len(), postings[0].tokens.len()), (1, 1, 2));
+    assert!(fixture.conn.is_autocommit());
 }
 
 #[test]
@@ -318,6 +447,7 @@ fn batch_busy_retry_rolls_back_failed_commit_before_repeating_batch() {
         backoff: BatchRetry::default().backoff,
         sleep: |_| {
             waits += 1;
+            assert!(waits <= 1, "busy-COMMIT flush exceeded one permitted wait");
             assert!(fixture.conn.is_autocommit(), "failed COMMIT must roll back before waiting");
             assert_eq!(read_build_checkpoint(reader.as_ref().unwrap()), before);
             reader.take().unwrap().rollback().unwrap();
@@ -333,6 +463,7 @@ fn batch_busy_retry_rolls_back_failed_commit_before_repeating_batch() {
         (1, 2, 42, 1)
     );
     assert!(batch.is_empty() && postings.is_empty());
+    assert_retry_exhausts_within_wait_budget(&fixture);
 }
 
 #[test]
@@ -354,8 +485,13 @@ fn batch_busy_retry_sqlite_locked_is_terminal() {
     let (mut batch, mut postings) = pending_batch();
     let mut waits = 0;
     trace_flush_attempts(&conn);
-    let result = flush(&conn, &mut batch, &mut postings)
-        .flush(BatchRetry { backoff: BatchRetry::default().backoff, sleep: |_| waits += 1 });
+    let result = flush(&conn, &mut batch, &mut postings).flush(BatchRetry {
+        backoff: BatchRetry::default().backoff,
+        sleep: |_| {
+            waits += 1;
+            assert!(waits <= 2, "LOCKED flush exceeded two permitted waits");
+        },
+    });
     drop(lock);
     let error = result.unwrap_err();
     assert!(
@@ -388,9 +524,14 @@ fn batch_busy_retry_sqlite_locked_is_terminal() {
     // retries cannot satisfy this negative case merely by rejecting all contention.
     let fixture = Fixture::new();
     let mut lock = Some(fixture.lock_writer());
+    let mut busy_waits = 0;
     let result = flush(&fixture.conn, &mut batch, &mut postings).flush(BatchRetry {
         backoff: BatchRetry::default().backoff,
-        sleep: |_| lock.take().unwrap().rollback().unwrap(),
+        sleep: |_| {
+            busy_waits += 1;
+            assert!(busy_waits <= 1, "released-writer flush exceeded one permitted wait");
+            lock.take().unwrap().rollback().unwrap();
+        },
     });
     drop(lock);
     assert!(result.is_ok(), "SQLITE_BUSY must still retry: {result:?}");
@@ -402,4 +543,5 @@ fn batch_busy_retry_sqlite_locked_is_terminal() {
         (1, 2, 42, 1)
     );
     assert!(batch.is_empty() && postings.is_empty());
+    assert_retry_exhausts_within_wait_budget(&fixture);
 }
