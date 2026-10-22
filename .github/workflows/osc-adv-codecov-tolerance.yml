@@ -1,0 +1,78 @@
+# Manual dispatch probe for the Codecov upload failure policy (fork-side verification).
+# Lives on the fork's DEFAULT branch only — never on a feature branch or a PR.
+# Proves the operator semantics the candidate relies on, in one dispatch, three jobs:
+#   test-upload-tolerance / coverage-upload-tolerance: a step failing under the candidate's
+#     failure policy (continue-on-error: true) leaves its job green with the step marked failed;
+#   red-control: a tolerated upload failure followed by a real test failure leaves the job red.
+# Dispatch with target_ref = an adv/... branch cut from the candidate; the checkout echo
+# proves which tree ran.
+
+name: osc-adv-codecov-tolerance
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Branch, tag or SHA to check out (provenance echo)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-upload-tolerance:
+    name: test-upload-fails-job-green
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+      - name: Upload test results to Codecov — replaced action, same failure policy
+        # Same step policy the candidate gives codecov/test-results-action@v1 in ci.yml.
+        continue-on-error: true
+        run: |
+          echo "replacement for codecov/test-results-action@v1: throwing like a TLS disconnect"
+          exit 1
+      - name: proof — job continued
+        run: echo "job continued past the tolerated test-results upload failure"
+
+  coverage-upload-tolerance:
+    name: coverage-upload-fails-job-green
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+      - name: Upload to Codecov — replaced action, same failure policy
+        # Same step policy the candidate gives codecov/codecov-action@v7 in ci.yml.
+        continue-on-error: true
+        run: |
+          echo "replacement for codecov/codecov-action@v7: throwing like a TLS disconnect"
+          exit 1
+      - name: proof — job continued
+        run: echo "job continued past the tolerated coverage upload failure"
+
+  red-control:
+    name: upload-tolerated-tests-fail-job-red
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_ref }}
+      - name: Show checked-out ref
+        run: |
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+      - name: Upload test results to Codecov — tolerated failure
+        # Same step policy the candidate gives the upload steps in ci.yml.
+        continue-on-error: true
+        run: exit 1
+      - name: Run tests — real failure, no continue-on-error
+        run: |
+          echo "replacement for a failing nextest run"
+          exit 1
