@@ -32,6 +32,7 @@ jobs:
           echo "checked-out SHA: $(git rev-parse HEAD)"
       - name: Upload test results to Codecov — replaced action, same failure policy
         # Same step policy the candidate gives codecov/test-results-action@v1 in ci.yml.
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
           echo "replacement for codecov/test-results-action@v1: throwing like a TLS disconnect"
@@ -70,6 +71,7 @@ jobs:
           echo "checked-out SHA: $(git rev-parse HEAD)"
       - name: Upload test results to Codecov — tolerated failure
         # Same step policy the candidate gives the upload steps in ci.yml.
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: exit 1
       - name: Run tests — real failure, no continue-on-error
